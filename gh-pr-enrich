@@ -24,6 +24,67 @@ if [ "$1" = "--version" ] || [ "$1" = "-v" ]; then
     exit 0
 fi
 
+# Handle install-skill subcommand
+if [ "$1" = "install-skill" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    SKILL_SOURCE="$SCRIPT_DIR/.claude/skills/gh-pr-enrich"
+    SKILL_TARGET="$HOME/.claude/skills/gh-pr-enrich"
+
+    # Check if skill exists in extension
+    if [ ! -d "$SKILL_SOURCE" ]; then
+        echo "Error: Skill not found at $SKILL_SOURCE"
+        echo "Try upgrading the extension: gh extension upgrade pr-enrich"
+        exit 1
+    fi
+
+    # Create skills directory if needed
+    mkdir -p "$HOME/.claude/skills"
+
+    # Check if already installed
+    if [ -L "$SKILL_TARGET" ]; then
+        CURRENT_LINK=$(readlink "$SKILL_TARGET")
+        if [ "$CURRENT_LINK" = "$SKILL_SOURCE" ]; then
+            echo "✅ Skill already installed at $SKILL_TARGET"
+            exit 0
+        else
+            echo "⚠️  Existing symlink points to: $CURRENT_LINK"
+            echo "   Updating to: $SKILL_SOURCE"
+            rm "$SKILL_TARGET"
+        fi
+    elif [ -d "$SKILL_TARGET" ]; then
+        echo "Error: Directory already exists at $SKILL_TARGET"
+        echo "Remove it first if you want to install the symlinked skill:"
+        echo "  rm -rf $SKILL_TARGET"
+        exit 1
+    fi
+
+    # Create symlink
+    ln -s "$SKILL_SOURCE" "$SKILL_TARGET"
+    echo "✅ Claude skill installed!"
+    echo "   Source: $SKILL_SOURCE"
+    echo "   Target: $SKILL_TARGET"
+    echo ""
+    echo "The skill will auto-update when you run: gh extension upgrade pr-enrich"
+    exit 0
+fi
+
+# Handle uninstall-skill subcommand
+if [ "$1" = "uninstall-skill" ]; then
+    SKILL_TARGET="$HOME/.claude/skills/gh-pr-enrich"
+
+    if [ -L "$SKILL_TARGET" ]; then
+        rm "$SKILL_TARGET"
+        echo "✅ Claude skill uninstalled"
+    elif [ -d "$SKILL_TARGET" ]; then
+        echo "⚠️  $SKILL_TARGET is a directory, not a symlink"
+        echo "   Remove manually if desired: rm -rf $SKILL_TARGET"
+        exit 1
+    else
+        echo "ℹ️  Skill not installed at $SKILL_TARGET"
+    fi
+    exit 0
+fi
+
 # Handle --help flag
 if [ "$1" = "--help" ] || [ "$1" = "-h" ] || [ $# -lt 1 ]; then
     cat << 'HELP'
@@ -31,6 +92,11 @@ gh pr-enrich - Comprehensive PR analysis with optional Claude AI enrichment
 
 USAGE:
   gh pr-enrich <PR_NUMBER> [OPTIONS]
+  gh pr-enrich <SUBCOMMAND>
+
+SUBCOMMANDS:
+  install-skill     Install Claude Code skill (symlink to ~/.claude/skills/)
+  uninstall-skill   Remove the Claude Code skill symlink
 
 OPTIONS:
   --json            Output only JSON (default: combined)
@@ -42,6 +108,7 @@ OPTIONS:
   -v, --version     Show version
 
 EXAMPLES:
+  gh pr-enrich install-skill          # Install Claude Code skill
   gh pr-enrich 123                    # Basic PR report
   gh pr-enrich 123 --enrich           # With Claude AI analysis
   gh pr-enrich 123 --output-dir ./pr  # Custom output directory
