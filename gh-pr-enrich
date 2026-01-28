@@ -37,6 +37,7 @@ OPTIONS:
   --markdown        Output only Markdown (default: combined)
   --output-dir DIR  Directory to save output (default: .reports/pr-reviews/pr-<N>)
   --enrich          Run Claude AI analysis on unresolved comment threads
+  --prompt FILE     Custom prompt file for Claude analysis (overrides defaults)
   -h, --help        Show this help message
   -v, --version     Show version
 
@@ -45,9 +46,20 @@ EXAMPLES:
   gh pr-enrich 123 --enrich           # With Claude AI analysis
   gh pr-enrich 123 --output-dir ./pr  # Custom output directory
   gh pr-enrich 123 --json             # JSON output only
+  gh pr-enrich 123 --enrich --prompt ./my-prompt.txt  # Custom analysis prompt
+
+PROMPT CUSTOMIZATION:
+  The Claude analysis prompt is loaded from (in priority order):
+  1. --prompt FILE argument
+  2. GH_PR_ENRICH_PROMPT environment variable
+  3. .gh-pr-enrich-prompt.txt in current directory
+  4. default-prompt.txt bundled with extension
+
+  See default-prompt.txt in the extension directory for format.
 
 ENVIRONMENT VARIABLES:
   PR_REVIEW_OUTPUT_ROOT   Override default output directory root
+  GH_PR_ENRICH_PROMPT     Path to custom prompt file for Claude analysis
 
 DEPENDENCIES:
   Required: gh (GitHub CLI), jq
@@ -72,8 +84,54 @@ DEFAULT_OUTPUT_ROOT="${PR_REVIEW_OUTPUT_ROOT:-.reports/pr-reviews}"
 OUTPUT_DIR="$DEFAULT_OUTPUT_ROOT/pr-$PR_NUMBER"
 CUSTOM_OUTPUT_DIR=false
 ENRICH_WITH_CLAUDE=false
+CUSTOM_PROMPT_FILE=""
 REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "current-repo")
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Get the directory where this extension is installed
+get_extension_dir() {
+    local script_path
+    script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    echo "$script_path"
+}
+
+# Load system prompt from file, filtering out comments
+# Priority: --prompt arg > $GH_PR_ENRICH_PROMPT > .gh-pr-enrich-prompt.txt > default-prompt.txt
+load_system_prompt() {
+    local prompt_file=""
+    local extension_dir
+    extension_dir="$(get_extension_dir)"
+
+    # Check --prompt argument first (highest priority)
+    if [ -n "$CUSTOM_PROMPT_FILE" ] && [ -f "$CUSTOM_PROMPT_FILE" ]; then
+        prompt_file="$CUSTOM_PROMPT_FILE"
+    # Check environment variable
+    elif [ -n "${GH_PR_ENRICH_PROMPT:-}" ] && [ -f "$GH_PR_ENRICH_PROMPT" ]; then
+        prompt_file="$GH_PR_ENRICH_PROMPT"
+    # Check for local repo override
+    elif [ -f ".gh-pr-enrich-prompt.txt" ]; then
+        prompt_file=".gh-pr-enrich-prompt.txt"
+    # Fall back to bundled default
+    elif [ -f "$extension_dir/default-prompt.txt" ]; then
+        prompt_file="$extension_dir/default-prompt.txt"
+    fi
+
+    if [ -n "$prompt_file" ]; then
+        # Filter out comment lines (starting with #) and empty lines at start/end
+        grep -v '^#' "$prompt_file" | sed '/./,$!d' | sed ':a;/^[[:space:]]*$/d;N;ba'
+    else
+        # Fallback if no file found (shouldn't happen normally)
+        echo "You are a senior code reviewer analyzing unresolved PR comment threads.
+Your task is to:
+1. Categorize issues by type (security, performance, architecture, style, documentation, etc.)
+2. Identify systemic patterns that appear across multiple comments
+3. Suggest adjacent areas that may have similar problems worth investigating
+4. Create a prioritized task list for addressing the issues
+
+Focus on actionable insights. Be specific about file paths and patterns.
+If there are no systemic issues or adjacent problems, return empty arrays for those fields."
+    fi
+}
 
 # Parse options
 while [[ $# -gt 0 ]]; do
@@ -98,6 +156,18 @@ while [[ $# -gt 0 ]]; do
         --enrich)
             ENRICH_WITH_CLAUDE=true
             shift
+            ;;
+        --prompt)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --prompt requires a file path."
+                exit 1
+            fi
+            if [ ! -f "$2" ]; then
+                echo "Error: Prompt file not found: $2"
+                exit 1
+            fi
+            CUSTOM_PROMPT_FILE="$2"
+            shift 2
             ;;
         *)
             echo "Unknown option: $1"
@@ -343,15 +413,9 @@ run_claude_analysis() {
     local context_file="$1"
     local output_file="$2"
 
-    local system_prompt="You are a senior code reviewer analyzing unresolved PR comment threads.
-Your task is to:
-1. Categorize issues by type (security, performance, architecture, style, documentation, etc.)
-2. Identify systemic patterns that appear across multiple comments
-3. Suggest adjacent areas that may have similar problems worth investigating
-4. Create a prioritized task list for addressing the issues
-
-Focus on actionable insights. Be specific about file paths and patterns.
-If there are no systemic issues or adjacent problems, return empty arrays for those fields."
+    # Load system prompt from configurable file
+    local system_prompt
+    system_prompt="$(load_system_prompt)"
 
     local user_prompt="Analyze these unresolved PR comment threads and provide structured analysis:
 

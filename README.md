@@ -41,6 +41,7 @@ gh pr-enrich 123 --output-dir ./my-reports
 | `--markdown` | Output only Markdown |
 | `--output-dir DIR` | Custom output directory |
 | `--enrich` | Run Claude AI analysis on unresolved threads |
+| `--prompt FILE` | Custom prompt file for Claude analysis |
 | `-h, --help` | Show help |
 | `-v, --version` | Show version |
 
@@ -73,6 +74,33 @@ When using `--enrich`, Claude analyzes unresolved comment threads and provides:
 
 - [Claude CLI](https://claude.ai/code) must be installed and authenticated
 
+### Customizing the Analysis Prompt
+
+The Claude analysis prompt can be customized. The extension looks for prompts in this order:
+
+1. `--prompt FILE` command-line argument
+2. `GH_PR_ENRICH_PROMPT` environment variable
+3. `.gh-pr-enrich-prompt.txt` in the current directory
+4. `default-prompt.txt` bundled with the extension
+
+To customize, copy the default prompt and modify it:
+
+```bash
+# Find extension directory
+EXTENSION_DIR=$(dirname $(which gh-pr-enrich 2>/dev/null || echo ~/.local/share/gh/extensions/gh-pr-enrich/gh-pr-enrich))
+
+# Copy default prompt to your repo
+cp "$EXTENSION_DIR/default-prompt.txt" .gh-pr-enrich-prompt.txt
+
+# Or set globally via environment
+export GH_PR_ENRICH_PROMPT="$HOME/.config/gh-pr-enrich-prompt.txt"
+```
+
+**Prompt file format:**
+- Lines starting with `#` are comments (ignored)
+- The remaining text becomes the system prompt for Claude
+- See `default-prompt.txt` for the expected format
+
 ## Dependencies
 
 | Tool | Required | Install |
@@ -86,6 +114,9 @@ When using `--enrich`, Claude analyzes unresolved comment threads and provides:
 ```bash
 # Override default output directory
 export PR_REVIEW_OUTPUT_ROOT="./custom-reports"
+
+# Custom prompt file for Claude analysis
+export GH_PR_ENRICH_PROMPT="$HOME/.config/gh-pr-enrich-prompt.txt"
 ```
 
 ## Examples
