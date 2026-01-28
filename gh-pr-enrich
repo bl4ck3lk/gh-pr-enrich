@@ -1,0 +1,609 @@
+#!/bin/bash
+# gh-pr-enrich - GitHub CLI extension for comprehensive PR analysis
+# Fetches PR details, comments, and optionally enriches with Claude AI analysis.
+#
+# Installation:
+#   gh extension install bl4ck3lk/gh-pr-enrich
+#
+# Usage:
+#   gh pr-enrich <PR_NUMBER> [--json] [--markdown] [--output-dir <DIR>] [--enrich]
+#
+# Examples:
+#   gh pr-enrich 123                    # Fetch PR details
+#   gh pr-enrich 123 --enrich           # Fetch + Claude analysis
+#   gh pr-enrich 123 --json             # Output JSON only
+#   gh pr-enrich 123 --output-dir ./my-reports
+
+set -e
+
+VERSION="1.0.0"
+
+# Handle --version flag
+if [ "$1" = "--version" ] || [ "$1" = "-v" ]; then
+    echo "gh-pr-enrich version $VERSION"
+    exit 0
+fi
+
+# Handle --help flag
+if [ "$1" = "--help" ] || [ "$1" = "-h" ] || [ $# -lt 1 ]; then
+    cat << 'HELP'
+gh pr-enrich - Comprehensive PR analysis with optional Claude AI enrichment
+
+USAGE:
+  gh pr-enrich <PR_NUMBER> [OPTIONS]
+
+OPTIONS:
+  --json            Output only JSON (default: combined)
+  --markdown        Output only Markdown (default: combined)
+  --output-dir DIR  Directory to save output (default: .reports/pr-reviews/pr-<N>)
+  --enrich          Run Claude AI analysis on unresolved comment threads
+  -h, --help        Show this help message
+  -v, --version     Show version
+
+EXAMPLES:
+  gh pr-enrich 123                    # Basic PR report
+  gh pr-enrich 123 --enrich           # With Claude AI analysis
+  gh pr-enrich 123 --output-dir ./pr  # Custom output directory
+  gh pr-enrich 123 --json             # JSON output only
+
+ENVIRONMENT VARIABLES:
+  PR_REVIEW_OUTPUT_ROOT   Override default output directory root
+
+DEPENDENCIES:
+  Required: gh (GitHub CLI), jq
+  Optional: claude (Claude CLI, for --enrich)
+
+For more info: https://github.com/bl4ck3lk/gh-pr-enrich
+HELP
+    exit 0
+fi
+
+PR_NUMBER=$1
+
+# Validate PR_NUMBER is a positive integer (prevent path traversal)
+if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+    echo "Error: PR_NUMBER must be a positive integer, got: '$PR_NUMBER'"
+    exit 1
+fi
+
+shift
+OUTPUT_FORMAT="combined"
+DEFAULT_OUTPUT_ROOT="${PR_REVIEW_OUTPUT_ROOT:-.reports/pr-reviews}"
+OUTPUT_DIR="$DEFAULT_OUTPUT_ROOT/pr-$PR_NUMBER"
+CUSTOM_OUTPUT_DIR=false
+ENRICH_WITH_CLAUDE=false
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "current-repo")
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Parse options
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --json)
+            OUTPUT_FORMAT="json"
+            shift
+            ;;
+        --markdown)
+            OUTPUT_FORMAT="markdown"
+            shift
+            ;;
+        --output-dir)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --output-dir requires a directory path."
+                exit 1
+            fi
+            CUSTOM_OUTPUT_DIR=true
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --enrich)
+            ENRICH_WITH_CLAUDE=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Run 'gh pr-enrich --help' for usage"
+            exit 1
+            ;;
+    esac
+done
+
+# Ensure jq is available
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is required but not installed."
+    echo "Install with: brew install jq (macOS) or apt-get install jq (Linux)"
+    exit 1
+fi
+
+# Check Claude CLI if enrichment requested (warn but don't fail)
+if [ "$ENRICH_WITH_CLAUDE" = true ]; then
+    if ! command -v claude &> /dev/null; then
+        echo "Warning: Claude CLI not found. Skipping enrichment."
+        echo "Install from: https://claude.ai/code"
+        ENRICH_WITH_CLAUDE=false
+    fi
+fi
+
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+
+echo "Fetching details for PR #$PR_NUMBER in $REPO..."
+echo "Saving report to: $OUTPUT_DIR"
+
+# 1. Fetch PR summary
+echo "Fetching PR summary..."
+PR_SUMMARY_FIELDS="number,title,body,author,state,url,createdAt,updatedAt,mergedAt,closedAt,labels,assignees,reviewRequests,reviews,milestone,projectCards,additions,deletions,changedFiles,mergeable,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,headRepository,headRepositoryOwner,files,commits,statusCheckRollup"
+gh pr view "$PR_NUMBER" --json "$PR_SUMMARY_FIELDS" \
+    > "$OUTPUT_DIR/pr-summary.json" 2>/dev/null || {
+        echo "Error fetching PR summary. Ensure PR #$PR_NUMBER exists and you have access."
+        exit 1
+    }
+
+# 2. Fetch all comments
+echo "Fetching all comments..."
+gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+    | jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
+        id: .id,
+        body: (.body // ""),
+        user: .user.login,
+        created_at: .created_at,
+        updated_at: .updated_at,
+        type: "issue_comment",
+        html_url: .html_url
+    })' > "$OUTPUT_DIR/issue-comments.json"
+
+gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+    | jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
+        id: .id,
+        body: (.body // ""),
+        user: .user.login,
+        state: .state,
+        submitted_at: .submitted_at,
+        type: "review_comment",
+        commit_id: .commit_id,
+        html_url: .html_url
+    })' > "$OUTPUT_DIR/review-comments.json"
+
+gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/comments" \
+    | jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
+        id: .id,
+        body: (.body // ""),
+        path: .path,
+        position: .position,
+        line: .original_line,
+        user: .user.login,
+        created_at: .created_at,
+        updated_at: .updated_at,
+        type: "inline_comment",
+        html_url: .html_url
+    })' > "$OUTPUT_DIR/inline-comments.json"
+
+# 3. Fetch comment threads with GraphQL IDs
+echo "Fetching comment threads with GraphQL IDs..."
+OWNER=$(echo "$REPO" | cut -d'/' -f1)
+REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
+
+GRAPHQL_QUERY='
+query($owner: String!, $name: String!, $prNumber: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $prNumber) {
+      reviewThreads(last: 100) {
+        nodes {
+          id
+          isResolved
+          comments(first: 10) {
+            nodes {
+              id
+              databaseId
+              body
+              author {
+                login
+              }
+              createdAt
+              url
+            }
+          }
+        }
+      }
+    }
+  }
+}
+'
+
+gh api graphql -F owner="$OWNER" -F name="$REPO_NAME" -F prNumber="$PR_NUMBER" -f query="$GRAPHQL_QUERY" \
+    > "$OUTPUT_DIR/comment-threads.json" 2>/dev/null || {
+        echo "Note: Could not fetch comment threads with GraphQL IDs."
+        echo '{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}' > "$OUTPUT_DIR/comment-threads.json"
+    }
+
+# Process comment threads to create ID mapping
+jq -r '.data.repository.pullRequest.reviewThreads.nodes[] |
+    select(.comments.nodes | length > 0) |
+    .comments.nodes[] |
+    select(.databaseId != null) |
+    "\(.databaseId):\(.id)"' "$OUTPUT_DIR/comment-threads.json" > "$OUTPUT_DIR/id-mapping.txt" 2>/dev/null || {
+        echo "" > "$OUTPUT_DIR/id-mapping.txt"
+    }
+
+# Function to add GraphQL IDs to comments
+create_comments_with_graphql_ids() {
+    local input_file="$1"
+    local output_file="$2"
+    local comment_type="$3"
+
+    jq --rawfile id_map "$OUTPUT_DIR/id-mapping.txt" '
+        map(. as $comment |
+            . + {
+                graphql_id: (
+                    if ($comment.id and ($comment.id | type == "number")) then
+                        ($id_map | split("\n") | map(select(length > 0) | split(":")) | map({key: .[0], value: .[1]}) | from_entries | .[$comment.id|tostring])
+                    else
+                        null
+                    end
+                ),
+                comment_type: $comment_type
+            }
+        )
+    ' "$input_file" --arg comment_type "$comment_type" > "$output_file"
+}
+
+# ============================================================================
+# Claude Enrichment Functions
+# ============================================================================
+
+extract_unresolved_threads() {
+    local threads_file="$1"
+    local output_file="$2"
+
+    jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved == false)
+        | {
+            thread_id: .id,
+            comments: [.comments.nodes[] | {
+                author: (.author.login // "unknown"),
+                body: .body,
+                url: .url
+            }]
+        }]' "$threads_file" > "$output_file"
+}
+
+build_claude_context() {
+    local output_dir="$1"
+
+    jq -n \
+        --argjson pr "$(<"$output_dir/pr-summary.json")" \
+        --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
+        '{
+            pr: {
+                title: $pr.title,
+                body: ($pr.body // "No description"),
+                author: $pr.author.login,
+                files_changed: [$pr.files[].path]
+            },
+            unresolved_threads: $unresolved
+        }' > "$output_dir/claude-context.json"
+}
+
+CLAUDE_ANALYSIS_SCHEMA='{
+  "type": "object",
+  "properties": {
+    "issue_categories": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "severity": { "enum": ["critical", "high", "medium", "low"] },
+          "description": { "type": "string" },
+          "thread_ids": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["name", "severity", "description", "thread_ids"]
+      }
+    },
+    "systemic_issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "pattern": { "type": "string" },
+          "evidence": { "type": "array", "items": { "type": "string" } },
+          "recommendation": { "type": "string" }
+        },
+        "required": ["pattern", "evidence", "recommendation"]
+      }
+    },
+    "adjacent_problems": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "area": { "type": "string" },
+          "risk": { "type": "string" },
+          "investigation_hint": { "type": "string" }
+        },
+        "required": ["area", "risk", "investigation_hint"]
+      }
+    },
+    "task_list": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "priority": { "enum": ["critical", "high", "medium", "low"] },
+          "task": { "type": "string" },
+          "thread_ids": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["priority", "task", "thread_ids"]
+      }
+    }
+  },
+  "required": ["issue_categories", "systemic_issues", "adjacent_problems", "task_list"]
+}'
+
+run_claude_analysis() {
+    local context_file="$1"
+    local output_file="$2"
+
+    local system_prompt="You are a senior code reviewer analyzing unresolved PR comment threads.
+Your task is to:
+1. Categorize issues by type (security, performance, architecture, style, documentation, etc.)
+2. Identify systemic patterns that appear across multiple comments
+3. Suggest adjacent areas that may have similar problems worth investigating
+4. Create a prioritized task list for addressing the issues
+
+Focus on actionable insights. Be specific about file paths and patterns.
+If there are no systemic issues or adjacent problems, return empty arrays for those fields."
+
+    local user_prompt="Analyze these unresolved PR comment threads and provide structured analysis:
+
+$(cat "$context_file")"
+
+    claude --print \
+        --model sonnet \
+        --output-format json \
+        --json-schema "$CLAUDE_ANALYSIS_SCHEMA" \
+        --system-prompt "$system_prompt" \
+        "$user_prompt" > "$output_file" 2>/dev/null
+
+    return $?
+}
+
+generate_analysis_report() {
+    local analysis_file="$1"
+    local output_file="$2"
+
+    jq -r '
+    "# 🤖 Claude Analysis Report\n\n" +
+    "## Issue Categories\n\n" +
+    (if (.issue_categories | length) == 0 then
+        "_No issue categories identified._\n\n"
+    else
+        (.issue_categories | map(
+            "### " + .name + " (" + .severity + ")\n" +
+            .description + "\n\n" +
+            "**Threads:** " + (if (.thread_ids | length) > 0 then (.thread_ids | join(", ")) else "N/A" end) + "\n"
+        ) | join("\n"))
+    end) +
+    "\n## Systemic Issues\n\n" +
+    (if (.systemic_issues | length) == 0 then
+        "_No systemic patterns identified._\n\n"
+    else
+        (.systemic_issues | map(
+            "### " + .pattern + "\n\n" +
+            "**Evidence:**\n" + (.evidence | map("- " + .) | join("\n")) + "\n\n" +
+            "**Recommendation:** " + .recommendation + "\n"
+        ) | join("\n"))
+    end) +
+    "\n## Adjacent Problems to Investigate\n\n" +
+    (if (.adjacent_problems | length) == 0 then
+        "_No adjacent problem areas identified._\n"
+    else
+        (.adjacent_problems | map(
+            "- **" + .area + "** (" + .risk + "): " + .investigation_hint
+        ) | join("\n"))
+    end) +
+    "\n\n## Task List\n\n" +
+    (if (.task_list | length) == 0 then
+        "_No tasks generated._\n"
+    else
+        (.task_list | map(
+            "- [" + .priority + "] " + .task +
+            (if (.thread_ids | length) > 0 then " _(threads: " + (.thread_ids | join(", ")) + ")_" else "" end)
+        ) | join("\n"))
+    end)
+    ' "$analysis_file" > "$output_file"
+}
+
+# ============================================================================
+# Main Processing
+# ============================================================================
+
+# Add GraphQL IDs to all comment types
+create_comments_with_graphql_ids "$OUTPUT_DIR/issue-comments.json" "$OUTPUT_DIR/issue-comments-with-graphql.json" "issue_comment"
+create_comments_with_graphql_ids "$OUTPUT_DIR/review-comments.json" "$OUTPUT_DIR/review-comments-with-graphql.json" "review_comment"
+create_comments_with_graphql_ids "$OUTPUT_DIR/inline-comments.json" "$OUTPUT_DIR/inline-comments-with-graphql.json" "inline_comment"
+
+# Combine comments
+jq -s 'add | sort_by(.created_at // .submitted_at // "")' \
+    "$OUTPUT_DIR"/issue-comments-with-graphql.json \
+    "$OUTPUT_DIR"/review-comments-with-graphql.json \
+    "$OUTPUT_DIR"/inline-comments-with-graphql.json \
+    > "$OUTPUT_DIR/all-comments-with-graphql.json"
+
+jq -s 'add | sort_by(.created_at // .submitted_at // "")' \
+    "$OUTPUT_DIR"/issue-comments.json \
+    "$OUTPUT_DIR"/review-comments.json \
+    "$OUTPUT_DIR"/inline-comments.json \
+    > "$OUTPUT_DIR/all-comments.json"
+
+# 4. Fetch checks and status
+echo "Fetching checks and status..."
+gh pr checks "$PR_NUMBER" --json checkRuns,statusCheckRollup,statuses > "$OUTPUT_DIR/checks.json" 2>/dev/null || {
+    echo "Note: Could not fetch checks (may require additional permissions)."
+    echo '{}' > "$OUTPUT_DIR/checks.json"
+}
+
+# 5. Generate statistics
+echo "Generating statistics..."
+
+COMMENT_STATS=$(jq -n \
+    --argjson comments "$(cat "$OUTPUT_DIR/all-comments.json")" \
+    '{
+        total: ($comments | length),
+        by_type: ($comments | group_by(.type) | map({type: .[0].type, count: length})),
+        by_user: ($comments | group_by(.user) | map({user: .[0].user, count: length}) | sort_by(-.count) | .[0:10]),
+        recent: ($comments | sort_by(.created_at) | reverse | .[0:5])
+    }')
+
+CHECKS_STATS=$(jq -r '.statusCheckRollup | {
+    overall_state: .state,
+    conclusion: .conclusion,
+    contexts: (.contexts | length),
+    passing: (.contexts | map(select(.state == "success")) | length),
+    failing: (.contexts | map(select(.state == "failure")) | length),
+    pending: (.contexts | map(select(.state == "pending")) | length)
+}' "$OUTPUT_DIR/checks.json" 2>/dev/null || echo '{"overall_state": "unknown"}')
+
+# 6. Create combined JSON
+echo "Creating combined JSON..."
+jq -n \
+    --argjson summary "$(<"$OUTPUT_DIR/pr-summary.json")" \
+    --argjson comments "$(<"$OUTPUT_DIR/all-comments-with-graphql.json")" \
+    --argjson checks "$(<"$OUTPUT_DIR/checks.json")" \
+    --argjson comment_stats "$COMMENT_STATS" \
+    --argjson checks_stats "$CHECKS_STATS" \
+    --argjson comment_threads "$(<"$OUTPUT_DIR/comment-threads.json")" \
+    --arg timestamp "$TIMESTAMP" \
+    --arg repo "$REPO" \
+    '{
+        metadata: {
+            generated_at: $timestamp,
+            repository: $repo,
+            pr_number: ($summary.number | tonumber)
+        },
+        pr: $summary,
+        comments: $comments,
+        comment_threads: $comment_threads,
+        checks: $checks,
+        statistics: {
+            comments: $comment_stats,
+            checks: $checks_stats
+        }
+    }' > "$OUTPUT_DIR/combined-data.json"
+
+# 7. Create Markdown report
+echo "Creating Markdown report..."
+cat > "$OUTPUT_DIR/comprehensive-report.md" << EOF
+# Comprehensive PR Review Report: #$PR_NUMBER
+
+**Repository:** $REPO
+**Generated:** $TIMESTAMP
+**PR URL:** $(jq -r '.url' "$OUTPUT_DIR/pr-summary.json")
+
+## 📋 PR Summary
+
+**Title:** $(jq -r '.title' "$OUTPUT_DIR/pr-summary.json")
+**Author:** $(jq -r '.author.login' "$OUTPUT_DIR/pr-summary.json")
+**State:** $(jq -r '.state' "$OUTPUT_DIR/pr-summary.json")
+**Created:** $(jq -r '.createdAt' "$OUTPUT_DIR/pr-summary.json")
+**Updated:** $(jq -r '.updatedAt' "$OUTPUT_DIR/pr-summary.json")
+**Mergeable:** $(jq -r '.mergeable' "$OUTPUT_DIR/pr-summary.json")
+**Draft:** $(jq -r '.isDraft' "$OUTPUT_DIR/pr-summary.json")
+
+**Changes:**
+- Files: $(jq -r '.changedFiles' "$OUTPUT_DIR/pr-summary.json")
+- Additions: $(jq -r '.additions' "$OUTPUT_DIR/pr-summary.json")
+- Deletions: $(jq -r '.deletions' "$OUTPUT_DIR/pr-summary.json")
+
+**Labels:** $(jq -r '.labels[]?.name // empty' "$OUTPUT_DIR/pr-summary.json" | tr '\n' ', ' | sed 's/,$//')
+**Assignees:** $(jq -r '.assignees[]?.login // empty' "$OUTPUT_DIR/pr-summary.json" | tr '\n' ', ' | sed 's/,$//')
+**Reviewers:** $(jq -r '.requestedReviewers[]?.login // empty' "$OUTPUT_DIR/pr-summary.json" | tr '\n' ', ' | sed 's/,$//')
+
+### Files Changed
+$(jq -r '.files[] | "- **\(.path)** (+\(.additions) / -\(.deletions))"' "$OUTPUT_DIR/pr-summary.json")
+
+## ✅ Checks & Status
+
+**Overall State:** $(jq -r '.statusCheckRollup.state // "unknown"' "$OUTPUT_DIR/checks.json")
+**Conclusion:** $(jq -r '.statusCheckRollup.conclusion // "N/A"' "$OUTPUT_DIR/checks.json")
+
+## 💬 Comments Analysis
+
+$(echo "$COMMENT_STATS" | jq -r '
+"**Total Comments:** " + ((.total // 0) | tostring) + "\n\n" +
+"### By Type\n" + ((.by_type // []) | map("- **" + (.type // "unknown") + ":** " + ((.count // 0) | tostring)) | join("\n")) + "\n\n" +
+"### Top Commenters\n" + ((.by_user // []) | map("- **" + (.user // "unknown") + ":** " + ((.count // 0) | tostring)) | join("\n"))
+')
+
+## 🧵 Comment Threads
+
+To resolve a comment thread:
+\`\`\`bash
+gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "<THREAD_ID>"}) { thread { isResolved } } }'
+\`\`\`
+
+---
+
+*Report generated by gh-pr-enrich v$VERSION at $TIMESTAMP*
+EOF
+
+# 8. Optional: Claude enrichment
+if [ "$ENRICH_WITH_CLAUDE" = true ]; then
+    echo "Running Claude analysis on unresolved threads..."
+
+    extract_unresolved_threads "$OUTPUT_DIR/comment-threads.json" "$OUTPUT_DIR/unresolved-threads.json"
+
+    UNRESOLVED_COUNT=$(jq 'length' "$OUTPUT_DIR/unresolved-threads.json")
+
+    if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
+        echo "Found $UNRESOLVED_COUNT unresolved thread(s). Analyzing with Claude Sonnet..."
+
+        build_claude_context "$OUTPUT_DIR"
+
+        if run_claude_analysis "$OUTPUT_DIR/claude-context.json" "$OUTPUT_DIR/claude-raw-response.json"; then
+            echo "✅ Claude analysis complete"
+
+            if jq -e '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" > /dev/null 2>&1; then
+                jq '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" > "$OUTPUT_DIR/claude-analysis.json"
+            else
+                cp "$OUTPUT_DIR/claude-raw-response.json" "$OUTPUT_DIR/claude-analysis.json"
+            fi
+
+            generate_analysis_report "$OUTPUT_DIR/claude-analysis.json" "$OUTPUT_DIR/claude-analysis.md"
+
+            jq --argjson analysis "$(<"$OUTPUT_DIR/claude-analysis.json")" \
+               '. + {claude_analysis: $analysis}' \
+               "$OUTPUT_DIR/combined-data.json" > "$OUTPUT_DIR/combined-data.tmp.json" && \
+               mv "$OUTPUT_DIR/combined-data.tmp.json" "$OUTPUT_DIR/combined-data.json"
+
+            cat >> "$OUTPUT_DIR/comprehensive-report.md" << 'ANALYSIS_SECTION'
+
+---
+
+ANALYSIS_SECTION
+            cat "$OUTPUT_DIR/claude-analysis.md" >> "$OUTPUT_DIR/comprehensive-report.md"
+        else
+            echo "⚠️  Claude analysis failed. Continuing without enrichment."
+        fi
+    else
+        echo "No unresolved threads found. Skipping Claude analysis."
+    fi
+fi
+
+# Output
+case $OUTPUT_FORMAT in
+    "json")
+        cat "$OUTPUT_DIR/combined-data.json"
+        ;;
+    "markdown")
+        cat "$OUTPUT_DIR/comprehensive-report.md"
+        ;;
+    "combined")
+        echo "✅ Report generated successfully!"
+        echo "📁 Directory: $OUTPUT_DIR"
+        echo "📊 Markdown: $OUTPUT_DIR/comprehensive-report.md"
+        echo "🤖 JSON: $OUTPUT_DIR/combined-data.json"
+        if [ -f "$OUTPUT_DIR/claude-analysis.json" ]; then
+            echo "🧠 Claude Analysis: $OUTPUT_DIR/claude-analysis.md"
+        fi
+        ;;
+esac

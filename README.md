@@ -1,0 +1,119 @@
+# gh-pr-enrich
+
+A GitHub CLI extension for comprehensive PR analysis with optional Claude AI enrichment.
+
+## Features
+
+- 📋 **Complete PR Details**: Summary, files, labels, assignees, reviewers
+- 💬 **All Comments**: Issue comments, review comments, inline code comments
+- 🧵 **Thread Tracking**: GraphQL IDs for programmatic thread resolution
+- ✅ **CI/CD Status**: Check runs and status information
+- 📊 **Statistics**: Comment counts by type/user, recent activity
+- 🤖 **Claude AI Analysis** (optional): Categorize issues, identify systemic patterns, generate task lists
+
+## Installation
+
+```bash
+gh extension install bl4ck3lk/gh-pr-enrich
+```
+
+## Usage
+
+```bash
+# Basic PR report
+gh pr-enrich 123
+
+# With Claude AI analysis of unresolved comments
+gh pr-enrich 123 --enrich
+
+# Output JSON only (for scripting)
+gh pr-enrich 123 --json
+
+# Custom output directory
+gh pr-enrich 123 --output-dir ./my-reports
+```
+
+## Options
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Output only JSON |
+| `--markdown` | Output only Markdown |
+| `--output-dir DIR` | Custom output directory |
+| `--enrich` | Run Claude AI analysis on unresolved threads |
+| `-h, --help` | Show help |
+| `-v, --version` | Show version |
+
+## Output Files
+
+When run, the extension creates a directory with:
+
+```
+.reports/pr-reviews/pr-123/
+├── comprehensive-report.md      # Human-readable summary
+├── combined-data.json           # Machine-readable data
+├── pr-summary.json              # PR metadata
+├── all-comments.json            # All comments combined
+├── comment-threads.json         # Thread data with GraphQL IDs
+├── checks.json                  # CI/CD status
+├── claude-analysis.json         # (if --enrich) AI analysis
+└── claude-analysis.md           # (if --enrich) AI report
+```
+
+## Claude AI Analysis
+
+When using `--enrich`, Claude analyzes unresolved comment threads and provides:
+
+- **Issue Categories**: Groups issues by type (security, performance, architecture, etc.)
+- **Systemic Issues**: Identifies patterns across multiple comments
+- **Adjacent Problems**: Suggests related areas to investigate
+- **Task List**: Prioritized actions linked to thread IDs
+
+### Requirements for `--enrich`
+
+- [Claude CLI](https://claude.ai/code) must be installed and authenticated
+
+## Dependencies
+
+| Tool | Required | Install |
+|------|----------|---------|
+| `gh` | ✅ Yes | `brew install gh` |
+| `jq` | ✅ Yes | `brew install jq` |
+| `claude` | Only for `--enrich` | [claude.ai/code](https://claude.ai/code) |
+
+## Environment Variables
+
+```bash
+# Override default output directory
+export PR_REVIEW_OUTPUT_ROOT="./custom-reports"
+```
+
+## Examples
+
+### Analyze a PR and get structured output
+
+```bash
+gh pr-enrich 123 --json | jq '.statistics.comments'
+```
+
+### Get unresolved thread IDs
+
+```bash
+gh pr-enrich 123
+jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | .id' \
+  .reports/pr-reviews/pr-123/comment-threads.json
+```
+
+### Resolve a comment thread
+
+```bash
+gh api graphql -f query='mutation {
+  resolveReviewThread(input: {threadId: "PRRT_xxx"}) {
+    thread { isResolved }
+  }
+}'
+```
+
+## License
+
+MIT
