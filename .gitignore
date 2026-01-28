@@ -1,0 +1,10 @@
+# Reports directory (generated output)
+.reports/
+
+# macOS
+.DS_Store
+
+# Editor files
+*.swp
+*.swo
+*~
