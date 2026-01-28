@@ -46,6 +46,13 @@ gh pr-enrich 123 --output-dir ./my-reports
 | `-h, --help` | Show help |
 | `-v, --version` | Show version |
 
+## Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| `install-skill` | Install Claude Code skill to `~/.claude/skills/` |
+| `uninstall-skill` | Remove the Claude Code skill |
+
 ## Output Files
 
 When run, the extension creates a directory with:
@@ -152,15 +159,15 @@ This extension includes a [Claude Code](https://claude.ai/code) skill for enhanc
 
 ### Installing the Skill
 
-After installing the extension, symlink the skill to your Claude skills directory:
-
 ```bash
-# Create skills directory if needed
-mkdir -p ~/.claude/skills
+gh pr-enrich install-skill
+```
 
-# Symlink the skill (updates automatically with extension upgrades)
-ln -s ~/.local/share/gh/extensions/gh-pr-enrich/.claude/skills/gh-pr-enrich \
-      ~/.claude/skills/gh-pr-enrich
+This creates a symlink to `~/.claude/skills/gh-pr-enrich` that auto-updates when you upgrade the extension.
+
+To uninstall:
+```bash
+gh pr-enrich uninstall-skill
 ```
 
 ### What the Skill Provides

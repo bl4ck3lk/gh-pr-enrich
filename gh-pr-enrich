@@ -24,6 +24,129 @@ if [ "$1" = "--version" ] || [ "$1" = "-v" ]; then
     exit 0
 fi
 
+# Cross-platform path canonicalization (works on both BSD/macOS and GNU/Linux)
+# Returns absolute path, resolving symlinks
+canonicalize_path() {
+    local path="$1"
+    if [ -d "$path" ]; then
+        (cd "$path" && pwd -P)
+    elif [ -L "$path" ]; then
+        local target
+        target=$(readlink "$path")
+        if [[ "$target" = /* ]]; then
+            # Absolute symlink target
+            canonicalize_path "$target"
+        else
+            # Relative symlink target - resolve from symlink's directory
+            local dir
+            dir=$(dirname "$path")
+            canonicalize_path "$dir/$target"
+        fi
+    elif [ -f "$path" ]; then
+        local dir
+        dir=$(cd "$(dirname "$path")" && pwd -P)
+        echo "$dir/$(basename "$path")"
+    else
+        # Path doesn't exist, just normalize it
+        echo "$path"
+    fi
+}
+
+# Handle install-skill subcommand
+if [ "$1" = "install-skill" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+    SKILL_SOURCE="$SCRIPT_DIR/.claude/skills/gh-pr-enrich"
+    SKILL_TARGET="$HOME/.claude/skills/gh-pr-enrich"
+    SKILLS_DIR="$HOME/.claude/skills"
+
+    # Check if skill exists in extension
+    if [ ! -d "$SKILL_SOURCE" ]; then
+        echo "Error: Skill not found at $SKILL_SOURCE"
+        echo "Try upgrading the extension: gh extension upgrade pr-enrich"
+        exit 1
+    fi
+
+    # Pre-flight validation: Check ~/.claude/skills path
+    if [ -f "$SKILLS_DIR" ]; then
+        echo "Error: $SKILLS_DIR exists as a regular file, not a directory."
+        echo "Remove it first: rm $SKILLS_DIR"
+        exit 1
+    fi
+
+    # Create skills directory if needed
+    if [ ! -d "$SKILLS_DIR" ]; then
+        if ! mkdir -p "$SKILLS_DIR" 2>/dev/null; then
+            echo "Error: Could not create directory $SKILLS_DIR"
+            echo "Check permissions on $HOME/.claude"
+            exit 1
+        fi
+    fi
+
+    # Pre-flight validation: Check target path
+    if [ -f "$SKILL_TARGET" ] && [ ! -L "$SKILL_TARGET" ]; then
+        echo "Error: $SKILL_TARGET exists as a regular file, not a symlink."
+        echo "Remove it first: rm $SKILL_TARGET"
+        exit 1
+    fi
+
+    # Check if already installed (with proper path canonicalization)
+    if [ -L "$SKILL_TARGET" ]; then
+        CURRENT_CANONICAL=$(canonicalize_path "$SKILL_TARGET")
+        SOURCE_CANONICAL=$(canonicalize_path "$SKILL_SOURCE")
+        if [ "$CURRENT_CANONICAL" = "$SOURCE_CANONICAL" ]; then
+            echo "✅ Skill already installed at $SKILL_TARGET"
+            exit 0
+        else
+            echo "⚠️  Existing symlink points to: $(readlink "$SKILL_TARGET")"
+            echo "   Updating to: $SKILL_SOURCE"
+            rm "$SKILL_TARGET"
+        fi
+    elif [ -d "$SKILL_TARGET" ]; then
+        echo "Error: Directory already exists at $SKILL_TARGET"
+        echo "Remove it first if you want to install the symlinked skill:"
+        echo "  rm -rf $SKILL_TARGET"
+        exit 1
+    fi
+
+    # Create symlink
+    if ! ln -s "$SKILL_SOURCE" "$SKILL_TARGET" 2>/dev/null; then
+        echo "Error: Could not create symlink at $SKILL_TARGET"
+        echo "Check permissions on $SKILLS_DIR"
+        exit 1
+    fi
+    echo "✅ Claude skill installed!"
+    echo "   Source: $SKILL_SOURCE"
+    echo "   Target: $SKILL_TARGET"
+    echo ""
+    echo "The skill will auto-update when you run: gh extension upgrade pr-enrich"
+    exit 0
+fi
+
+# Handle uninstall-skill subcommand
+if [ "$1" = "uninstall-skill" ]; then
+    SKILL_TARGET="$HOME/.claude/skills/gh-pr-enrich"
+
+    if [ -L "$SKILL_TARGET" ]; then
+        if ! rm "$SKILL_TARGET" 2>/dev/null; then
+            echo "Error: Could not remove symlink at $SKILL_TARGET"
+            echo "Check permissions"
+            exit 1
+        fi
+        echo "✅ Claude skill uninstalled"
+    elif [ -d "$SKILL_TARGET" ]; then
+        echo "⚠️  $SKILL_TARGET is a directory, not a symlink"
+        echo "   Remove manually if desired: rm -rf $SKILL_TARGET"
+        exit 1
+    elif [ -f "$SKILL_TARGET" ]; then
+        echo "⚠️  $SKILL_TARGET is a regular file, not a symlink"
+        echo "   Remove manually if desired: rm $SKILL_TARGET"
+        exit 1
+    else
+        echo "ℹ️  Skill not installed at $SKILL_TARGET"
+    fi
+    exit 0
+fi
+
 # Handle --help flag
 if [ "$1" = "--help" ] || [ "$1" = "-h" ] || [ $# -lt 1 ]; then
     cat << 'HELP'
@@ -31,6 +154,11 @@ gh pr-enrich - Comprehensive PR analysis with optional Claude AI enrichment
 
 USAGE:
   gh pr-enrich <PR_NUMBER> [OPTIONS]
+  gh pr-enrich <SUBCOMMAND>
+
+SUBCOMMANDS:
+  install-skill     Install Claude Code skill (symlink to ~/.claude/skills/)
+  uninstall-skill   Remove the Claude Code skill symlink
 
 OPTIONS:
   --json            Output only JSON (default: combined)
@@ -42,6 +170,7 @@ OPTIONS:
   -v, --version     Show version
 
 EXAMPLES:
+  gh pr-enrich install-skill          # Install Claude Code skill
   gh pr-enrich 123                    # Basic PR report
   gh pr-enrich 123 --enrich           # With Claude AI analysis
   gh pr-enrich 123 --output-dir ./pr  # Custom output directory
@@ -117,8 +246,8 @@ load_system_prompt() {
     fi
 
     if [ -n "$prompt_file" ]; then
-        # Filter out comment lines (starting with #) and empty lines at start/end
-        grep -v '^#' "$prompt_file" | sed '/./,$!d' | sed ':a;/^[[:space:]]*$/d;N;ba'
+        # Filter out comment lines and leading blank lines (portable: works on BSD and GNU)
+        grep -v '^#' "$prompt_file" | awk 'NF{found=1} found'
     else
         # Fallback if no file found (shouldn't happen normally)
         echo "You are a senior code reviewer analyzing unresolved PR comment threads.
