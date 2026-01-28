@@ -1,0 +1,411 @@
+---
+name: gh-pr-enrich
+description: Fetch comprehensive PR details and optionally run Claude AI analysis on unresolved comment threads. Use when reviewing PRs, addressing PR feedback, investigating review comments, or when users request PR analysis. Produces structured JSON and Markdown reports with issue categorization, systemic patterns, and prioritized task lists.
+---
+
+# gh-pr-enrich Skill
+
+Comprehensive PR analysis using the `gh pr-enrich` GitHub CLI extension. Fetches complete PR context (comments, threads, checks, files) and optionally enriches with Claude AI analysis to categorize issues, identify patterns, and generate actionable task lists.
+
+## When to Use This Skill
+
+Use this skill when:
+- User asks to "analyze PR #X" or "review PR comments"
+- Addressing PR feedback and need structured view of unresolved issues
+- Investigating review comment patterns across a PR
+- Need to understand the full context of PR discussions
+- Want to identify systemic issues from reviewer feedback
+- Creating a task list from PR review comments
+
+## Prerequisites
+
+- GitHub CLI (`gh`) authenticated with repo access
+- `jq` installed for JSON processing
+- `gh pr-enrich` extension installed: `gh extension install bl4ck3lk/gh-pr-enrich`
+- For AI enrichment: [Claude CLI](https://claude.ai/code) installed and authenticated
+
+## Quick Start
+
+```bash
+# Install the extension (one-time)
+gh extension install bl4ck3lk/gh-pr-enrich
+
+# Basic PR analysis
+gh pr-enrich 123
+
+# With Claude AI enrichment (analyzes unresolved threads)
+gh pr-enrich 123 --enrich
+
+# JSON output for scripting
+gh pr-enrich 123 --json
+```
+
+## Command Reference
+
+### Syntax
+
+```bash
+gh pr-enrich <PR_NUMBER> [OPTIONS]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Output only JSON (for scripting) |
+| `--markdown` | Output only Markdown report |
+| `--output-dir DIR` | Custom output directory |
+| `--enrich` | Run Claude AI analysis on unresolved threads |
+| `--prompt FILE` | Custom prompt file for AI analysis |
+| `-h, --help` | Show help |
+| `-v, --version` | Show version |
+
+### Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `PR_REVIEW_OUTPUT_ROOT` | Override default output directory root |
+| `GH_PR_ENRICH_PROMPT` | Path to custom prompt file for Claude analysis |
+
+## Output Files
+
+Default location: `.reports/pr-reviews/pr-<NUMBER>/`
+
+| File | Description |
+|------|-------------|
+| `comprehensive-report.md` | Human-readable summary of PR |
+| `combined-data.json` | Complete machine-readable data |
+| `pr-summary.json` | PR metadata (title, body, author, files) |
+| `all-comments.json` | All comments combined |
+| `comment-threads.json` | Thread data with GraphQL IDs and `isResolved` status |
+| `checks.json` | CI/CD status information |
+| `claude-analysis.json` | (if --enrich) Structured AI analysis |
+| `claude-analysis.md` | (if --enrich) Human-readable AI report |
+
+## Analyzing Output
+
+### Reading the Claude Analysis
+
+When using `--enrich`, the AI analysis contains four key sections:
+
+#### 1. Issue Categories
+
+Groups unresolved comments by type with severity ratings:
+
+```json
+{
+  "issue_categories": [
+    {
+      "name": "Missing Request Correlation IDs",
+      "severity": "high",
+      "description": "Multiple Sentry captures lack request_id...",
+      "thread_ids": ["PRRT_xxx", "PRRT_yyy"]
+    }
+  ]
+}
+```
+
+**Severity levels:**
+- `critical` - Security vulnerabilities, data loss, breaking changes
+- `high` - Bugs, performance issues, architectural problems
+- `medium` - Code quality, maintainability, missing tests
+- `low` - Style, documentation, minor improvements
+
+#### 2. Systemic Issues
+
+Patterns that appear across multiple comments:
+
+```json
+{
+  "systemic_issues": [
+    {
+      "pattern": "Incomplete Error Handling Pattern",
+      "evidence": [
+        "Thread PRRT_xxx: missing error context",
+        "Thread PRRT_yyy: silent failure in catch block"
+      ],
+      "recommendation": "Create standard error wrapper..."
+    }
+  ]
+}
+```
+
+**Use these to:**
+- Identify root causes vs symptoms
+- Prioritize fixes that address multiple issues
+- Improve codebase-wide patterns
+
+#### 3. Adjacent Problems
+
+Related areas that may have similar issues:
+
+```json
+{
+  "adjacent_problems": [
+    {
+      "area": "Other API endpoints",
+      "risk": "Same error handling pattern may exist",
+      "investigation_hint": "Search for similar try/catch blocks..."
+    }
+  ]
+}
+```
+
+**Use these to:**
+- Proactively find related bugs
+- Scope follow-up investigations
+- Prevent whack-a-mole debugging
+
+#### 4. Task List
+
+Prioritized actions linked to thread IDs:
+
+```json
+{
+  "task_list": [
+    {
+      "priority": "critical",
+      "task": "Add request_id to all captureException calls",
+      "thread_ids": ["PRRT_xxx", "PRRT_yyy"]
+    }
+  ]
+}
+```
+
+**Use these to:**
+- Create TODO list for addressing feedback
+- Prioritize work by severity
+- Track which threads each fix addresses
+
+### Working with Thread IDs
+
+Thread IDs (format: `PRRT_xxx`) are GraphQL identifiers for review threads. Use them to:
+
+**Find specific threads:**
+```bash
+jq '.data.repository.pullRequest.reviewThreads.nodes[]
+    | select(.id == "PRRT_xxx")' comment-threads.json
+```
+
+**Get all unresolved threads:**
+```bash
+jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+    | select(.isResolved == false)]' comment-threads.json
+```
+
+**Resolve a thread programmatically:**
+```bash
+gh api graphql -f query='mutation {
+  resolveReviewThread(input: {threadId: "PRRT_xxx"}) {
+    thread { isResolved }
+  }
+}'
+```
+
+### Extracting Actionable Data
+
+**Get high-priority tasks:**
+```bash
+jq '.task_list | map(select(.priority == "critical" or .priority == "high"))' \
+  claude-analysis.json
+```
+
+**List all issue categories by severity:**
+```bash
+jq '.issue_categories | sort_by(.severity) | reverse | .[] | "\(.severity): \(.name)"' \
+  claude-analysis.json
+```
+
+**Get thread count per category:**
+```bash
+jq '.issue_categories | map({name, count: (.thread_ids | length)})' \
+  claude-analysis.json
+```
+
+**Export tasks as markdown checklist:**
+```bash
+jq -r '.task_list[] | "- [ ] [\(.priority)] \(.task)"' claude-analysis.json
+```
+
+## Workflow Examples
+
+### Workflow 1: Comprehensive PR Review
+
+```bash
+# Fetch and analyze the PR
+gh pr-enrich 123 --enrich
+
+# Read the analysis
+cat .reports/pr-reviews/pr-123/claude-analysis.md
+
+# Check systemic issues
+jq '.systemic_issues' .reports/pr-reviews/pr-123/claude-analysis.json
+
+# Get prioritized task list
+jq -r '.task_list[] | "[\(.priority)] \(.task)"' \
+  .reports/pr-reviews/pr-123/claude-analysis.json
+```
+
+### Workflow 2: Address PR Feedback Systematically
+
+```bash
+# 1. Fetch and enrich
+gh pr-enrich 123 --enrich
+
+# 2. Create working checklist from critical/high tasks
+jq -r '.task_list[]
+  | select(.priority == "critical" or .priority == "high")
+  | "- [ ] \(.task)"' .reports/pr-reviews/pr-123/claude-analysis.json > todo.md
+
+# 3. Work through each task, resolving threads as you go
+# After fixing an issue:
+gh api graphql -f query='mutation {
+  resolveReviewThread(input: {threadId: "PRRT_xxx"}) {
+    thread { isResolved }
+  }
+}'
+```
+
+### Workflow 3: Investigate Patterns Before Fixing
+
+```bash
+# Run analysis
+gh pr-enrich 123 --enrich
+
+# Check for systemic issues first
+jq '.systemic_issues[] | {pattern, recommendation}' \
+  .reports/pr-reviews/pr-123/claude-analysis.json
+
+# Look at adjacent problems to scope investigation
+jq '.adjacent_problems[] | {area, investigation_hint}' \
+  .reports/pr-reviews/pr-123/claude-analysis.json
+```
+
+### Workflow 4: Custom Analysis Focus
+
+Create a security-focused prompt:
+
+```bash
+# Create custom prompt
+cat > ~/.config/security-pr-prompt.txt << 'EOF'
+You are a security engineer analyzing unresolved PR comment threads.
+
+Focus on:
+1. Security vulnerabilities (injection, auth bypass, data exposure)
+2. Input validation gaps
+3. Error handling that leaks information
+4. Authentication/authorization issues
+
+Severity ratings:
+- critical: Exploitable vulnerabilities
+- high: Security gaps requiring immediate attention
+- medium: Defense-in-depth improvements
+- low: Security best practices
+
+Be specific about attack vectors and remediation steps.
+EOF
+
+# Use custom prompt
+gh pr-enrich 123 --enrich --prompt ~/.config/security-pr-prompt.txt
+```
+
+## Integration with Claude Code
+
+### Addressing PR Comments in Session
+
+When working in a Claude Code session to address PR feedback:
+
+```bash
+# 1. Fetch the PR context
+gh pr-enrich 123 --enrich
+
+# 2. Read the analysis into context
+# Claude can now reference:
+# - .reports/pr-reviews/pr-123/claude-analysis.json
+# - .reports/pr-reviews/pr-123/comprehensive-report.md
+# - .reports/pr-reviews/pr-123/comment-threads.json
+```
+
+Then instruct Claude:
+> "Read the claude-analysis.json and address each critical and high priority task in order. After fixing each issue, provide the thread ID so I can resolve it."
+
+### Combining with TodoWrite
+
+Use the task list to populate Claude's todo tracking:
+
+```bash
+# Extract tasks
+jq -r '.task_list[] | "\(.priority): \(.task)"' \
+  .reports/pr-reviews/pr-123/claude-analysis.json
+```
+
+Then ask Claude to add these to the todo list and work through them systematically.
+
+## Customizing the Analysis Prompt
+
+The prompt is loaded from (in priority order):
+1. `--prompt FILE` argument
+2. `GH_PR_ENRICH_PROMPT` environment variable
+3. `.gh-pr-enrich-prompt.txt` in repo root
+4. `default-prompt.txt` bundled with extension
+
+**Prompt file format:**
+- Lines starting with `#` are comments (ignored)
+- Remaining text becomes the system prompt
+- Must work with the JSON schema (issue_categories, systemic_issues, adjacent_problems, task_list)
+
+**Example custom prompts:**
+
+| Focus | Key Instructions |
+|-------|------------------|
+| Security | Focus on OWASP Top 10, auth issues, input validation |
+| Performance | Focus on N+1 queries, memory leaks, render cycles |
+| Architecture | Focus on coupling, abstraction layers, patterns |
+| Documentation | Focus on missing docs, incorrect comments, API clarity |
+
+## Troubleshooting
+
+### Extension Not Found
+
+```bash
+# Install or upgrade
+gh extension install bl4ck3lk/gh-pr-enrich
+gh extension upgrade pr-enrich
+```
+
+### No Unresolved Threads
+
+If `--enrich` reports "No unresolved threads found":
+- All review threads may already be resolved
+- Check `comment-threads.json` to verify thread status
+- Issue comments (not on code lines) aren't tracked as threads
+
+### Claude Analysis Empty
+
+If analysis returns empty arrays:
+- Verify Claude CLI is authenticated: `claude --version`
+- Check the context file was created: `cat claude-context.json`
+- Try with a custom, simpler prompt to debug
+
+### Thread Resolution Fails
+
+```bash
+# Verify thread ID exists
+jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.id == "PRRT_xxx")' \
+  comment-threads.json
+
+# Check if already resolved
+jq '.data.repository.pullRequest.reviewThreads.nodes[]
+    | select(.id == "PRRT_xxx") | .isResolved' comment-threads.json
+```
+
+## Related Skills
+
+- [`github-pr-fetcher`](../github-pr-fetcher/SKILL.md) - Original PR fetching script (less portable)
+- [`root-cause-tracing`](../root-cause-tracing/SKILL.md) - For debugging issues found in analysis
+
+## Resources
+
+- **Repository:** https://github.com/bl4ck3lk/gh-pr-enrich
+- **Claude CLI:** https://claude.ai/code
+- **GitHub CLI:** https://cli.github.com/
