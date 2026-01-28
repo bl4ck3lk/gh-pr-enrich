@@ -10,6 +10,9 @@ A GitHub CLI extension for comprehensive PR analysis with optional Claude AI enr
 - ✅ **CI/CD Status**: Check runs and status information
 - 📊 **Statistics**: Comment counts by type/user, recent activity
 - 🤖 **Claude AI Analysis** (optional): Categorize issues, identify systemic patterns, generate task lists
+- 🔧 **Thread Resolution**: Resolve comment threads directly from CLI
+- 👀 **Watch Mode**: Monitor PRs for new comments with auto-analysis
+- 🎯 **Interactive Mode**: Work through issues one by one with guided fixing
 - 🧠 **Claude Code Skill**: Included skill teaches Claude how to use and analyze output
 
 ## Installation
@@ -27,11 +30,23 @@ gh pr-enrich 123
 # With Claude AI analysis of unresolved comments
 gh pr-enrich 123 --enrich
 
+# Include code diffs in analysis for richer context
+gh pr-enrich 123 --enrich --diff
+
 # Output JSON only (for scripting)
 gh pr-enrich 123 --json
 
 # Custom output directory
 gh pr-enrich 123 --output-dir ./my-reports
+
+# Resolve comment threads by ID
+gh pr-enrich resolve PRRT_xxx PRRT_yyy
+
+# Watch a PR for new comments (checks every 5 min by default)
+gh pr-enrich watch 123 --interval 2 --enrich
+
+# Interactive mode to work through issues
+gh pr-enrich address 123
 ```
 
 ## Options
@@ -42,6 +57,7 @@ gh pr-enrich 123 --output-dir ./my-reports
 | `--markdown` | Output only Markdown |
 | `--output-dir DIR` | Custom output directory |
 | `--enrich` | Run Claude AI analysis on unresolved threads |
+| `--diff` | Include code diffs in Claude context (richer analysis) |
 | `--prompt FILE` | Custom prompt file for Claude analysis |
 | `-h, --help` | Show help |
 | `-v, --version` | Show version |
@@ -52,6 +68,9 @@ gh pr-enrich 123 --output-dir ./my-reports
 |------------|-------------|
 | `install-skill` | Install Claude Code skill to `~/.claude/skills/` |
 | `uninstall-skill` | Remove the Claude Code skill |
+| `resolve <ID...>` | Resolve one or more PR review threads by GraphQL ID |
+| `watch <PR>` | Monitor PR for new comments (options: `--interval`, `--enrich`, `--notify`) |
+| `address <PR>` | Interactive mode to work through issues one by one |
 
 ## Output Files
 
@@ -66,7 +85,9 @@ When run, the extension creates a directory with:
 ├── comment-threads.json         # Thread data with GraphQL IDs
 ├── checks.json                  # CI/CD status
 ├── claude-analysis.json         # (if --enrich) AI analysis
-└── claude-analysis.md           # (if --enrich) AI report
+├── claude-analysis.md           # (if --enrich) AI report
+├── pr-diff.txt                  # (if --diff) Raw unified diff
+└── pr-diff.json                 # (if --diff) Structured diff by file
 ```
 
 ## Claude AI Analysis
@@ -143,14 +164,34 @@ jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == f
   .reports/pr-reviews/pr-123/comment-threads.json
 ```
 
-### Resolve a comment thread
+### Resolve comment threads
 
 ```bash
-gh api graphql -f query='mutation {
-  resolveReviewThread(input: {threadId: "PRRT_xxx"}) {
-    thread { isResolved }
-  }
-}'
+# Resolve a single thread
+gh pr-enrich resolve PRRT_xxx
+
+# Resolve multiple threads at once
+gh pr-enrich resolve PRRT_xxx PRRT_yyy PRRT_zzz
+```
+
+### Monitor a PR for new comments
+
+```bash
+# Watch with 2-minute intervals and auto-analyze new comments
+gh pr-enrich watch 123 --interval 2 --enrich
+
+# Watch with desktop notifications (macOS)
+gh pr-enrich watch 123 --notify
+```
+
+### Work through issues interactively
+
+```bash
+# Requires previous --enrich run
+gh pr-enrich 123 --enrich
+gh pr-enrich address 123
+
+# Controls: [f]ixed, [s]kip, [o]pen in browser, [q]uit
 ```
 
 ## Claude Code Skill
