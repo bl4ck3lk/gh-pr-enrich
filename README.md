@@ -10,6 +10,7 @@ A GitHub CLI extension for comprehensive PR analysis with optional Claude AI enr
 - ✅ **CI/CD Status**: Check runs and status information
 - 📊 **Statistics**: Comment counts by type/user, recent activity
 - 🤖 **Claude AI Analysis** (optional): Categorize issues, identify systemic patterns, generate task lists
+- 🧠 **Claude Code Skill**: Included skill teaches Claude how to use and analyze output
 
 ## Installation
 
@@ -144,6 +145,47 @@ gh api graphql -f query='mutation {
   }
 }'
 ```
+
+## Claude Code Skill
+
+This extension includes a [Claude Code](https://claude.ai/code) skill for enhanced integration. The skill provides Claude with detailed knowledge of how to use this extension and analyze its output.
+
+### Installing the Skill
+
+After installing the extension, symlink the skill to your Claude skills directory:
+
+```bash
+# Create skills directory if needed
+mkdir -p ~/.claude/skills
+
+# Symlink the skill (updates automatically with extension upgrades)
+ln -s ~/.local/share/gh/extensions/gh-pr-enrich/.claude/skills/gh-pr-enrich \
+      ~/.claude/skills/gh-pr-enrich
+```
+
+### What the Skill Provides
+
+Once installed, Claude Code can:
+
+- **Fetch and analyze PRs** when you ask to "analyze PR #123" or "review PR comments"
+- **Interpret analysis results** - understands issue categories, systemic patterns, and task lists
+- **Work with thread IDs** - find, filter, and resolve comment threads programmatically
+- **Create task lists** from the prioritized AI analysis
+- **Customize prompts** for security-focused, performance-focused, or other specialized reviews
+
+### Example Usage in Claude Code
+
+```
+> Use gh-pr-enrich to analyze PR 42 and create a todo list from critical issues
+
+> Read the claude-analysis.json and address each high-priority task
+
+> What systemic patterns were found in the PR review?
+```
+
+### Skill Location
+
+The skill is located at `.claude/skills/gh-pr-enrich/SKILL.md` in this repository.
 
 ## License
 
