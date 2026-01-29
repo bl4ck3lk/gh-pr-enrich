@@ -6,13 +6,20 @@
 #   gh extension install bl4ck3lk/gh-pr-enrich
 #
 # Usage:
-#   gh pr-enrich <PR_NUMBER> [--json] [--markdown] [--output-dir <DIR>] [--enrich]
+#   gh pr-enrich <PR_NUMBER> [--json] [--markdown] [--output-dir <DIR>] [--enrich] [--diff]
+#   gh pr-enrich resolve <THREAD_ID> [THREAD_ID...]
+#   gh pr-enrich watch <PR_NUMBER> [--interval MIN] [--enrich] [--notify]
+#   gh pr-enrich address <PR_NUMBER>
+#   gh pr-enrich install-skill | uninstall-skill
 #
 # Examples:
 #   gh pr-enrich 123                    # Fetch PR details
 #   gh pr-enrich 123 --enrich           # Fetch + Claude analysis
+#   gh pr-enrich 123 --enrich --diff    # Analysis with code context
 #   gh pr-enrich 123 --json             # Output JSON only
-#   gh pr-enrich 123 --output-dir ./my-reports
+#   gh pr-enrich resolve PRRT_xxx       # Resolve a comment thread
+#   gh pr-enrich watch 123 --enrich     # Monitor PR for changes
+#   gh pr-enrich address 123            # Interactive issue fixing
 
 set -e
 
@@ -147,6 +154,404 @@ if [ "$1" = "uninstall-skill" ]; then
     exit 0
 fi
 
+# Handle resolve subcommand - resolve PR review threads by ID
+if [ "$1" = "resolve" ]; then
+    shift
+    if [ $# -eq 0 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+        echo "Usage: gh pr-enrich resolve <THREAD_ID> [THREAD_ID...]"
+        echo ""
+        echo "Resolve one or more PR review threads by their GraphQL ID."
+        echo "Thread IDs start with 'PRRT_' and can be found in:"
+        echo "  - claude-analysis.json (task_list[].thread_ids)"
+        echo "  - comment-threads.json"
+        echo ""
+        echo "Example:"
+        echo "  gh pr-enrich resolve PRRT_kwDORDoRf85rizQq PRRT_kwDORDoRf85rizQ3"
+        exit 0
+    fi
+
+    RESOLVED=0
+    FAILED=0
+
+    for THREAD_ID in "$@"; do
+        # Validate thread ID format (PRRT_ prefix + base64-safe characters)
+        if [[ ! "$THREAD_ID" =~ ^PRRT_[A-Za-z0-9_-]+$ ]]; then
+            echo "⚠️  Skipping invalid thread ID: $THREAD_ID (must start with PRRT_ followed by valid characters)"
+            ((FAILED++))
+            continue
+        fi
+
+        # Resolve the thread via GraphQL (using parameterized query to prevent injection)
+        RESULT=$(gh api graphql \
+            -F threadId="$THREAD_ID" \
+            -f query='mutation($threadId: ID!) {
+                resolveReviewThread(input: {threadId: $threadId}) {
+                    thread { isResolved id }
+                }
+            }' 2>&1)
+
+        if echo "$RESULT" | jq -e '.data.resolveReviewThread.thread.isResolved' > /dev/null 2>&1; then
+            echo "✅ Resolved: $THREAD_ID"
+            ((RESOLVED++))
+        else
+            ERROR=$(echo "$RESULT" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "$RESULT")
+            echo "❌ Failed to resolve $THREAD_ID: $ERROR"
+            ((FAILED++))
+        fi
+    done
+
+    echo ""
+    echo "Summary: $RESOLVED resolved, $FAILED failed"
+    exit 0
+fi
+
+# Handle watch subcommand - monitor PR for new comments
+if [ "$1" = "watch" ]; then
+    shift
+    if [ $# -eq 0 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+        echo "Usage: gh pr-enrich watch <PR_NUMBER> [OPTIONS]"
+        echo ""
+        echo "Monitor a PR for new comments and optionally run analysis."
+        echo ""
+        echo "Options:"
+        echo "  --interval MIN   Check interval in minutes (default: 5)"
+        echo "  --enrich         Run Claude analysis when new comments found"
+        echo "  --notify         Show desktop notification (macOS only)"
+        echo ""
+        echo "Example:"
+        echo "  gh pr-enrich watch 123 --interval 2 --enrich"
+        echo ""
+        echo "Press Ctrl+C to stop watching."
+        exit 0
+    fi
+
+    WATCH_PR="$1"
+    shift
+
+    # Validate PR number
+    if ! [[ "$WATCH_PR" =~ ^[0-9]+$ ]]; then
+        echo "Error: PR number must be a positive integer"
+        exit 1
+    fi
+
+    WATCH_INTERVAL=5
+    WATCH_ENRICH=false
+    WATCH_NOTIFY=false
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --interval)
+                if [ -z "${2:-}" ]; then
+                    echo "Error: --interval requires a numeric value"
+                    exit 1
+                fi
+                if ! [[ "$2" =~ ^[0-9]+$ ]] || [ "$2" -lt 1 ]; then
+                    echo "Error: --interval must be a positive integer (got: '$2')"
+                    exit 1
+                fi
+                WATCH_INTERVAL="$2"
+                shift 2
+                ;;
+            --enrich)
+                WATCH_ENRICH=true
+                shift
+                ;;
+            --notify)
+                WATCH_NOTIFY=true
+                shift
+                ;;
+            *)
+                echo "Unknown option: $1"
+                exit 1
+                ;;
+        esac
+    done
+
+    # Validate repository access
+    REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)
+    if [ -z "$REPO" ]; then
+        echo "Error: Could not determine repository. Are you in a git repo with a GitHub remote?"
+        exit 1
+    fi
+
+    # Verify PR exists before starting watch loop
+    if ! gh pr view "$WATCH_PR" --json number > /dev/null 2>&1; then
+        echo "Error: PR #$WATCH_PR not found in $REPO"
+        echo "Verify the PR number and that you have access to the repository."
+        exit 1
+    fi
+
+    echo "👀 Watching PR #$WATCH_PR in $REPO"
+    echo "   Checking every $WATCH_INTERVAL minute(s)"
+    echo "   Enrich: $WATCH_ENRICH | Notify: $WATCH_NOTIFY"
+    echo "   Press Ctrl+C to stop"
+    echo ""
+
+    # Split repo into owner and name for parameterized queries
+    REPO_OWNER="${REPO%/*}"
+    REPO_NAME="${REPO#*/}"
+
+    # Get initial comment count
+    LAST_COUNT=$(gh pr view "$WATCH_PR" --json comments,reviews --jq '(.comments | length) + (.reviews | length)' 2>/dev/null || echo "0")
+    # Note: Limited to 100 review threads. PRs with more threads may show incomplete counts.
+    LAST_UNRESOLVED=$(gh api graphql \
+        -F owner="$REPO_OWNER" \
+        -F name="$REPO_NAME" \
+        -F prNumber="$WATCH_PR" \
+        -f query='query($owner: String!, $name: String!, $prNumber: Int!) {
+            repository(owner: $owner, name: $name) {
+                pullRequest(number: $prNumber) {
+                    reviewThreads(first: 100) {
+                        nodes { isResolved }
+                    }
+                }
+            }
+        }' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' 2>/dev/null || echo "0")
+
+    echo "📊 Initial state: $LAST_COUNT comments/reviews, $LAST_UNRESOLVED unresolved threads"
+    echo ""
+
+    CONSECUTIVE_FAILURES=0
+    MAX_FAILURES=3
+
+    while true; do
+        sleep $((WATCH_INTERVAL * 60))
+
+        # Get current counts (using parameterized queries to prevent injection)
+        CURRENT_COUNT=$(gh pr view "$WATCH_PR" --json comments,reviews --jq '(.comments | length) + (.reviews | length)' 2>/dev/null)
+        CURRENT_UNRESOLVED=$(gh api graphql \
+            -F owner="$REPO_OWNER" \
+            -F name="$REPO_NAME" \
+            -F prNumber="$WATCH_PR" \
+            -f query='query($owner: String!, $name: String!, $prNumber: Int!) {
+                repository(owner: $owner, name: $name) {
+                    pullRequest(number: $prNumber) {
+                        reviewThreads(first: 100) {
+                            nodes { isResolved }
+                        }
+                    }
+                }
+            }' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' 2>/dev/null)
+
+        TIMESTAMP=$(date '+%H:%M:%S')
+
+        # Check for API failures
+        if [ -z "$CURRENT_COUNT" ] || [ -z "$CURRENT_UNRESOLVED" ]; then
+            ((CONSECUTIVE_FAILURES++))
+            echo "[$TIMESTAMP] ⚠️  API request failed (attempt $CONSECUTIVE_FAILURES/$MAX_FAILURES)"
+            if [ "$CONSECUTIVE_FAILURES" -ge "$MAX_FAILURES" ]; then
+                echo "[$TIMESTAMP] ❌ Too many consecutive failures. Check network/auth and restart watch."
+                exit 1
+            fi
+            continue
+        fi
+        CONSECUTIVE_FAILURES=0
+
+        if [ "$CURRENT_COUNT" -ne "$LAST_COUNT" ] || [ "$CURRENT_UNRESOLVED" -ne "$LAST_UNRESOLVED" ]; then
+            NEW_COMMENTS=$((CURRENT_COUNT - LAST_COUNT))
+            THREAD_DIFF=$((CURRENT_UNRESOLVED - LAST_UNRESOLVED))
+
+            echo "[$TIMESTAMP] 🔔 Changes detected!"
+            [ "$NEW_COMMENTS" -ne 0 ] && echo "   New comments/reviews: $NEW_COMMENTS"
+            [ "$THREAD_DIFF" -gt 0 ] && echo "   New unresolved threads: +$THREAD_DIFF"
+            [ "$THREAD_DIFF" -lt 0 ] && echo "   Threads resolved: ${THREAD_DIFF#-}"
+
+            # Desktop notification (macOS)
+            if [ "$WATCH_NOTIFY" = true ] && command -v osascript &> /dev/null; then
+                osascript -e "display notification \"${NEW_COMMENTS} new comments, ${CURRENT_UNRESOLVED} unresolved\" with title \"PR #${WATCH_PR} Updated\"" 2>/dev/null || true
+            fi
+
+            # Run enrichment if requested
+            if [ "$WATCH_ENRICH" = true ] && [ "$CURRENT_UNRESOLVED" -gt 0 ]; then
+                echo "   Running analysis..."
+                if "$0" "$WATCH_PR" --enrich --output-dir ".reports/pr-reviews/pr-$WATCH_PR" > /dev/null 2>&1; then
+                    if [ -f ".reports/pr-reviews/pr-$WATCH_PR/claude-analysis.md" ]; then
+                        echo "   ✅ Analysis updated: .reports/pr-reviews/pr-$WATCH_PR/claude-analysis.md"
+                    else
+                        echo "   ⚠️  Analysis ran but no claude-analysis.md created (no unresolved threads or Claude unavailable)"
+                    fi
+                else
+                    echo "   ❌ Analysis failed - check manually with: gh pr-enrich $WATCH_PR --enrich"
+                fi
+            fi
+
+            LAST_COUNT=$CURRENT_COUNT
+            LAST_UNRESOLVED=$CURRENT_UNRESOLVED
+            echo ""
+        else
+            echo "[$TIMESTAMP] No changes (comments: $CURRENT_COUNT, unresolved: $CURRENT_UNRESOLVED)"
+        fi
+    done
+fi
+
+# Handle address subcommand - interactive mode to work through issues
+if [ "$1" = "address" ]; then
+    shift
+    if [ $# -eq 0 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+        echo "Usage: gh pr-enrich address <PR_NUMBER>"
+        echo ""
+        echo "Interactive mode to work through PR review issues one by one."
+        echo "Shows each task from Claude analysis and lets you mark as fixed."
+        echo ""
+        echo "Requires: Previous 'gh pr-enrich <PR> --enrich' run"
+        echo ""
+        echo "Controls:"
+        echo "  f - Mark as fixed (resolves thread)"
+        echo "  s - Skip to next task"
+        echo "  o - Open thread in browser"
+        echo "  q - Quit"
+        exit 0
+    fi
+
+    ADDRESS_PR="$1"
+    if ! [[ "$ADDRESS_PR" =~ ^[0-9]+$ ]]; then
+        echo "Error: PR number must be a positive integer"
+        exit 1
+    fi
+
+    ANALYSIS_FILE=".reports/pr-reviews/pr-$ADDRESS_PR/claude-analysis.json"
+
+    if [ ! -f "$ANALYSIS_FILE" ]; then
+        echo "Error: Analysis not found at $ANALYSIS_FILE"
+        echo "Run 'gh pr-enrich $ADDRESS_PR --enrich' first"
+        exit 1
+    fi
+
+    # Validate JSON structure before use
+    if ! jq -e '.task_list' "$ANALYSIS_FILE" > /dev/null 2>&1; then
+        echo "Error: Analysis file is missing 'task_list' or contains invalid JSON"
+        echo "File: $ANALYSIS_FILE"
+        echo "Re-run: gh pr-enrich $ADDRESS_PR --enrich"
+        exit 1
+    fi
+
+    # Get task count
+    TASK_COUNT=$(jq '.task_list | length' "$ANALYSIS_FILE")
+    if [ "$TASK_COUNT" -eq 0 ]; then
+        echo "✅ No tasks found in analysis. All done!"
+        exit 0
+    fi
+
+    echo "📋 Found $TASK_COUNT tasks to address"
+    echo ""
+
+    CURRENT=0
+    FIXED=0
+    SKIPPED=0
+
+    while [ $CURRENT -lt $TASK_COUNT ]; do
+        TASK=$(jq -r ".task_list[$CURRENT]" "$ANALYSIS_FILE")
+        PRIORITY=$(echo "$TASK" | jq -r '.priority')
+        DESCRIPTION=$(echo "$TASK" | jq -r '.task')
+        THREAD_IDS=$(echo "$TASK" | jq -r '.thread_ids | join(", ")')
+
+        # Color based on priority
+        case $PRIORITY in
+            critical) PRIORITY_COLOR="\033[1;31m" ;;  # Bold red
+            high)     PRIORITY_COLOR="\033[0;31m" ;;  # Red
+            medium)   PRIORITY_COLOR="\033[0;33m" ;;  # Yellow
+            low)      PRIORITY_COLOR="\033[0;32m" ;;  # Green
+            *)        PRIORITY_COLOR="\033[0m" ;;
+        esac
+
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo -e "Task $((CURRENT + 1))/$TASK_COUNT [${PRIORITY_COLOR}${PRIORITY}\033[0m]"
+        echo ""
+        echo "$DESCRIPTION"
+        echo ""
+        if [ -n "$THREAD_IDS" ] && [ "$THREAD_IDS" != "null" ]; then
+            echo "Threads: $THREAD_IDS"
+        fi
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo -n "[f]ixed  [s]kip  [o]pen in browser  [q]uit > "
+
+        read -r -n 1 ACTION
+        echo ""
+
+        case $ACTION in
+            f|F)
+                # Resolve all threads for this task (using parameterized query to prevent injection)
+                THREAD_ARRAY=$(echo "$TASK" | jq -r '.thread_ids[]' 2>/dev/null)
+                RESOLVE_FAILED=0
+                if [ -n "$THREAD_ARRAY" ]; then
+                    for TID in $THREAD_ARRAY; do
+                        # Validate thread ID format before API call
+                        if [[ ! "$TID" =~ ^PRRT_[A-Za-z0-9_-]+$ ]]; then
+                            echo "  ⚠️  Invalid thread ID format: $TID"
+                            ((RESOLVE_FAILED++))
+                            continue
+                        fi
+                        RESULT=$(gh api graphql \
+                            -F threadId="$TID" \
+                            -f query='mutation($threadId: ID!) {
+                                resolveReviewThread(input: {threadId: $threadId}) {
+                                    thread { isResolved }
+                                }
+                            }' 2>&1)
+                        if echo "$RESULT" | jq -e '.data.resolveReviewThread.thread.isResolved' > /dev/null 2>&1; then
+                            echo "  ✅ Resolved: $TID"
+                        else
+                            ERROR=$(echo "$RESULT" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "$RESULT")
+                            echo "  ❌ Failed to resolve $TID: $ERROR"
+                            ((RESOLVE_FAILED++))
+                        fi
+                    done
+                    if [ "$RESOLVE_FAILED" -gt 0 ]; then
+                        echo "  ⚠️  $RESOLVE_FAILED thread(s) failed to resolve - task may not be fully addressed"
+                    fi
+                fi
+                ((FIXED++))
+                ((CURRENT++))
+                echo ""
+                ;;
+            s|S)
+                echo "  ⏭️  Skipped"
+                ((SKIPPED++))
+                ((CURRENT++))
+                echo ""
+                ;;
+            o|O)
+                # Get first thread URL
+                FIRST_TID=$(echo "$TASK" | jq -r '.thread_ids[0] // empty')
+                if [ -n "$FIRST_TID" ]; then
+                    # Find URL in comment threads
+                    THREAD_FILE=".reports/pr-reviews/pr-$ADDRESS_PR/comment-threads.json"
+                    if [ -f "$THREAD_FILE" ]; then
+                        URL=$(jq -r ".data.repository.pullRequest.reviewThreads.nodes[] | select(.id == \"$FIRST_TID\") | .comments.nodes[0].url // empty" "$THREAD_FILE")
+                        if [ -n "$URL" ]; then
+                            echo "  🌐 Opening: $URL"
+                            # Try macOS 'open', then Linux 'xdg-open'; Windows not supported
+                            open "$URL" 2>/dev/null || xdg-open "$URL" 2>/dev/null || echo "  Could not open browser (try manually: $URL)"
+                        else
+                            echo "  Could not find URL for thread $FIRST_TID"
+                        fi
+                    else
+                        echo "  Thread details file not found: $THREAD_FILE"
+                        echo "  Re-run: gh pr-enrich $ADDRESS_PR to refresh data"
+                    fi
+                else
+                    echo "  No thread ID associated with this task"
+                fi
+                # Don't advance - let user decide after viewing
+                ;;
+            q|Q)
+                echo ""
+                echo "Quitting..."
+                break
+                ;;
+            *)
+                echo "  Unknown action. Use f/s/o/q"
+                ;;
+        esac
+    done
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Summary: $FIXED fixed, $SKIPPED skipped, $((TASK_COUNT - CURRENT)) remaining"
+    exit 0
+fi
+
 # Handle --help flag
 if [ "$1" = "--help" ] || [ "$1" = "-h" ] || [ $# -lt 1 ]; then
     cat << 'HELP'
@@ -154,28 +559,35 @@ gh pr-enrich - Comprehensive PR analysis with optional Claude AI enrichment
 
 USAGE:
   gh pr-enrich <PR_NUMBER> [OPTIONS]
-  gh pr-enrich <SUBCOMMAND>
+  gh pr-enrich <SUBCOMMAND> [ARGS]
 
 SUBCOMMANDS:
-  install-skill     Install Claude Code skill (symlink to ~/.claude/skills/)
-  uninstall-skill   Remove the Claude Code skill symlink
+  install-skill       Install Claude Code skill (symlink to ~/.claude/skills/)
+  uninstall-skill     Remove the Claude Code skill symlink
+  resolve <ID...>     Resolve PR review threads by GraphQL ID
+  watch <PR> [OPTS]   Monitor PR for new comments (--interval, --enrich, --notify)
+  address <PR>        Interactive mode to work through issues one by one
 
 OPTIONS:
   --json            Output only JSON (default: combined)
   --markdown        Output only Markdown (default: combined)
   --output-dir DIR  Directory to save output (default: .reports/pr-reviews/pr-<N>)
   --enrich          Run Claude AI analysis on unresolved comment threads
+  --diff            Include code diffs in Claude context (richer analysis)
   --prompt FILE     Custom prompt file for Claude analysis (overrides defaults)
   -h, --help        Show this help message
   -v, --version     Show version
 
 EXAMPLES:
-  gh pr-enrich install-skill          # Install Claude Code skill
-  gh pr-enrich 123                    # Basic PR report
-  gh pr-enrich 123 --enrich           # With Claude AI analysis
-  gh pr-enrich 123 --output-dir ./pr  # Custom output directory
-  gh pr-enrich 123 --json             # JSON output only
-  gh pr-enrich 123 --enrich --prompt ./my-prompt.txt  # Custom analysis prompt
+  gh pr-enrich install-skill              # Install Claude Code skill
+  gh pr-enrich 123                        # Basic PR report
+  gh pr-enrich 123 --enrich               # With Claude AI analysis
+  gh pr-enrich 123 --enrich --diff        # Analysis with code context
+  gh pr-enrich 123 --output-dir ./pr      # Custom output directory
+  gh pr-enrich 123 --json                 # JSON output only
+  gh pr-enrich resolve PRRT_xxx PRRT_yyy  # Resolve multiple threads
+  gh pr-enrich watch 123 --enrich         # Monitor and auto-analyze
+  gh pr-enrich address 123                # Interactive issue fixing
 
 PROMPT CUSTOMIZATION:
   The Claude analysis prompt is loaded from (in priority order):
@@ -213,6 +625,7 @@ DEFAULT_OUTPUT_ROOT="${PR_REVIEW_OUTPUT_ROOT:-.reports/pr-reviews}"
 OUTPUT_DIR="$DEFAULT_OUTPUT_ROOT/pr-$PR_NUMBER"
 CUSTOM_OUTPUT_DIR=false
 ENRICH_WITH_CLAUDE=false
+INCLUDE_DIFF=false
 CUSTOM_PROMPT_FILE=""
 REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "current-repo")
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -284,6 +697,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --enrich)
             ENRICH_WITH_CLAUDE=true
+            shift
+            ;;
+        --diff)
+            INCLUDE_DIFF=true
             shift
             ;;
         --prompt)
@@ -465,21 +882,87 @@ extract_unresolved_threads() {
         }]' "$threads_file" > "$output_file"
 }
 
+# Fetch the PR diff and create both raw and structured versions
+# Args:
+#   $1 - output_dir: Directory to save diff files
+#   $2 - pr_num: PR number to fetch diff for
+# Creates:
+#   pr-diff.txt - Raw unified diff
+#   pr-diff.json - Structured diff with file-level separation
+fetch_pr_diff() {
+    local output_dir="$1"
+    local pr_num="$2"
+
+    # Fetch the unified diff for the PR
+    if ! gh pr diff "$pr_num" > "$output_dir/pr-diff.txt" 2>/dev/null; then
+        echo "⚠️  Could not fetch PR diff (binary files only, empty PR, or access denied)"
+        echo "   Analysis will proceed without code context."
+        echo "" > "$output_dir/pr-diff.txt"
+    fi
+
+    # Also create a structured version with file-level diffs
+    # Truncate large diffs to avoid token limits in Claude API
+    # 5000 chars per file balances context richness with API constraints
+    jq -n --arg diff "$(<"$output_dir/pr-diff.txt")" \
+        '{
+            raw_diff: $diff,
+            file_diffs: ($diff | split("diff --git ") | .[1:] | map(
+                . as $chunk |
+                ($chunk | split("\n") | .[0] | split(" ") | .[-1] | ltrimstr("b/")) as $filepath |
+                {
+                    file: $filepath,
+                    content: ("diff --git " + $chunk)
+                }
+            ))
+        }' > "$output_dir/pr-diff.json" 2>/dev/null || {
+            echo '{"raw_diff": "", "file_diffs": []}' > "$output_dir/pr-diff.json"
+        }
+}
+
 build_claude_context() {
     local output_dir="$1"
+    local include_diff="${2:-false}"
 
-    jq -n \
-        --argjson pr "$(<"$output_dir/pr-summary.json")" \
-        --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
-        '{
-            pr: {
-                title: $pr.title,
-                body: ($pr.body // "No description"),
-                author: $pr.author.login,
-                files_changed: [$pr.files[].path]
-            },
-            unresolved_threads: $unresolved
-        }' > "$output_dir/claude-context.json"
+    if [ "$include_diff" = "true" ] && [ -f "$output_dir/pr-diff.json" ]; then
+        # Include diff in context for richer analysis
+        jq -n \
+            --argjson pr "$(<"$output_dir/pr-summary.json")" \
+            --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
+            --argjson diff "$(<"$output_dir/pr-diff.json")" \
+            '{
+                pr: {
+                    title: $pr.title,
+                    body: ($pr.body // "No description"),
+                    author: $pr.author.login,
+                    files_changed: [$pr.files[].path]
+                },
+                unresolved_threads: $unresolved,
+                code_changes: {
+                    summary: "Diff included for context. Each file_diff contains the actual code changes.",
+                    file_diffs: ($diff.file_diffs | map({
+                        file: .file,
+                        diff: (if (.content | length) > 5000 then
+                            (.content | .[0:5000] + "\n... (truncated)")
+                        else
+                            .content
+                        end)
+                    }))
+                }
+            }' > "$output_dir/claude-context.json"
+    else
+        jq -n \
+            --argjson pr "$(<"$output_dir/pr-summary.json")" \
+            --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
+            '{
+                pr: {
+                    title: $pr.title,
+                    body: ($pr.body // "No description"),
+                    author: $pr.author.login,
+                    files_changed: [$pr.files[].path]
+                },
+                unresolved_threads: $unresolved
+            }' > "$output_dir/claude-context.json"
+    fi
 }
 
 CLAUDE_ANALYSIS_SCHEMA='{
@@ -750,7 +1233,13 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
     if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
         echo "Found $UNRESOLVED_COUNT unresolved thread(s). Analyzing with Claude Sonnet..."
 
-        build_claude_context "$OUTPUT_DIR"
+        # Fetch diff if requested
+        if [ "$INCLUDE_DIFF" = true ]; then
+            echo "Fetching PR diff for richer context..."
+            fetch_pr_diff "$OUTPUT_DIR" "$PR_NUMBER"
+        fi
+
+        build_claude_context "$OUTPUT_DIR" "$INCLUDE_DIFF"
 
         if run_claude_analysis "$OUTPUT_DIR/claude-context.json" "$OUTPUT_DIR/claude-raw-response.json"; then
             echo "✅ Claude analysis complete"
