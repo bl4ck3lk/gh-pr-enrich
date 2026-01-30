@@ -1161,9 +1161,9 @@ jq -s 'add | sort_by(.created_at // .submitted_at // "")' \
 
 # 4. Fetch checks and status
 echo "Fetching checks and status..."
-gh pr checks "$PR_NUMBER" --json checkRuns,statusCheckRollup,statuses > "$OUTPUT_DIR/checks.json" 2>/dev/null || {
-    echo "Note: Could not fetch checks (may require additional permissions)."
-    echo '{}' > "$OUTPUT_DIR/checks.json"
+gh pr checks "$PR_NUMBER" --json name,state,bucket,workflow,startedAt,completedAt,event,link,description > "$OUTPUT_DIR/checks.json" 2>/dev/null || {
+    echo "Note: Could not fetch checks (may require additional permissions or no checks configured)."
+    echo '[]' > "$OUTPUT_DIR/checks.json"
 }
 
 # 5. Generate statistics
@@ -1178,14 +1178,23 @@ COMMENT_STATS=$(jq -n \
         recent: ($comments | sort_by(.created_at) | reverse | .[0:5])
     }')
 
-CHECKS_STATS=$(jq -r '.statusCheckRollup | {
-    overall_state: .state,
-    conclusion: .conclusion,
-    contexts: (.contexts | length),
-    passing: (.contexts | map(select(.state == "success")) | length),
-    failing: (.contexts | map(select(.state == "failure")) | length),
-    pending: (.contexts | map(select(.state == "pending")) | length)
-}' "$OUTPUT_DIR/checks.json" 2>/dev/null || echo '{"overall_state": "unknown"}')
+# Compute overall state from individual checks (bucket field: pass, fail, pending, skipping, cancel)
+CHECKS_STATS=$(jq -r '{
+    total: length,
+    passing: (map(select(.bucket == "pass")) | length),
+    failing: (map(select(.bucket == "fail")) | length),
+    pending: (map(select(.bucket == "pending")) | length),
+    skipped: (map(select(.bucket == "skipping")) | length),
+    cancelled: (map(select(.bucket == "cancel")) | length),
+    overall_state: (
+        if length == 0 then "no_checks"
+        elif (map(select(.bucket == "fail")) | length) > 0 then "failure"
+        elif (map(select(.bucket == "pending")) | length) > 0 then "pending"
+        elif (map(select(.bucket == "pass" or .bucket == "skipping" or .bucket == "cancel")) | length) == length then "success"
+        else "mixed"
+        end
+    )
+}' "$OUTPUT_DIR/checks.json" 2>/dev/null || echo '{"overall_state": "unknown", "total": 0, "passing": 0, "failing": 0, "pending": 0, "skipped": 0, "cancelled": 0}')
 
 # 6. Create combined JSON
 echo "Creating combined JSON..."
@@ -1247,8 +1256,11 @@ $(jq -r '.files[] | "- **\(.path)** (+\(.additions) / -\(.deletions))"' "$OUTPUT
 
 ## ✅ Checks & Status
 
-**Overall State:** $(jq -r '.statusCheckRollup.state // "unknown"' "$OUTPUT_DIR/checks.json")
-**Conclusion:** $(jq -r '.statusCheckRollup.conclusion // "N/A"' "$OUTPUT_DIR/checks.json")
+**Overall State:** $(echo "$CHECKS_STATS" | jq -r '.overall_state // "unknown"')
+**Total Checks:** $(echo "$CHECKS_STATS" | jq -r '.total // 0')
+**Passing:** $(echo "$CHECKS_STATS" | jq -r '.passing // 0') | **Failing:** $(echo "$CHECKS_STATS" | jq -r '.failing // 0') | **Pending:** $(echo "$CHECKS_STATS" | jq -r '.pending // 0')
+
+$(jq -r 'if length > 0 then "### Check Details\n" + (map("- **\(.name)**: \(.state) (\(.bucket))" + (if ((.workflow? | type) == "object" and (.workflow.name? != null)) then " - \(.workflow.name)" elif (.workflow? | type) == "string" then " - \(.workflow)" else "" end)) | join("\n")) else "No checks configured for this PR." end' "$OUTPUT_DIR/checks.json")
 
 ## 💬 Comments Analysis
 
