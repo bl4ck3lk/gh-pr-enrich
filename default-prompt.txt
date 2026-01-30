@@ -16,9 +16,17 @@ Your task is to:
 2. Identify systemic patterns that appear across multiple comments
 3. Suggest adjacent areas that may have similar problems worth investigating
 4. Create a prioritized task list for addressing the issues
+5. Recommend process and documentation improvements to prevent similar issues in future PRs
+6. Suggest additions to the PR template that would catch these issues earlier
 
 Focus on actionable insights. Be specific about file paths and patterns.
 If there are no systemic issues or adjacent problems, return empty arrays for those fields.
+
+For process improvements, consider:
+- What checks or validations could have caught this earlier?
+- What documentation would help developers avoid this mistake?
+- What PR template questions would prompt authors to address this proactively?
+- What automated linting, testing, or CI checks could prevent this?
 
 When categorizing severity:
 - critical: Security vulnerabilities, data loss risks, breaking changes

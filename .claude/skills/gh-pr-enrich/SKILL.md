@@ -119,7 +119,7 @@ Default location: `.reports/pr-reviews/pr-<NUMBER>/`
 
 ### Reading the Claude Analysis
 
-When using `--enrich`, the AI analysis contains four key sections:
+When using `--enrich`, the AI analysis contains six key sections:
 
 #### 1. Issue Categories
 
@@ -209,6 +209,56 @@ Prioritized actions linked to thread IDs:
 - Create TODO list for addressing feedback
 - Prioritize work by severity
 - Track which threads each fix addresses
+
+#### 5. Process Improvements
+
+Suggestions to prevent similar issues in future PRs:
+
+```json
+{
+  "process_improvements": [
+    {
+      "category": "automation",
+      "suggestion": "Add ESLint rule for error handling patterns",
+      "rationale": "Multiple comments about inconsistent error handling could be caught automatically",
+      "implementation_hint": "Configure eslint-plugin-promise with consistent-return rule"
+    }
+  ]
+}
+```
+
+**Categories:**
+- `documentation` - README, code comments, ADRs
+- `automation` - Linting, CI checks, pre-commit hooks
+- `testing` - Unit tests, integration tests, test coverage
+- `review_process` - Review checklists, required reviewers
+- `tooling` - Development tools, IDE configurations
+
+**Use these to:**
+- Systematically prevent recurring issues
+- Build institutional knowledge
+- Improve team velocity over time
+
+#### 6. PR Template Suggestions
+
+Additions to your PR template that would catch issues earlier:
+
+```json
+{
+  "pr_template_suggestions": [
+    {
+      "section": "Testing Checklist",
+      "checkbox_or_question": "- [ ] Error handling follows project patterns (see docs/error-handling.md)",
+      "why": "3 of 5 issues related to inconsistent error handling"
+    }
+  ]
+}
+```
+
+**Use these to:**
+- Evolve your PR template based on real feedback patterns
+- Shift issue detection left (author catches before reviewer)
+- Document team standards incrementally
 
 ### Working with Thread IDs
 
