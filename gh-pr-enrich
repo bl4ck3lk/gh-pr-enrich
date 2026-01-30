@@ -1190,7 +1190,7 @@ CHECKS_STATS=$(jq -r '{
         if length == 0 then "no_checks"
         elif (map(select(.bucket == "fail")) | length) > 0 then "failure"
         elif (map(select(.bucket == "pending")) | length) > 0 then "pending"
-        elif (map(select(.bucket == "pass")) | length) == length then "success"
+        elif (map(select(.bucket == "pass" or .bucket == "skipping" or .bucket == "cancel")) | length) == length then "success"
         else "mixed"
         end
     )
