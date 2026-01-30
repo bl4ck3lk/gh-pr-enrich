@@ -1260,7 +1260,7 @@ $(jq -r '.files[] | "- **\(.path)** (+\(.additions) / -\(.deletions))"' "$OUTPUT
 **Total Checks:** $(echo "$CHECKS_STATS" | jq -r '.total // 0')
 **Passing:** $(echo "$CHECKS_STATS" | jq -r '.passing // 0') | **Failing:** $(echo "$CHECKS_STATS" | jq -r '.failing // 0') | **Pending:** $(echo "$CHECKS_STATS" | jq -r '.pending // 0')
 
-$(jq -r 'if length > 0 then "### Check Details\n" + (map("- **\(.name)**: \(.state) (\(.bucket))" + if .workflow then " - \(.workflow.name)" else "" end) | join("\n")) else "No checks configured for this PR." end' "$OUTPUT_DIR/checks.json")
+$(jq -r 'if length > 0 then "### Check Details\n" + (map("- **\(.name)**: \(.state) (\(.bucket))" + (if ((.workflow? | type) == "object" and (.workflow.name? != null)) then " - \(.workflow.name)" elif (.workflow? | type) == "string" then " - \(.workflow)" else "" end)) | join("\n")) else "No checks configured for this PR." end' "$OUTPUT_DIR/checks.json")
 
 ## 💬 Comments Analysis
 
