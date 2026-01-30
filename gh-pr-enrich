@@ -1016,9 +1016,34 @@ CLAUDE_ANALYSIS_SCHEMA='{
         },
         "required": ["priority", "task", "thread_ids"]
       }
+    },
+    "process_improvements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "category": { "enum": ["documentation", "automation", "testing", "review_process", "tooling"] },
+          "suggestion": { "type": "string" },
+          "rationale": { "type": "string" },
+          "implementation_hint": { "type": "string" }
+        },
+        "required": ["category", "suggestion", "rationale"]
+      }
+    },
+    "pr_template_suggestions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "section": { "type": "string" },
+          "checkbox_or_question": { "type": "string" },
+          "why": { "type": "string" }
+        },
+        "required": ["section", "checkbox_or_question", "why"]
+      }
     }
   },
-  "required": ["issue_categories", "systemic_issues", "adjacent_problems", "task_list"]
+  "required": ["issue_categories", "systemic_issues", "adjacent_problems", "task_list", "process_improvements", "pr_template_suggestions"]
 }'
 
 run_claude_analysis() {
@@ -1084,6 +1109,29 @@ generate_analysis_report() {
         (.task_list | map(
             "- [" + .priority + "] " + .task +
             (if (.thread_ids | length) > 0 then " _(threads: " + (.thread_ids | join(", ")) + ")_" else "" end)
+        ) | join("\n"))
+    end) +
+    "\n\n## Process Improvements\n\n" +
+    "_Suggestions to prevent similar issues in future PRs:_\n\n" +
+    (if (.process_improvements | length) == 0 then
+        "_No process improvements suggested._\n"
+    else
+        (.process_improvements | map(
+            "### " + .suggestion + "\n" +
+            "**Category:** " + .category + "\n\n" +
+            .rationale + "\n" +
+            (if .implementation_hint then "\n**How to implement:** " + .implementation_hint + "\n" else "" end)
+        ) | join("\n"))
+    end) +
+    "\n\n## PR Template Suggestions\n\n" +
+    "_Additions to the PR template that would catch these issues earlier:_\n\n" +
+    (if (.pr_template_suggestions | length) == 0 then
+        "_No PR template changes suggested._\n"
+    else
+        (.pr_template_suggestions | map(
+            "### " + .section + "\n" +
+            "```\n" + .checkbox_or_question + "\n```\n" +
+            "_Why:_ " + .why + "\n"
         ) | join("\n"))
     end)
     ' "$analysis_file" > "$output_file"

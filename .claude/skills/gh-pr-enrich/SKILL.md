@@ -17,6 +17,39 @@ Use this skill when:
 - Want to identify systemic issues from reviewer feedback
 - Creating a task list from PR review comments
 
+## Required Analysis Workflow
+
+**IMPORTANT:** After running `gh pr-enrich --enrich`, you MUST complete these steps before addressing individual tasks:
+
+### 1. Review Systemic Issues (REQUIRED)
+
+Always check `systemic_issues` first. These reveal root causes that may affect multiple tasks:
+
+```bash
+jq '.systemic_issues' .reports/pr-reviews/pr-<NUMBER>/claude-analysis.json
+```
+
+**Why this matters:** Individual comments are often symptoms of deeper patterns. Fixing the systemic issue may resolve multiple tasks at once, or inform how you approach each fix.
+
+### 2. Investigate Adjacent Problems (REQUIRED)
+
+Always review `adjacent_problems` to identify related areas that need attention:
+
+```bash
+jq '.adjacent_problems' .reports/pr-reviews/pr-<NUMBER>/claude-analysis.json
+```
+
+**Why this matters:** PR reviewers see only the changed code. Adjacent problems highlight areas with similar issues that weren't in the PR diff. Investigating these prevents:
+- Incomplete fixes that miss related code
+- Future PRs with the same feedback
+- Whack-a-mole debugging cycles
+
+### 3. Then Address Tasks in Priority Order
+
+Only after completing steps 1-2 should you work through the `task_list`. Your understanding of systemic issues and adjacent problems should inform how you implement each fix.
+
+**DO NOT** skip to the task list without reviewing systemic issues and adjacent problems first.
+
 ## Prerequisites
 
 - GitHub CLI (`gh`) authenticated with repo access
@@ -86,7 +119,7 @@ Default location: `.reports/pr-reviews/pr-<NUMBER>/`
 
 ### Reading the Claude Analysis
 
-When using `--enrich`, the AI analysis contains four key sections:
+When using `--enrich`, the AI analysis contains six key sections:
 
 #### 1. Issue Categories
 
@@ -176,6 +209,56 @@ Prioritized actions linked to thread IDs:
 - Create TODO list for addressing feedback
 - Prioritize work by severity
 - Track which threads each fix addresses
+
+#### 5. Process Improvements
+
+Suggestions to prevent similar issues in future PRs:
+
+```json
+{
+  "process_improvements": [
+    {
+      "category": "automation",
+      "suggestion": "Add ESLint rule for error handling patterns",
+      "rationale": "Multiple comments about inconsistent error handling could be caught automatically",
+      "implementation_hint": "Configure eslint-plugin-promise with consistent-return rule"
+    }
+  ]
+}
+```
+
+**Categories:**
+- `documentation` - README, code comments, ADRs
+- `automation` - Linting, CI checks, pre-commit hooks
+- `testing` - Unit tests, integration tests, test coverage
+- `review_process` - Review checklists, required reviewers
+- `tooling` - Development tools, IDE configurations
+
+**Use these to:**
+- Systematically prevent recurring issues
+- Build institutional knowledge
+- Improve team velocity over time
+
+#### 6. PR Template Suggestions
+
+Additions to your PR template that would catch issues earlier:
+
+```json
+{
+  "pr_template_suggestions": [
+    {
+      "section": "Testing Checklist",
+      "checkbox_or_question": "- [ ] Error handling follows project patterns (see docs/error-handling.md)",
+      "why": "3 of 5 issues related to inconsistent error handling"
+    }
+  ]
+}
+```
+
+**Use these to:**
+- Evolve your PR template based on real feedback patterns
+- Shift issue detection left (author catches before reviewer)
+- Document team standards incrementally
 
 ### Working with Thread IDs
 
@@ -326,8 +409,20 @@ gh pr-enrich 123 --enrich
 # - .reports/pr-reviews/pr-123/comment-threads.json
 ```
 
-Then instruct Claude:
-> "Read the claude-analysis.json and address each critical and high priority task in order. After fixing each issue, provide the thread ID so I can resolve it."
+**Claude MUST follow this sequence:**
+
+1. **Read systemic_issues first** - Understand the underlying patterns before making any changes
+2. **Read adjacent_problems** - Identify related areas that may need the same fixes
+3. **Investigate adjacent areas** - Search the codebase for similar issues flagged in adjacent_problems
+4. **Then work through task_list** - Address tasks with full context of patterns and related code
+
+**Example prompt for Claude:**
+> "Read the claude-analysis.json. First summarize the systemic issues and adjacent problems you found. Investigate the adjacent areas mentioned. Then address each critical and high priority task in order, applying fixes consistently across all affected areas. After fixing each issue, provide the thread ID so I can resolve it."
+
+**Anti-pattern to avoid:**
+> ~~"Read the claude-analysis.json and address each task in order."~~
+
+This skips the critical analysis steps and leads to incomplete, symptom-focused fixes.
 
 ### Combining with TodoWrite
 
