@@ -123,7 +123,7 @@ gh pr-enrich retrospective --format pr-template  # PR template additions
 | `--reports-dir DIR` | Path to reports directory | `.reports/pr-reviews` |
 | `--output-dir DIR` | Where to save output | `.reports/retrospectives` |
 | `--enrich` | Use Claude for meta-analysis | false |
-| `--min-prs N` | Minimum PRs required | 3 |
+| `--min-prs N` | Warn if fewer PRs found | 3 |
 | `--format TYPE` | Output format: `claude-md`, `pr-template`, `checklist` | - |
 | `--json` | Output JSON only | - |
 | `--markdown` | Output Markdown only | - |
@@ -133,7 +133,7 @@ gh pr-enrich retrospective --format pr-template  # PR template additions
 The retrospective generates:
 
 - **Cross-PR Patterns**: Issues that repeat across multiple PRs with occurrence counts
-- **Component Hotspots**: Files/areas receiving the most review feedback
+- **Category Hotspots**: Issue/task categories receiving the most review feedback
 - **Guiding Questions**: Checklist derived from recurring issues
 - **Improvement Tracking**: Process suggestions made across PRs
 - **Team Summary**: High-level stats for sprint retrospectives

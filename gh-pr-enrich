@@ -475,6 +475,7 @@ RETRO_HELP
                 {pattern: .pattern, pr: $pr_num, recommendation: .recommendation}
             ] |
             # Group by pattern (normalize to lowercase for matching)
+            sort_by(.pattern | ascii_downcase) |
             group_by(.pattern | ascii_downcase) |
             # Create pattern summary
             map({
@@ -515,12 +516,13 @@ RETRO_HELP
                 )
             ] |
             # Group by category
+            sort_by(.category) |
             group_by(.category) |
             map({
                 category: .[0].category,
                 issue_count: length,
                 prs: [.[].pr] | unique,
-                severities: (group_by(.severity) | map({severity: .[0].severity, count: length}))
+                severities: (sort_by(.severity) | group_by(.severity) | map({severity: .[0].severity, count: length}))
             }) |
             sort_by(-.issue_count)
         '
@@ -570,6 +572,7 @@ RETRO_HELP
                 suggestions_made: [.prs[] | (.process_improvements // []) | length] | add,
                 by_category: (
                     [.prs[] | (.process_improvements // [])[]] |
+                    sort_by(.category) |
                     group_by(.category) |
                     map({category: .[0].category, count: length})
                 ),
@@ -599,8 +602,9 @@ RETRO_HELP
             },
             top_issue_categories: (
                 [$agg.prs[] | (.issue_categories // [])[]] |
+                sort_by(.name) |
                 group_by(.name) |
-                map({name: .[0].name, count: length, severities: (group_by(.severity) | map({s: .[0].severity, c: length}))}) |
+                map({name: .[0].name, count: length, severities: (sort_by(.severity) | group_by(.severity) | map({s: .[0].severity, c: length}))}) |
                 sort_by(-.count) |
                 .[0:5]
             ),
