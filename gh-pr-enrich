@@ -293,7 +293,7 @@ RETRO_HELP
                 RETRO_ENRICH=false
             elif ! command -v timeout &> /dev/null; then
                 echo "Warning: 'timeout' command not found. Skipping enrichment." >&2
-                echo "Install coreutils: brew install coreutils (macOS) or apt install coreutils (Linux)" >&2
+                echo "On macOS: 'brew install coreutils' installs 'gtimeout' (create a 'timeout' alias or symlink), on Linux: 'apt install coreutils'." >&2
                 RETRO_ENRICH=false
             fi
         fi
