@@ -152,7 +152,7 @@ Analyze patterns across all PRs in the reports folder to identify systemic
 issues, generate guiding questions, and help prevent recurring problems.
 
 OPTIONS:
-  --since DATE        Analyze PRs from this date (ISO 8601 or "30d", "2w")
+  --since DATE        Analyze PRs from this date (ISO 8601 or "30d", "2w", "3m")
   --author LOGIN      Filter by PR author(s), comma-separated
   --reports-dir DIR   Path to reports directory (default: .reports/pr-reviews)
   --output-dir DIR    Where to save output (default: .reports/retrospectives)
@@ -277,12 +277,16 @@ RETRO_HELP
         exit 1
     fi
 
-    # Check Claude CLI if enrichment requested (after retro_log is defined)
+    # Check Claude CLI and timeout command if enrichment requested
     check_claude_cli() {
         if [ "$RETRO_ENRICH" = true ]; then
             if ! command -v claude &> /dev/null; then
                 echo "Warning: Claude CLI not found. Skipping enrichment." >&2
                 echo "Install from: https://claude.ai/code" >&2
+                RETRO_ENRICH=false
+            elif ! command -v timeout &> /dev/null; then
+                echo "Warning: 'timeout' command not found. Skipping enrichment." >&2
+                echo "Install coreutils: brew install coreutils (macOS) or apt install coreutils (Linux)" >&2
                 RETRO_ENRICH=false
             fi
         fi
@@ -1749,11 +1753,15 @@ if ! command -v jq &> /dev/null; then
     exit 1
 fi
 
-# Check Claude CLI if enrichment requested (warn but don't fail)
+# Check Claude CLI and timeout command if enrichment requested (warn but don't fail)
 if [ "$ENRICH_WITH_CLAUDE" = true ]; then
     if ! command -v claude &> /dev/null; then
-        echo "Warning: Claude CLI not found. Skipping enrichment."
-        echo "Install from: https://claude.ai/code"
+        echo "Warning: Claude CLI not found. Skipping enrichment." >&2
+        echo "Install from: https://claude.ai/code" >&2
+        ENRICH_WITH_CLAUDE=false
+    elif ! command -v timeout &> /dev/null; then
+        echo "Warning: 'timeout' command not found. Skipping enrichment." >&2
+        echo "Install coreutils: brew install coreutils (macOS) or apt install coreutils (Linux)" >&2
         ENRICH_WITH_CLAUDE=false
     fi
 fi
@@ -2074,10 +2082,8 @@ run_claude_analysis() {
     local system_prompt
     system_prompt="$(load_system_prompt)"
 
-    # Write schema to temp file to avoid command line length issues
-    local schema_file
-    schema_file=$(mktemp)
-    echo "$CLAUDE_ANALYSIS_SCHEMA" > "$schema_file"
+    # Store schema in variable for direct use
+    local schema_content="$CLAUDE_ANALYSIS_SCHEMA"
 
     # Build prompt and pipe via stdin to avoid arg length limits
     local user_prompt="Analyze these unresolved PR comment threads and provide structured analysis:
@@ -2093,7 +2099,7 @@ $(cat "$context_file")"
         --setting-sources "" \
         --model sonnet \
         --output-format json \
-        --json-schema "$(cat "$schema_file")" \
+        --json-schema "$schema_content" \
         --system-prompt "$system_prompt" \
         > "$output_file" 2>/dev/null; then
         echo "✅ Claude analysis complete" >&2
@@ -2107,7 +2113,6 @@ $(cat "$context_file")"
         fi
     fi
 
-    rm -f "$schema_file"
     return $exit_code
 }
 

@@ -118,7 +118,7 @@ gh pr-enrich retrospective --format pr-template  # PR template additions
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--since DATE` | Filter PRs from date (ISO 8601 or `30d`, `2w`) | All |
+| `--since DATE` | Filter PRs from date (ISO 8601 or `30d`, `2w`, `3m`) | All |
 | `--author LOGIN` | Filter by author(s), comma-separated | All |
 | `--reports-dir DIR` | Path to reports directory | `.reports/pr-reviews` |
 | `--output-dir DIR` | Where to save output | `.reports/retrospectives` |
