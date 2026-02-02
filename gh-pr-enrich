@@ -129,6 +129,1001 @@ if [ "$1" = "install-skill" ]; then
     exit 0
 fi
 
+# Handle retrospective subcommand - analyze patterns across all PR reports
+if [ "$1" = "retrospective" ]; then
+    shift
+
+    # Default values
+    RETRO_SINCE=""
+    RETRO_AUTHOR=""
+    RETRO_REPORTS_DIR="${PR_REVIEW_OUTPUT_ROOT:-.reports/pr-reviews}"
+    RETRO_OUTPUT_DIR=".reports/retrospectives"
+    RETRO_ENRICH=false
+    RETRO_MIN_PRS=3
+    RETRO_FORMAT=""
+    RETRO_OUTPUT_FORMAT="combined"
+
+    # Show help
+    if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+        cat << 'RETRO_HELP'
+Usage: gh pr-enrich retrospective [OPTIONS]
+
+Analyze patterns across all PRs in the reports folder to identify systemic
+issues, generate guiding questions, and help prevent recurring problems.
+
+OPTIONS:
+  --since DATE        Analyze PRs from this date (ISO 8601 or "30d", "2w")
+  --author LOGIN      Filter by PR author(s), comma-separated
+  --reports-dir DIR   Path to reports directory (default: .reports/pr-reviews)
+  --output-dir DIR    Where to save output (default: .reports/retrospectives)
+  --enrich            Use Claude for meta-analysis
+  --min-prs N         Minimum PRs required for analysis (default: 3)
+  --format TYPE       Extra output format: claude-md, pr-template, checklist
+  --json              Output JSON only
+  --markdown          Output Markdown only
+  -h, --help          Show this help
+
+EXAMPLES:
+  gh pr-enrich retrospective                    # Analyze all PRs
+  gh pr-enrich retrospective --since 30d        # Last 30 days
+  gh pr-enrich retrospective --author octocat   # Single author
+  gh pr-enrich retrospective --enrich           # With Claude meta-analysis
+  gh pr-enrich retrospective --format claude-md # Output CLAUDE.md section
+
+OUTPUT:
+  The retrospective generates:
+  - Cross-PR systemic patterns (issues that repeat across PRs)
+  - File/component hotspots (areas receiving most feedback)
+  - Guiding questions checklist (derived from recurring issues)
+  - Improvement tracking (suggestions made vs adopted)
+  - Team retrospective summary (for sprint retros)
+
+  With --enrich, Claude provides:
+  - Meta-patterns and root causes
+  - Knowledge gap identification
+  - Automation opportunities
+  - Refined guiding questions
+RETRO_HELP
+        exit 0
+    fi
+
+    # Parse retrospective options
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --since)
+                if [ -z "${2:-}" ]; then
+                    echo "Error: --since requires a date value"
+                    exit 1
+                fi
+                RETRO_SINCE="$2"
+                shift 2
+                ;;
+            --author)
+                if [ -z "${2:-}" ]; then
+                    echo "Error: --author requires a login value"
+                    exit 1
+                fi
+                RETRO_AUTHOR="$2"
+                shift 2
+                ;;
+            --reports-dir)
+                if [ -z "${2:-}" ]; then
+                    echo "Error: --reports-dir requires a directory path"
+                    exit 1
+                fi
+                RETRO_REPORTS_DIR="$2"
+                shift 2
+                ;;
+            --output-dir)
+                if [ -z "${2:-}" ]; then
+                    echo "Error: --output-dir requires a directory path"
+                    exit 1
+                fi
+                RETRO_OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            --enrich)
+                RETRO_ENRICH=true
+                shift
+                ;;
+            --min-prs)
+                if [ -z "${2:-}" ]; then
+                    echo "Error: --min-prs requires a numeric value"
+                    exit 1
+                fi
+                if ! [[ "$2" =~ ^[0-9]+$ ]] || [ "$2" -lt 1 ]; then
+                    echo "Error: --min-prs must be a positive integer (got: '$2')"
+                    exit 1
+                fi
+                RETRO_MIN_PRS="$2"
+                shift 2
+                ;;
+            --format)
+                if [ -z "${2:-}" ]; then
+                    echo "Error: --format requires a type (claude-md, pr-template, checklist)"
+                    exit 1
+                fi
+                case "$2" in
+                    claude-md|pr-template|checklist)
+                        RETRO_FORMAT="$2"
+                        ;;
+                    *)
+                        echo "Error: --format must be one of: claude-md, pr-template, checklist"
+                        exit 1
+                        ;;
+                esac
+                shift 2
+                ;;
+            --json)
+                RETRO_OUTPUT_FORMAT="json"
+                shift
+                ;;
+            --markdown)
+                RETRO_OUTPUT_FORMAT="markdown"
+                shift
+                ;;
+            *)
+                echo "Unknown option: $1"
+                echo "Run 'gh pr-enrich retrospective --help' for usage"
+                exit 1
+                ;;
+        esac
+    done
+
+    # Validate reports directory exists
+    if [ ! -d "$RETRO_REPORTS_DIR" ]; then
+        echo "Error: Reports directory not found: $RETRO_REPORTS_DIR"
+        echo "Run 'gh pr-enrich <PR_NUMBER> --enrich' to generate PR reports first."
+        exit 1
+    fi
+
+    # Check Claude CLI if enrichment requested
+    if [ "$RETRO_ENRICH" = true ]; then
+        if ! command -v claude &> /dev/null; then
+            echo "Warning: Claude CLI not found. Skipping enrichment."
+            echo "Install from: https://claude.ai/code"
+            RETRO_ENRICH=false
+        fi
+    fi
+
+    # ============================================================================
+    # Retrospective Helper Functions
+    # ============================================================================
+
+    # Convert relative date (30d, 2w) to ISO 8601 date
+    # Args: $1 - date string (ISO 8601 or relative like "30d", "2w")
+    # Output: ISO 8601 date string
+    parse_since_date() {
+        local input="$1"
+
+        # If already ISO 8601 format, return as-is
+        if [[ "$input" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+            echo "$input"
+            return 0
+        fi
+
+        # Parse relative format (e.g., 30d, 2w)
+        local num unit
+        if [[ "$input" =~ ^([0-9]+)([dwm])$ ]]; then
+            num="${BASH_REMATCH[1]}"
+            unit="${BASH_REMATCH[2]}"
+
+            case "$unit" in
+                d) # days
+                    if [[ "$OSTYPE" == "darwin"* ]]; then
+                        date -v-${num}d +%Y-%m-%d
+                    else
+                        date -d "$num days ago" +%Y-%m-%d
+                    fi
+                    ;;
+                w) # weeks
+                    local days=$((num * 7))
+                    if [[ "$OSTYPE" == "darwin"* ]]; then
+                        date -v-${days}d +%Y-%m-%d
+                    else
+                        date -d "$days days ago" +%Y-%m-%d
+                    fi
+                    ;;
+                m) # months
+                    if [[ "$OSTYPE" == "darwin"* ]]; then
+                        date -v-${num}m +%Y-%m-%d
+                    else
+                        date -d "$num months ago" +%Y-%m-%d
+                    fi
+                    ;;
+            esac
+            return 0
+        fi
+
+        echo "Error: Invalid date format '$input'. Use ISO 8601 (2024-01-15) or relative (30d, 2w, 3m)." >&2
+        return 1
+    }
+
+    # Discover PR reports with optional filtering
+    # Sets: PR_REPORTS array with paths to claude-analysis.json files
+    discover_pr_reports() {
+        local reports_dir="$1"
+        local since_date="$2"
+        local author_filter="$3"
+
+        PR_REPORTS=()
+        local pr_count=0
+        local skipped_no_analysis=0
+        local skipped_date=0
+        local skipped_author=0
+
+        # Find all PR directories
+        for pr_dir in "$reports_dir"/pr-*/; do
+            [ -d "$pr_dir" ] || continue
+
+            local analysis_file="$pr_dir/claude-analysis.json"
+            local summary_file="$pr_dir/pr-summary.json"
+
+            # Skip if no claude-analysis.json
+            if [ ! -f "$analysis_file" ]; then
+                ((skipped_no_analysis++)) || true
+                continue
+            fi
+
+            # Apply date filter
+            if [ -n "$since_date" ] && [ -f "$summary_file" ]; then
+                local pr_date
+                pr_date=$(jq -r '.createdAt // .updatedAt // ""' "$summary_file" 2>/dev/null | cut -d'T' -f1)
+                if [ -n "$pr_date" ] && [[ "$pr_date" < "$since_date" ]]; then
+                    ((skipped_date++)) || true
+                    continue
+                fi
+            fi
+
+            # Apply author filter
+            if [ -n "$author_filter" ] && [ -f "$summary_file" ]; then
+                local pr_author
+                pr_author=$(jq -r '.author.login // ""' "$summary_file" 2>/dev/null)
+                # Check if author matches any in comma-separated list
+                local author_match=false
+                IFS=',' read -ra AUTHORS <<< "$author_filter"
+                for auth in "${AUTHORS[@]}"; do
+                    auth=$(echo "$auth" | xargs)  # trim whitespace
+                    if [ "$pr_author" = "$auth" ]; then
+                        author_match=true
+                        break
+                    fi
+                done
+                if [ "$author_match" = false ]; then
+                    ((skipped_author++)) || true
+                    continue
+                fi
+            fi
+
+            PR_REPORTS+=("$analysis_file")
+            ((pr_count++)) || true
+        done
+
+        echo "Found $pr_count PR reports with Claude analysis" >&2
+        [ "$skipped_no_analysis" -gt 0 ] && echo "  Skipped $skipped_no_analysis PRs without claude-analysis.json" >&2 || true
+        [ "$skipped_date" -gt 0 ] && echo "  Skipped $skipped_date PRs before $since_date" >&2 || true
+        [ "$skipped_author" -gt 0 ] && echo "  Skipped $skipped_author PRs by other authors" >&2 || true
+    }
+
+    # Aggregate data from all PR reports
+    # Args: PR_REPORTS array (global)
+    # Output: Aggregated JSON to stdout
+    aggregate_pr_data() {
+        if [ ${#PR_REPORTS[@]} -eq 0 ]; then
+            echo '{"prs": [], "total_prs": 0}'
+            return
+        fi
+
+        # Combine all analysis files with PR metadata
+        local combined="[]"
+        for report in "${PR_REPORTS[@]}"; do
+            local pr_dir
+            pr_dir=$(dirname "$report")
+            local pr_num
+            pr_num=$(basename "$pr_dir" | sed 's/pr-//')
+            local summary_file="$pr_dir/pr-summary.json"
+
+            local pr_meta="{}"
+            if [ -f "$summary_file" ]; then
+                pr_meta=$(jq -c '{
+                    number: .number,
+                    title: .title,
+                    author: .author.login,
+                    created_at: .createdAt,
+                    files: [.files[].path]
+                }' "$summary_file" 2>/dev/null || echo '{}')
+            fi
+
+            # Merge analysis with metadata
+            local pr_data
+            pr_data=$(jq -c --argjson meta "$pr_meta" '. + {pr_meta: $meta}' "$report" 2>/dev/null)
+
+            combined=$(echo "$combined" | jq -c --argjson pr "$pr_data" '. + [$pr]')
+        done
+
+        # Output aggregated structure
+        jq -n --argjson prs "$combined" '{
+            prs: $prs,
+            total_prs: ($prs | length)
+        }'
+    }
+
+    # Calculate cross-PR patterns (issues that repeat across PRs)
+    # Args: $1 - aggregated data JSON
+    # Output: Patterns JSON to stdout
+    calculate_cross_pr_patterns() {
+        local aggregated="$1"
+
+        echo "$aggregated" | jq '
+            # Extract all systemic issues with PR context
+            [.prs[] |
+                .pr_meta.number as $pr_num |
+                (.systemic_issues // [])[] |
+                {pattern: .pattern, pr: $pr_num, recommendation: .recommendation}
+            ] |
+            # Group by pattern (normalize to lowercase for matching)
+            group_by(.pattern | ascii_downcase) |
+            # Create pattern summary
+            map({
+                pattern: .[0].pattern,
+                occurrences: length,
+                pr_numbers: [.[].pr] | unique,
+                severity: (if length >= 3 then "high" elif length >= 2 then "medium" else "low" end),
+                prevention_strategy: .[0].recommendation
+            }) |
+            # Sort by occurrences descending
+            sort_by(-.occurrences)
+        '
+    }
+
+    # Calculate file/component hotspots
+    # Args: $1 - aggregated data JSON
+    # Output: Hotspots JSON to stdout
+    calculate_file_hotspots() {
+        local aggregated="$1"
+
+        echo "$aggregated" | jq '
+            # Collect all file references from issue categories and task lists
+            [.prs[] |
+                .pr_meta.files as $files |
+                .pr_meta.number as $pr_num |
+                (
+                    # From issue categories
+                    ((.issue_categories // [])[] | {
+                        category: .name,
+                        severity: .severity,
+                        pr: $pr_num
+                    }),
+                    # From task list
+                    ((.task_list // [])[] | {
+                        category: "task",
+                        severity: .priority,
+                        pr: $pr_num
+                    })
+                )
+            ] |
+            # Group by category
+            group_by(.category) |
+            map({
+                category: .[0].category,
+                issue_count: length,
+                prs: [.[].pr] | unique,
+                severities: (group_by(.severity) | map({severity: .[0].severity, count: length}))
+            }) |
+            sort_by(-.issue_count)
+        '
+    }
+
+    # Generate guiding questions from patterns
+    # Args: $1 - patterns JSON, $2 - hotspots JSON
+    # Output: Questions checklist to stdout
+    generate_guiding_questions() {
+        local patterns="$1"
+        local hotspots="$2"
+
+        # Combine patterns and hotspots to generate questions
+        jq -n --argjson patterns "$patterns" --argjson hotspots "$hotspots" '
+        {
+            before_implementation: [
+                ($patterns[] | select(.occurrences >= 2) |
+                    "Have I addressed the pattern: \(.pattern)?"
+                ),
+                ($hotspots[:5][] |
+                    "Have I checked \(.category) for similar issues?"
+                )
+            ] | unique,
+
+            before_review: [
+                ($patterns[] | select(.severity == "high") |
+                    "Does this change avoid: \(.pattern)?"
+                )
+            ] | unique,
+
+            after_review: [
+                "Have I updated the team on systemic patterns found?",
+                "Should this pattern be added to our documentation?"
+            ]
+        }'
+    }
+
+    # Generate improvement tracking
+    # Args: $1 - aggregated data JSON
+    # Output: Tracking JSON to stdout
+    generate_improvement_tracking() {
+        local aggregated="$1"
+
+        echo "$aggregated" | jq '
+            # Count process improvements suggested
+            {
+                suggestions_made: [.prs[] | (.process_improvements // []) | length] | add,
+                by_category: (
+                    [.prs[] | (.process_improvements // [])[]] |
+                    group_by(.category) |
+                    map({category: .[0].category, count: length})
+                ),
+                pr_template_suggestions: [.prs[] | (.pr_template_suggestions // []) | length] | add
+            }
+        '
+    }
+
+    # Generate team retrospective summary
+    # Args: $1 - aggregated data, $2 - patterns, $3 - hotspots
+    # Output: Summary JSON to stdout
+    generate_retro_summary() {
+        local aggregated="$1"
+        local patterns="$2"
+        local hotspots="$3"
+
+        jq -n \
+            --argjson agg "$aggregated" \
+            --argjson patterns "$patterns" \
+            --argjson hotspots "$hotspots" '
+        {
+            overview: {
+                total_prs_analyzed: $agg.total_prs,
+                total_issues: [$agg.prs[] | (.issue_categories // []) | length] | add,
+                total_tasks: [$agg.prs[] | (.task_list // []) | length] | add,
+                total_patterns: ($patterns | length)
+            },
+            top_issue_categories: (
+                [$agg.prs[] | (.issue_categories // [])[]] |
+                group_by(.name) |
+                map({name: .[0].name, count: length, severities: (group_by(.severity) | map({s: .[0].severity, c: length}))}) |
+                sort_by(-.count) |
+                .[0:5]
+            ),
+            recurring_patterns: ($patterns | .[0:5]),
+            hotspot_areas: ($hotspots | .[0:5]),
+            recommended_actions: [
+                ($patterns[:3][] | {
+                    action: .prevention_strategy,
+                    effort: "medium",
+                    impact: (if .occurrences >= 3 then "high" else "medium" end),
+                    addresses_prs: .pr_numbers
+                })
+            ]
+        }'
+    }
+
+    # Claude meta-analysis schema for retrospectives
+    RETRO_CLAUDE_SCHEMA='{
+      "type": "object",
+      "properties": {
+        "meta_patterns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "root_cause": { "type": "string" },
+              "manifestations": { "type": "array", "items": { "type": "string" } },
+              "prevention_strategy": { "type": "string" },
+              "implementation_steps": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["root_cause", "manifestations", "prevention_strategy"]
+          }
+        },
+        "knowledge_gaps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "topic": { "type": "string" },
+              "evidence": { "type": "array", "items": { "type": "string" } },
+              "learning_resources": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["topic", "evidence"]
+          }
+        },
+        "automation_opportunities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "tool_or_check": { "type": "string" },
+              "issues_caught": { "type": "array", "items": { "type": "string" } },
+              "implementation_hint": { "type": "string" }
+            },
+            "required": ["tool_or_check", "issues_caught"]
+          }
+        },
+        "guiding_questions_refined": {
+          "type": "object",
+          "properties": {
+            "planning_phase": { "type": "array", "items": { "type": "string" } },
+            "implementation_phase": { "type": "array", "items": { "type": "string" } },
+            "review_phase": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "claude_md_additions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "section": { "type": "string" },
+              "content": { "type": "string" }
+            },
+            "required": ["section", "content"]
+          }
+        },
+        "pr_template_additions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "section": { "type": "string" },
+              "checkbox_or_question": { "type": "string" },
+              "rationale": { "type": "string" }
+            },
+            "required": ["section", "checkbox_or_question", "rationale"]
+          }
+        }
+      },
+      "required": ["meta_patterns", "knowledge_gaps", "automation_opportunities", "guiding_questions_refined", "claude_md_additions", "pr_template_additions"]
+    }'
+
+    # Run Claude meta-analysis on aggregated retrospective data
+    run_retrospective_claude_analysis() {
+        local context_file="$1"
+        local output_file="$2"
+
+        local system_prompt="You are analyzing aggregated data from multiple PR reviews to identify meta-patterns, knowledge gaps, and opportunities for improvement.
+
+Your task is to:
+1. Identify root causes that explain multiple recurring patterns
+2. Highlight knowledge gaps the team should address
+3. Suggest automation (linting, CI checks) that would catch these issues
+4. Refine guiding questions to be specific and actionable
+5. Propose additions to CLAUDE.md and PR templates
+
+Focus on actionable, specific insights. Prioritize items that would have the highest impact."
+
+        local user_prompt="Analyze this aggregated PR retrospective data and provide meta-analysis:
+
+$(cat "$context_file")"
+
+        claude --print \
+            --model sonnet \
+            --output-format json \
+            --json-schema "$RETRO_CLAUDE_SCHEMA" \
+            --system-prompt "$system_prompt" \
+            "$user_prompt" > "$output_file"
+
+        return $?
+    }
+
+    # Generate markdown report from retrospective data
+    generate_retrospective_markdown() {
+        local summary="$1"
+        local patterns="$2"
+        local hotspots="$3"
+        local questions="$4"
+        local tracking="$5"
+        local claude_analysis="${6:-}"
+
+        local timestamp
+        timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+        cat << EOF
+# Team Retrospective Report
+
+**Generated:** $timestamp
+
+## Overview
+
+$(echo "$summary" | jq -r '
+"- **PRs Analyzed:** \(.overview.total_prs_analyzed)
+- **Total Issues Found:** \(.overview.total_issues // 0)
+- **Total Tasks Generated:** \(.overview.total_tasks // 0)
+- **Recurring Patterns:** \(.overview.total_patterns)"
+')
+
+## Top Issue Categories
+
+$(echo "$summary" | jq -r '
+if (.top_issue_categories | length) == 0 then
+    "_No issue categories found._"
+else
+    .top_issue_categories[] |
+    "- **\(.name)** (\(.count) occurrences)"
+end
+')
+
+## Cross-PR Systemic Patterns
+
+$(echo "$patterns" | jq -r '
+if length == 0 then
+    "_No recurring patterns identified._"
+else
+    .[] |
+    "### \(.pattern)
+
+**Occurrences:** \(.occurrences) | **Severity:** \(.severity)
+**PRs:** \(.pr_numbers | map("#\(.)") | join(", "))
+
+**Prevention Strategy:** \(.prevention_strategy // "N/A")
+"
+end
+')
+
+## Component Hotspots
+
+$(echo "$hotspots" | jq -r '
+if length == 0 then
+    "_No hotspots identified._"
+else
+    .[:10][] |
+    "- **\(.category)** - \(.issue_count) issues across \(.prs | length) PRs"
+end
+')
+
+## Guiding Questions Checklist
+
+### Before Implementation
+$(echo "$questions" | jq -r '
+if (.before_implementation | length) == 0 then
+    "_No questions generated._"
+else
+    .before_implementation[] | "- [ ] \(.)"
+end
+')
+
+### Before Review
+$(echo "$questions" | jq -r '
+if (.before_review | length) == 0 then
+    "_No questions generated._"
+else
+    .before_review[] | "- [ ] \(.)"
+end
+')
+
+### After Review
+$(echo "$questions" | jq -r '.after_review[] | "- [ ] \(.)"')
+
+## Improvement Tracking
+
+$(echo "$tracking" | jq -r '
+"- **Total Suggestions Made:** \(.suggestions_made // 0)
+- **PR Template Suggestions:** \(.pr_template_suggestions // 0)
+
+### By Category
+" + (if (.by_category | length) == 0 then "_None_" else (.by_category[] | "- \(.category): \(.count)") | . end)
+')
+
+## Recommended Actions
+
+$(echo "$summary" | jq -r '
+if (.recommended_actions | length) == 0 then
+    "_No recommended actions._"
+else
+    .recommended_actions[] |
+    "### \(.action)
+**Effort:** \(.effort) | **Impact:** \(.impact)
+**Addresses PRs:** \(.addresses_prs | map("#\(.)") | join(", "))
+"
+end
+')
+EOF
+
+        # Add Claude meta-analysis if available
+        if [ -n "$claude_analysis" ] && [ -f "$claude_analysis" ]; then
+            cat << 'CLAUDE_HEADER'
+
+---
+
+## 🤖 Claude Meta-Analysis
+
+CLAUDE_HEADER
+
+            jq -r '
+"### Root Cause Analysis
+
+" + (if (.meta_patterns | length) == 0 then "_No meta-patterns identified._" else
+(.meta_patterns[] |
+"#### \(.root_cause)
+
+**Manifestations:**
+" + (.manifestations | map("- " + .) | join("\n")) + "
+
+**Prevention:** \(.prevention_strategy)
+" + (if .implementation_steps then "**Steps:** " + (.implementation_steps | join(" → ")) else "" end))
+end) + "
+
+### Knowledge Gaps
+
+" + (if (.knowledge_gaps | length) == 0 then "_No knowledge gaps identified._" else
+(.knowledge_gaps[] | "- **\(.topic):** " + (.evidence | join("; ")))
+end) + "
+
+### Automation Opportunities
+
+" + (if (.automation_opportunities | length) == 0 then "_No automation opportunities identified._" else
+(.automation_opportunities[] | "- **\(.tool_or_check):** Would catch " + (.issues_caught | join(", ")))
+end)
+' "$claude_analysis"
+        fi
+
+        cat << 'FOOTER'
+
+---
+
+*Report generated by gh-pr-enrich retrospective*
+FOOTER
+    }
+
+    # Generate special format outputs
+    generate_format_output() {
+        local format="$1"
+        local questions="$2"
+        local summary="$3"
+        local claude_analysis="${4:-}"
+
+        case "$format" in
+            claude-md)
+                cat << 'CLAUDE_MD_HEADER'
+## Lessons Learned from PR Reviews
+
+<!-- Add this section to your CLAUDE.md -->
+
+### Common Patterns to Avoid
+
+CLAUDE_MD_HEADER
+                echo "$summary" | jq -r '
+                    .recurring_patterns[:5][] |
+                    "- **\(.pattern)**: \(.prevention_strategy // "Address proactively")"
+                '
+
+                if [ -n "$claude_analysis" ] && [ -f "$claude_analysis" ]; then
+                    echo ""
+                    echo "### Implementation Guidelines"
+                    jq -r '.claude_md_additions[] | "#### \(.section)\n\(.content)\n"' "$claude_analysis"
+                fi
+                ;;
+
+            pr-template)
+                cat << 'PR_TEMPLATE_HEADER'
+## PR Review Checklist
+
+<!-- Add these items to your PR template -->
+
+PR_TEMPLATE_HEADER
+                echo "$questions" | jq -r '
+                    "### Before Submitting\n" +
+                    (.before_implementation | map("- [ ] " + .) | join("\n")) +
+                    "\n\n### Before Requesting Review\n" +
+                    (.before_review | map("- [ ] " + .) | join("\n"))
+                '
+
+                if [ -n "$claude_analysis" ] && [ -f "$claude_analysis" ]; then
+                    echo ""
+                    echo "### Additional Checks"
+                    jq -r '.pr_template_additions[] | "- [ ] \(.checkbox_or_question)\n  _(\(.rationale))_"' "$claude_analysis"
+                fi
+                ;;
+
+            checklist)
+                cat << 'CHECKLIST_HEADER'
+# Implementation Checklist
+
+<!-- Standalone checklist derived from PR review patterns -->
+
+CHECKLIST_HEADER
+                echo "$questions" | jq -r '
+                    "## Planning Phase\n" +
+                    (.before_implementation | map("- [ ] " + .) | join("\n")) +
+                    "\n\n## Implementation Phase\n" +
+                    (.before_review | map("- [ ] " + .) | join("\n")) +
+                    "\n\n## Review Phase\n" +
+                    (.after_review | map("- [ ] " + .) | join("\n"))
+                '
+
+                if [ -n "$claude_analysis" ] && [ -f "$claude_analysis" ]; then
+                    echo ""
+                    echo "## Refined Questions from Analysis"
+                    jq -r '
+                        "### Planning\n" +
+                        (.guiding_questions_refined.planning_phase // [] | map("- [ ] " + .) | join("\n")) +
+                        "\n\n### Implementation\n" +
+                        (.guiding_questions_refined.implementation_phase // [] | map("- [ ] " + .) | join("\n")) +
+                        "\n\n### Review\n" +
+                        (.guiding_questions_refined.review_phase // [] | map("- [ ] " + .) | join("\n"))
+                    ' "$claude_analysis"
+                fi
+                ;;
+        esac
+    }
+
+    # ============================================================================
+    # Main Retrospective Logic
+    # ============================================================================
+
+    # Helper to print progress messages (to stderr for --json/--markdown modes)
+    retro_log() {
+        if [ "$RETRO_OUTPUT_FORMAT" = "json" ] || [ "$RETRO_OUTPUT_FORMAT" = "markdown" ]; then
+            echo "$1" >&2
+        else
+            echo "$1"
+        fi
+    }
+
+    retro_log "Running retrospective analysis..."
+
+    # Parse since date if provided
+    if [ -n "$RETRO_SINCE" ]; then
+        RETRO_SINCE=$(parse_since_date "$RETRO_SINCE") || exit 1
+        retro_log "Filtering PRs since: $RETRO_SINCE"
+    fi
+
+    # Discover PR reports
+    discover_pr_reports "$RETRO_REPORTS_DIR" "$RETRO_SINCE" "$RETRO_AUTHOR"
+
+    # Check minimum PRs requirement
+    if [ ${#PR_REPORTS[@]} -eq 0 ]; then
+        echo "Error: No PR reports found with Claude analysis." >&2
+        echo "Run 'gh pr-enrich <PR_NUMBER> --enrich' to generate PR reports first." >&2
+        exit 1
+    fi
+
+    if [ ${#PR_REPORTS[@]} -lt "$RETRO_MIN_PRS" ]; then
+        retro_log "Warning: Found ${#PR_REPORTS[@]} PR(s), but minimum is $RETRO_MIN_PRS."
+        retro_log "Use --min-prs to lower the threshold, or generate more PR reports."
+        retro_log "Continuing with available data..."
+    fi
+
+    # Create output directory
+    mkdir -p "$RETRO_OUTPUT_DIR"
+
+    TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
+
+    # Aggregate data
+    retro_log "Aggregating PR data..."
+    AGGREGATED=$(aggregate_pr_data)
+    echo "$AGGREGATED" > "$RETRO_OUTPUT_DIR/aggregated-data.json"
+
+    # Calculate patterns
+    retro_log "Calculating cross-PR patterns..."
+    PATTERNS=$(calculate_cross_pr_patterns "$AGGREGATED")
+    echo "$PATTERNS" > "$RETRO_OUTPUT_DIR/cross-pr-patterns.json"
+
+    # Calculate hotspots
+    retro_log "Calculating hotspots..."
+    HOTSPOTS=$(calculate_file_hotspots "$AGGREGATED")
+    echo "$HOTSPOTS" > "$RETRO_OUTPUT_DIR/hotspots.json"
+
+    # Generate guiding questions
+    retro_log "Generating guiding questions..."
+    QUESTIONS=$(generate_guiding_questions "$PATTERNS" "$HOTSPOTS")
+    echo "$QUESTIONS" > "$RETRO_OUTPUT_DIR/guiding-questions.json"
+
+    # Generate improvement tracking
+    retro_log "Generating improvement tracking..."
+    TRACKING=$(generate_improvement_tracking "$AGGREGATED")
+    echo "$TRACKING" > "$RETRO_OUTPUT_DIR/improvement-tracking.json"
+
+    # Generate summary
+    retro_log "Generating summary..."
+    SUMMARY=$(generate_retro_summary "$AGGREGATED" "$PATTERNS" "$HOTSPOTS")
+    echo "$SUMMARY" > "$RETRO_OUTPUT_DIR/summary.json"
+
+    # Optional Claude enrichment
+    CLAUDE_ANALYSIS_FILE=""
+    if [ "$RETRO_ENRICH" = true ]; then
+        retro_log "Running Claude meta-analysis..."
+
+        # Build context for Claude
+        jq -n \
+            --argjson summary "$SUMMARY" \
+            --argjson patterns "$PATTERNS" \
+            --argjson hotspots "$HOTSPOTS" \
+            --argjson tracking "$TRACKING" \
+            '{
+                summary: $summary,
+                patterns: $patterns,
+                hotspots: $hotspots,
+                tracking: $tracking
+            }' > "$RETRO_OUTPUT_DIR/claude-context.json"
+
+        if run_retrospective_claude_analysis "$RETRO_OUTPUT_DIR/claude-context.json" "$RETRO_OUTPUT_DIR/claude-raw-response.json"; then
+            retro_log "✅ Claude meta-analysis complete"
+
+            if jq -e '.structured_output' "$RETRO_OUTPUT_DIR/claude-raw-response.json" > /dev/null 2>&1; then
+                jq '.structured_output' "$RETRO_OUTPUT_DIR/claude-raw-response.json" > "$RETRO_OUTPUT_DIR/claude-meta-analysis.json"
+            else
+                cp "$RETRO_OUTPUT_DIR/claude-raw-response.json" "$RETRO_OUTPUT_DIR/claude-meta-analysis.json"
+            fi
+            CLAUDE_ANALYSIS_FILE="$RETRO_OUTPUT_DIR/claude-meta-analysis.json"
+        else
+            retro_log "⚠️  Claude meta-analysis failed. Continuing without enrichment."
+        fi
+    fi
+
+    # Generate markdown report
+    retro_log "Generating markdown report..."
+    generate_retrospective_markdown "$SUMMARY" "$PATTERNS" "$HOTSPOTS" "$QUESTIONS" "$TRACKING" "$CLAUDE_ANALYSIS_FILE" \
+        > "$RETRO_OUTPUT_DIR/retrospective-report.md"
+
+    # Generate combined JSON
+    jq -n \
+        --argjson summary "$SUMMARY" \
+        --argjson patterns "$PATTERNS" \
+        --argjson hotspots "$HOTSPOTS" \
+        --argjson questions "$QUESTIONS" \
+        --argjson tracking "$TRACKING" \
+        --arg timestamp "$TIMESTAMP" \
+        '{
+            metadata: {
+                generated_at: $timestamp,
+                version: "1.0"
+            },
+            summary: $summary,
+            cross_pr_patterns: $patterns,
+            hotspots: $hotspots,
+            guiding_questions: $questions,
+            improvement_tracking: $tracking
+        }' > "$RETRO_OUTPUT_DIR/retrospective-data.json"
+
+    # Add Claude analysis to combined JSON if available
+    if [ -n "$CLAUDE_ANALYSIS_FILE" ] && [ -f "$CLAUDE_ANALYSIS_FILE" ]; then
+        jq --argjson claude "$(cat "$CLAUDE_ANALYSIS_FILE")" \
+            '. + {claude_meta_analysis: $claude}' \
+            "$RETRO_OUTPUT_DIR/retrospective-data.json" > "$RETRO_OUTPUT_DIR/retrospective-data.tmp.json" && \
+            mv "$RETRO_OUTPUT_DIR/retrospective-data.tmp.json" "$RETRO_OUTPUT_DIR/retrospective-data.json"
+    fi
+
+    # Handle special format output
+    if [ -n "$RETRO_FORMAT" ]; then
+        echo ""
+        echo "=== ${RETRO_FORMAT} output ==="
+        echo ""
+        generate_format_output "$RETRO_FORMAT" "$QUESTIONS" "$SUMMARY" "$CLAUDE_ANALYSIS_FILE"
+        exit 0
+    fi
+
+    # Standard output
+    case $RETRO_OUTPUT_FORMAT in
+        "json")
+            cat "$RETRO_OUTPUT_DIR/retrospective-data.json"
+            ;;
+        "markdown")
+            cat "$RETRO_OUTPUT_DIR/retrospective-report.md"
+            ;;
+        "combined")
+            echo "✅ Retrospective analysis complete!"
+            echo "📁 Directory: $RETRO_OUTPUT_DIR"
+            echo "📊 Markdown: $RETRO_OUTPUT_DIR/retrospective-report.md"
+            echo "🤖 JSON: $RETRO_OUTPUT_DIR/retrospective-data.json"
+            if [ -n "$CLAUDE_ANALYSIS_FILE" ]; then
+                echo "🧠 Claude Analysis: $RETRO_OUTPUT_DIR/claude-meta-analysis.json"
+            fi
+            echo ""
+            echo "Quick stats:"
+            echo "$SUMMARY" | jq -r '"  PRs analyzed: \(.overview.total_prs_analyzed)"'
+            echo "$PATTERNS" | jq -r '"  Recurring patterns: \(length)"'
+            ;;
+    esac
+
+    exit 0
+fi
+
 # Handle uninstall-skill subcommand
 if [ "$1" = "uninstall-skill" ]; then
     SKILL_TARGET="$HOME/.claude/skills/gh-pr-enrich"
@@ -567,6 +1562,7 @@ SUBCOMMANDS:
   resolve <ID...>     Resolve PR review threads by GraphQL ID
   watch <PR> [OPTS]   Monitor PR for new comments (--interval, --enrich, --notify)
   address <PR>        Interactive mode to work through issues one by one
+  retrospective       Analyze patterns across all PRs (--since, --author, --enrich)
 
 OPTIONS:
   --json            Output only JSON (default: combined)
