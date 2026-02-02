@@ -277,6 +277,13 @@ RETRO_HELP
         exit 1
     fi
 
+    # Ensure jq is available
+    if ! command -v jq &> /dev/null; then
+        echo "Error: jq is required but not installed."
+        echo "Install with: brew install jq (macOS) or apt-get install jq (Linux)"
+        exit 1
+    fi
+
     # Check Claude CLI and timeout command if enrichment requested
     check_claude_cli() {
         if [ "$RETRO_ENRICH" = true ]; then
