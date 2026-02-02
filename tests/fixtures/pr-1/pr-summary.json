@@ -1,0 +1,7 @@
+{
+  "number": 1,
+  "title": "Add user authentication",
+  "author": {"login": "alice"},
+  "createdAt": "2025-01-15T10:00:00Z",
+  "files": [{"path": "src/auth.js"}, {"path": "src/api.js"}]
+}

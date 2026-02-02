@@ -1,0 +1,44 @@
+{
+  "issue_categories": [
+    {
+      "name": "Error Handling",
+      "severity": "medium",
+      "description": "Silent failures in background jobs",
+      "thread_ids": ["PRRT_test2"]
+    },
+    {
+      "name": "Testing",
+      "severity": "medium",
+      "description": "Missing unit tests",
+      "thread_ids": ["PRRT_test3"]
+    }
+  ],
+  "systemic_issues": [
+    {
+      "pattern": "Inconsistent error handling",
+      "evidence": ["Thread PRRT_test2: silent catch block"],
+      "recommendation": "Add standardized error wrapper"
+    }
+  ],
+  "adjacent_problems": [],
+  "task_list": [
+    {
+      "priority": "medium",
+      "task": "Fix silent failures in jobs",
+      "thread_ids": ["PRRT_test2"]
+    },
+    {
+      "priority": "low",
+      "task": "Add unit tests",
+      "thread_ids": ["PRRT_test3"]
+    }
+  ],
+  "process_improvements": [
+    {
+      "category": "testing",
+      "suggestion": "Require test coverage for new code",
+      "rationale": "Multiple PRs lack tests"
+    }
+  ],
+  "pr_template_suggestions": []
+}

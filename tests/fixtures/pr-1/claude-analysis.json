@@ -1,0 +1,33 @@
+{
+  "issue_categories": [
+    {
+      "name": "Error Handling",
+      "severity": "high",
+      "description": "Missing error handling in API calls",
+      "thread_ids": ["PRRT_test1"]
+    }
+  ],
+  "systemic_issues": [
+    {
+      "pattern": "Inconsistent error handling",
+      "evidence": ["Thread PRRT_test1: missing try/catch"],
+      "recommendation": "Add standardized error wrapper"
+    }
+  ],
+  "adjacent_problems": [
+    {
+      "area": "Other API endpoints",
+      "risk": "Same pattern may exist",
+      "investigation_hint": "Search for similar fetch calls"
+    }
+  ],
+  "task_list": [
+    {
+      "priority": "high",
+      "task": "Add error handling to API calls",
+      "thread_ids": ["PRRT_test1"]
+    }
+  ],
+  "process_improvements": [],
+  "pr_template_suggestions": []
+}
