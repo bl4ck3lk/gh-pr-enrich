@@ -708,7 +708,8 @@ $(cat "$context_file")"
 
         local exit_code=0
         # Use --setting-sources "" to bypass plugin loading which can cause hangs
-        if echo "$user_prompt" | timeout "$timeout_secs" claude --print \
+        # Use --signal=KILL --foreground because claude --print doesn't respond gracefully to SIGTERM during init
+        if echo "$user_prompt" | timeout --signal=KILL --foreground "$timeout_secs" claude --print \
             --setting-sources "" \
             --model sonnet \
             --output-format json \
@@ -718,7 +719,8 @@ $(cat "$context_file")"
             echo "✅ Retrospective analysis complete" >&2
         else
             exit_code=$?
-            if [ "$exit_code" -eq 124 ]; then
+            # 124 = timeout with SIGTERM, 137 = timeout with SIGKILL (128 + 9)
+            if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
                 echo "⏱️  Retrospective analysis timed out after ${timeout_secs}s (set CLAUDE_TIMEOUT to increase)" >&2
             else
                 echo "❌ Retrospective analysis failed (exit code: $exit_code)" >&2
@@ -2086,7 +2088,8 @@ $(cat "$context_file")"
 
     local exit_code=0
     # Use --setting-sources "" to bypass plugin loading which can cause hangs
-    if echo "$user_prompt" | timeout "$timeout_secs" claude --print \
+    # Use --signal=KILL --foreground because claude --print doesn't respond gracefully to SIGTERM during init
+    if echo "$user_prompt" | timeout --signal=KILL --foreground "$timeout_secs" claude --print \
         --setting-sources "" \
         --model sonnet \
         --output-format json \
@@ -2096,7 +2099,8 @@ $(cat "$context_file")"
         echo "✅ Claude analysis complete" >&2
     else
         exit_code=$?
-        if [ "$exit_code" -eq 124 ]; then
+        # 124 = timeout with SIGTERM, 137 = timeout with SIGKILL (128 + 9)
+        if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
             echo "⏱️  Claude analysis timed out after ${timeout_secs}s (set CLAUDE_TIMEOUT to increase)" >&2
         else
             echo "❌ Claude analysis failed (exit code: $exit_code)" >&2
