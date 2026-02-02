@@ -686,6 +686,7 @@ RETRO_HELP
     run_retrospective_claude_analysis() {
         local context_file="$1"
         local output_file="$2"
+        local timeout_secs="${CLAUDE_TIMEOUT:-180}"  # Default 3 minutes for retrospective (larger context)
 
         local system_prompt="You are analyzing aggregated data from multiple PR reviews to identify meta-patterns, knowledge gaps, and opportunities for improvement.
 
@@ -698,18 +699,33 @@ Your task is to:
 
 Focus on actionable, specific insights. Prioritize items that would have the highest impact."
 
+        # Build prompt and pipe via stdin to avoid arg length limits
         local user_prompt="Analyze this aggregated PR retrospective data and provide meta-analysis:
 
 $(cat "$context_file")"
 
-        claude --print \
+        echo "🧠 Running retrospective Claude analysis (timeout: ${timeout_secs}s)..." >&2
+
+        local exit_code=0
+        # Use --setting-sources "" to bypass plugin loading which can cause hangs
+        if echo "$user_prompt" | timeout "$timeout_secs" claude --print \
+            --setting-sources "" \
             --model sonnet \
             --output-format json \
             --json-schema "$RETRO_CLAUDE_SCHEMA" \
             --system-prompt "$system_prompt" \
-            "$user_prompt" > "$output_file"
+            > "$output_file" 2>/dev/null; then
+            echo "✅ Retrospective analysis complete" >&2
+        else
+            exit_code=$?
+            if [ "$exit_code" -eq 124 ]; then
+                echo "⏱️  Retrospective analysis timed out after ${timeout_secs}s (set CLAUDE_TIMEOUT to increase)" >&2
+            else
+                echo "❌ Retrospective analysis failed (exit code: $exit_code)" >&2
+            fi
+        fi
 
-        return $?
+        return $exit_code
     }
 
     # Generate markdown report from retrospective data
@@ -2050,23 +2066,45 @@ CLAUDE_ANALYSIS_SCHEMA='{
 run_claude_analysis() {
     local context_file="$1"
     local output_file="$2"
+    local timeout_secs="${CLAUDE_TIMEOUT:-120}"  # Default 2 minutes, configurable via env
 
     # Load system prompt from configurable file
     local system_prompt
     system_prompt="$(load_system_prompt)"
 
+    # Write schema to temp file to avoid command line length issues
+    local schema_file
+    schema_file=$(mktemp)
+    echo "$CLAUDE_ANALYSIS_SCHEMA" > "$schema_file"
+
+    # Build prompt and pipe via stdin to avoid arg length limits
     local user_prompt="Analyze these unresolved PR comment threads and provide structured analysis:
 
 $(cat "$context_file")"
 
-    claude --print \
+    echo "🧠 Running Claude analysis (timeout: ${timeout_secs}s)..." >&2
+
+    local exit_code=0
+    # Use --setting-sources "" to bypass plugin loading which can cause hangs
+    if echo "$user_prompt" | timeout "$timeout_secs" claude --print \
+        --setting-sources "" \
         --model sonnet \
         --output-format json \
-        --json-schema "$CLAUDE_ANALYSIS_SCHEMA" \
+        --json-schema "$(cat "$schema_file")" \
         --system-prompt "$system_prompt" \
-        "$user_prompt" > "$output_file" 2>/dev/null
+        > "$output_file" 2>/dev/null; then
+        echo "✅ Claude analysis complete" >&2
+    else
+        exit_code=$?
+        if [ "$exit_code" -eq 124 ]; then
+            echo "⏱️  Claude analysis timed out after ${timeout_secs}s (set CLAUDE_TIMEOUT to increase)" >&2
+        else
+            echo "❌ Claude analysis failed (exit code: $exit_code)" >&2
+        fi
+    fi
 
-    return $?
+    rm -f "$schema_file"
+    return $exit_code
 }
 
 generate_analysis_report() {

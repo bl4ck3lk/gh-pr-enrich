@@ -201,6 +201,9 @@ export PR_REVIEW_OUTPUT_ROOT="./custom-reports"
 
 # Custom prompt file for Claude analysis
 export GH_PR_ENRICH_PROMPT="$HOME/.config/gh-pr-enrich-prompt.txt"
+
+# Timeout for Claude analysis (default: 120s for PR analysis, 180s for retrospective)
+export CLAUDE_TIMEOUT=300  # 5 minutes
 ```
 
 ## Examples
