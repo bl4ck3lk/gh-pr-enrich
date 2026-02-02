@@ -71,6 +71,7 @@ gh pr-enrich address 123
 | `resolve <ID...>` | Resolve one or more PR review threads by GraphQL ID |
 | `watch <PR>` | Monitor PR for new comments (options: `--interval`, `--enrich`, `--notify`) |
 | `address <PR>` | Interactive mode to work through issues one by one |
+| `retrospective` | Analyze patterns across all PRs (options: `--since`, `--author`, `--enrich`, `--format`) |
 
 ## Output Files
 
@@ -89,6 +90,60 @@ When run, the extension creates a directory with:
 ├── pr-diff.txt                  # (if --diff) Raw unified diff
 └── pr-diff.json                 # (if --diff) Structured diff by file
 ```
+
+## Retrospective Analysis
+
+The `retrospective` subcommand analyzes patterns across all your PR reports to identify systemic issues and generate actionable insights.
+
+```bash
+# Basic retrospective (analyzes all PRs in .reports/pr-reviews)
+gh pr-enrich retrospective
+
+# Analyze PRs from the last 30 days
+gh pr-enrich retrospective --since 30d
+
+# Filter by author
+gh pr-enrich retrospective --author alice,bob
+
+# With Claude meta-analysis for deeper insights
+gh pr-enrich retrospective --enrich
+
+# Output formats for integration
+gh pr-enrich retrospective --format claude-md    # CLAUDE.md section
+gh pr-enrich retrospective --format checklist    # Implementation checklist
+gh pr-enrich retrospective --format pr-template  # PR template additions
+```
+
+### Retrospective Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--since DATE` | Filter PRs from date (ISO 8601 or `30d`, `2w`, `3m`) | All |
+| `--author LOGIN` | Filter by author(s), comma-separated | All |
+| `--reports-dir DIR` | Path to reports directory | `.reports/pr-reviews` |
+| `--output-dir DIR` | Where to save output | `.reports/retrospectives` |
+| `--enrich` | Use Claude for meta-analysis | false |
+| `--min-prs N` | Warn if fewer PRs found | 3 |
+| `--format TYPE` | Output format: `claude-md`, `pr-template`, `checklist` | - |
+| `--json` | Output JSON only | - |
+| `--markdown` | Output Markdown only | - |
+
+### Retrospective Output
+
+The retrospective generates:
+
+- **Cross-PR Patterns**: Issues that repeat across multiple PRs with occurrence counts
+- **Category Hotspots**: Issue/task categories receiving the most review feedback
+- **Guiding Questions**: Checklist derived from recurring issues
+- **Improvement Tracking**: Process suggestions made across PRs
+- **Team Summary**: High-level stats for sprint retrospectives
+
+With `--enrich`, Claude provides additional meta-analysis:
+
+- Root causes behind recurring patterns
+- Knowledge gaps the team should address
+- Automation opportunities (linting, CI checks)
+- Refined guiding questions by development phase
 
 ## Claude AI Analysis
 
@@ -146,6 +201,9 @@ export PR_REVIEW_OUTPUT_ROOT="./custom-reports"
 
 # Custom prompt file for Claude analysis
 export GH_PR_ENRICH_PROMPT="$HOME/.config/gh-pr-enrich-prompt.txt"
+
+# Timeout for Claude analysis (default: 120s for PR analysis, 180s for retrospective)
+export CLAUDE_TIMEOUT=300  # 5 minutes
 ```
 
 ## Examples

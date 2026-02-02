@@ -1,0 +1,7 @@
+{
+  "number": 3,
+  "title": "Add async data fetcher",
+  "author": {"login": "alice"},
+  "createdAt": "2025-01-25T10:00:00Z",
+  "files": [{"path": "src/fetcher.js"}, {"path": "src/api.js"}]
+}

@@ -1,0 +1,7 @@
+{
+  "number": 2,
+  "title": "Add background job processor",
+  "author": {"login": "bob"},
+  "createdAt": "2025-01-20T10:00:00Z",
+  "files": [{"path": "src/jobs.js"}, {"path": "src/worker.js"}]
+}

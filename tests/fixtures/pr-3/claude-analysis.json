@@ -1,0 +1,33 @@
+{
+  "issue_categories": [
+    {
+      "name": "Error Handling",
+      "severity": "high",
+      "description": "Unhandled promise rejections",
+      "thread_ids": ["PRRT_test4"]
+    }
+  ],
+  "systemic_issues": [
+    {
+      "pattern": "Inconsistent error handling",
+      "evidence": ["Thread PRRT_test4: unhandled rejection"],
+      "recommendation": "Add standardized error wrapper"
+    }
+  ],
+  "adjacent_problems": [],
+  "task_list": [
+    {
+      "priority": "high",
+      "task": "Handle promise rejections",
+      "thread_ids": ["PRRT_test4"]
+    }
+  ],
+  "process_improvements": [],
+  "pr_template_suggestions": [
+    {
+      "section": "Testing",
+      "checkbox_or_question": "- [ ] Error cases are handled",
+      "why": "Recurring error handling issues"
+    }
+  ]
+}

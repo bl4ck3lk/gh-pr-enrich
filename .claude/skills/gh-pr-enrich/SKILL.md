@@ -16,6 +16,9 @@ Use this skill when:
 - Need to understand the full context of PR discussions
 - Want to identify systemic issues from reviewer feedback
 - Creating a task list from PR review comments
+- User asks for "team retrospective", "analyze patterns", or "recurring issues"
+- Need to generate CLAUDE.md additions from PR feedback history
+- Want to create implementation checklists from past reviews
 
 ## Required Analysis Workflow
 
@@ -492,6 +495,103 @@ jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.id == "PRRT_xxx
 # Check if already resolved
 jq '.data.repository.pullRequest.reviewThreads.nodes[]
     | select(.id == "PRRT_xxx") | .isResolved' comment-threads.json
+```
+
+## Retrospective Analysis
+
+The `retrospective` subcommand analyzes patterns across all PR reports to identify systemic issues and generate actionable insights.
+
+### When to Use Retrospective
+
+- After completing a sprint or milestone
+- When noticing recurring PR feedback
+- To generate CLAUDE.md additions from lessons learned
+- To create team-wide implementation checklists
+- Before starting a new feature to review past patterns
+
+### Retrospective Command
+
+```bash
+# Basic retrospective
+gh pr-enrich retrospective
+
+# Last 30 days with Claude meta-analysis
+gh pr-enrich retrospective --since 30d --enrich
+
+# Filter by author
+gh pr-enrich retrospective --author alice,bob
+
+# Output formats for integration
+gh pr-enrich retrospective --format claude-md    # CLAUDE.md section
+gh pr-enrich retrospective --format checklist    # Implementation checklist
+gh pr-enrich retrospective --format pr-template  # PR template additions
+```
+
+### Retrospective Options
+
+| Option | Description |
+|--------|-------------|
+| `--since DATE` | Filter PRs from date (ISO 8601 or `30d`, `2w`, `3m`) |
+| `--author LOGIN` | Filter by author(s), comma-separated |
+| `--reports-dir DIR` | Path to reports directory |
+| `--output-dir DIR` | Where to save output |
+| `--enrich` | Use Claude for meta-analysis |
+| `--min-prs N` | Warn if fewer PRs found |
+| `--format TYPE` | Output: `claude-md`, `pr-template`, `checklist` |
+| `--json` | Output JSON only |
+| `--markdown` | Output Markdown only |
+
+### Retrospective Output
+
+The retrospective generates several files in `.reports/retrospectives/`:
+
+| File | Description |
+|------|-------------|
+| `retrospective-report.md` | Human-readable summary |
+| `retrospective-data.json` | Complete machine-readable data |
+| `cross-pr-patterns.json` | Patterns with occurrence counts |
+| `hotspots.json` | Components by issue frequency |
+| `guiding-questions.json` | Generated checklists |
+| `claude-meta-analysis.json` | (if --enrich) Deep analysis |
+
+### Interpreting Retrospective Output
+
+**Cross-PR Patterns**: Issues appearing in multiple PRs indicate systemic problems. High occurrence + high severity = priority fix.
+
+```bash
+# Find patterns appearing 3+ times
+jq '.cross_pr_patterns[] | select(.occurrences >= 3)' \
+  .reports/retrospectives/retrospective-data.json
+```
+
+**Hotspots**: Components with many issues need architectural review or better test coverage.
+
+**Guiding Questions**: Use these as pre-implementation checklists to prevent recurring issues.
+
+### Workflow: Sprint Retrospective
+
+```bash
+# 1. Generate retrospective for the sprint
+gh pr-enrich retrospective --since 2w --enrich
+
+# 2. Review the report
+cat .reports/retrospectives/retrospective-report.md
+
+# 3. Extract CLAUDE.md additions
+gh pr-enrich retrospective --since 2w --format claude-md >> .claude/CLAUDE.md
+
+# 4. Update PR template
+gh pr-enrich retrospective --since 2w --format pr-template
+```
+
+### Workflow: Pre-Implementation Review
+
+```bash
+# Before starting a new feature, review past patterns
+gh pr-enrich retrospective --format checklist > implementation-checklist.md
+
+# Use the checklist during development
+cat implementation-checklist.md
 ```
 
 ## Related Skills
