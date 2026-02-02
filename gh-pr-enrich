@@ -157,7 +157,7 @@ OPTIONS:
   --reports-dir DIR   Path to reports directory (default: .reports/pr-reviews)
   --output-dir DIR    Where to save output (default: .reports/retrospectives)
   --enrich            Use Claude for meta-analysis
-  --min-prs N         Minimum PRs required for analysis (default: 3)
+  --min-prs N         Warn if fewer than N PRs found (default: 3)
   --format TYPE       Extra output format: claude-md, pr-template, checklist
   --json              Output JSON only
   --markdown          Output Markdown only
@@ -277,14 +277,16 @@ RETRO_HELP
         exit 1
     fi
 
-    # Check Claude CLI if enrichment requested
-    if [ "$RETRO_ENRICH" = true ]; then
-        if ! command -v claude &> /dev/null; then
-            echo "Warning: Claude CLI not found. Skipping enrichment."
-            echo "Install from: https://claude.ai/code"
-            RETRO_ENRICH=false
+    # Check Claude CLI if enrichment requested (after retro_log is defined)
+    check_claude_cli() {
+        if [ "$RETRO_ENRICH" = true ]; then
+            if ! command -v claude &> /dev/null; then
+                echo "Warning: Claude CLI not found. Skipping enrichment." >&2
+                echo "Install from: https://claude.ai/code" >&2
+                RETRO_ENRICH=false
+            fi
         fi
-    fi
+    }
 
     # ============================================================================
     # Retrospective Helper Functions
@@ -476,16 +478,15 @@ RETRO_HELP
         '
     }
 
-    # Calculate file/component hotspots
+    # Calculate issue/task category hotspots
     # Args: $1 - aggregated data JSON
     # Output: Hotspots JSON to stdout
-    calculate_file_hotspots() {
+    calculate_category_hotspots() {
         local aggregated="$1"
 
         echo "$aggregated" | jq '
-            # Collect all file references from issue categories and task lists
+            # Collect all issue-category and task-category references across PRs
             [.prs[] |
-                .pr_meta.files as $files |
                 .pr_meta.number as $pr_num |
                 (
                     # From issue categories
@@ -965,6 +966,9 @@ CHECKLIST_HEADER
         fi
     }
 
+    # Check Claude CLI availability (now that retro_log is defined)
+    check_claude_cli
+
     retro_log "Running retrospective analysis..."
 
     # Parse since date if provided
@@ -1006,7 +1010,7 @@ CHECKLIST_HEADER
 
     # Calculate hotspots
     retro_log "Calculating hotspots..."
-    HOTSPOTS=$(calculate_file_hotspots "$AGGREGATED")
+    HOTSPOTS=$(calculate_category_hotspots "$AGGREGATED")
     echo "$HOTSPOTS" > "$RETRO_OUTPUT_DIR/hotspots.json"
 
     # Generate guiding questions
@@ -1069,10 +1073,11 @@ CHECKLIST_HEADER
         --argjson questions "$QUESTIONS" \
         --argjson tracking "$TRACKING" \
         --arg timestamp "$TIMESTAMP" \
+        --arg version "$VERSION" \
         '{
             metadata: {
                 generated_at: $timestamp,
-                version: "1.0"
+                version: $version
             },
             summary: $summary,
             cross_pr_patterns: $patterns,

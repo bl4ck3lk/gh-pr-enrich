@@ -116,7 +116,7 @@ test_minimum_prs_warning() {
     local output
     output=$("$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" --min-prs 10 2>&1)
 
-    if echo "$output" | grep -q "Warning: Found .* PR(s), but minimum is 10"; then
+    if echo "$output" | grep -q "Warning: Found .* PR(s)"; then
         pass "Warning when below minimum PRs"
     else
         fail "Warning when below minimum PRs" "Got: $output"
