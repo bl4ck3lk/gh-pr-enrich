@@ -536,7 +536,7 @@ gh pr-enrich retrospective --format pr-template  # PR template additions
 | `--reports-dir DIR` | Path to reports directory |
 | `--output-dir DIR` | Where to save output |
 | `--enrich` | Use Claude for meta-analysis |
-| `--min-prs N` | Minimum PRs required for analysis |
+| `--min-prs N` | Warn if fewer PRs found |
 | `--format TYPE` | Output: `claude-md`, `pr-template`, `checklist` |
 | `--json` | Output JSON only |
 | `--markdown` | Output Markdown only |
