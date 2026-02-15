@@ -1961,11 +1961,18 @@ build_claude_context() {
     local output_dir="$1"
     local include_diff="${2:-false}"
 
+    # Load issue comments if available (top-level PR comments including bot comments)
+    local issue_comments='[]'
+    if [ -f "$output_dir/issue-comments.json" ]; then
+        issue_comments="$(<"$output_dir/issue-comments.json")"
+    fi
+
     if [ "$include_diff" = "true" ] && [ -f "$output_dir/pr-diff.json" ]; then
         # Include diff in context for richer analysis
         jq -n \
             --argjson pr "$(<"$output_dir/pr-summary.json")" \
             --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
+            --argjson issue_comments "$issue_comments" \
             --argjson diff "$(<"$output_dir/pr-diff.json")" \
             '{
                 pr: {
@@ -1975,6 +1982,16 @@ build_claude_context() {
                     files_changed: [$pr.files[].path]
                 },
                 unresolved_threads: $unresolved,
+                issue_comments: ($issue_comments | map({
+                    user: .user,
+                    body: (if (.body | length) > 5000 then
+                        (.body | .[0:5000] + "\n... (truncated)")
+                    else
+                        .body
+                    end),
+                    url: .html_url,
+                    created_at: .created_at
+                })),
                 code_changes: {
                     summary: "Diff included for context. Each file_diff contains the actual code changes.",
                     file_diffs: ($diff.file_diffs | map({
@@ -1991,6 +2008,7 @@ build_claude_context() {
         jq -n \
             --argjson pr "$(<"$output_dir/pr-summary.json")" \
             --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
+            --argjson issue_comments "$issue_comments" \
             '{
                 pr: {
                     title: $pr.title,
@@ -1998,7 +2016,17 @@ build_claude_context() {
                     author: $pr.author.login,
                     files_changed: [$pr.files[].path]
                 },
-                unresolved_threads: $unresolved
+                unresolved_threads: $unresolved,
+                issue_comments: ($issue_comments | map({
+                    user: .user,
+                    body: (if (.body | length) > 5000 then
+                        (.body | .[0:5000] + "\n... (truncated)")
+                    else
+                        .body
+                    end),
+                    url: .html_url,
+                    created_at: .created_at
+                }))
             }' > "$output_dir/claude-context.json"
     fi
 }
@@ -2097,7 +2125,7 @@ run_claude_analysis() {
     local schema_content="$CLAUDE_ANALYSIS_SCHEMA"
 
     # Build prompt and pipe via stdin to avoid arg length limits
-    local user_prompt="Analyze these unresolved PR comment threads and provide structured analysis:
+    local user_prompt="Analyze these unresolved PR comment threads and issue comments (including CI/bot reports) and provide structured analysis:
 
 $(cat "$context_file")"
 
@@ -2343,14 +2371,15 @@ EOF
 
 # 8. Optional: Claude enrichment
 if [ "$ENRICH_WITH_CLAUDE" = true ]; then
-    echo "Running Claude analysis on unresolved threads..."
+    echo "Running Claude analysis on unresolved threads and issue comments..."
 
     extract_unresolved_threads "$OUTPUT_DIR/comment-threads.json" "$OUTPUT_DIR/unresolved-threads.json"
 
     UNRESOLVED_COUNT=$(jq 'length' "$OUTPUT_DIR/unresolved-threads.json")
+    ISSUE_COMMENT_COUNT=$(jq 'length' "$OUTPUT_DIR/issue-comments.json" 2>/dev/null || echo "0")
 
-    if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
-        echo "Found $UNRESOLVED_COUNT unresolved thread(s). Analyzing with Claude Sonnet..."
+    if [ "$UNRESOLVED_COUNT" -gt 0 ] || [ "$ISSUE_COMMENT_COUNT" -gt 0 ]; then
+        echo "Found $UNRESOLVED_COUNT unresolved thread(s) and $ISSUE_COMMENT_COUNT issue comment(s). Analyzing with Claude Sonnet..."
 
         # Fetch diff if requested
         if [ "$INCLUDE_DIFF" = true ]; then
@@ -2386,7 +2415,7 @@ ANALYSIS_SECTION
             echo "⚠️  Claude analysis failed. Continuing without enrichment."
         fi
     else
-        echo "No unresolved threads found. Skipping Claude analysis."
+        echo "No unresolved threads or issue comments found. Skipping Claude analysis."
     fi
 fi
 
