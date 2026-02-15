@@ -1961,18 +1961,30 @@ build_claude_context() {
     local output_dir="$1"
     local include_diff="${2:-false}"
 
-    # Load issue comments if available (top-level PR comments including bot comments)
-    local issue_comments='[]'
-    if [ -f "$output_dir/issue-comments.json" ]; then
-        issue_comments="$(<"$output_dir/issue-comments.json")"
+    # Ensure issue-comments.json exists (avoids --slurpfile error)
+    if [ ! -f "$output_dir/issue-comments.json" ]; then
+        echo '[]' > "$output_dir/issue-comments.json"
     fi
+
+    # Shared jq filter for mapping/truncating issue comments (single definition)
+    local issue_comments_filter='($issue_comments[0] | map({
+        user: .user,
+        body: (if (.body | length) > 5000 then
+            (.body | .[0:5000] + "\n... (truncated)")
+        else
+            .body
+        end),
+        url: .html_url,
+        created_at: .created_at
+    }))'
 
     if [ "$include_diff" = "true" ] && [ -f "$output_dir/pr-diff.json" ]; then
         # Include diff in context for richer analysis
+        # Use --slurpfile to avoid ARG_MAX limits on large comment payloads
         jq -n \
             --argjson pr "$(<"$output_dir/pr-summary.json")" \
             --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
-            --argjson issue_comments "$issue_comments" \
+            --slurpfile issue_comments "$output_dir/issue-comments.json" \
             --argjson diff "$(<"$output_dir/pr-diff.json")" \
             '{
                 pr: {
@@ -1982,16 +1994,7 @@ build_claude_context() {
                     files_changed: [$pr.files[].path]
                 },
                 unresolved_threads: $unresolved,
-                issue_comments: ($issue_comments | map({
-                    user: .user,
-                    body: (if (.body | length) > 5000 then
-                        (.body | .[0:5000] + "\n... (truncated)")
-                    else
-                        .body
-                    end),
-                    url: .html_url,
-                    created_at: .created_at
-                })),
+                issue_comments: '"$issue_comments_filter"',
                 code_changes: {
                     summary: "Diff included for context. Each file_diff contains the actual code changes.",
                     file_diffs: ($diff.file_diffs | map({
@@ -2005,10 +2008,11 @@ build_claude_context() {
                 }
             }' > "$output_dir/claude-context.json"
     else
+        # Use --slurpfile to avoid ARG_MAX limits on large comment payloads
         jq -n \
             --argjson pr "$(<"$output_dir/pr-summary.json")" \
             --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
-            --argjson issue_comments "$issue_comments" \
+            --slurpfile issue_comments "$output_dir/issue-comments.json" \
             '{
                 pr: {
                     title: $pr.title,
@@ -2017,16 +2021,7 @@ build_claude_context() {
                     files_changed: [$pr.files[].path]
                 },
                 unresolved_threads: $unresolved,
-                issue_comments: ($issue_comments | map({
-                    user: .user,
-                    body: (if (.body | length) > 5000 then
-                        (.body | .[0:5000] + "\n... (truncated)")
-                    else
-                        .body
-                    end),
-                    url: .html_url,
-                    created_at: .created_at
-                }))
+                issue_comments: '"$issue_comments_filter"'
             }' > "$output_dir/claude-context.json"
     fi
 }

@@ -140,28 +140,9 @@ test_context_includes_issue_comments() {
     mkdir -p "$dir"
     create_test_fixtures "$dir"
 
-    # Run build_claude_context by extracting and calling the function
-    # We use jq directly to simulate what build_claude_context should produce
+    # Build the expected claude-context.json directly using jq; we do not invoke
+    # build_claude_context here, only its core JSON construction logic.
     local context_file="$dir/claude-context.json"
-
-    # Actually run the real script's function via a sourcing trick:
-    # Export the function, then call it in a subshell
-    bash -c "
-        # Define the function as the script should have it after the fix
-        source /dev/stdin << 'FUNC'
-build_claude_context() {
-    local output_dir=\"\$1\"
-    local include_diff=\"\${2:-false}\"
-    # This is a stub - we test the OUTPUT, not the function itself
-}
-FUNC
-    " 2>/dev/null || true
-
-    # Instead, let's directly test the output by running the script components.
-    # The real test: does claude-context.json contain issue_comments?
-    # We'll call the actual script in a controlled way.
-
-    # For unit testing, we verify the jq logic that should be in build_claude_context
     jq -n \
         --argjson pr "$(<"$dir/pr-summary.json")" \
         --argjson unresolved "$(<"$dir/unresolved-threads.json")" \
@@ -278,7 +259,7 @@ test_long_issue_comment_truncation() {
 
     # Create an issue comment with a very long body (>5000 chars)
     local long_body
-    long_body=$(python3 -c "print('x' * 6000)")
+    long_body=$(head -c 6000 /dev/zero | tr '\0' 'x')
     jq --arg body "$long_body" '[{
         "id": 2001,
         "body": $body,
