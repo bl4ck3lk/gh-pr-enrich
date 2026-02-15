@@ -2115,7 +2115,7 @@ CLAUDE_ANALYSIS_SCHEMA='{
 run_claude_analysis() {
     local context_file="$1"
     local output_file="$2"
-    local timeout_secs="${CLAUDE_TIMEOUT:-120}"  # Default 2 minutes, configurable via env
+    local timeout_secs="${CLAUDE_TIMEOUT:-300}"  # Default 5 minutes, configurable via env
 
     # Load system prompt from configurable file
     local system_prompt
