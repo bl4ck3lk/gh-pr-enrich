@@ -724,7 +724,9 @@ $(cat "$context_file")"
         local exit_code=0
         # Use --setting-sources "" to bypass plugin loading which can cause hangs
         # Use --signal=KILL --foreground because claude --print doesn't respond gracefully to SIGTERM during init
-        if echo "$user_prompt" | timeout --signal=KILL --foreground "$timeout_secs" claude --print \
+        # Unset CLAUDECODE to allow nested invocation from within a Claude Code session
+        if echo "$user_prompt" | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+            timeout --signal=KILL --foreground "$timeout_secs" claude --print \
             --setting-sources "" \
             --model sonnet \
             --output-format json \
@@ -2129,7 +2131,9 @@ $(cat "$context_file")"
     local exit_code=0
     # Use --setting-sources "" to bypass plugin loading which can cause hangs
     # Use --signal=KILL --foreground because claude --print doesn't respond gracefully to SIGTERM during init
-    if echo "$user_prompt" | timeout --signal=KILL --foreground "$timeout_secs" claude --print \
+    # Unset CLAUDECODE to allow nested invocation from within a Claude Code session
+    if echo "$user_prompt" | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+        timeout --signal=KILL --foreground "$timeout_secs" claude --print \
         --setting-sources "" \
         --model sonnet \
         --output-format json \
