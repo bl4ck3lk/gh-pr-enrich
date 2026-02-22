@@ -1,5 +1,6 @@
 #!/bin/bash
 # Test suite for build_claude_context including issue comments
+# Uses integration testing: invokes the actual gh-pr-enrich script via --test-build-context
 
 set -e
 
@@ -41,10 +42,16 @@ setup() {
 }
 
 # ============================================================================
-# Helper: Source the functions from gh-pr-enrich
-# We can't source the whole script (it runs main logic), so we extract
-# the functions we need to test by creating a minimal test harness.
+# Integration Testing Approach
+# Tests invoke the actual build_claude_context function via --test-build-context.
+# This ensures tests catch regressions in the real implementation.
 # ============================================================================
+
+# Invoke the real build_claude_context via the hidden test mode
+run_build_claude_context() {
+    local dir="$1"
+    "$GH_PR_ENRICH" --test-build-context "$dir" 2>/dev/null
+}
 
 create_test_fixtures() {
     local dir="$1"
@@ -132,7 +139,7 @@ EOF
 }
 
 # ============================================================================
-# Tests
+# Tests (Integration tests invoking real implementation)
 # ============================================================================
 
 test_context_includes_issue_comments() {
@@ -140,32 +147,9 @@ test_context_includes_issue_comments() {
     mkdir -p "$dir"
     create_test_fixtures "$dir"
 
-    # Build the expected claude-context.json directly using jq; we do not invoke
-    # build_claude_context here, only its core JSON construction logic.
+    # Invoke the real build_claude_context function
+    run_build_claude_context "$dir"
     local context_file="$dir/claude-context.json"
-    jq -n \
-        --argjson pr "$(<"$dir/pr-summary.json")" \
-        --argjson unresolved "$(<"$dir/unresolved-threads.json")" \
-        --argjson issue_comments "$(<"$dir/issue-comments.json")" \
-        '{
-            pr: {
-                title: $pr.title,
-                body: ($pr.body // "No description"),
-                author: $pr.author.login,
-                files_changed: [$pr.files[].path]
-            },
-            unresolved_threads: $unresolved,
-            issue_comments: ($issue_comments | map({
-                user: .user,
-                body: (if (.body | length) > 5000 then
-                    (.body | .[0:5000] + "\n... (truncated)")
-                else
-                    .body
-                end),
-                url: .html_url,
-                created_at: .created_at
-            }))
-        }' > "$context_file" 2>/dev/null
 
     # Test 1: issue_comments field exists
     if jq -e '.issue_comments' "$context_file" > /dev/null 2>&1; then
@@ -217,31 +201,9 @@ test_context_with_empty_issue_comments() {
     create_test_fixtures "$dir"
     create_empty_issue_comments "$dir"
 
+    # Invoke the real build_claude_context function
+    run_build_claude_context "$dir"
     local context_file="$dir/claude-context.json"
-
-    jq -n \
-        --argjson pr "$(<"$dir/pr-summary.json")" \
-        --argjson unresolved "$(<"$dir/unresolved-threads.json")" \
-        --argjson issue_comments "$(<"$dir/issue-comments.json")" \
-        '{
-            pr: {
-                title: $pr.title,
-                body: ($pr.body // "No description"),
-                author: $pr.author.login,
-                files_changed: [$pr.files[].path]
-            },
-            unresolved_threads: $unresolved,
-            issue_comments: ($issue_comments | map({
-                user: .user,
-                body: (if (.body | length) > 5000 then
-                    (.body | .[0:5000] + "\n... (truncated)")
-                else
-                    .body
-                end),
-                url: .html_url,
-                created_at: .created_at
-            }))
-        }' > "$context_file" 2>/dev/null
 
     local count
     count=$(jq '.issue_comments | length' "$context_file")
@@ -260,7 +222,7 @@ test_long_issue_comment_truncation() {
     # Create an issue comment with a very long body (>5000 chars)
     local long_body
     long_body=$(head -c 6000 /dev/zero | tr '\0' 'x')
-    jq --arg body "$long_body" '[{
+    jq -n --arg body "$long_body" '[{
         "id": 2001,
         "body": $body,
         "user": "github-actions[bot]",
@@ -268,33 +230,11 @@ test_long_issue_comment_truncation() {
         "updated_at": "2026-02-14T10:00:00Z",
         "type": "issue_comment",
         "html_url": "https://github.com/test/repo/pull/99#issuecomment-2001"
-    }]' -n > "$dir/issue-comments.json"
+    }]' > "$dir/issue-comments.json"
 
+    # Invoke the real build_claude_context function
+    run_build_claude_context "$dir"
     local context_file="$dir/claude-context.json"
-
-    jq -n \
-        --argjson pr "$(<"$dir/pr-summary.json")" \
-        --argjson unresolved "$(<"$dir/unresolved-threads.json")" \
-        --argjson issue_comments "$(<"$dir/issue-comments.json")" \
-        '{
-            pr: {
-                title: $pr.title,
-                body: ($pr.body // "No description"),
-                author: $pr.author.login,
-                files_changed: [$pr.files[].path]
-            },
-            unresolved_threads: $unresolved,
-            issue_comments: ($issue_comments | map({
-                user: .user,
-                body: (if (.body | length) > 5000 then
-                    (.body | .[0:5000] + "\n... (truncated)")
-                else
-                    .body
-                end),
-                url: .html_url,
-                created_at: .created_at
-            }))
-        }' > "$context_file" 2>/dev/null
 
     local body_len
     body_len=$(jq '.issue_comments[0].body | length' "$context_file")

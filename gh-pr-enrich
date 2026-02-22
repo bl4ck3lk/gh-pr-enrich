@@ -1647,23 +1647,37 @@ HELP
     exit 0
 fi
 
-PR_NUMBER=$1
-
-# Validate PR_NUMBER is a positive integer (prevent path traversal)
-if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
-    echo "Error: PR_NUMBER must be a positive integer, got: '$PR_NUMBER'"
-    exit 1
+# Early check for test-build-context mode (before PR_NUMBER validation)
+if [ "$1" = "--test-build-context" ]; then
+    if [ -z "${2:-}" ]; then
+        echo "Error: --test-build-context requires a directory path."
+        exit 1
+    fi
+    TEST_BUILD_CONTEXT_DIR="$2"
+    # Will be handled after function definitions
 fi
 
-shift
-OUTPUT_FORMAT="combined"
-DEFAULT_OUTPUT_ROOT="${PR_REVIEW_OUTPUT_ROOT:-.reports/pr-reviews}"
-OUTPUT_DIR="$DEFAULT_OUTPUT_ROOT/pr-$PR_NUMBER"
-CUSTOM_OUTPUT_DIR=false
-ENRICH_WITH_CLAUDE=false
-INCLUDE_DIFF=false
-CUSTOM_PROMPT_FILE=""
-REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "current-repo")
+# Skip main logic if in test mode - will be handled after function definitions
+if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
+    PR_NUMBER=$1
+
+    # Validate PR_NUMBER is a positive integer (prevent path traversal)
+    if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+        echo "Error: PR_NUMBER must be a positive integer, got: '$PR_NUMBER'"
+        exit 1
+    fi
+
+    shift
+    OUTPUT_FORMAT="combined"
+    DEFAULT_OUTPUT_ROOT="${PR_REVIEW_OUTPUT_ROOT:-.reports/pr-reviews}"
+    OUTPUT_DIR="$DEFAULT_OUTPUT_ROOT/pr-$PR_NUMBER"
+    CUSTOM_OUTPUT_DIR=false
+    ENRICH_WITH_CLAUDE=false
+    INCLUDE_DIFF=false
+    CUSTOM_PROMPT_FILE=""
+    REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "current-repo")
+fi
+
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # Get the directory where this extension is installed
@@ -1711,8 +1725,9 @@ If there are no systemic issues or adjacent problems, return empty arrays for th
     fi
 }
 
-# Parse options
-while [[ $# -gt 0 ]]; do
+# Parse options (skip in test mode)
+if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
+    while [[ $# -gt 0 ]]; do
     case $1 in
         --json)
             OUTPUT_FORMAT="json"
@@ -1758,6 +1773,7 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+fi  # End of: if [ -z "$TEST_BUILD_CONTEXT_DIR" ] for argument parsing
 
 # Ensure jq is available
 if ! command -v jq &> /dev/null; then
@@ -1779,6 +1795,8 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
     fi
 fi
 
+# Main PR logic (skip in test mode)
+if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
@@ -2224,7 +2242,7 @@ generate_analysis_report() {
 }
 
 # ============================================================================
-# Main Processing
+# Main Processing (continuation of main logic block started above)
 # ============================================================================
 
 # Add GraphQL IDs to all comment types
@@ -2436,3 +2454,52 @@ case $OUTPUT_FORMAT in
         fi
         ;;
 esac
+
+fi  # End of: if [ -z "$TEST_BUILD_CONTEXT_DIR" ]
+
+# Test mode: build context and exit (for integration testing)
+# Inlined version of build_claude_context to avoid function scoping issues
+if [ -n "$TEST_BUILD_CONTEXT_DIR" ]; then
+    if [ ! -d "$TEST_BUILD_CONTEXT_DIR" ]; then
+        echo "Error: Directory not found: $TEST_BUILD_CONTEXT_DIR"
+        exit 1
+    fi
+
+    output_dir="$TEST_BUILD_CONTEXT_DIR"
+    include_diff="false"
+
+    # Ensure issue-comments.json exists (avoids --slurpfile error)
+    if [ ! -f "$output_dir/issue-comments.json" ]; then
+        echo '[]' > "$output_dir/issue-comments.json"
+    fi
+
+    # Shared jq filter for mapping/truncating issue comments
+    issue_comments_filter='($issue_comments[0] | map({
+        user: .user,
+        body: (if (.body | length) > 5000 then
+            (.body | .[0:5000] + "\n... (truncated)")
+        else
+            .body
+        end),
+        url: .html_url,
+        created_at: .created_at
+    }))'
+
+    # Build claude-context.json without diff
+    jq -n \
+        --argjson pr "$(<"$output_dir/pr-summary.json")" \
+        --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
+        --slurpfile issue_comments "$output_dir/issue-comments.json" \
+        '{
+            pr: {
+                title: $pr.title,
+                body: ($pr.body // "No description"),
+                author: $pr.author.login,
+                files_changed: [$pr.files[].path]
+            },
+            unresolved_threads: $unresolved,
+            issue_comments: '"$issue_comments_filter"'
+        }' > "$output_dir/claude-context.json"
+
+    exit 0
+fi
