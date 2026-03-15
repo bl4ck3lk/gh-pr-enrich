@@ -7,6 +7,21 @@ description: Fetch comprehensive PR details and optionally run Claude AI analysi
 
 Comprehensive PR analysis using the `gh pr-enrich` GitHub CLI extension. Fetches complete PR context (comments, threads, checks, files) and optionally enriches with Claude AI analysis to categorize issues, identify patterns, and generate actionable task lists.
 
+## Why This Skill Exists (RED Baseline)
+
+Without this skill, agents addressing PR feedback fall into predictable failure modes:
+
+| What agents do without gh-pr-enrich | What gh-pr-enrich prevents |
+|--------------------------------------|---------------------------|
+| Read comments one at a time, miss patterns | Groups issues by category, surfaces systemic root causes |
+| Fix symptoms without investigating adjacent code | Adjacent problems section flags related areas proactively |
+| Address tasks then forget to resolve threads | Mandatory thread resolution workflow with final audit |
+| Declare "done" without verifying CI | Completion gate requires `gh pr checks` evidence |
+| Miss non-thread comments entirely | Explicit non-thread comment check in workflow |
+| Treat each PR in isolation | Retrospective analysis connects patterns across PRs |
+
+**The gap:** A general-purpose agent addressing PR feedback will fix individual comments without seeing the systemic pattern, forget to resolve threads, skip CI verification, and miss non-thread comments. This skill makes all four impossible to skip.
+
 ## When to Use This Skill
 
 Use this skill when:
@@ -91,6 +106,8 @@ query($owner: String!, $repo: String!, $number: Int!) {
 }' -f owner=OWNER -f repo=REPO -F number=PR_NUMBER \
   | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
 ```
+
+**Thread pagination warning:** The `first: 100` limit means PRs with >100 review threads will silently miss threads. If the thread count returned equals exactly 100, assume truncation — increase the limit or paginate with cursors.
 
 If any threads remain unresolved, investigate whether they were:
 - **Addressed but not resolved** — resolve them now
@@ -234,11 +251,13 @@ Groups unresolved comments by type with severity ratings:
 }
 ```
 
-**Severity levels:**
-- `critical` - Security vulnerabilities, data loss, breaking changes
-- `high` - Bugs, performance issues, architectural problems
-- `medium` - Code quality, maintainability, missing tests
-- `low` - Style, documentation, minor improvements
+**Severity levels (each must cite evidence):**
+- `critical` - Security vulnerabilities, data loss, breaking changes — because [specific thread citing exploitable issue]
+- `high` - Bugs, performance issues, architectural problems — because [specific thread with reproduction steps or impact]
+- `medium` - Code quality, maintainability, missing tests — because [thread citing measurable maintenance impact]
+- `low` - Style, documentation, minor improvements — because [thread citing convention or standard]
+
+Severity without evidence from the actual thread content is guessing, not analysis.
 
 #### 2. Systemic Issues
 
@@ -558,6 +577,34 @@ This leads to forgotten thread resolutions. Claude MUST resolve threads as it go
 > ~~"All tasks addressed, work is complete."~~
 Never declare complete without verifying: (a) all addressed threads are resolved, (b) all CI checks pass.
 
+## Common Rationalizations
+
+| Excuse | Reality |
+|--------|---------|
+| "I'll resolve threads after fixing everything" | You'll forget. Resolve as you go — progress should be visible to reviewers immediately. |
+| "CI was passing before my changes" | CI tests your changes against the full suite. Run `gh pr checks` after every push. |
+| "I already read the comments" | Reading ≠ systematic analysis. Run `--enrich` and follow the workflow. Systemic issues hide in individually-innocuous comments. |
+| "Only 2 threads, I don't need the full workflow" | Systemic issues hide in even 1 thread. The adjacent problems step takes 2 minutes and prevents the next PR getting the same feedback. |
+| "Adjacent problems are out of scope" | Adjacent problems prevent the next PR getting the same feedback. 5 minutes of investigation now saves hours of review cycles later. |
+| "Tests pass so CI will be fine" | Tests != CI. Linting, type checks, build steps, security scans, and other checks also run. Verify independently. |
+| "I'll check CI later" | Later = never. Failed checks block merge and waste reviewer time. Check immediately after pushing. |
+| "Thread resolution is the author's job" | Thread resolution is whoever addresses the feedback. If you fixed it, you resolve it. |
+
+**If you catch yourself thinking any of these, STOP. You are about to skip a mandatory step.**
+
+## Red Flags — STOP
+
+- About to declare work complete without running the completion gate
+- Addressing tasks without first reading systemic issues and adjacent problems
+- Resolving threads without replying first (silent resolves are dismissive)
+- Re-requesting review while CI checks are failing or pending
+- Reading stale `.reports/` files to check current thread/CI status
+- Skipping non-thread comment check ("they're probably not important")
+- Fixing a task without checking if the same pattern exists in adjacent code
+- Using placeholder strings (`OWNER`, `REPO`) in GraphQL queries instead of resolved values
+
+**All of these mean: stop, go back to the workflow, and follow it.**
+
 ### Stale Data Warning
 
 After making fixes, the local `.reports/` files are **stale snapshots** from when `gh pr-enrich` was run. Do NOT re-read them to check current thread status or CI results. Instead:
@@ -744,6 +791,15 @@ If analysis returns empty arrays:
 
 ### Thread Resolution Fails
 
+**Common failure modes and recovery:**
+
+| Error | Cause | Recovery |
+|-------|-------|----------|
+| `NOT_FOUND` | Thread ID is wrong or from a different PR | Re-fetch `comment-threads.json` and verify the ID |
+| `FORBIDDEN` | Insufficient permissions | Check you have write access to the repo |
+| Already resolved | Thread was resolved by another actor | Safe to skip — verify with a fresh query |
+| Network error | Transient failure | Retry once. If persistent, check `gh auth status` |
+
 ```bash
 # Verify thread ID exists
 jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.id == "PRRT_xxx")' \
@@ -825,6 +881,8 @@ jq '.cross_pr_patterns[] | select(.occurrences >= 3)' \
 
 **Guiding Questions**: Use these as pre-implementation checklists to prevent recurring issues.
 
+**Connection to entropy ENFORCEMENT-GAP:** Cross-PR patterns that show monotonic increase (e.g., hardcoded strings: 9 → 11 → 18 across PRs) are ENFORCEMENT-GAP findings — the root cause is a missing lint rule or CI check, not developer negligence. When retrospective reveals growing patterns, recommend the specific enforcement mechanism (pre-commit hook, CI rule, build check) that would prevent new occurrences. See `skills/entropy/references/cross-cutting-anti-patterns.md` Protocol 5 for the full escalation pattern.
+
 ### Workflow: Sprint Retrospective
 
 ```bash
@@ -850,6 +908,17 @@ gh pr-enrich retrospective --format checklist > implementation-checklist.md
 # Use the checklist during development
 cat implementation-checklist.md
 ```
+
+## Integration
+
+| Pair with | When | How |
+|-----------|------|-----|
+| `review-tribunal` | Phase 0 (Scope & Context) | Tribunal invokes `gh pr-enrich --enrich` to gather PR diff, threads, and context for all 6 agents |
+| `product-reviewer` | Phase 1 (Intent Discovery) | Product-reviewer uses enriched PR data as the primary source for intent extraction |
+| `rationalist-master-reviewer` | Default PR mode | Rationalist invokes `gh pr-enrich` when reviewing the current branch's PR |
+| `entropy` | Retrospective → ENFORCEMENT-GAP | Retrospective cross-PR patterns feed directly into entropy's Protocol 5 (Escalation Pattern) for growing violations |
+| `post-fix-validation` | After fixing PR feedback | Post-fix-validation Layer 5 (regression suite) should verify CI via `gh pr checks` |
+| `root-cause-tracing` | Debugging issues found in analysis | When a systemic issue requires deep investigation |
 
 ## Related Skills
 
