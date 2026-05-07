@@ -69,31 +69,67 @@ test_no_pull_request_review_id_field() {
 }
 
 # ---------------------------------------------------------------------------
-# Dynamic check: the canonical non-thread-comment filter must select exactly
-# the issue_comment entries from a real-shaped fixture, and nothing else.
+# Dynamic check: extract the non-thread-comment jq filter from SKILL.md and
+# run it against a fixture with known contents. Expected values are hardcoded
+# from the fixture (count=1, id=1001) so the assertion is independent of the
+# extracted filter — a regression in either SKILL.md or the filter behavior
+# fails the test.
+#
+# The fixture has 3 entries: id=1001 (issue_comment), 2001 (review_comment),
+# 3001 (inline_comment). Any correct issue_comment selector returns exactly
+# one entry whose id is 1001. The buggy `.pull_request_review_id == null`
+# filter from PR #7 returns all three (count=3, first_id=1001), failing the
+# count assertion.
 # ---------------------------------------------------------------------------
-test_issue_comment_filter_against_fixture() {
+test_skill_md_issue_comment_filter() {
     if [ ! -f "$FIXTURE" ]; then
         fail "fixture missing: $FIXTURE" "(cannot exercise jq filter against schema)"
         return
     fi
 
-    local total expected actual types
-    total=$(jq 'length' "$FIXTURE")
-    expected=$(jq '[.[] | select(.type == "issue_comment")] | length' "$FIXTURE")
-    actual=$(jq '[.[] | select(.type == "issue_comment")] | length' "$FIXTURE")
-    types=$(jq -r '[.[] | .type] | unique | join(",")' "$FIXTURE")
-
-    if [ "$total" -le "$expected" ]; then
-        fail "fixture is not heterogeneous (total=$total, issue_comments=$expected)" \
-             "fixture must contain at least one non-issue_comment entry to validate the filter"
+    # Sanity-check the fixture matches the contract this test relies on.
+    local fixture_count fixture_first_issue_id
+    fixture_count=$(jq 'length' "$FIXTURE")
+    fixture_first_issue_id=$(jq -r 'first(.[] | select(.type == "issue_comment") | .id)' "$FIXTURE")
+    if [ "$fixture_count" != "3" ] || [ "$fixture_first_issue_id" != "1001" ]; then
+        fail "fixture contract violated" \
+             "expected 3 entries with issue_comment id=1001; got count=$fixture_count, first_issue_id=$fixture_first_issue_id"
         return
     fi
 
-    if [ "$actual" = "$expected" ] && [ "$expected" -ge 1 ]; then
-        pass "issue_comment filter selects $expected of $total entries (types: $types)"
+    # Extract the jq filter from SKILL.md's non-thread-comment example.
+    # The example has the form: jq '[.[] | select(.type == "...")]' followed
+    # (often on a continuation line) by `pr-$PR_NUMBER/all-comments.json`.
+    # We capture the body inside the first single-quoted argument that uses
+    # the array-iteration + .type discriminator pattern.
+    local filter
+    filter=$(grep -oE "jq '\[\.\[\] \| select\(\.type [^']+\)\]'" "$SKILL_MD" \
+             | head -1 \
+             | sed -E "s/^jq '(.*)'\$/\\1/")
+
+    if [ -z "$filter" ]; then
+        fail "could not extract issue_comment filter from SKILL.md" \
+             "expected a line of the form: jq '[.[] | select(...)]' ... pr-\$PR_NUMBER/all-comments.json"
+        return
+    fi
+
+    # Hardcoded expected values from the fixture.
+    local expected_count=1
+    local expected_id=1001
+    local actual_count actual_id
+    actual_count=$(jq "($filter) | length" "$FIXTURE" 2>/dev/null) || {
+        fail "extracted jq filter failed to parse" "filter: $filter"
+        return
+    }
+    actual_id=$(jq -r "($filter)[0].id // \"\"" "$FIXTURE" 2>/dev/null)
+
+    if [ "$actual_count" = "$expected_count" ] && [ "$actual_id" = "$expected_id" ]; then
+        pass "SKILL.md filter \`$filter\` selects exactly the issue_comment entry (count=$expected_count, id=$expected_id)"
     else
-        fail "issue_comment filter returned $actual; expected $expected" ""
+        fail "SKILL.md filter does not select the expected issue_comment entry" \
+             "filter: $filter
+  expected count=$expected_count, id=$expected_id
+  actual   count=$actual_count, id=$actual_id"
     fi
 }
 
@@ -132,7 +168,7 @@ echo ""
 
 test_no_literal_placeholders_in_graphql
 test_no_pull_request_review_id_field
-test_issue_comment_filter_against_fixture
+test_skill_md_issue_comment_filter
 test_legacy_filter_proves_bug_class
 
 echo ""

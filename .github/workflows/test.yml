@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show tool versions
+        run: |
+          bash --version | head -1
+          jq --version
+          gh --version | head -1
+
+      - name: SKILL.md regression checks
+        run: tests/test-skill-md.sh
+
+      - name: Retrospective subcommand tests
+        run: tests/test-retrospective.sh
+
+      - name: Enrichment-context tests
+        run: tests/test-enrichment-context.sh

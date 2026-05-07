@@ -76,18 +76,19 @@ After fixing each task, you MUST reply to and resolve the corresponding review t
 
 ```bash
 # Step A: Reply to the thread with what you did
+THREAD_ID="PRRT_xxx"
 gh api graphql -f query='mutation($threadId: ID!, $body: String!) {
   addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
     comment { id }
   }
-}' -f threadId="PRRT_xxx" -f body="Fixed in $(git rev-parse --short HEAD) — [brief description of the fix]"
+}' -f threadId="$THREAD_ID" -f body="Fixed in $(git rev-parse --short HEAD) — [brief description of the fix]"
 
-# Step B: Then resolve the thread
-gh api graphql -f query='mutation {
-  resolveReviewThread(input: {threadId: "PRRT_xxx"}) {
+# Step B: Then resolve the thread (parameterized — same variable as Step A)
+gh api graphql -f query='mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
     thread { isResolved }
   }
-}'
+}' -f threadId="$THREAD_ID"
 ```
 
 **After all tasks are complete**, verify no threads were missed (assumes `$OWNER`, `$REPO`, `$PR_NUMBER` were resolved earlier — see "Resolving Owner, Repo, and PR Number"):
@@ -121,13 +122,13 @@ After all fixes are committed and pushed, you MUST verify that all GitHub Action
 
 ```bash
 # Check current status of all checks on the PR
-gh pr checks <PR_NUMBER>
+gh pr checks "$PR_NUMBER"
 ```
 
 **Interpret the results:**
 - All checks pass → proceed to notify reviewers
 - Any check fails → investigate and fix before declaring work complete
-- Checks pending → wait and re-check (use `gh pr checks <PR_NUMBER> --watch` or poll)
+- Checks pending → wait and re-check (use `gh pr checks "$PR_NUMBER" --watch` or poll)
 
 **If a check fails:**
 
@@ -392,11 +393,11 @@ jq '[.data.repository.pullRequest.reviewThreads.nodes[]
 
 **Resolve a thread programmatically:**
 ```bash
-gh api graphql -f query='mutation {
-  resolveReviewThread(input: {threadId: "PRRT_xxx"}) {
+gh api graphql -f query='mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
     thread { isResolved }
   }
-}'
+}' -f threadId="$THREAD_ID"
 ```
 
 ### Extracting Actionable Data
@@ -429,13 +430,14 @@ jq -r '.task_list[] | "- [ ] [\(.priority)] \(.task)"' claude-analysis.json
 ### Workflow 1: Comprehensive PR Review
 
 ```bash
-# 1. Resolve context
+# 1. Resolve context (current branch's PR; for a specific PR override
+#    PR_NUMBER manually as documented in "Resolving Owner, Repo, and PR Number")
 OWNER=$(gh repo view --json owner -q '.owner.login')
 REPO=$(gh repo view --json name -q '.name')
-PR_NUMBER=123
+PR_NUMBER=$(gh pr view --json number -q '.number')
 
 # 2. Fetch and analyze the PR
-gh pr-enrich $PR_NUMBER --enrich
+gh pr-enrich "$PR_NUMBER" --enrich
 
 # 3. Read the analysis
 cat .reports/pr-reviews/pr-$PR_NUMBER/claude-analysis.md
@@ -470,18 +472,19 @@ jq -r '.task_list[]
 # 4. Work through each task. After each fix, REPLY first then RESOLVE
 #    (see "Resolve Addressed Threads" — Step A reply, Step B resolve).
 # Step A: reply with the fix commit
+THREAD_ID="PRRT_xxx"
 gh api graphql -f query='mutation($threadId: ID!, $body: String!) {
   addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
     comment { id }
   }
-}' -f threadId="PRRT_xxx" -f body="Fixed in $(git rev-parse --short HEAD) — [brief description of the fix]"
+}' -f threadId="$THREAD_ID" -f body="Fixed in $(git rev-parse --short HEAD) — [brief description of the fix]"
 
-# Step B: then resolve the thread
-gh api graphql -f query='mutation {
-  resolveReviewThread(input: {threadId: "PRRT_xxx"}) {
+# Step B: then resolve the thread (parameterized — same variable as Step A)
+gh api graphql -f query='mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
     thread { isResolved }
   }
-}'
+}' -f threadId="$THREAD_ID"
 
 # 5. Final thread audit — verify no unresolved threads were missed
 gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
@@ -571,7 +574,7 @@ gh pr-enrich 123 --enrich
 6. **Work through task_list** - Address tasks with full context of patterns and related code
 7. **Reply and resolve threads as each task completes** - After fixing each task, reply with the fix commit, then resolve its thread IDs. Track resolved vs remaining threads.
 8. **Final thread audit** - After all tasks are done, query the PR for any remaining unresolved threads. Resolve any that were addressed. Leave a reply on any intentionally left open.
-9. **Verify all CI/CD checks pass** - Run `gh pr checks <PR_NUMBER>` and confirm all checks are green. If any fail, investigate and fix before declaring work complete.
+9. **Verify all CI/CD checks pass** - Run `gh pr checks "$PR_NUMBER"` and confirm all checks are green. If any fail, investigate and fix before declaring work complete.
 10. **Re-request review** - Notify original reviewers that feedback has been addressed.
 
 **Example prompt for Claude:**
@@ -620,8 +623,8 @@ Never declare complete without verifying: (a) all addressed threads are resolved
 After making fixes, the local `.reports/` files are **stale snapshots** from when `gh pr-enrich` was run. Do NOT re-read them to check current thread status or CI results. Instead:
 
 - **Thread status:** Use the live GraphQL query (see step 4/6)
-- **CI status:** Use `gh pr checks <PR_NUMBER>` (see step 7)
-- **To refresh all data:** Re-run `gh pr-enrich <PR_NUMBER>` (without `--enrich` to save time if you only need updated thread/check data)
+- **CI status:** Use `gh pr checks "$PR_NUMBER"` (see step 7)
+- **To refresh all data:** Re-run `gh pr-enrich "$PR_NUMBER"` (without `--enrich` to save time if you only need updated thread/check data)
 
 ### Handling Non-Thread Comments
 
@@ -698,7 +701,7 @@ echo "Unresolved threads remaining: $UNRESOLVED"
 
 ```bash
 # Verify all checks pass
-gh pr checks <PR_NUMBER>
+gh pr checks "$PR_NUMBER"
 ```
 
 - All checks pass → pass
