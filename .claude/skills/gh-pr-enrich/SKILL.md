@@ -90,11 +90,11 @@ gh api graphql -f query='mutation {
 }'
 ```
 
-**After all tasks are complete**, verify no threads were missed:
+**After all tasks are complete**, verify no threads were missed (assumes `$OWNER`, `$REPO`, `$PR_NUMBER` were resolved earlier — see "Resolving Owner, Repo, and PR Number"):
 
 ```bash
 # Re-fetch thread status and check for any still-unresolved threads
-gh api graphql -f query='
+gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
@@ -103,8 +103,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
       }
     }
   }
-}' -f owner=OWNER -f repo=REPO -F number=PR_NUMBER \
-  | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
+}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
 ```
 
 **Thread pagination warning:** The `first: 100` limit means PRs with >100 review threads will silently miss threads. If the thread count returned equals exactly 100, assume truncation — increase the limit or paginate with cursors.
@@ -446,7 +445,7 @@ jq '.systemic_issues' .reports/pr-reviews/pr-$PR_NUMBER/claude-analysis.json
 jq '.adjacent_problems' .reports/pr-reviews/pr-$PR_NUMBER/claude-analysis.json
 
 # 5. Check for non-thread comments (general PR comments not on code lines)
-jq '[.[] | select(.pull_request_review_id == null)]' \
+jq '[.[] | select(.type == "issue_comment")]' \
   .reports/pr-reviews/pr-$PR_NUMBER/all-comments.json
 
 # 6. Work through tasks, reply+resolve threads, verify CI
@@ -468,7 +467,16 @@ jq -r '.task_list[]
   | select(.priority == "critical" or .priority == "high")
   | "- [ ] \(.task)"' .reports/pr-reviews/pr-123/claude-analysis.json > todo.md
 
-# 4. Work through each task, resolving threads IMMEDIATELY after each fix
+# 4. Work through each task. After each fix, REPLY first then RESOLVE
+#    (see "Resolve Addressed Threads" — Step A reply, Step B resolve).
+# Step A: reply with the fix commit
+gh api graphql -f query='mutation($threadId: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
+    comment { id }
+  }
+}' -f threadId="PRRT_xxx" -f body="Fixed in $(git rev-parse --short HEAD) — [brief description of the fix]"
+
+# Step B: then resolve the thread
 gh api graphql -f query='mutation {
   resolveReviewThread(input: {threadId: "PRRT_xxx"}) {
     thread { isResolved }
@@ -476,18 +484,20 @@ gh api graphql -f query='mutation {
 }'
 
 # 5. Final thread audit — verify no unresolved threads were missed
-gh api graphql -f query='
-query { repository(owner: "OWNER", name: "REPO") {
-  pullRequest(number: 123) {
-    reviewThreads(first: 100) {
-      nodes { id isResolved comments(first: 1) { nodes { body } } }
+gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes { id isResolved comments(first: 1) { nodes { body } } }
+      }
     }
   }
-}}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
   | select(.isResolved == false)]'
 
 # 6. Verify all CI/CD checks pass
-gh pr checks 123
+gh pr checks "$PR_NUMBER"
 # If any fail: gh run view <RUN_ID> --log-failed
 ```
 
@@ -663,8 +673,8 @@ Before declaring any PR feedback session complete, Claude MUST pass this checkli
 ### Thread Resolution Verification
 
 ```bash
-# Query remaining unresolved threads
-UNRESOLVED=$(gh api graphql -f query='
+# Query remaining unresolved threads (assumes $OWNER/$REPO/$PR_NUMBER were resolved earlier)
+UNRESOLVED=$(gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
@@ -673,8 +683,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
       }
     }
   }
-}' -f owner=OWNER -f repo=REPO -F number=PR_NUMBER \
-  | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length')
+}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length')
 
 echo "Unresolved threads remaining: $UNRESOLVED"
 ```

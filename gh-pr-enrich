@@ -2251,6 +2251,16 @@ create_comments_with_graphql_ids "$OUTPUT_DIR/review-comments.json" "$OUTPUT_DIR
 create_comments_with_graphql_ids "$OUTPUT_DIR/inline-comments.json" "$OUTPUT_DIR/inline-comments-with-graphql.json" "inline_comment"
 
 # Combine comments
+#
+# all-comments.json schema: array of objects discriminated by `.type`.
+#   .type == "issue_comment"  -> {id, body, user, created_at, updated_at, type, html_url}
+#   .type == "review_comment" -> {id, body, user, state, submitted_at, type, commit_id, html_url}
+#   .type == "inline_comment" -> {id, body, path, position, line, user, created_at, updated_at, type, html_url}
+#
+# To select non-thread (top-level) PR comments, filter on .type == "issue_comment".
+# There is NO .pull_request_review_id field — that exists only on raw GitHub REST
+# /pulls/.../comments responses, which are stripped before being written here.
+# all-comments-with-graphql.json is the same shape plus {graphql_id, comment_type} on each entry.
 jq -s 'add | sort_by(.created_at // .submitted_at // "")' \
     "$OUTPUT_DIR"/issue-comments-with-graphql.json \
     "$OUTPUT_DIR"/review-comments-with-graphql.json \
