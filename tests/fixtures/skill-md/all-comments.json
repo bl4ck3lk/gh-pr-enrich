@@ -1,0 +1,33 @@
+[
+  {
+    "id": 1001,
+    "body": "Top-level PR comment (issue-level).",
+    "user": "alice",
+    "created_at": "2026-03-15T10:00:00Z",
+    "updated_at": "2026-03-15T10:00:00Z",
+    "type": "issue_comment",
+    "html_url": "https://github.com/example/repo/pull/1#issuecomment-1001"
+  },
+  {
+    "id": 2001,
+    "body": "Approving review.",
+    "user": "bob",
+    "state": "APPROVED",
+    "submitted_at": "2026-03-15T11:00:00Z",
+    "type": "review_comment",
+    "commit_id": "deadbeef",
+    "html_url": "https://github.com/example/repo/pull/1#pullrequestreview-2001"
+  },
+  {
+    "id": 3001,
+    "body": "Inline comment on a code line.",
+    "path": "src/foo.py",
+    "position": 12,
+    "line": 42,
+    "user": "carol",
+    "created_at": "2026-03-15T12:00:00Z",
+    "updated_at": "2026-03-15T12:00:00Z",
+    "type": "inline_comment",
+    "html_url": "https://github.com/example/repo/pull/1#discussion_r3001"
+  }
+]

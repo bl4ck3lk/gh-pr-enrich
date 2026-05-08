@@ -1,11 +1,26 @@
 ---
 name: gh-pr-enrich
-description: Fetch comprehensive PR details and optionally run Claude AI analysis on unresolved comment threads. Use when reviewing PRs, addressing PR feedback, investigating review comments, or when users request PR analysis. Produces structured JSON and Markdown reports with issue categorization, systemic patterns, and prioritized task lists.
+description: Fetch comprehensive PR details and optionally run Claude AI analysis on unresolved comment threads. Use when reviewing PRs, addressing PR feedback, investigating review comments, or when users request PR analysis. Produces structured JSON and Markdown reports with issue categorization, systemic patterns, and prioritized task lists. Enforces mandatory thread resolution after addressing feedback and CI/CD check verification before declaring work complete.
 ---
 
 # gh-pr-enrich Skill
 
 Comprehensive PR analysis using the `gh pr-enrich` GitHub CLI extension. Fetches complete PR context (comments, threads, checks, files) and optionally enriches with Claude AI analysis to categorize issues, identify patterns, and generate actionable task lists.
+
+## Why This Skill Exists (RED Baseline)
+
+Without this skill, agents addressing PR feedback fall into predictable failure modes:
+
+| What agents do without gh-pr-enrich | What gh-pr-enrich prevents |
+|--------------------------------------|---------------------------|
+| Read comments one at a time, miss patterns | Groups issues by category, surfaces systemic root causes |
+| Fix symptoms without investigating adjacent code | Adjacent problems section flags related areas proactively |
+| Address tasks then forget to resolve threads | Mandatory thread resolution workflow with final audit |
+| Declare "done" without verifying CI | Completion gate requires `gh pr checks` evidence |
+| Miss non-thread comments entirely | Explicit non-thread comment check in workflow |
+| Treat each PR in isolation | Retrospective analysis connects patterns across PRs |
+
+**The gap:** A general-purpose agent addressing PR feedback will fix individual comments without seeing the systemic pattern, forget to resolve threads, skip CI verification, and miss non-thread comments. This skill makes all four impossible to skip.
 
 ## When to Use This Skill
 
@@ -52,6 +67,101 @@ jq '.adjacent_problems' .reports/pr-reviews/pr-<NUMBER>/claude-analysis.json
 Only after completing steps 1-2 should you work through the `task_list`. Your understanding of systemic issues and adjacent problems should inform how you implement each fix.
 
 **DO NOT** skip to the task list without reviewing systemic issues and adjacent problems first.
+
+### 4. Resolve Addressed Threads (REQUIRED)
+
+After fixing each task, you MUST reply to and resolve the corresponding review threads immediately. Do NOT batch this to the end — resolve threads as you go so progress is visible to reviewers.
+
+**Reply first, then resolve.** Reviewers expect acknowledgment before resolution. A silent resolve feels dismissive and makes it hard to verify the fix.
+
+```bash
+# Step A: Reply to the thread with what you did
+THREAD_ID="PRRT_xxx"
+gh api graphql -f query='mutation($threadId: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
+    comment { id }
+  }
+}' -f threadId="$THREAD_ID" -f body="Fixed in $(git rev-parse --short HEAD) — [brief description of the fix]"
+
+# Step B: Then resolve the thread (parameterized — same variable as Step A)
+gh api graphql -f query='mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread { isResolved }
+  }
+}' -f threadId="$THREAD_ID"
+```
+
+**After all tasks are complete**, verify no threads were missed (assumes `$OWNER`, `$REPO`, `$PR_NUMBER` were resolved earlier — see "Resolving Owner, Repo, and PR Number"):
+
+```bash
+# Re-fetch thread status and check for any still-unresolved threads
+gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes { id isResolved }
+      }
+    }
+  }
+}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
+```
+
+**Thread pagination warning:** The `first: 100` limit means PRs with >100 review threads will silently miss threads. If the thread count returned equals exactly 100, assume truncation — increase the limit or paginate with cursors.
+
+If any threads remain unresolved, investigate whether they were:
+- **Addressed but not resolved** — resolve them now
+- **Intentionally left open** — leave a reply explaining why (e.g., "Will address in follow-up PR #X")
+- **Out of scope** — leave a reply stating the rationale
+
+**DO NOT** declare work complete while addressed threads remain unresolved. Unresolved threads block PR approval and signal to reviewers that feedback was ignored.
+
+### 5. Verify CI/CD Checks Pass (REQUIRED)
+
+After all fixes are committed and pushed, you MUST verify that all GitHub Actions and status checks pass. Do NOT assume your changes didn't break CI.
+
+```bash
+# Check current status of all checks on the PR
+gh pr checks "$PR_NUMBER"
+```
+
+**Interpret the results:**
+- All checks pass → proceed to notify reviewers
+- Any check fails → investigate and fix before declaring work complete
+- Checks pending → wait and re-check (use `gh pr checks "$PR_NUMBER" --watch` or poll)
+
+**If a check fails:**
+
+```bash
+# Get details on the failing check
+gh run list --branch <BRANCH_NAME> --limit 5
+gh run view <RUN_ID> --log-failed
+```
+
+1. Read the failure logs
+2. Determine if the failure is related to your changes or a flaky/pre-existing issue
+3. If related to your changes — fix, commit, push, and re-verify
+4. If pre-existing/flaky — document it in a PR comment so reviewers have context
+
+**DO NOT** request re-review or declare work complete while checks are failing. Failed checks block merge and waste reviewer time.
+
+## Resolving Owner, Repo, and PR Number
+
+Many commands in this skill require `OWNER`, `REPO`, and `PR_NUMBER`. Resolve these from git context at the start of every session:
+
+```bash
+# Extract owner and repo from the current git remote
+OWNER=$(gh repo view --json owner -q '.owner.login')
+REPO=$(gh repo view --json name -q '.name')
+
+# If working on the current branch's PR:
+PR_NUMBER=$(gh pr view --json number -q '.number')
+
+# Or specify directly:
+PR_NUMBER=123
+```
+
+**Always resolve these first.** Do not use literal placeholder strings in GraphQL queries.
 
 ## Prerequisites
 
@@ -141,11 +251,13 @@ Groups unresolved comments by type with severity ratings:
 }
 ```
 
-**Severity levels:**
-- `critical` - Security vulnerabilities, data loss, breaking changes
-- `high` - Bugs, performance issues, architectural problems
-- `medium` - Code quality, maintainability, missing tests
-- `low` - Style, documentation, minor improvements
+**Severity levels (each must cite evidence):**
+- `critical` - Security vulnerabilities, data loss, breaking changes — because [specific thread citing exploitable issue]
+- `high` - Bugs, performance issues, architectural problems — because [specific thread with reproduction steps or impact]
+- `medium` - Code quality, maintainability, missing tests — because [thread citing measurable maintenance impact]
+- `low` - Style, documentation, minor improvements — because [thread citing convention or standard]
+
+Severity without evidence from the actual thread content is guessing, not analysis.
 
 #### 2. Systemic Issues
 
@@ -281,11 +393,11 @@ jq '[.data.repository.pullRequest.reviewThreads.nodes[]
 
 **Resolve a thread programmatically:**
 ```bash
-gh api graphql -f query='mutation {
-  resolveReviewThread(input: {threadId: "PRRT_xxx"}) {
+gh api graphql -f query='mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
     thread { isResolved }
   }
-}'
+}' -f threadId="$THREAD_ID"
 ```
 
 ### Extracting Actionable Data
@@ -318,18 +430,28 @@ jq -r '.task_list[] | "- [ ] [\(.priority)] \(.task)"' claude-analysis.json
 ### Workflow 1: Comprehensive PR Review
 
 ```bash
-# Fetch and analyze the PR
-gh pr-enrich 123 --enrich
+# 1. Resolve context (current branch's PR; for a specific PR override
+#    PR_NUMBER manually as documented in "Resolving Owner, Repo, and PR Number")
+OWNER=$(gh repo view --json owner -q '.owner.login')
+REPO=$(gh repo view --json name -q '.name')
+PR_NUMBER=$(gh pr view --json number -q '.number')
 
-# Read the analysis
-cat .reports/pr-reviews/pr-123/claude-analysis.md
+# 2. Fetch and analyze the PR
+gh pr-enrich "$PR_NUMBER" --enrich
 
-# Check systemic issues
-jq '.systemic_issues' .reports/pr-reviews/pr-123/claude-analysis.json
+# 3. Read the analysis
+cat .reports/pr-reviews/pr-$PR_NUMBER/claude-analysis.md
 
-# Get prioritized task list
-jq -r '.task_list[] | "[\(.priority)] \(.task)"' \
-  .reports/pr-reviews/pr-123/claude-analysis.json
+# 4. Check systemic issues and adjacent problems
+jq '.systemic_issues' .reports/pr-reviews/pr-$PR_NUMBER/claude-analysis.json
+jq '.adjacent_problems' .reports/pr-reviews/pr-$PR_NUMBER/claude-analysis.json
+
+# 5. Check for non-thread comments (general PR comments not on code lines)
+jq '[.[] | select(.type == "issue_comment")]' \
+  .reports/pr-reviews/pr-$PR_NUMBER/all-comments.json
+
+# 6. Work through tasks, reply+resolve threads, verify CI
+# (see Required Analysis Workflow steps 3-5)
 ```
 
 ### Workflow 2: Address PR Feedback Systematically
@@ -338,18 +460,48 @@ jq -r '.task_list[] | "[\(.priority)] \(.task)"' \
 # 1. Fetch and enrich
 gh pr-enrich 123 --enrich
 
-# 2. Create working checklist from critical/high tasks
+# 2. Review systemic issues and adjacent problems FIRST
+jq '.systemic_issues' .reports/pr-reviews/pr-123/claude-analysis.json
+jq '.adjacent_problems' .reports/pr-reviews/pr-123/claude-analysis.json
+
+# 3. Create working checklist from critical/high tasks
 jq -r '.task_list[]
   | select(.priority == "critical" or .priority == "high")
   | "- [ ] \(.task)"' .reports/pr-reviews/pr-123/claude-analysis.json > todo.md
 
-# 3. Work through each task, resolving threads as you go
-# After fixing an issue:
-gh api graphql -f query='mutation {
-  resolveReviewThread(input: {threadId: "PRRT_xxx"}) {
+# 4. Work through each task. After each fix, REPLY first then RESOLVE
+#    (see "Resolve Addressed Threads" — Step A reply, Step B resolve).
+# Step A: reply with the fix commit
+THREAD_ID="PRRT_xxx"
+gh api graphql -f query='mutation($threadId: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
+    comment { id }
+  }
+}' -f threadId="$THREAD_ID" -f body="Fixed in $(git rev-parse --short HEAD) — [brief description of the fix]"
+
+# Step B: then resolve the thread (parameterized — same variable as Step A)
+gh api graphql -f query='mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
     thread { isResolved }
   }
-}'
+}' -f threadId="$THREAD_ID"
+
+# 5. Final thread audit — verify no unresolved threads were missed
+gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes { id isResolved comments(first: 1) { nodes { body } } }
+      }
+    }
+  }
+}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+  | select(.isResolved == false)]'
+
+# 6. Verify all CI/CD checks pass
+gh pr checks "$PR_NUMBER"
+# If any fail: gh run view <RUN_ID> --log-failed
 ```
 
 ### Workflow 3: Investigate Patterns Before Fixing
@@ -412,20 +564,98 @@ gh pr-enrich 123 --enrich
 # - .reports/pr-reviews/pr-123/comment-threads.json
 ```
 
-**Claude MUST follow this sequence:**
+**Claude MUST follow this sequence (no steps may be skipped):**
 
-1. **Read systemic_issues first** - Understand the underlying patterns before making any changes
-2. **Read adjacent_problems** - Identify related areas that may need the same fixes
-3. **Investigate adjacent areas** - Search the codebase for similar issues flagged in adjacent_problems
-4. **Then work through task_list** - Address tasks with full context of patterns and related code
+1. **Resolve context** - Extract `OWNER`, `REPO`, `PR_NUMBER` from git context (see "Resolving Owner, Repo, and PR Number")
+2. **Read systemic_issues first** - Understand the underlying patterns before making any changes
+3. **Read adjacent_problems** - Identify related areas that may need the same fixes
+4. **Investigate adjacent areas** - Search the codebase for similar issues flagged in adjacent_problems
+5. **Check non-thread comments** - Review general PR comments for actionable feedback not captured in review threads
+6. **Work through task_list** - Address tasks with full context of patterns and related code
+7. **Reply and resolve threads as each task completes** - After fixing each task, reply with the fix commit, then resolve its thread IDs. Track resolved vs remaining threads.
+8. **Final thread audit** - After all tasks are done, query the PR for any remaining unresolved threads. Resolve any that were addressed. Leave a reply on any intentionally left open.
+9. **Verify all CI/CD checks pass** - Run `gh pr checks "$PR_NUMBER"` and confirm all checks are green. If any fail, investigate and fix before declaring work complete.
+10. **Re-request review** - Notify original reviewers that feedback has been addressed.
 
 **Example prompt for Claude:**
-> "Read the claude-analysis.json. First summarize the systemic issues and adjacent problems you found. Investigate the adjacent areas mentioned. Then address each critical and high priority task in order, applying fixes consistently across all affected areas. After fixing each issue, provide the thread ID so I can resolve it."
+> "Read the claude-analysis.json. First summarize the systemic issues and adjacent problems you found. Investigate the adjacent areas mentioned. Check non-thread PR comments for additional feedback. Then address each critical and high priority task in order, applying fixes consistently across all affected areas. After fixing each task, reply with the fix commit and resolve its thread IDs. When all tasks are done, verify no threads were missed, confirm all CI checks pass, and re-request review."
 
-**Anti-pattern to avoid:**
+**Anti-patterns to avoid:**
 > ~~"Read the claude-analysis.json and address each task in order."~~
-
 This skips the critical analysis steps and leads to incomplete, symptom-focused fixes.
+
+> ~~"Fix all the issues, then I'll resolve the threads myself."~~
+This leads to forgotten thread resolutions. Claude MUST resolve threads as it goes.
+
+> ~~"All tasks addressed, work is complete."~~
+Never declare complete without verifying: (a) all addressed threads are resolved, (b) all CI checks pass.
+
+## Common Rationalizations
+
+| Excuse | Reality |
+|--------|---------|
+| "I'll resolve threads after fixing everything" | You'll forget. Resolve as you go — progress should be visible to reviewers immediately. |
+| "CI was passing before my changes" | CI tests your changes against the full suite. Run `gh pr checks` after every push. |
+| "I already read the comments" | Reading ≠ systematic analysis. Run `--enrich` and follow the workflow. Systemic issues hide in individually-innocuous comments. |
+| "Only 2 threads, I don't need the full workflow" | Systemic issues hide in even 1 thread. The adjacent problems step takes 2 minutes and prevents the next PR getting the same feedback. |
+| "Adjacent problems are out of scope" | Adjacent problems prevent the next PR getting the same feedback. 5 minutes of investigation now saves hours of review cycles later. |
+| "Tests pass so CI will be fine" | Tests != CI. Linting, type checks, build steps, security scans, and other checks also run. Verify independently. |
+| "I'll check CI later" | Later = never. Failed checks block merge and waste reviewer time. Check immediately after pushing. |
+| "Thread resolution is the author's job" | Thread resolution is whoever addresses the feedback. If you fixed it, you resolve it. |
+
+**If you catch yourself thinking any of these, STOP. You are about to skip a mandatory step.**
+
+## Red Flags — STOP
+
+- About to declare work complete without running the completion gate
+- Addressing tasks without first reading systemic issues and adjacent problems
+- Resolving threads without replying first (silent resolves are dismissive)
+- Re-requesting review while CI checks are failing or pending
+- Reading stale `.reports/` files to check current thread/CI status
+- Skipping non-thread comment check ("they're probably not important")
+- Fixing a task without checking if the same pattern exists in adjacent code
+- Using placeholder strings (`OWNER`, `REPO`) in GraphQL queries instead of resolved values
+
+**All of these mean: stop, go back to the workflow, and follow it.**
+
+### Stale Data Warning
+
+After making fixes, the local `.reports/` files are **stale snapshots** from when `gh pr-enrich` was run. Do NOT re-read them to check current thread status or CI results. Instead:
+
+- **Thread status:** Use the live GraphQL query (see step 4/6)
+- **CI status:** Use `gh pr checks "$PR_NUMBER"` (see step 7)
+- **To refresh all data:** Re-run `gh pr-enrich "$PR_NUMBER"` (without `--enrich` to save time if you only need updated thread/check data)
+
+### Handling Non-Thread Comments
+
+General PR comments (not attached to a code line) are NOT tracked as review threads and have no `isResolved` status. They can still contain actionable feedback.
+
+**Check for them:**
+```bash
+# List issue-level comments (not part of review threads)
+gh api repos/$OWNER/$REPO/issues/$PR_NUMBER/comments \
+  --jq '.[] | {id: .id, author: .user.login, body: .body}'
+```
+
+**How to handle:**
+- Read each non-thread comment for actionable feedback
+- If it requires a code change, address it and reply acknowledging the fix
+- If it's a question, reply with the answer
+- Non-thread comments cannot be "resolved" — replies are the only signal
+
+### Re-Requesting Review
+
+After all tasks are addressed, threads resolved, and CI is green, re-request review from the original reviewers:
+
+```bash
+# List who reviewed the PR
+gh pr view $PR_NUMBER --json reviews --jq '.reviews[].author.login' | sort -u
+
+# Re-request review
+gh pr edit $PR_NUMBER --add-reviewer <REVIEWER_LOGIN>
+```
+
+**Do this as the final step.** Re-requesting review before CI passes or threads are resolved wastes reviewer time.
 
 ### Combining with TodoWrite
 
@@ -438,6 +668,92 @@ jq -r '.task_list[] | "\(.priority): \(.task)"' \
 ```
 
 Then ask Claude to add these to the todo list and work through them systematically.
+
+## Completion Gate (MANDATORY)
+
+Before declaring any PR feedback session complete, Claude MUST pass this checklist. No exceptions.
+
+### Thread Resolution Verification
+
+```bash
+# Query remaining unresolved threads (assumes $OWNER/$REPO/$PR_NUMBER were resolved earlier)
+UNRESOLVED=$(gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes { id isResolved }
+      }
+    }
+  }
+}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length')
+
+echo "Unresolved threads remaining: $UNRESOLVED"
+```
+
+- If `UNRESOLVED == 0` → pass
+- If `UNRESOLVED > 0` → list each one and categorize:
+  - **Addressed but forgot to resolve** → resolve now
+  - **Intentionally deferred** → reply on thread with rationale
+  - **Not yet addressed** → address or explain in PR comment
+
+### CI/CD Checks Verification
+
+```bash
+# Verify all checks pass
+gh pr checks "$PR_NUMBER"
+```
+
+- All checks pass → pass
+- Any check fails → diagnose and fix (see step 5 in Required Analysis Workflow)
+- Checks still running → wait and re-check
+
+### Non-Thread Comment Check
+
+```bash
+# Check for general PR comments that may contain unaddressed feedback
+gh api repos/$OWNER/$REPO/issues/$PR_NUMBER/comments \
+  --jq '.[] | {author: .user.login, body: .body}' | head -50
+```
+
+- Review each comment for actionable items
+- Reply to any that were addressed or need a response
+
+### Re-Request Review
+
+```bash
+# Only after all gates above pass:
+gh pr edit $PR_NUMBER --add-reviewer <REVIEWER_LOGIN>
+```
+
+### Completion Summary Template
+
+When finishing a PR feedback session, Claude MUST output a summary in this format:
+
+```
+## PR Feedback Session Complete
+
+**Tasks addressed:** X of Y
+**Threads resolved:** A of B (C intentionally deferred)
+**Non-thread comments reviewed:** N
+**CI/CD status:** all passing | X failing (details below)
+**Review re-requested from:** [reviewer list] | not yet (reason)
+
+### Resolved threads
+- PRRT_xxx — [task description] — fixed in [commit]
+- PRRT_yyy — [task description] — fixed in [commit]
+
+### Deferred threads (with rationale)
+- PRRT_zzz — [reason for deferral]
+
+### Non-thread comments addressed
+- Comment by @reviewer — [summary of response]
+
+### CI/CD details (if any failures)
+- [check name] — [status] — [action taken or needed]
+```
+
+**Why this gate exists:** PR authors commonly address feedback but forget to resolve threads, don't check CI, skip non-thread comments, or forget to re-request review. This wastes reviewer time and delays merges. The completion gate makes all four impossible to skip.
 
 ## Customizing the Analysis Prompt
 
@@ -486,6 +802,15 @@ If analysis returns empty arrays:
 - Try with a custom, simpler prompt to debug
 
 ### Thread Resolution Fails
+
+**Common failure modes and recovery:**
+
+| Error | Cause | Recovery |
+|-------|-------|----------|
+| `NOT_FOUND` | Thread ID is wrong or from a different PR | Re-fetch `comment-threads.json` and verify the ID |
+| `FORBIDDEN` | Insufficient permissions | Check you have write access to the repo |
+| Already resolved | Thread was resolved by another actor | Safe to skip — verify with a fresh query |
+| Network error | Transient failure | Retry once. If persistent, check `gh auth status` |
 
 ```bash
 # Verify thread ID exists
@@ -568,6 +893,8 @@ jq '.cross_pr_patterns[] | select(.occurrences >= 3)' \
 
 **Guiding Questions**: Use these as pre-implementation checklists to prevent recurring issues.
 
+**Connection to entropy ENFORCEMENT-GAP:** Cross-PR patterns that show monotonic increase (e.g., hardcoded strings: 9 → 11 → 18 across PRs) are ENFORCEMENT-GAP findings — the root cause is a missing lint rule or CI check, not developer negligence. When retrospective reveals growing patterns, recommend the specific enforcement mechanism (pre-commit hook, CI rule, build check) that would prevent new occurrences. See `skills/entropy/references/cross-cutting-anti-patterns.md` Protocol 5 for the full escalation pattern.
+
 ### Workflow: Sprint Retrospective
 
 ```bash
@@ -593,6 +920,17 @@ gh pr-enrich retrospective --format checklist > implementation-checklist.md
 # Use the checklist during development
 cat implementation-checklist.md
 ```
+
+## Integration
+
+| Pair with | When | How |
+|-----------|------|-----|
+| `review-tribunal` | Phase 0 (Scope & Context) | Tribunal invokes `gh pr-enrich --enrich` to gather PR diff, threads, and context for all 6 agents |
+| `product-reviewer` | Phase 1 (Intent Discovery) | Product-reviewer uses enriched PR data as the primary source for intent extraction |
+| `rationalist-master-reviewer` | Default PR mode | Rationalist invokes `gh pr-enrich` when reviewing the current branch's PR |
+| `entropy` | Retrospective → ENFORCEMENT-GAP | Retrospective cross-PR patterns feed directly into entropy's Protocol 5 (Escalation Pattern) for growing violations |
+| `post-fix-validation` | After fixing PR feedback | Post-fix-validation Layer 5 (regression suite) should verify CI via `gh pr checks` |
+| `root-cause-tracing` | Debugging issues found in analysis | When a systemic issue requires deep investigation |
 
 ## Related Skills
 
