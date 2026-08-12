@@ -25,7 +25,7 @@ artifact with a separate schema and a separate invocation.
 | Decision | Choice | Consequence |
 |---|---|---|
 | Ownership | `gh-pr-enrich` producer; `xray` consumer | This repository owns the profile and v1 fixture. The separately released xray skill owns consumption and never recomputes it. |
-| Data source | Exact Git base/head snapshot plus paginated PR-file metadata | Enables reference counts, defect density, author familiarity, and CODEOWNERS while preserving a repeatable PR snapshot. Git reads never switch branches or write to the working tree. |
+| Data source | Exact Git base/head snapshot plus paginated PR-file and PR-commit metadata | Enables reference counts, defect density, verified author familiarity, and CODEOWNERS while preserving a repeatable PR snapshot. Git reads never switch branches or write to the working tree. |
 | Risk rules | Optional Claude phase classifies changes into a fixed taxonomy | No per-repo glob lists to maintain. The taxonomy and its weights stay in the script, so the score stays attributable. |
 | Remote analysis | Explicit, bounded opt-in | `--risk` alone is deterministic. Claude receives PR data only when the operator also opts into the approved remote-analysis path for that repository. |
 
@@ -40,9 +40,12 @@ is `unclassified`; it is never silently treated as `other` or safe to delegate. 
 may contain multiple classes, and all of them participate in the score and safety checks.
 
 Classifications are cached per repository. A cache entry is keyed by repository identity,
-taxonomy version, canonical path, and a fingerprint of the base blob plus the semantic evidence
-used to classify it. It also records the exact base OID as provenance. A cache hit requires every
-keyed value to match; otherwise the path is classified again. Cache updates are protected by a
+taxonomy version, canonical current path, base path, and fingerprints of the base blob, the
+complete base-to-head per-file diff, and the bounded semantic evidence used to classify it. It also
+records the exact base and head OIDs as provenance. The complete per-file diff fingerprint, rather
+than the bounded evidence alone, invalidates the entry when any part of that file's change changes.
+A missing or incomplete per-file diff disables cache reuse. A cache hit requires every keyed value
+to match; otherwise the path is classified again. Cache updates are protected by a
 repository-scoped lock and written by atomic rename, so concurrent runs cannot corrupt or mix
 repository state.
 
@@ -87,20 +90,25 @@ classifies.
 ## Deterministic signals
 
 The collection snapshot is `{base_oid, head_oid}` from `pr-summary.json.baseRefOid` and
-`headRefOid`. Before and after every GitHub PR-file or diff retrieval, the run re-reads those
-values for the same PR. If either value changes, it discards the collected PR-file/diff payload,
-records `pr_snapshot_changed`, and emits a partial profile rather than mixing snapshots. When the
-local head object is available, the diff is generated explicitly from `base_oid` and `head_oid`;
-otherwise a provider diff is accepted only when both snapshot checks match.
+`headRefOid`. Before and after every GitHub PR-file, PR-commit, or diff retrieval, the run re-reads
+those values for the same PR. If either value changes, it discards the collected PR-file,
+PR-commit, and diff payloads, records `pr_snapshot_changed`, and emits a partial profile rather
+than mixing snapshots. When the local head object is available, the diff is generated explicitly
+from `base_oid` and `head_oid`; otherwise a provider diff is accepted only when both snapshot
+checks match.
 
 For base-derived reads, the run verifies that `origin/<baseRefName>` resolves to `base_oid`, then
 uses the immutable `base_oid` in every `git show`, `git grep`, and `git log` call. No checkout,
 branch switch, or working-tree write is allowed. A missing or mismatched ref is not fetched or
 substituted: every affected signal is recorded as unavailable and contributes zero.
 
-Changed-file metadata comes from the paginated GitHub pull-files endpoint, normalized into
-`path`, `additions`, `deletions`, and `status`. The run asserts that its unique-file count matches
-`pr-summary.json.changedFiles`. A pagination, normalization, or count mismatch records
+Changed-file metadata comes from the paginated GitHub pull-files endpoint. It is normalized into
+`path`, `base_path`, `additions`, `deletions`, and `status`: `path` is the current filename used in
+reports, while `base_path` is `previous_filename` for a rename, `path` for a modified or removed
+file, and `null` for an added file. Every base-derived blob, history, and reference read uses
+`base_path`; head-derived evidence, CODEOWNERS matching, and report locations use `path`. The
+CODEOWNERS rules themselves still come from `base_oid`. The run asserts that its unique-file count
+matches `pr-summary.json.changedFiles`. A pagination, normalization, or count mismatch records
 `changed_files_incomplete`, makes the profile partial, and prevents the input from being presented
 as a complete risk view.
 
@@ -108,23 +116,27 @@ as a complete risk view.
 
 | Field | Derivation |
 |---|---|
-| `path`, `additions`, `deletions`, `status` | Paginated pull-files response, count-checked against `pr-summary.json` |
+| `path`, `base_path`, `additions`, `deletions`, `status` | Paginated pull-files response, including `previous_filename` normalization for renames, count-checked against `pr-summary.json` |
 | `is_test` | Path matches `(^\|/)(tests?\|__tests__\|spec)/`, `\.(test\|spec)\.[a-z]+$`, `_test\.(go\|py)$`, `Tests?\.swift$` |
 | `is_code` | Fixed, versioned predicate independent of Claude: a UTF-8 text file with extension in `c, cc, cpp, cs, go, java, js, jsx, mjs, cjs, ts, tsx, py, rb, php, rs, swift, kt, kts, scala, sh, sql`, excluding `is_test`, `(^\|/)(docs?\|documentation)/`, `(^\|/)generated/`, `*.min.js`, files whose first 20 lines contain `@generated` or `DO NOT EDIT`, and files reported binary by `git diff --numstat` |
 | `classes[]`, `class_sources[]`, `classification_evidence[]` | Taxonomy resolution above; sources are `pin`, `cache`, `model`, or `unclassified` |
 | `references.count`, `references.sample[]` | `git grep -l -F` at `base_oid` for the path-without-extension and the basename-without-extension, excluding the file itself, lockfiles, and minified assets |
 | `history.commits`, `history.fix_commits`, `history.defect_density` | `git log --format=%s` at `base_oid` for the path; `fix_commits` counts subjects matching `^(fix\|revert\|hotfix)` or `\b(bug\|regression)\b`, case-insensitive |
 | `history.distinct_authors` | `git log --format=%ae \| sort -u \| wc -l` |
-| `author_familiar` | PR author login matched case-insensitively against committer names and email local-parts in that file's history |
+| `author_familiar` | Verified PR-author email identities matched against author and committer emails in the file's base history |
 | `codeowners[]` | Glob match against `.github/CODEOWNERS`, `CODEOWNERS`, or `docs/CODEOWNERS` read via `git show` |
 
 `references.count` is a **textual reference count**, not a resolved import graph. It counts files
 that mention the module by name. The report labels it as such. A real import graph is a possible
 later upgrade via the existing `dependency-graph` skill; this design does not claim one.
 
-`author_familiar` is a heuristic — GitHub logins do not reliably map to git identities. When no
-commit in a file's history matches any identity form, the signal is recorded as `unknown` and
-contributes zero, rather than being reported as "author is new to this file".
+`author_familiar` is a heuristic, but its three states are reachable without treating a login or
+display name as a git identity. The runner builds an in-memory identity set from paginated PR
+commit metadata: it accepts a normalized author or committer email only when GitHub resolves that
+commit identity to the PR author's login. Raw identity values are not written to the profile. For a
+file with base history, an exact email match produces `true` and a verified identity set with no
+match produces `false`. No verified identity set, no base history, or unavailable commit/history
+metadata produces `unknown` and contributes zero.
 
 Added code lines and added test lines are sums over `is_code` and `is_test` files respectively.
 An unrecognized textual file type that is not one of the explicit exclusions is excluded from
@@ -356,9 +368,9 @@ scans are labeled candidates, author familiarity is labeled heuristic.
 
 All risk artifacts declare `schema_version: 1`. `risk-signals.json` records repository identity,
 PR number, the immutable `{base_oid, head_oid}` collection snapshot, resolved base OID,
-changed-file source/count, signal availability, classes and their provenance. `risk-profile.json`
-adds the score, tier, `validation_required[]`, narrative availability, remote-analysis metadata,
-and any dropped agent-safe entries.
+changed-file source/count, normalized current/base paths, signal availability, classes and their
+provenance. `risk-profile.json` adds the score, tier, `validation_required[]`, narrative
+availability, remote-analysis metadata, and any dropped agent-safe entries.
 
 The `gh-pr-enrich` repository owns the v1 producer and the shared fixture at
 `tests/fixtures/risk-profile-v1.json`. The consumer is a separately released `xray` skill change
@@ -442,10 +454,10 @@ Written before implementation.
 | Test | Covers |
 |---|---|
 | `tests/helpers/make-fixture-repo.sh` | Builds a scripted git repo in a temp dir with known history, authors, fix commits, cross-file references, semantic diff evidence, and more than 100 changed-file records |
-| `tests/test-risk-input.sh` | Mocks paginated pull-files responses, normalizes status values, checks the count against `changedFiles`, and asserts stale/mismatched base OIDs and a head force-push during collection produce a partial profile without source substitution |
-| `tests/test-risk-signals.sh` | Asserts exact values for every deterministic signal against that fixture, including `fix_commits / commits`, the five-commit eligibility rule, the versioned `is_code` predicate for docs-only and mixed PRs, and unavailable-signal behavior. No network, no `claude`. |
+| `tests/test-risk-input.sh` | Mocks paginated pull-file and pull-commit responses, normalizes status and rename `base_path` values, checks the file count against `changedFiles`, and asserts stale/mismatched base OIDs and a head force-push during collection produce a partial profile without source substitution |
+| `tests/test-risk-signals.sh` | Asserts exact values for every deterministic signal against that fixture, including rename-aware base history, verified author familiarity in `true`, `false`, and `unknown` states, `fix_commits / commits`, the five-commit eligibility rule, the versioned `is_code` predicate for docs-only and mixed PRs, and unavailable-signal behavior. No network, no `claude`. |
 | `tests/test-risk-scoring.sh` | Feeds fixture signal sets to the scoring function and asserts score, tier, full breakdown, every cap boundary, zero-test precedence, and both defect-density boundaries |
-| `tests/test-path-classes.sh` | Asserts base-only pin loading, pin-plus-current-class union, semantic-evidence validation, resolution order (pin + cache/model → unclassified), cache identity/version/fingerprint rejection, repository namespace isolation, atomic concurrent cache updates, and that only current-evidence cache coverage skips call A |
+| `tests/test-path-classes.sh` | Asserts base-only pin loading, pin-plus-current-class union, semantic-evidence validation, resolution order (pin + cache/model → unclassified), cache identity/version/base-path/base-blob/per-file-diff/evidence fingerprint rejection, repository namespace isolation, atomic concurrent cache updates, and that only complete current-change cache coverage skips call A |
 | `tests/test-risk-remote-safety.sh` | Asserts protected policy loading, a PR cannot self-authorize egress, tenant-identity mismatch denial, exact-payload secret-detection no-egress (including final diff), byte/file/hunk/token/timeout/cost limits, malformed output rejection, and that prompt-like PR text cannot produce executable actions |
 | `tests/test-risk-report.sh` | Renders fixture `risk-profile.json` to markdown; asserts `agent_safe` rejects changed-path mismatches, sensitive, `other`, and `unclassified` entries; asserts validation applicability and `signals_unavailable` are always rendered |
 | `tests/test-risk-output.sh` | Runs `--enrich --risk` with controlled parallel results; asserts one serialized combined-data/report write, atomic artifacts, and the producer side of the shared `schema_version: 1` fixture consumed by the separately owned `xray` contract test |
