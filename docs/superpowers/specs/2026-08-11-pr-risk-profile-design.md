@@ -40,9 +40,10 @@ is `unclassified`; it is never silently treated as `other` or safe to delegate. 
 may contain multiple classes, and all of them participate in the score and safety checks.
 
 Classifications are cached per repository. A cache entry is keyed by repository identity,
-taxonomy version, canonical current path, base path, and fingerprints of the base blob, the
-complete base-to-head per-file diff, and the bounded semantic evidence used to classify it. It also
-records the exact base and head OIDs as provenance. The complete per-file diff fingerprint, rather
+taxonomy version, canonical current path, base path, and fingerprints of the base-side blob at the
+merge base, the complete per-file diff from the merge base to head, and the bounded semantic
+evidence used to classify it. It also records the exact base, head, and merge-base OIDs as
+provenance. The complete per-file diff fingerprint, rather
 than the bounded evidence alone, invalidates the entry when any part of that file's change changes.
 A missing or incomplete per-file diff disables cache reuse. A cache hit requires every keyed value
 to match; otherwise the path is classified again. Cache updates are protected by a
@@ -74,8 +75,9 @@ Classification inputs and resolution:
 
 1. `.gh-pr-enrich-path-classes.json` at repo root contributes base classifications only when read
    with `git show <base_oid>:.gh-pr-enrich-path-classes.json`.
-2. `<reports_root>/path-classes.json` supplies a provenance-checked current-change classification
-   when its evidence fingerprint matches.
+2. The per-repository classification cache — `path-classes.json` at its canonical location
+   defined once in the Output files table — supplies a provenance-checked current-change
+   classification when its evidence fingerprint matches.
 3. Claude call A classifies any remaining current changes from bounded semantic evidence.
 4. A path without a current-change classification receives `unclassified`, with the reason
    recorded in `signals_unavailable[]`.
@@ -93,14 +95,27 @@ The collection snapshot is `{base_oid, head_oid}` from `pr-summary.json.baseRefO
 `headRefOid`. Before and after every GitHub PR-file, PR-commit, or diff retrieval, the run re-reads
 those values for the same PR. If either value changes, it discards the collected PR-file,
 PR-commit, and diff payloads, records `pr_snapshot_changed`, and emits a partial profile rather
-than mixing snapshots. When the local head object is available, the diff is generated explicitly
-from `base_oid` and `head_oid`; otherwise a provider diff is accepted only when both snapshot
-checks match.
+than mixing snapshots.
+
+The diff is always merge-base derived. When the local base and head objects are available, the
+run computes `merge_base_oid` with `git merge-base base_oid head_oid` and generates the diff with
+`git diff base_oid...head_oid` (three-dot: merge base to head), so commits that landed only on an
+advancing base branch never appear as spurious reverse changes. `merge_base_oid` is recorded in
+`risk-signals.json` as provenance alongside the snapshot OIDs. When the merge base cannot be
+computed locally, a provider diff is accepted only when both snapshot checks match — GitHub's PR
+diff and pull-files endpoints already use merge-base semantics, so both sources describe the same
+change, and the changed-file count assertion below stays coherent across sources. Every
+diff-derived input — per-file diffs and `git diff --numstat` reads, `pr-diff.txt` and its hunk
+scans, cache fingerprints, pre-send secret scanning, and model-facing diff excerpts — uses this
+merge-base diff; no signal compares the `base_oid` and `head_oid` trees directly.
 
 For base-derived reads, the run verifies that `origin/<baseRefName>` resolves to `base_oid`, then
 uses the immutable `base_oid` in every `git show`, `git grep`, and `git log` call. No checkout,
 branch switch, or working-tree write is allowed. A missing or mismatched ref is not fetched or
-substituted: every affected signal is recorded as unavailable and contributes zero.
+substituted: every affected signal is recorded as unavailable and contributes zero. These
+base-derived signals (references, history, CODEOWNERS, pins) intentionally read the base branch
+tip: they measure the state of the branch the PR merges into, while the change itself is always
+taken from the merge-base diff defined above.
 
 Changed-file metadata comes from the paginated GitHub pull-files endpoint. It is normalized into
 `path`, `base_path`, `additions`, `deletions`, and `status`: `path` is the current filename used in
@@ -193,9 +208,9 @@ record into `score.breakdown[]`, so any total can be traced back to the inputs t
 |---|---|---|---|
 | A | Change class | Each distinct class present among changed files adds its weight once | 45 |
 | B | Reference reach | Max `references.count` over non-test files: 0–2→0, 3–9→4, 10–29→8, 30–99→14, 100+→20 | 20 |
-| C | Test deficit | Evaluate in order: zero test lines and ≥200 code lines→18; otherwise added test lines ÷ added code lines: ≥0.5→0, ≥0.2 and <0.5→4, ≥0.05 and <0.2→8, <0.05 and ≥50 code lines→14 | 18 |
+| C | Test deficit | Evaluate in order: zero test lines and ≥200 code lines→18; otherwise added test lines ÷ added code lines: ≥0.5→0, ≥0.2 and <0.5→4, ≥0.05 and <0.2→8, <0.05 and ≥50 code lines→14, <0.05 and 1–49 code lines→8 | 18 |
 | D | Defect density | Max `history.fix_commits / history.commits` over files with ≥5 commits: <0.2→0, ≥0.2 and <0.4→5, ≥0.4→10 | 10 |
-| E | Familiarity gap | Fraction of non-test files author has never touched: 0→0, ≤0.34→3, ≤0.67→6, >0.67→9 | 9 |
+| E | Familiarity gap | Fraction of non-test files author has never touched: 0→0, >0 and ≤0.34→3, >0.34 and ≤0.67→6, >0.67→9 | 9 |
 | F | Contract breaks | 6 per distinct candidate | 18 |
 | G | Swallowed errors | 3 per added candidate | 9 |
 | H | Churn | Total changed lines: <100→0, 100–399→3, 400–999→6, ≥1000→10 | 10 |
@@ -208,6 +223,13 @@ Empty-set rules, so no contribution divides by zero or scores an absent populati
 - **E** counts only files whose `author_familiar` resolved to `true` or `false`. Files resolved as
   `unknown` are excluded from both numerator and denominator; when every file is `unknown`, E
   contributes 0 and `author_familiarity` is appended to `signals_unavailable[]`.
+
+Coverage check: every contribution's ranges are disjoint and jointly cover its full input space.
+B, D, E, and H partition their domains with no overlap and no gap; C, evaluated in order after its
+empty-set rule, assigns exactly one value to every combination of added code lines (≥1) and test
+ratio, including the sub-0.05-ratio bands at both 1–49 and ≥50 code lines. All contributions are
+integers, the maximum total is 139, and the tier ranges below cover every integer from 0 to 139.
+Any future edit to this table must preserve this property.
 
 Tiers: `low` 0–14, `moderate` 15–34, `high` 35–64, `critical` ≥65.
 
@@ -293,7 +315,8 @@ Post-processing validates that every requested path came back exactly once, `cla
 `evidence` are both nonempty, every class is in the enum, and every returned evidence excerpt is
 nonempty and corresponds to the bounded local input. Missing, empty, or invalid entries become
 `unclassified` and are recorded in `signals_unavailable[]`. Only valid entries are merged into
-`<reports_root>/path-classes.json` through the locked, atomic update path.
+the per-repository classification cache (canonical location in the Output files table) through
+the locked, atomic update path.
 
 Skipped entirely only when matching current-change cache entries cover every path; pin coverage
 alone never skips call A.
@@ -370,8 +393,9 @@ scans are labeled candidates, author familiarity is labeled heuristic.
 ### Schema and `xray` contract
 
 All risk artifacts declare `schema_version: 1`. `risk-signals.json` records repository identity,
-PR number, the immutable `{base_oid, head_oid}` collection snapshot, resolved base OID,
-changed-file source/count, normalized current/base paths, signal availability, classes and their
+PR number, the immutable `{base_oid, head_oid}` collection snapshot, resolved base OID, the
+computed `merge_base_oid` (or its unavailability), changed-file source/count, normalized
+current/base paths, signal availability, classes and their
 provenance. `risk-profile.json` adds the score, tier, `validation_required[]`, narrative
 availability, remote-analysis metadata, and any dropped agent-safe entries.
 
@@ -457,10 +481,10 @@ Written before implementation.
 | Test | Covers |
 |---|---|
 | `tests/helpers/make-fixture-repo.sh` | Builds a scripted git repo in a temp dir with known history, authors, fix commits, cross-file references, semantic diff evidence, and more than 100 changed-file records |
-| `tests/test-risk-input.sh` | Mocks paginated pull-file and pull-commit responses, normalizes status and rename `base_path` values, checks the file count against `changedFiles`, and asserts stale/mismatched base OIDs and a head force-push during collection produce a partial profile without source substitution |
+| `tests/test-risk-input.sh` | Mocks paginated pull-file and pull-commit responses, normalizes status and rename `base_path` values, checks the file count against `changedFiles`, asserts the local diff is generated from the merge base (`base_oid...head_oid`) rather than tip-to-tip when the base branch has advanced past the merge base, and asserts stale/mismatched base OIDs and a head force-push during collection produce a partial profile without source substitution |
 | `tests/test-risk-signals.sh` | Asserts exact values for every deterministic signal against that fixture, including rename-aware base history, verified author familiarity in `true`, `false`, and `unknown` states, bounded fix-keyword matching that excludes subjects such as `Fixture updates`, `fix_commits / commits`, the five-commit eligibility rule, the versioned `is_code` and `is_test_source` predicates for docs-only, fixture-heavy, and mixed PRs, and unavailable-signal behavior. No network, no `claude`. |
-| `tests/test-risk-scoring.sh` | Feeds fixture signal sets to the scoring function and asserts score, tier, full breakdown, every cap boundary, zero-test precedence, source-only test-line accounting, and both defect-density boundaries |
-| `tests/test-path-classes.sh` | Asserts base-only pin loading, pin-plus-current-class union, nonempty class/evidence requirements, semantic-evidence validation, resolution order (pin + cache/model → unclassified), cache identity/version/base-path/base-blob/per-file-diff/evidence fingerprint rejection, repository namespace isolation, atomic concurrent cache updates, and that only complete current-change cache coverage skips call A |
+| `tests/test-risk-scoring.sh` | Feeds fixture signal sets to the scoring function and asserts score, tier, full breakdown, every cap boundary, zero-test precedence, the sub-0.05-ratio bands at both 1–49 and ≥50 code lines, the disjoint familiarity-gap boundaries, source-only test-line accounting, and both defect-density boundaries |
+| `tests/test-path-classes.sh` | Asserts base-only pin loading, pin-plus-current-class union, nonempty class/evidence requirements, semantic-evidence validation, resolution order (pin + cache/model → unclassified), cache identity/version/base-path/merge-base-blob/per-file-diff/evidence fingerprint rejection, repository namespace isolation, atomic concurrent cache updates, and that only complete current-change cache coverage skips call A |
 | `tests/test-risk-remote-safety.sh` | Asserts protected policy loading, a PR cannot self-authorize egress, tenant-identity mismatch denial, exact-payload secret-detection no-egress (including final diff), byte/file/hunk/token/timeout/cost limits, malformed output rejection, and that prompt-like PR text cannot produce executable actions |
 | `tests/test-risk-report.sh` | Renders fixture `risk-profile.json` to markdown; asserts `agent_safe` rejects changed-path mismatches, sensitive, `other`, and `unclassified` entries; asserts validation applicability and `signals_unavailable` are always rendered |
 | `tests/test-risk-output.sh` | Runs `--enrich --risk` with controlled parallel results; asserts one serialized combined-data/report write, atomic artifacts, and the producer side of the shared `schema_version: 1` fixture consumed by the separately owned `xray` contract test |
