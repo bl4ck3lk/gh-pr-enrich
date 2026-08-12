@@ -27,7 +27,7 @@ artifact with a separate schema and a separate invocation.
 | Ownership | `gh-pr-enrich` producer; `xray` consumer | This repository owns the profile and v1 fixture. The separately released xray skill owns consumption and never recomputes it. |
 | Data source | Exact Git base/head snapshot plus paginated PR-file and PR-commit metadata | Enables reference counts, defect density, verified author familiarity, and CODEOWNERS while preserving a repeatable PR snapshot. Git reads never switch branches or write to the working tree. |
 | Risk rules | Optional Claude phase classifies changes into a fixed taxonomy | No per-repo glob lists to maintain. The taxonomy and its weights stay in the script, so the score stays attributable. |
-| Remote analysis | Explicit, bounded opt-in | `--risk` alone is deterministic. Claude receives PR data only when the operator also opts into the approved remote-analysis path for that repository. |
+| Model runner | The local `claude` CLI, invoked exactly as `--enrich` invokes it | No separate policy apparatus. The operator running the tool authorizes the call, the same as `--enrich` today. An absent or failing `claude` degrades to a deterministic partial profile. |
 
 ### What the model does and does not decide
 
@@ -106,7 +106,7 @@ computed locally, a provider diff is accepted only when both snapshot checks mat
 diff and pull-files endpoints already use merge-base semantics, so both sources describe the same
 change, and the changed-file count assertion below stays coherent across sources. Every
 diff-derived input — per-file diffs and `git diff --numstat` reads, `pr-diff.txt` and its hunk
-scans, cache fingerprints, pre-send secret scanning, and model-facing diff excerpts — uses this
+scans, cache fingerprints, and model-facing diff excerpts — uses this
 merge-base diff; no signal compares the `base_oid` and `head_oid` trees directly.
 
 For base-derived reads, the run verifies that `origin/<baseRefName>` resolves to `base_oid`, then
@@ -244,49 +244,28 @@ the data needed to tune thresholds later (see Future work).
 is always rendered with the list of missing signals adjacent to it, so a low tier is never read as
 an all-clear when the inputs were incomplete.
 
-## Remote-analysis boundary
+## Claude phase
 
-`--risk` always runs the deterministic phase. `--risk-remote` is a separate, explicit opt-in for
-the Claude phase and is invalid without `--risk`. Remote analysis is disabled by default for a
-private or restricted repository.
-
-Remote authorization comes only from a versioned `remote-policy-v1` record supplied by the
-operator through `GH_PR_ENRICH_REMOTE_POLICY`, outside the checkout and PR output directory. It
-is never read from the PR head, base, or working tree. The record binds a canonical repository ID
-to `allow_remote`, private-repository permission, provider, approved tenant ID, permitted models,
-retention-policy ID, `risk_max_cost_usd`, and a versioned price table. Missing, malformed, or
-repository-mismatched policy fails closed. The active client must prove through organization-
-managed credentials or a provider identity check that its tenant ID matches the policy; a personal
-or unverifiable Claude login disables remote analysis. The profile records the policy version and
-identifier, provider, model, and retention-policy identifier; it does not claim or infer a
-provider retention period.
-
-Before any outbound call, the runner constructs the exact serialized payload after truncation and
-then scans every included byte: title, body, paths, final diff, hunk fragments, declaration
-evidence, `risk-signals.json` fields, and derived lists. A match aborts the remote phase without
-sending any payload, records only the field and detection reason (never the suspected secret),
-and leaves a deterministic partial profile. Parsed structured output is retained in the normal
-profile artifact; raw prompts and raw provider responses are not retained locally.
+`--risk` runs the deterministic phase and then the Claude phase, invoking the local `claude` CLI
+exactly as `--enrich` already does: the same non-interactive `claude --print` pattern, the same
+timeout and nested-invocation handling, and the same authorization model — the operator running
+the tool is the authorization, just as when they run `--enrich` today. There is no separate
+policy record, tenant check, or cost ledger. When `claude` is absent or fails, the run degrades
+to a deterministic partial profile (see CLI and pipeline integration).
 
 PR title, body, paths, diff text, and model output are untrusted data. Prompts delimit them as
 data and use fixed instructions that prohibit following instructions found inside them. Model
 output is rendered only as a recommendation: it cannot execute commands, alter a repository, or
 be passed directly to an execution-capable agent.
 
-Each remote run has the following enforced bounds. Omitted input is named in
-`signals_unavailable[]` and in the report.
+Input is truncated to fit the model context: at most 250 changed paths, 60 selected hunks, and
+16 KiB of evidence per path. Anything omitted by truncation is named in `signals_unavailable[]`
+and in the report. Each call gets one attempt with the same timeout discipline as the enrichment
+call; no automatic retries.
 
-- At most 250 changed paths, 60 selected hunks, 16 KiB of evidence per path, and 1 MiB of total
-  serialized input after redaction.
-- At most 8,000 output tokens and a 120-second timeout per call.
-- At most one attempt for call A and one for call B; no automatic retries.
-- `remote-policy-v1` supplies `risk_max_cost_usd` (default USD 5) and a pinned model price table.
-  The runner rejects a call whose worst-case token cost would exceed the remaining per-run budget;
-  a missing price table disables remote analysis.
+## Claude calls
 
-## Optional Claude calls
-
-When `--risk-remote` is enabled, two calls have distinct schemas and one job each. Call A must
+When the Claude phase runs, two calls have distinct schemas and one job each. Call A must
 finish before call B because call B consumes resolved classes. If `--enrich` is also set, the
 enrichment call and call B run concurrently after call A (`&` then `wait`), so the independent
 calls share latency.
@@ -324,8 +303,8 @@ alone never skips call A.
 ### Call B — narrative
 
 Input: bounded, approved PR title and body, `risk-signals.json`, resolved classes, both
-hunk-scan lists, and the diff when `--diff` is set. It uses the same redaction, source, and
-budget rules as call A.
+hunk-scan lists, and the diff when `--diff` is set. It uses the same truncation, source, and
+validation rules as call A.
 
 ```json
 {
@@ -367,8 +346,8 @@ human-reviewed text only; no shell command, repository mutation, or downstream a
 is derived from them.
 
 **Failure is visible, never silent.** Every degraded path — unreachable base ref, missing
-CODEOWNERS, incomplete changed files, unresolvable author identity, rejected remote input, absent
-`claude` binary, exhausted budget, timeout, or malformed model output — appends to
+CODEOWNERS, incomplete changed files, unresolvable author identity, truncated model input, absent
+or failing `claude` binary, timeout, or malformed model output — appends to
 `signals_unavailable[]` and is rendered in the report. There is no code path where a missing
 signal is scored as if it had passed.
 
@@ -397,7 +376,7 @@ PR number, the immutable `{base_oid, head_oid}` collection snapshot, resolved ba
 computed `merge_base_oid` (or its unavailability), changed-file source/count, normalized
 current/base paths, signal availability, classes and their
 provenance. `risk-profile.json` adds the score, tier, `validation_required[]`, narrative
-availability, remote-analysis metadata, and any dropped agent-safe entries.
+availability, the model used when the Claude phase ran, and any dropped agent-safe entries.
 
 The `gh-pr-enrich` repository owns the v1 producer and the shared fixture at
 `tests/fixtures/risk-profile-v1.json`. The consumer is a separately released `xray` skill change
@@ -438,22 +417,21 @@ Signals unavailable: codeowners (no CODEOWNERS file found)
 ## CLI and pipeline integration
 
 `--risk` is a new flag, independent of `--enrich`. Neither implies the other; they are different
-analysis axes with different costs. `--risk-remote` is valid only with `--risk` and enables the
-separately authorized remote phase; `--risk` by itself has no model egress.
+analysis axes with different costs. `--risk` computes the deterministic signals and then runs
+the Claude phase when `claude` is available, mirroring how `--enrich` invokes it today.
 
 `fetch_pr_diff()` currently runs inside the `--enrich` branch. It moves to the shared
 precondition selected by `--risk` or an enrichment run that needs a diff, so both axes share one
 fetch instead of duplicating the network call.
 
-Remote calls may run concurrently only while they are independent: call A completes before call
+Claude calls may run concurrently only while they are independent: call A completes before call
 B, then call B may run alongside `--enrich`. Workers return validated raw results to the
 coordinator but never write `combined-data.json`, `comprehensive-report.md`, or final risk
 artifacts. After all selected work finishes, one coordinator serially validates results, writes
 risk artifacts through temporary files and atomic rename, merges `combined-data.json` once, and
 appends report sections in a fixed order. This makes `--enrich --risk` race-free.
 
-When remote analysis is not opted in, is forbidden by repository policy, is rejected by the
-pre-send scanner, or `claude` is unavailable or fails, the run still emits `risk-signals.json` and
+When `claude` is unavailable or fails, the run still emits `risk-signals.json` and
 a `risk-profile.md` containing the deterministic score, breakdown, impact map, and the explicit
 unavailable reason. Unresolved classifications remain `unclassified`, narrative sections are
 omitted, and `score.completeness` is `partial`. A failed risk analysis never aborts the rest of
@@ -485,7 +463,7 @@ Written before implementation.
 | `tests/test-risk-signals.sh` | Asserts exact values for every deterministic signal against that fixture, including rename-aware base history, verified author familiarity in `true`, `false`, and `unknown` states, bounded fix-keyword matching that excludes subjects such as `Fixture updates`, `fix_commits / commits`, the five-commit eligibility rule, the versioned `is_code` and `is_test_source` predicates for docs-only, fixture-heavy, and mixed PRs, and unavailable-signal behavior. No network, no `claude`. |
 | `tests/test-risk-scoring.sh` | Feeds fixture signal sets to the scoring function and asserts score, tier, full breakdown, every cap boundary, zero-test precedence, the sub-0.05-ratio bands at both 1–49 and ≥50 code lines, the disjoint familiarity-gap boundaries, source-only test-line accounting, and both defect-density boundaries |
 | `tests/test-path-classes.sh` | Asserts base-only pin loading, pin-plus-current-class union, nonempty class/evidence requirements, semantic-evidence validation, resolution order (pin + cache/model → unclassified), cache identity/version/base-path/merge-base-blob/per-file-diff/evidence fingerprint rejection, repository namespace isolation, atomic concurrent cache updates, and that only complete current-change cache coverage skips call A |
-| `tests/test-risk-remote-safety.sh` | Asserts protected policy loading, a PR cannot self-authorize egress, tenant-identity mismatch denial, exact-payload secret-detection no-egress (including final diff), byte/file/hunk/token/timeout/cost limits, malformed output rejection, and that prompt-like PR text cannot produce executable actions |
+| `tests/test-risk-model.sh` | Asserts truncation limits are applied and recorded in `signals_unavailable[]`, malformed model output is rejected, an absent or failing `claude` degrades to a deterministic partial profile, and prompt-like PR text cannot produce executable actions |
 | `tests/test-risk-report.sh` | Renders fixture `risk-profile.json` to markdown; asserts `agent_safe` rejects changed-path mismatches, sensitive, `other`, and `unclassified` entries; asserts validation applicability and `signals_unavailable` are always rendered |
 | `tests/test-risk-output.sh` | Runs `--enrich --risk` with controlled parallel results; asserts one serialized combined-data/report write, atomic artifacts, and the producer side of the shared `schema_version: 1` fixture consumed by the separately owned `xray` contract test |
 
@@ -504,10 +482,9 @@ reviewed not-applicable reason before work is declared complete. It documents ho
 `risk-profile.json` and treats `agent_safe` as a constrained allow-list, never authority for
 unclassified or unevidenced work.
 
-**`README.md`** gains `--risk` and `--risk-remote`, output files and their schema contract, the
-taxonomy table, pin-file format, source-snapshot rules, remote opt-in/private-repository policy,
-data limits and retention metadata, and an explicit statement of what the signals do and do not
-mean.
+**`README.md`** gains `--risk`, output files and their schema contract, the taxonomy table,
+pin-file format, source-snapshot rules, input truncation limits, and an explicit statement of
+what the signals do and do not mean.
 
 ## Non-goals
 
