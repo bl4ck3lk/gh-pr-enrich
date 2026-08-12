@@ -118,10 +118,11 @@ as a complete risk view.
 |---|---|
 | `path`, `base_path`, `additions`, `deletions`, `status` | Paginated pull-files response, including `previous_filename` normalization for renames, count-checked against `pr-summary.json` |
 | `is_test` | Path matches `(^\|/)(tests?\|__tests__\|spec)/`, `\.(test\|spec)\.[a-z]+$`, `_test\.(go\|py)$`, `Tests?\.swift$` |
+| `is_test_source` | `is_test` and a UTF-8 text file with a source extension from the `is_code` allow-list, excluding paths matching `(^\|/)(fixtures?\|__fixtures__\|snapshots?\|__snapshots__\|docs?\|documentation)(/\|$)`, minified assets, files whose first 20 lines contain `@generated` or `DO NOT EDIT`, and files reported binary by `git diff --numstat` |
 | `is_code` | Fixed, versioned predicate independent of Claude: a UTF-8 text file with extension in `c, cc, cpp, cs, go, java, js, jsx, mjs, cjs, ts, tsx, py, rb, php, rs, swift, kt, kts, scala, sh, sql`, excluding `is_test`, `(^\|/)(docs?\|documentation)/`, `(^\|/)generated/`, `*.min.js`, files whose first 20 lines contain `@generated` or `DO NOT EDIT`, and files reported binary by `git diff --numstat` |
 | `classes[]`, `class_sources[]`, `classification_evidence[]` | Taxonomy resolution above; sources are `pin`, `cache`, `model`, or `unclassified` |
 | `references.count`, `references.sample[]` | `git grep -l -F` at `base_oid` for the path-without-extension and the basename-without-extension, excluding the file itself, lockfiles, and minified assets |
-| `history.commits`, `history.fix_commits`, `history.defect_density` | `git log --format=%s` at `base_oid` for the path; `fix_commits` counts subjects matching `^(fix\|revert\|hotfix)` or `\b(bug\|regression)\b`, case-insensitive |
+| `history.commits`, `history.fix_commits`, `history.defect_density` | `git log --format=%s` at `base_oid` for the path; `fix_commits` counts subjects matching `^(fix\|revert\|hotfix)\b` or `\b(bug\|regression)\b`, case-insensitive |
 | `history.distinct_authors` | `git log --format=%ae \| sort -u \| wc -l` |
 | `author_familiar` | Verified PR-author email identities matched against author and committer emails in the file's base history |
 | `codeowners[]` | Glob match against `.github/CODEOWNERS`, `CODEOWNERS`, or `docs/CODEOWNERS` read via `git show` |
@@ -138,9 +139,10 @@ file with base history, an exact email match produces `true` and a verified iden
 match produces `false`. No verified identity set, no base history, or unavailable commit/history
 metadata produces `unknown` and contributes zero.
 
-Added code lines and added test lines are sums over `is_code` and `is_test` files respectively.
-An unrecognized textual file type that is not one of the explicit exclusions is excluded from
-contribution C and recorded as
+Added code lines and added test lines are sums over `is_code` and `is_test_source` files
+respectively. Test-directory fixtures, snapshots, documentation, generated output, and other
+non-source assets never enter the test-line numerator. An unrecognized textual file type that is
+not one of the explicit exclusions is excluded from contribution C and recorded as
 `test_deficit_file_type_unknown`; the score is partial rather than assuming it needs no tests.
 This makes docs-only, manifest-only, configuration-only, lockfile-only, generated, and binary
 changes zero-code inputs while keeping mixed source/test PRs deterministic.
@@ -287,10 +289,11 @@ those inputs do not support a class remains `unclassified`.
 }
 ```
 
-Post-processing validates that every requested path came back exactly once, every class is in the
-enum, and every returned evidence item corresponds to the bounded local input. Missing or invalid
-entries become `unclassified` and are recorded in `signals_unavailable[]`. Only valid entries are
-merged into `<reports_root>/path-classes.json` through the locked, atomic update path.
+Post-processing validates that every requested path came back exactly once, `classes` and
+`evidence` are both nonempty, every class is in the enum, and every returned evidence excerpt is
+nonempty and corresponds to the bounded local input. Missing, empty, or invalid entries become
+`unclassified` and are recorded in `signals_unavailable[]`. Only valid entries are merged into
+`<reports_root>/path-classes.json` through the locked, atomic update path.
 
 Skipped entirely only when matching current-change cache entries cover every path; pin coverage
 alone never skips call A.
@@ -455,9 +458,9 @@ Written before implementation.
 |---|---|
 | `tests/helpers/make-fixture-repo.sh` | Builds a scripted git repo in a temp dir with known history, authors, fix commits, cross-file references, semantic diff evidence, and more than 100 changed-file records |
 | `tests/test-risk-input.sh` | Mocks paginated pull-file and pull-commit responses, normalizes status and rename `base_path` values, checks the file count against `changedFiles`, and asserts stale/mismatched base OIDs and a head force-push during collection produce a partial profile without source substitution |
-| `tests/test-risk-signals.sh` | Asserts exact values for every deterministic signal against that fixture, including rename-aware base history, verified author familiarity in `true`, `false`, and `unknown` states, `fix_commits / commits`, the five-commit eligibility rule, the versioned `is_code` predicate for docs-only and mixed PRs, and unavailable-signal behavior. No network, no `claude`. |
-| `tests/test-risk-scoring.sh` | Feeds fixture signal sets to the scoring function and asserts score, tier, full breakdown, every cap boundary, zero-test precedence, and both defect-density boundaries |
-| `tests/test-path-classes.sh` | Asserts base-only pin loading, pin-plus-current-class union, semantic-evidence validation, resolution order (pin + cache/model → unclassified), cache identity/version/base-path/base-blob/per-file-diff/evidence fingerprint rejection, repository namespace isolation, atomic concurrent cache updates, and that only complete current-change cache coverage skips call A |
+| `tests/test-risk-signals.sh` | Asserts exact values for every deterministic signal against that fixture, including rename-aware base history, verified author familiarity in `true`, `false`, and `unknown` states, bounded fix-keyword matching that excludes subjects such as `Fixture updates`, `fix_commits / commits`, the five-commit eligibility rule, the versioned `is_code` and `is_test_source` predicates for docs-only, fixture-heavy, and mixed PRs, and unavailable-signal behavior. No network, no `claude`. |
+| `tests/test-risk-scoring.sh` | Feeds fixture signal sets to the scoring function and asserts score, tier, full breakdown, every cap boundary, zero-test precedence, source-only test-line accounting, and both defect-density boundaries |
+| `tests/test-path-classes.sh` | Asserts base-only pin loading, pin-plus-current-class union, nonempty class/evidence requirements, semantic-evidence validation, resolution order (pin + cache/model → unclassified), cache identity/version/base-path/base-blob/per-file-diff/evidence fingerprint rejection, repository namespace isolation, atomic concurrent cache updates, and that only complete current-change cache coverage skips call A |
 | `tests/test-risk-remote-safety.sh` | Asserts protected policy loading, a PR cannot self-authorize egress, tenant-identity mismatch denial, exact-payload secret-detection no-egress (including final diff), byte/file/hunk/token/timeout/cost limits, malformed output rejection, and that prompt-like PR text cannot produce executable actions |
 | `tests/test-risk-report.sh` | Renders fixture `risk-profile.json` to markdown; asserts `agent_safe` rejects changed-path mismatches, sensitive, `other`, and `unclassified` entries; asserts validation applicability and `signals_unavailable` are always rendered |
 | `tests/test-risk-output.sh` | Runs `--enrich --risk` with controlled parallel results; asserts one serialized combined-data/report write, atomic artifacts, and the producer side of the shared `schema_version: 1` fixture consumed by the separately owned `xray` contract test |
