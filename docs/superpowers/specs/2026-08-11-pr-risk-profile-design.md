@@ -123,7 +123,8 @@ reports, while `base_path` is `previous_filename` for a rename, `path` for a mod
 file, and `null` for an added file. Every base-derived blob, history, and reference read uses
 `base_path`; head-derived evidence, CODEOWNERS matching, and report locations use `path`. The
 CODEOWNERS rules themselves still come from `base_oid`. The run asserts that its unique-file count
-matches `pr-summary.json.changedFiles`. A pagination, normalization, or count mismatch records
+matches `pr-summary.json.changedFiles`. A pagination, normalization, or count mismatch — including
+a PR that exceeds the pull-files endpoint's 3,000-file cap — records
 `changed_files_incomplete`, makes the profile partial, and prevents the input from being presented
 as a complete risk view.
 
@@ -135,10 +136,11 @@ as a complete risk view.
 | `is_test` | Path matches `(^\|/)(tests?\|__tests__\|spec)/`, `\.(test\|spec)\.[a-z]+$`, `_test\.(go\|py)$`, `Tests?\.swift$` |
 | `is_test_source` | `is_test` and a UTF-8 text file with a source extension from the `is_code` allow-list, excluding paths matching `(^\|/)(fixtures?\|__fixtures__\|snapshots?\|__snapshots__\|docs?\|documentation)(/\|$)`, minified assets, files whose first 20 lines contain `@generated` or `DO NOT EDIT`, and files reported binary by `git diff --numstat` |
 | `is_code` | Fixed, versioned predicate independent of Claude: a UTF-8 text file with extension in `c, cc, cpp, cs, go, java, js, jsx, mjs, cjs, ts, tsx, py, rb, php, rs, swift, kt, kts, scala, sh, sql`, excluding `is_test`, `(^\|/)(docs?\|documentation)/`, `(^\|/)generated/`, `*.min.js`, files whose first 20 lines contain `@generated` or `DO NOT EDIT`, and files reported binary by `git diff --numstat` |
+| `is_recognized_non_code` | Fixed, versioned predicate for files that need no test-line accounting: extension in `json, yaml, yml, toml, ini, cfg, conf, xml, html, css, scss, md, markdown, rst, txt, csv, svg, lock, sum`, basename in `Dockerfile, Makefile, Gemfile, Rakefile, Procfile, CODEOWNERS, LICENSE, NOTICE, go.mod`, any dotfile at any depth, `(^\|/)(docs?\|documentation)/` paths, generated or minified files, or files reported binary by `git diff --numstat` |
 | `classes[]`, `class_sources[]`, `classification_evidence[]` | Taxonomy resolution above; sources are `pin`, `cache`, `model`, or `unclassified` |
 | `references.count`, `references.sample[]` | `git grep -l -F` at `base_oid` for the path-without-extension and the basename-without-extension, excluding the file itself, lockfiles, and minified assets |
-| `history.commits`, `history.fix_commits`, `history.defect_density` | `git log --format=%s` at `base_oid` for the path; `fix_commits` counts subjects matching `^(fix\|revert\|hotfix)\b` or `\b(bug\|regression)\b`, case-insensitive |
-| `history.distinct_authors` | `git log --format=%ae \| sort -u \| wc -l` |
+| `history.commits`, `history.fix_commits`, `history.defect_density` | `git log --follow --format=%s` at `base_oid` for the single path, so history continues across renames that occurred earlier in base history; `fix_commits` counts subjects matching `^(fix\|revert\|hotfix)\b` or `\b(bug\|regression)\b`, case-insensitive |
+| `history.distinct_authors` | `git log --follow --format=%ae \| sort -u \| wc -l` over the same rename-following single-path history |
 | `author_familiar` | Verified PR-author email identities matched against author and committer emails in the file's base history |
 | `codeowners[]` | Glob match against `.github/CODEOWNERS`, `CODEOWNERS`, or `docs/CODEOWNERS` read via `git show` |
 
@@ -154,13 +156,20 @@ file with base history, an exact email match produces `true` and a verified iden
 match produces `false`. No verified identity set, no base history, or unavailable commit/history
 metadata produces `unknown` and contributes zero.
 
+The pull-commits endpoint returns at most 250 commits per PR. The runner compares the number of
+retrieved commit records against the PR's declared commit count from `pr-summary.json`; on any
+mismatch — which includes every PR with more than 250 commits — the identity set is incomplete
+and is not used: every file resolves `unknown`, E contributes 0, and `author_familiarity` is
+appended to `signals_unavailable[]`. An incomplete identity set never produces `false`.
+
 Added code lines and added test lines are sums over `is_code` and `is_test_source` files
 respectively. Test-directory fixtures, snapshots, documentation, generated output, and other
-non-source assets never enter the test-line numerator. An unrecognized textual file type that is
-not one of the explicit exclusions is excluded from contribution C and recorded as
+non-source assets never enter the test-line numerator. A file matching `is_recognized_non_code`
+is a complete zero-code input: it contributes nothing to contribution C and does not degrade
+completeness, so manifest-only, configuration-only, lockfile-only, docs-only, generated, and
+binary changes stay deterministic. A textual file that is not `is_code`, not `is_test`, and not
+matched by `is_recognized_non_code` is excluded from contribution C and recorded as
 `test_deficit_file_type_unknown`; the score is partial rather than assuming it needs no tests.
-This makes docs-only, manifest-only, configuration-only, lockfile-only, generated, and binary
-changes zero-code inputs while keeping mixed source/test PRs deterministic.
 
 For a file with at least five commits, `history.defect_density = history.fix_commits /
 history.commits`, as a decimal in `[0, 1]`. A file with fewer than five commits has no density;
@@ -303,8 +312,10 @@ alone never skips call A.
 ### Call B — narrative
 
 Input: bounded, approved PR title and body, `risk-signals.json`, resolved classes, both
-hunk-scan lists, and the diff when `--diff` is set. It uses the same truncation, source, and
-validation rules as call A.
+hunk-scan lists, and always the bounded merge-base diff — the deterministic phase already fetched
+it, and `human_focus`, line-level guidance, and the manual test plan cannot be grounded without
+the actual change. `--diff` continues to control only whether the enrichment call receives the
+diff. Call B uses the same truncation, source, and validation rules as call A.
 
 ```json
 {
@@ -458,12 +469,12 @@ Written before implementation.
 
 | Test | Covers |
 |---|---|
-| `tests/helpers/make-fixture-repo.sh` | Builds a scripted git repo in a temp dir with known history, authors, fix commits, cross-file references, semantic diff evidence, and more than 100 changed-file records |
-| `tests/test-risk-input.sh` | Mocks paginated pull-file and pull-commit responses, normalizes status and rename `base_path` values, checks the file count against `changedFiles`, asserts the local diff is generated from the merge base (`base_oid...head_oid`) rather than tip-to-tip when the base branch has advanced past the merge base, and asserts stale/mismatched base OIDs and a head force-push during collection produce a partial profile without source substitution |
-| `tests/test-risk-signals.sh` | Asserts exact values for every deterministic signal against that fixture, including rename-aware base history, verified author familiarity in `true`, `false`, and `unknown` states, bounded fix-keyword matching that excludes subjects such as `Fixture updates`, `fix_commits / commits`, the five-commit eligibility rule, the versioned `is_code` and `is_test_source` predicates for docs-only, fixture-heavy, and mixed PRs, and unavailable-signal behavior. No network, no `claude`. |
+| `tests/helpers/make-fixture-repo.sh` | Builds a scripted git repo in a temp dir with known history, authors, fix commits, cross-file references, semantic diff evidence, a file renamed earlier in base history, and more than 100 changed-file records |
+| `tests/test-risk-input.sh` | Mocks paginated pull-file and pull-commit responses, normalizes status and rename `base_path` values, checks the file count against `changedFiles`, asserts the local diff is generated from the merge base (`base_oid...head_oid`) rather than tip-to-tip when the base branch has advanced past the merge base, asserts a PR whose commit count exceeds the 250-commit pull-commits cap marks author familiarity unavailable instead of resolving `false`, and asserts stale/mismatched base OIDs and a head force-push during collection produce a partial profile without source substitution |
+| `tests/test-risk-signals.sh` | Asserts exact values for every deterministic signal against that fixture, including rename-following base history (`--follow`) across a rename that occurred earlier in base history, verified author familiarity in `true`, `false`, and `unknown` states, bounded fix-keyword matching that excludes subjects such as `Fixture updates`, `fix_commits / commits`, the five-commit eligibility rule, the versioned `is_code`, `is_test_source`, and `is_recognized_non_code` predicates for docs-only, manifest-only, fixture-heavy, and mixed PRs, and unavailable-signal behavior. No network, no `claude`. |
 | `tests/test-risk-scoring.sh` | Feeds fixture signal sets to the scoring function and asserts score, tier, full breakdown, every cap boundary, zero-test precedence, the sub-0.05-ratio bands at both 1–49 and ≥50 code lines, the disjoint familiarity-gap boundaries, source-only test-line accounting, and both defect-density boundaries |
 | `tests/test-path-classes.sh` | Asserts base-only pin loading, pin-plus-current-class union, nonempty class/evidence requirements, semantic-evidence validation, resolution order (pin + cache/model → unclassified), cache identity/version/base-path/merge-base-blob/per-file-diff/evidence fingerprint rejection, repository namespace isolation, atomic concurrent cache updates, and that only complete current-change cache coverage skips call A |
-| `tests/test-risk-model.sh` | Asserts truncation limits are applied and recorded in `signals_unavailable[]`, malformed model output is rejected, an absent or failing `claude` degrades to a deterministic partial profile, and prompt-like PR text cannot produce executable actions |
+| `tests/test-risk-model.sh` | Asserts truncation limits are applied and recorded in `signals_unavailable[]`, call B always receives the bounded merge-base diff regardless of `--diff`, malformed model output is rejected, an absent or failing `claude` degrades to a deterministic partial profile, and prompt-like PR text cannot produce executable actions |
 | `tests/test-risk-report.sh` | Renders fixture `risk-profile.json` to markdown; asserts `agent_safe` rejects changed-path mismatches, sensitive, `other`, and `unclassified` entries; asserts validation applicability and `signals_unavailable` are always rendered |
 | `tests/test-risk-output.sh` | Runs `--enrich --risk` with controlled parallel results; asserts one serialized combined-data/report write, atomic artifacts, and the producer side of the shared `schema_version: 1` fixture consumed by the separately owned `xray` contract test |
 
