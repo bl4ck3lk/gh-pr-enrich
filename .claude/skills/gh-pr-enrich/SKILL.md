@@ -1,6 +1,6 @@
 ---
 name: gh-pr-enrich
-description: Fetch comprehensive PR details and optionally run Claude AI analysis on unresolved comment threads. Use when reviewing PRs, addressing PR feedback, investigating review comments, or when users request PR analysis. Produces structured JSON and Markdown reports with issue categorization, systemic patterns, and prioritized task lists. Enforces mandatory thread resolution after addressing feedback and CI/CD check verification before declaring work complete.
+description: Fetch comprehensive PR details and optionally run Claude AI analysis on unresolved comment threads and issue comments (including bot/CI reports). Use when reviewing PRs, addressing PR feedback, investigating review comments, or when users request PR analysis. Produces structured JSON and Markdown reports with issue categorization, systemic patterns, and prioritized task lists. Enforces mandatory thread resolution after addressing feedback and CI/CD check verification before declaring work complete.
 ---
 
 # gh-pr-enrich Skill
@@ -83,12 +83,8 @@ gh api graphql -f query='mutation($threadId: ID!, $body: String!) {
   }
 }' -f threadId="$THREAD_ID" -f body="Fixed in $(git rev-parse --short HEAD) — [brief description of the fix]"
 
-# Step B: Then resolve the thread (parameterized — same variable as Step A)
-gh api graphql -f query='mutation($threadId: ID!) {
-  resolveReviewThread(input: {threadId: $threadId}) {
-    thread { isResolved }
-  }
-}' -f threadId="$THREAD_ID"
+# Step B: Then resolve the thread (same variable as Step A; accepts multiple IDs)
+gh pr-enrich resolve "$THREAD_ID"
 ```
 
 **After all tasks are complete**, verify no threads were missed (assumes `$OWNER`, `$REPO`, `$PR_NUMBER` were resolved earlier — see "Resolving Owner, Repo, and PR Number"):
@@ -179,8 +175,11 @@ gh extension install bl4ck3lk/gh-pr-enrich
 # Basic PR analysis
 gh pr-enrich 123
 
-# With Claude AI enrichment (analyzes unresolved threads)
+# With Claude AI enrichment (analyzes unresolved threads and issue comments)
 gh pr-enrich 123 --enrich
+
+# Enrichment with code diffs included in the Claude context
+gh pr-enrich 123 --enrich --diff
 
 # JSON output for scripting
 gh pr-enrich 123 --json
@@ -192,7 +191,19 @@ gh pr-enrich 123 --json
 
 ```bash
 gh pr-enrich <PR_NUMBER> [OPTIONS]
+gh pr-enrich <SUBCOMMAND> [ARGS]
 ```
+
+### Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| `install-skill` | Symlink this skill into `~/.claude/skills/` |
+| `uninstall-skill` | Remove the skill symlink |
+| `resolve <ID...>` | Resolve one or more review threads by GraphQL ID |
+| `watch <PR>` | Monitor a PR for new comments (`--interval MIN`, `--enrich`, `--notify`) |
+| `address <PR>` | Interactive mode to work through analyzed issues one by one (requires a prior `--enrich` run) |
+| `retrospective` | Cross-PR pattern analysis (see "Retrospective Analysis" below) |
 
 ### Options
 
@@ -201,7 +212,8 @@ gh pr-enrich <PR_NUMBER> [OPTIONS]
 | `--json` | Output only JSON (for scripting) |
 | `--markdown` | Output only Markdown report |
 | `--output-dir DIR` | Custom output directory |
-| `--enrich` | Run Claude AI analysis on unresolved threads |
+| `--enrich` | Run Claude AI analysis on unresolved threads and issue comments |
+| `--diff` | Include code diffs in Claude context (richer analysis) |
 | `--prompt FILE` | Custom prompt file for AI analysis |
 | `-h, --help` | Show help |
 | `-v, --version` | Show version |
@@ -212,6 +224,7 @@ gh pr-enrich <PR_NUMBER> [OPTIONS]
 |----------|---------|
 | `PR_REVIEW_OUTPUT_ROOT` | Override default output directory root |
 | `GH_PR_ENRICH_PROMPT` | Path to custom prompt file for Claude analysis |
+| `CLAUDE_TIMEOUT` | Timeout in seconds for Claude analysis (default: 300 for PR analysis, 180 for retrospective) |
 
 ## Output Files
 
@@ -223,10 +236,12 @@ Default location: `.reports/pr-reviews/pr-<NUMBER>/`
 | `combined-data.json` | Complete machine-readable data |
 | `pr-summary.json` | PR metadata (title, body, author, files) |
 | `all-comments.json` | All comments combined |
+| `issue-comments.json` | Top-level PR comments (part of the enrichment context) |
 | `comment-threads.json` | Thread data with GraphQL IDs and `isResolved` status |
 | `checks.json` | CI/CD status information |
 | `claude-analysis.json` | (if --enrich) Structured AI analysis |
 | `claude-analysis.md` | (if --enrich) Human-readable AI report |
+| `pr-diff.txt` / `pr-diff.json` | (if --diff) Raw and per-file structured diff |
 
 ## Analyzing Output
 
@@ -391,8 +406,12 @@ jq '[.data.repository.pullRequest.reviewThreads.nodes[]
     | select(.isResolved == false)]' comment-threads.json
 ```
 
-**Resolve a thread programmatically:**
+**Resolve threads programmatically:**
 ```bash
+# Built-in subcommand (accepts one or more IDs)
+gh pr-enrich resolve "$THREAD_ID"
+
+# Equivalent raw GraphQL
 gh api graphql -f query='mutation($threadId: ID!) {
   resolveReviewThread(input: {threadId: $threadId}) {
     thread { isResolved }
@@ -479,12 +498,8 @@ gh api graphql -f query='mutation($threadId: ID!, $body: String!) {
   }
 }' -f threadId="$THREAD_ID" -f body="Fixed in $(git rev-parse --short HEAD) — [brief description of the fix]"
 
-# Step B: then resolve the thread (parameterized — same variable as Step A)
-gh api graphql -f query='mutation($threadId: ID!) {
-  resolveReviewThread(input: {threadId: $threadId}) {
-    thread { isResolved }
-  }
-}' -f threadId="$THREAD_ID"
+# Step B: then resolve the thread (same variable as Step A; accepts multiple IDs)
+gh pr-enrich resolve "$THREAD_ID"
 
 # 5. Final thread audit — verify no unresolved threads were missed
 gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
@@ -629,6 +644,8 @@ After making fixes, the local `.reports/` files are **stale snapshots** from whe
 ### Handling Non-Thread Comments
 
 General PR comments (not attached to a code line) are NOT tracked as review threads and have no `isResolved` status. They can still contain actionable feedback.
+
+Since v1.1.0, `--enrich` includes these issue comments (including bot/CI reports from github-actions, security scanners, etc.) in the Claude analysis context, so their findings appear in `claude-analysis.json`. Still check them live at completion — new comments may have arrived after the report was generated.
 
 **Check for them:**
 ```bash
@@ -787,12 +804,12 @@ gh extension install bl4ck3lk/gh-pr-enrich
 gh extension upgrade pr-enrich
 ```
 
-### No Unresolved Threads
+### Claude Analysis Skipped
 
-If `--enrich` reports "No unresolved threads found":
-- All review threads may already be resolved
-- Check `comment-threads.json` to verify thread status
-- Issue comments (not on code lines) aren't tracked as threads
+If `--enrich` reports "No unresolved threads or issue comments found":
+- Enrichment runs when the PR has unresolved review threads OR top-level issue comments; with neither, it is skipped
+- All review threads may already be resolved — check `comment-threads.json` to verify thread status
+- Check `issue-comments.json` to confirm the PR has no top-level comments
 
 ### Claude Analysis Empty
 

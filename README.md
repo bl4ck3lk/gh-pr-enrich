@@ -9,7 +9,7 @@ A GitHub CLI extension for comprehensive PR analysis with optional Claude AI enr
 - 🧵 **Thread Tracking**: GraphQL IDs for programmatic thread resolution
 - ✅ **CI/CD Status**: Check runs and status information
 - 📊 **Statistics**: Comment counts by type/user, recent activity
-- 🤖 **Claude AI Analysis** (optional): Categorize issues, identify systemic patterns, generate task lists
+- 🤖 **Claude AI Analysis** (optional): Analyze unresolved review threads and issue comments (including bot/CI reports) to categorize issues, identify systemic patterns, and generate task lists
 - 🔧 **Thread Resolution**: Resolve comment threads directly from CLI
 - 👀 **Watch Mode**: Monitor PRs for new comments with auto-analysis
 - 🎯 **Interactive Mode**: Work through issues one by one with guided fixing
@@ -56,7 +56,7 @@ gh pr-enrich address 123
 | `--json` | Output only JSON |
 | `--markdown` | Output only Markdown |
 | `--output-dir DIR` | Custom output directory |
-| `--enrich` | Run Claude AI analysis on unresolved threads |
+| `--enrich` | Run Claude AI analysis on unresolved threads and issue comments |
 | `--diff` | Include code diffs in Claude context (richer analysis) |
 | `--prompt FILE` | Custom prompt file for Claude analysis |
 | `-h, --help` | Show help |
@@ -83,6 +83,7 @@ When run, the extension creates a directory with:
 ├── combined-data.json           # Machine-readable data
 ├── pr-summary.json              # PR metadata
 ├── all-comments.json            # All comments combined
+├── issue-comments.json          # Top-level PR comments (part of enrichment context)
 ├── comment-threads.json         # Thread data with GraphQL IDs
 ├── checks.json                  # CI/CD status
 ├── claude-analysis.json         # (if --enrich) AI analysis
@@ -90,6 +91,8 @@ When run, the extension creates a directory with:
 ├── pr-diff.txt                  # (if --diff) Raw unified diff
 └── pr-diff.json                 # (if --diff) Structured diff by file
 ```
+
+Intermediate artifacts (`review-comments.json`, `inline-comments.json`, `unresolved-threads.json`, `claude-context.json`, `claude-raw-response.json`, `id-mapping.txt`) are also kept in the same directory for debugging.
 
 ## Retrospective Analysis
 
@@ -147,12 +150,16 @@ With `--enrich`, Claude provides additional meta-analysis:
 
 ## Claude AI Analysis
 
-When using `--enrich`, Claude analyzes unresolved comment threads and provides:
+When using `--enrich`, Claude analyzes unresolved review threads **and** top-level issue comments — including bot/CI reports from github-actions, security scanners, and similar tools — and provides:
 
 - **Issue Categories**: Groups issues by type (security, performance, architecture, etc.)
 - **Systemic Issues**: Identifies patterns across multiple comments
 - **Adjacent Problems**: Suggests related areas to investigate
 - **Task List**: Prioritized actions linked to thread IDs
+- **Process Improvements**: Automation, documentation, and review-process suggestions to prevent recurrence
+- **PR Template Suggestions**: Checklist items that would catch these issues before review
+
+The analysis runs when the PR has unresolved threads or issue comments; if it has neither, enrichment is skipped.
 
 ### Requirements for `--enrich`
 
@@ -202,8 +209,8 @@ export PR_REVIEW_OUTPUT_ROOT="./custom-reports"
 # Custom prompt file for Claude analysis
 export GH_PR_ENRICH_PROMPT="$HOME/.config/gh-pr-enrich-prompt.txt"
 
-# Timeout for Claude analysis (default: 120s for PR analysis, 180s for retrospective)
-export CLAUDE_TIMEOUT=300  # 5 minutes
+# Timeout for Claude analysis (default: 300s for PR analysis, 180s for retrospective)
+export CLAUDE_TIMEOUT=600  # 10 minutes
 ```
 
 ## Examples
@@ -292,6 +299,18 @@ Once installed, Claude Code can:
 ### Skill Location
 
 The skill is located at `.claude/skills/gh-pr-enrich/SKILL.md` in this repository.
+
+## Development
+
+Run the test suite (CI runs the same scripts on every push and PR):
+
+```bash
+tests/test-skill-md.sh            # SKILL.md regression checks
+tests/test-retrospective.sh       # Retrospective subcommand tests
+tests/test-enrichment-context.sh  # Enrichment-context tests
+```
+
+Design specs for planned features live in `docs/superpowers/specs/` (currently the PR risk profile contract for a future `--risk` flag; not yet implemented).
 
 ## License
 
