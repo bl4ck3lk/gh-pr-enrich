@@ -1608,7 +1608,7 @@ OPTIONS:
   --json            Output only JSON (default: combined)
   --markdown        Output only Markdown (default: combined)
   --output-dir DIR  Directory to save output (default: .reports/pr-reviews/pr-<N>)
-  --enrich          Run Claude AI analysis on unresolved comment threads
+  --enrich          Run Claude AI analysis on unresolved threads and issue comments
   --diff            Include code diffs in Claude context (richer analysis)
   --prompt FILE     Custom prompt file for Claude analysis (overrides defaults)
   -h, --help        Show this help message
