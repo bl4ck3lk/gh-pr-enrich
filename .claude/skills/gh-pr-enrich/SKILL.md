@@ -83,8 +83,9 @@ gh api graphql -f query='mutation($threadId: ID!, $body: String!) {
   }
 }' -f threadId="$THREAD_ID" -f body="Fixed in $(git rev-parse --short HEAD) — [brief description of the fix]"
 
-# Step B: Then resolve the thread (same variable as Step A; accepts multiple IDs)
+# Step B: Then resolve the thread (same variable as Step A)
 gh pr-enrich resolve "$THREAD_ID"
+# For multiple threads, pass each ID as a separate argument: gh pr-enrich resolve PRRT_xxx PRRT_yyy
 ```
 
 **After all tasks are complete**, verify no threads were missed (assumes `$OWNER`, `$REPO`, `$PR_NUMBER` were resolved earlier — see "Resolving Owner, Repo, and PR Number"):
