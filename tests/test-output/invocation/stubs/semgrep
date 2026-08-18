@@ -1,0 +1,9 @@
+#!/bin/bash
+cat << 'JSON'
+{"results": [
+  {"check_id": "javascript.lang.security.audit.unsafe-exec",
+   "path": "src/retry.js",
+   "start": {"line": 12},
+   "extra": {"severity": "ERROR", "message": "Detected unsafe exec", "metadata": {"cwe": ["CWE-78"]}}}
+], "errors": []}
+JSON

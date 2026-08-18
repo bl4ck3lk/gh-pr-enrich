@@ -134,10 +134,19 @@ else
     fail "analyzer stderr is captured to a log next to the response" "no $STDERR_LOG written"
 fi
 # Static guard: the analyzer's own output must go to the log, never to /dev/null.
-ANALYSIS_FN=$(sed -n '/^run_claude_analysis/,/^}/p' "$GH_PR_ENRICH")
-assert_contains "$ANALYSIS_FN" '2> "$stderr_log"' "analyzer stderr is redirected to the log file"
-assert_not_contains "$ANALYSIS_FN" '> "$output_file" 2>/dev/null' \
+INVOKER_FN=$(sed -n '/^invoke_claude() {/,/^}/p' "$GH_PR_ENRICH")
+assert_contains "$INVOKER_FN" '2> "$stderr_log"' "analyzer stderr is redirected to the log file"
+assert_not_contains "$INVOKER_FN" '> "$output_file" 2>/dev/null' \
     "analyzer output redirection no longer discards stderr"
+
+# One invoker, two callers: the PR analysis and the retrospective must not grow
+# separate copies of the CLI invocation, or a fix to one will miss the other.
+assert_eq "1" "$(grep -v '^\s*#' "$GH_PR_ENRICH" | grep -c 'claude --print')" \
+    "the Claude CLI is invoked from exactly one place"
+assert_contains "$(sed -n '/^run_claude_analysis() {/,/^}/p' "$GH_PR_ENRICH")" 'invoke_claude' \
+    "PR analysis delegates to the shared invoker"
+assert_contains "$(sed -n '/run_retrospective_claude_analysis() {/,/^    }/p' "$GH_PR_ENRICH")" 'invoke_claude' \
+    "retrospective analysis delegates to the shared invoker"
 
 # ---------------------------------------------------------------------------
 # Failure paths must be diagnosable, and must not leak shell internals
