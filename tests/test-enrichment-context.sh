@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test suite for build_claude_context including issue comments
-# Uses integration testing: invokes the actual gh-pr-enrich script via --test-build-context
+# Uses integration testing: invokes the shipped build_claude_context via --test-call
 
 set -e
 
@@ -9,28 +9,8 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output/enrichment"
 GH_PR_ENRICH="$PROJECT_DIR/gh-pr-enrich"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    echo -e "${GREEN}✓${NC} $1"
-    ((TESTS_PASSED++)) || true
-    ((TESTS_RUN++)) || true
-}
-
-fail() {
-    echo -e "${RED}✗${NC} $1"
-    echo "  $2"
-    ((TESTS_FAILED++)) || true
-    ((TESTS_RUN++)) || true
-}
+# shellcheck source=lib/assert.sh
+source "$SCRIPT_DIR/lib/assert.sh"
 
 cleanup() {
     rm -rf "$TEST_OUTPUT_DIR"
@@ -47,10 +27,10 @@ setup() {
 # This ensures tests catch regressions in the real implementation.
 # ============================================================================
 
-# Invoke the real build_claude_context via the hidden test mode
+# Invoke the real build_claude_context via the hidden test dispatcher
 run_build_claude_context() {
     local dir="$1"
-    "$GH_PR_ENRICH" --test-build-context "$dir" 2>/dev/null
+    "$GH_PR_ENRICH" --test-call build_claude_context "$dir" "${2:-false}" 2>/dev/null
 }
 
 create_test_fixtures() {
@@ -298,10 +278,7 @@ test_no_enrichment_when_both_empty() {
 # Main
 # ============================================================================
 
-echo "============================================"
-echo "gh pr-enrich enrichment context test suite"
-echo "============================================"
-echo ""
+suite_start "gh pr-enrich enrichment context test suite"
 
 setup
 
@@ -311,16 +288,5 @@ test_long_issue_comment_truncation
 test_enrichment_triggers_with_only_issue_comments
 test_no_enrichment_when_both_empty
 
-# Summary
-echo ""
-echo "============================================"
-echo "Results: $TESTS_PASSED/$TESTS_RUN passed"
-if [ "$TESTS_FAILED" -gt 0 ]; then
-    echo -e "${RED}$TESTS_FAILED tests failed${NC}"
-    cleanup
-    exit 1
-else
-    echo -e "${GREEN}All tests passed!${NC}"
-    cleanup
-    exit 0
-fi
+trap cleanup EXIT
+suite_end

@@ -1647,18 +1647,27 @@ HELP
     exit 0
 fi
 
-# Early check for test-build-context mode (before PR_NUMBER validation)
-if [ "$1" = "--test-build-context" ]; then
+# Hidden test dispatcher (checked before PR_NUMBER validation).
+#
+#   gh-pr-enrich --test-call <function> [args...]
+#
+# Invokes one internal function directly so test suites exercise shipped code
+# instead of a copy. Only functions named in TEST_CALLABLE_FUNCTIONS are
+# dispatchable — argv must never be able to call arbitrary shell functions.
+TEST_CALL_FN=""
+TEST_CALL_ARGS=()
+if [ "${1:-}" = "--test-call" ]; then
     if [ -z "${2:-}" ]; then
-        echo "Error: --test-build-context requires a directory path."
+        echo "Error: --test-call requires a function name." >&2
         exit 1
     fi
-    TEST_BUILD_CONTEXT_DIR="$2"
-    # Will be handled after function definitions
+    TEST_CALL_FN="$2"
+    shift 2
+    TEST_CALL_ARGS=("$@")
 fi
 
-# Skip main logic if in test mode - will be handled after function definitions
-if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
+# Skip CLI argument handling in test-call mode ($1 is not a PR number there)
+if [ -z "$TEST_CALL_FN" ]; then
     PR_NUMBER=$1
 
     # Validate PR_NUMBER is a positive integer (prevent path traversal)
@@ -1725,8 +1734,8 @@ If there are no systemic issues or adjacent problems, return empty arrays for th
     fi
 }
 
-# Parse options (skip in test mode)
-if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
+# Parse options (skipped in test-call mode)
+if [ -z "$TEST_CALL_FN" ]; then
     while [[ $# -gt 0 ]]; do
     case $1 in
         --json)
@@ -1773,7 +1782,7 @@ if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
             ;;
     esac
 done
-fi  # End of: if [ -z "$TEST_BUILD_CONTEXT_DIR" ] for argument parsing
+fi  # End of: if [ -z "$TEST_CALL_FN" ] for argument parsing
 
 # Ensure jq is available
 if ! command -v jq &> /dev/null; then
@@ -1795,108 +1804,12 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
     fi
 fi
 
-# Main PR logic (skip in test mode)
-if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
-# Create output directory
-mkdir -p "$OUTPUT_DIR"
-
-echo "Fetching details for PR #$PR_NUMBER in $REPO..."
-echo "Saving report to: $OUTPUT_DIR"
-
-# 1. Fetch PR summary
-echo "Fetching PR summary..."
-PR_SUMMARY_FIELDS="number,title,body,author,state,url,createdAt,updatedAt,mergedAt,closedAt,labels,assignees,reviewRequests,reviews,milestone,projectCards,additions,deletions,changedFiles,mergeable,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,headRepository,headRepositoryOwner,files,commits,statusCheckRollup"
-gh pr view "$PR_NUMBER" --json "$PR_SUMMARY_FIELDS" \
-    > "$OUTPUT_DIR/pr-summary.json" 2>/dev/null || {
-        echo "Error fetching PR summary. Ensure PR #$PR_NUMBER exists and you have access."
-        exit 1
-    }
-
-# 2. Fetch all comments
-echo "Fetching all comments..."
-gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
-    | jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
-        id: .id,
-        body: (.body // ""),
-        user: .user.login,
-        created_at: .created_at,
-        updated_at: .updated_at,
-        type: "issue_comment",
-        html_url: .html_url
-    })' > "$OUTPUT_DIR/issue-comments.json"
-
-gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
-    | jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
-        id: .id,
-        body: (.body // ""),
-        user: .user.login,
-        state: .state,
-        submitted_at: .submitted_at,
-        type: "review_comment",
-        commit_id: .commit_id,
-        html_url: .html_url
-    })' > "$OUTPUT_DIR/review-comments.json"
-
-gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/comments" \
-    | jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
-        id: .id,
-        body: (.body // ""),
-        path: .path,
-        position: .position,
-        line: .original_line,
-        user: .user.login,
-        created_at: .created_at,
-        updated_at: .updated_at,
-        type: "inline_comment",
-        html_url: .html_url
-    })' > "$OUTPUT_DIR/inline-comments.json"
-
-# 3. Fetch comment threads with GraphQL IDs
-echo "Fetching comment threads with GraphQL IDs..."
-OWNER=$(echo "$REPO" | cut -d'/' -f1)
-REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
-
-GRAPHQL_QUERY='
-query($owner: String!, $name: String!, $prNumber: Int!) {
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $prNumber) {
-      reviewThreads(last: 100) {
-        nodes {
-          id
-          isResolved
-          comments(first: 10) {
-            nodes {
-              id
-              databaseId
-              body
-              author {
-                login
-              }
-              createdAt
-              url
-            }
-          }
-        }
-      }
-    }
-  }
-}
-'
-
-gh api graphql -F owner="$OWNER" -F name="$REPO_NAME" -F prNumber="$PR_NUMBER" -f query="$GRAPHQL_QUERY" \
-    > "$OUTPUT_DIR/comment-threads.json" 2>/dev/null || {
-        echo "Note: Could not fetch comment threads with GraphQL IDs."
-        echo '{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}' > "$OUTPUT_DIR/comment-threads.json"
-    }
-
-# Process comment threads to create ID mapping
-jq -r '.data.repository.pullRequest.reviewThreads.nodes[] |
-    select(.comments.nodes | length > 0) |
-    .comments.nodes[] |
-    select(.databaseId != null) |
-    "\(.databaseId):\(.id)"' "$OUTPUT_DIR/comment-threads.json" > "$OUTPUT_DIR/id-mapping.txt" 2>/dev/null || {
-        echo "" > "$OUTPUT_DIR/id-mapping.txt"
-    }
+# ============================================================================
+# Enrichment Functions
+#
+# Defined at top level (not inside the main-flow guard) so that the CLI path and
+# the --test-call dispatcher execute the same code. Never inline a copy of these.
+# ============================================================================
 
 # Function to add GraphQL IDs to comments
 create_comments_with_graphql_ids() {
@@ -2242,7 +2155,134 @@ generate_analysis_report() {
 }
 
 # ============================================================================
-# Main Processing (continuation of main logic block started above)
+# Test dispatcher
+#
+# Runs after every definition above and exits before the CLI flow. Keeps the
+# test suites pointed at shipped functions rather than at copies.
+# ============================================================================
+TEST_CALLABLE_FUNCTIONS="build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis generate_analysis_report dedupe_bot_comments collect_sast_findings"
+
+if [ -n "$TEST_CALL_FN" ]; then
+    case " $TEST_CALLABLE_FUNCTIONS " in
+        *" $TEST_CALL_FN "*)
+            "$TEST_CALL_FN" "${TEST_CALL_ARGS[@]+"${TEST_CALL_ARGS[@]}"}"
+            exit $?
+            ;;
+        *)
+            echo "Error: '$TEST_CALL_FN' is not test-callable." >&2
+            echo "Allowed: $TEST_CALLABLE_FUNCTIONS" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+# ============================================================================
+# Main PR logic
+# ============================================================================
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+
+echo "Fetching details for PR #$PR_NUMBER in $REPO..."
+echo "Saving report to: $OUTPUT_DIR"
+
+# 1. Fetch PR summary
+echo "Fetching PR summary..."
+PR_SUMMARY_FIELDS="number,title,body,author,state,url,createdAt,updatedAt,mergedAt,closedAt,labels,assignees,reviewRequests,reviews,milestone,projectCards,additions,deletions,changedFiles,mergeable,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,headRepository,headRepositoryOwner,files,commits,statusCheckRollup"
+gh pr view "$PR_NUMBER" --json "$PR_SUMMARY_FIELDS" \
+    > "$OUTPUT_DIR/pr-summary.json" 2>/dev/null || {
+        echo "Error fetching PR summary. Ensure PR #$PR_NUMBER exists and you have access."
+        exit 1
+    }
+
+# 2. Fetch all comments
+echo "Fetching all comments..."
+gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+    | jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
+        id: .id,
+        body: (.body // ""),
+        user: .user.login,
+        created_at: .created_at,
+        updated_at: .updated_at,
+        type: "issue_comment",
+        html_url: .html_url
+    })' > "$OUTPUT_DIR/issue-comments.json"
+
+gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+    | jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
+        id: .id,
+        body: (.body // ""),
+        user: .user.login,
+        state: .state,
+        submitted_at: .submitted_at,
+        type: "review_comment",
+        commit_id: .commit_id,
+        html_url: .html_url
+    })' > "$OUTPUT_DIR/review-comments.json"
+
+gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/comments" \
+    | jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
+        id: .id,
+        body: (.body // ""),
+        path: .path,
+        position: .position,
+        line: .original_line,
+        user: .user.login,
+        created_at: .created_at,
+        updated_at: .updated_at,
+        type: "inline_comment",
+        html_url: .html_url
+    })' > "$OUTPUT_DIR/inline-comments.json"
+
+# 3. Fetch comment threads with GraphQL IDs
+echo "Fetching comment threads with GraphQL IDs..."
+OWNER=$(echo "$REPO" | cut -d'/' -f1)
+REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
+
+GRAPHQL_QUERY='
+query($owner: String!, $name: String!, $prNumber: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $prNumber) {
+      reviewThreads(last: 100) {
+        nodes {
+          id
+          isResolved
+          comments(first: 10) {
+            nodes {
+              id
+              databaseId
+              body
+              author {
+                login
+              }
+              createdAt
+              url
+            }
+          }
+        }
+      }
+    }
+  }
+}
+'
+
+gh api graphql -F owner="$OWNER" -F name="$REPO_NAME" -F prNumber="$PR_NUMBER" -f query="$GRAPHQL_QUERY" \
+    > "$OUTPUT_DIR/comment-threads.json" 2>/dev/null || {
+        echo "Note: Could not fetch comment threads with GraphQL IDs."
+        echo '{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}' > "$OUTPUT_DIR/comment-threads.json"
+    }
+
+# Process comment threads to create ID mapping
+jq -r '.data.repository.pullRequest.reviewThreads.nodes[] |
+    select(.comments.nodes | length > 0) |
+    .comments.nodes[] |
+    select(.databaseId != null) |
+    "\(.databaseId):\(.id)"' "$OUTPUT_DIR/comment-threads.json" > "$OUTPUT_DIR/id-mapping.txt" 2>/dev/null || {
+        echo "" > "$OUTPUT_DIR/id-mapping.txt"
+    }
+
+
+# ============================================================================
+# Main Processing
 # ============================================================================
 
 # Add GraphQL IDs to all comment types
@@ -2464,52 +2504,3 @@ case $OUTPUT_FORMAT in
         fi
         ;;
 esac
-
-fi  # End of: if [ -z "$TEST_BUILD_CONTEXT_DIR" ]
-
-# Test mode: build context and exit (for integration testing)
-# Inlined version of build_claude_context to avoid function scoping issues
-if [ -n "$TEST_BUILD_CONTEXT_DIR" ]; then
-    if [ ! -d "$TEST_BUILD_CONTEXT_DIR" ]; then
-        echo "Error: Directory not found: $TEST_BUILD_CONTEXT_DIR"
-        exit 1
-    fi
-
-    output_dir="$TEST_BUILD_CONTEXT_DIR"
-    include_diff="false"
-
-    # Ensure issue-comments.json exists (avoids --slurpfile error)
-    if [ ! -f "$output_dir/issue-comments.json" ]; then
-        echo '[]' > "$output_dir/issue-comments.json"
-    fi
-
-    # Shared jq filter for mapping/truncating issue comments
-    issue_comments_filter='($issue_comments[0] | map({
-        user: .user,
-        body: (if (.body | length) > 5000 then
-            (.body | .[0:5000] + "\n... (truncated)")
-        else
-            .body
-        end),
-        url: .html_url,
-        created_at: .created_at
-    }))'
-
-    # Build claude-context.json without diff
-    jq -n \
-        --argjson pr "$(<"$output_dir/pr-summary.json")" \
-        --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
-        --slurpfile issue_comments "$output_dir/issue-comments.json" \
-        '{
-            pr: {
-                title: $pr.title,
-                body: ($pr.body // "No description"),
-                author: $pr.author.login,
-                files_changed: [$pr.files[].path]
-            },
-            unresolved_threads: $unresolved,
-            issue_comments: '"$issue_comments_filter"'
-        }' > "$output_dir/claude-context.json"
-
-    exit 0
-fi
