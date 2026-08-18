@@ -17,12 +17,15 @@ jobs:
           bash --version | head -1
           jq --version
           gh --version | head -1
+          shellcheck --version | head -2
 
-      - name: SKILL.md regression checks
-        run: tests/test-skill-md.sh
+      - name: Shell syntax check
+        run: bash -n gh-pr-enrich
 
-      - name: Retrospective subcommand tests
-        run: tests/test-retrospective.sh
+      - name: Lint shell scripts
+        run: shellcheck -S error gh-pr-enrich tests/*.sh tests/lib/*.sh
 
-      - name: Enrichment-context tests
-        run: tests/test-enrichment-context.sh
+      # Runs every suite, including any suite added later. Individual suites are
+      # not listed here so a new test file cannot be silently left out of CI.
+      - name: Test suites
+        run: tests/run-all.sh

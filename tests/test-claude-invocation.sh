@@ -133,8 +133,11 @@ if [ -f "$STDERR_LOG" ]; then
 else
     fail "analyzer stderr is captured to a log next to the response" "no $STDERR_LOG written"
 fi
-assert_not_contains "$(grep -c '2>/dev/null' "$GH_PR_ENRICH" >/dev/null && sed -n '/^run_claude_analysis/,/^}/p' "$GH_PR_ENRICH")" \
-    "2>/dev/null" "run_claude_analysis no longer discards stderr"
+# Static guard: the analyzer's own output must go to the log, never to /dev/null.
+ANALYSIS_FN=$(sed -n '/^run_claude_analysis/,/^}/p' "$GH_PR_ENRICH")
+assert_contains "$ANALYSIS_FN" '2> "$stderr_log"' "analyzer stderr is redirected to the log file"
+assert_not_contains "$ANALYSIS_FN" '> "$output_file" 2>/dev/null' \
+    "analyzer output redirection no longer discards stderr"
 
 # ---------------------------------------------------------------------------
 # SAST pre-pass

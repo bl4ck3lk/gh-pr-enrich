@@ -1,11 +1,11 @@
 ---
 name: gh-pr-enrich
-description: Fetch comprehensive PR details and optionally run Claude AI analysis on unresolved comment threads and issue comments (including bot/CI reports). Use when reviewing PRs, addressing PR feedback, investigating review comments, or when users request PR analysis. Produces structured JSON and Markdown reports with issue categorization, systemic patterns, and prioritized task lists. Enforces mandatory thread resolution after addressing feedback and CI/CD check verification before declaring work complete.
+description: Use when reviewing a PR, addressing PR review feedback, investigating review comments or bot/CI reports on a PR, auditing a PR for bugs before merge, or looking for recurring issues across past PRs.
 ---
 
 # gh-pr-enrich Skill
 
-Comprehensive PR analysis using the `gh pr-enrich` GitHub CLI extension. Fetches complete PR context (comments, threads, checks, files) and optionally enriches with Claude AI analysis to categorize issues, identify patterns, and generate actionable task lists.
+Comprehensive PR analysis using the `gh pr-enrich` GitHub CLI extension. Fetches complete PR context (comments, threads, checks, commits, linked issues) and optionally runs a verification pass with Claude that checks each claim against the code, sweeps a fixed category list, and produces anchored, executable tasks.
 
 ## Why This Skill Exists (RED Baseline)
 
@@ -13,14 +13,19 @@ Without this skill, agents addressing PR feedback fall into predictable failure 
 
 | What agents do without gh-pr-enrich | What gh-pr-enrich prevents |
 |--------------------------------------|---------------------------|
+| Treat every review comment as correct | Each finding carries a verdict; refuted claims land in `disputed_comments` |
+| Fix only what reviewers noticed | Fixed category sweep with an explicit verdict per category |
+| Rank a bug as "low" because it arrived as a style note | Severity derives from impact × likelihood, never from category |
+| Produce vague tasks ("improve error handling") | Every task carries file, line, suggested fix and a verification step |
 | Read comments one at a time, miss patterns | Groups issues by category, surfaces systemic root causes |
-| Fix symptoms without investigating adjacent code | Adjacent problems section flags related areas proactively |
+| Fix symptoms without investigating adjacent code | Adjacent problems are checked, and marked when they were not |
 | Address tasks then forget to resolve threads | Mandatory thread resolution workflow with final audit |
 | Declare "done" without verifying CI | Completion gate requires `gh pr checks` evidence |
 | Miss non-thread comments entirely | Explicit non-thread comment check in workflow |
+| Trust a truncated report as a complete one | Coverage block records every dropped or shortened input |
 | Treat each PR in isolation | Retrospective analysis connects patterns across PRs |
 
-**The gap:** A general-purpose agent addressing PR feedback will fix individual comments without seeing the systemic pattern, forget to resolve threads, skip CI verification, and miss non-thread comments. This skill makes all four impossible to skip.
+**The gap:** A general-purpose agent addressing PR feedback accepts reviewer claims as facts, fixes only what was pointed out, forgets to resolve threads, and skips CI verification. This skill makes each of those failures visible.
 
 ## When to Use This Skill
 
@@ -39,6 +44,41 @@ Use this skill when:
 
 **IMPORTANT:** After running `gh pr-enrich --enrich`, you MUST complete these steps before addressing individual tasks:
 
+### 0. Separate Verified Findings from Claims (REQUIRED)
+
+Every finding carries a `verdict`. Read it before you plan any work:
+
+```bash
+ANALYSIS=.reports/pr-reviews/pr-<NUMBER>/claude-analysis.json
+
+# Findings that were traced in the code
+jq '[.issue_categories[] | select(.verdict == "confirmed")]' "$ANALYSIS"
+
+# Findings that could not be verified — investigate before fixing
+jq '[.issue_categories[] | select(.verdict == "plausible")]' "$ANALYSIS"
+
+# Reviewer or bot claims that were checked and found wrong
+jq '.disputed_comments' "$ANALYSIS"
+```
+
+**Why this matters:** A review comment is a claim, not a fact. Fixing a refuted claim changes working code for no reason and closes the thread with a false explanation.
+
+- `confirmed` → fix it.
+- `plausible` → verify it yourself first, then fix or dispute.
+- `refuted` / listed in `disputed_comments` → **do not fix.** Reply on the thread with the reason it does not apply, and resolve only after the reviewer agrees.
+
+### 0b. Check What Was Actually Swept (REQUIRED)
+
+```bash
+# Categories the analyzer could not check, and why
+jq '[.category_coverage[] | select(.verdict == "not_reviewable")]' "$ANALYSIS"
+
+# What the analyzer was and was not shown
+jq '.analysis_context_coverage' .reports/pr-reviews/pr-<NUMBER>/combined-data.json
+```
+
+**Why this matters:** "No findings" and "not checked" look identical in a task list. `not_reviewable` categories and truncated inputs are the gaps where bugs survive a clean-looking review. If a category you care about is `not_reviewable`, review it yourself or re-run with `--diff` and repository access.
+
 ### 1. Review Systemic Issues (REQUIRED)
 
 Always check `systemic_issues` first. These reveal root causes that may affect multiple tasks:
@@ -55,12 +95,17 @@ Always review `adjacent_problems` to identify related areas that need attention:
 
 ```bash
 jq '.adjacent_problems' .reports/pr-reviews/pr-<NUMBER>/claude-analysis.json
+
+# The ones the analyzer could not search itself — these are yours to check
+jq '[.adjacent_problems[] | select(.checked != true)]' .reports/pr-reviews/pr-<NUMBER>/claude-analysis.json
 ```
 
 **Why this matters:** PR reviewers see only the changed code. Adjacent problems highlight areas with similar issues that weren't in the PR diff. Investigating these prevents:
 - Incomplete fixes that miss related code
 - Future PRs with the same feedback
 - Whack-a-mole debugging cycles
+
+`checked: true` means the analyzer searched and reported what it found. `checked: false` means it could not search — treat that as an open investigation, not a clean result.
 
 ### 3. Then Address Tasks in Priority Order
 
@@ -91,20 +136,22 @@ gh pr-enrich resolve "$THREAD_ID"
 **After all tasks are complete**, verify no threads were missed (assumes `$OWNER`, `$REPO`, `$PR_NUMBER` were resolved earlier — see "Resolving Owner, Repo, and PR Number"):
 
 ```bash
-# Re-fetch thread status and check for any still-unresolved threads
-gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
-query($owner: String!, $repo: String!, $number: Int!) {
+# Re-fetch thread status and check for any still-unresolved threads.
+# --paginate follows the cursor: a PR with more than 100 threads must not lose the rest.
+gh api graphql --paginate -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
+query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
         nodes { id isResolved }
       }
     }
   }
-}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
+}' | jq -s '[.[].data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
 ```
 
-**Thread pagination warning:** The `first: 100` limit means PRs with >100 review threads will silently miss threads. If the thread count returned equals exactly 100, assume truncation — increase the limit or paginate with cursors.
+**Always use `--paginate` with `jq -s`.** A single page silently caps the audit at 100 threads, and a missed thread reads exactly like a resolved one.
 
 If any threads remain unresolved, investigate whether they were:
 - **Addressed but not resolved** — resolve them now
@@ -215,9 +262,14 @@ gh pr-enrich <SUBCOMMAND> [ARGS]
 | `--output-dir DIR` | Custom output directory |
 | `--enrich` | Run Claude AI analysis on unresolved threads and issue comments |
 | `--diff` | Include code diffs in Claude context (richer analysis) |
+| `--sast` | Run a semgrep pre-pass on changed files; findings enter the analysis as deterministic ground truth |
+| `--no-code-access` | Deny the analyzer repository access (sandboxed runs). Findings can then only be `plausible` |
+| `--model NAME` | Model for the analysis (default: `sonnet`) |
 | `--prompt FILE` | Custom prompt file for AI analysis |
 | `-h, --help` | Show help |
 | `-v, --version` | Show version |
+
+**Recommended for a real bug hunt:** `gh pr-enrich <N> --enrich --diff --sast`. The analyzer reads the repository by default, so it can verify claims rather than paraphrase them.
 
 ### Environment Variables
 
@@ -225,7 +277,14 @@ gh pr-enrich <SUBCOMMAND> [ARGS]
 |----------|---------|
 | `PR_REVIEW_OUTPUT_ROOT` | Override default output directory root |
 | `GH_PR_ENRICH_PROMPT` | Path to custom prompt file for Claude analysis |
-| `CLAUDE_TIMEOUT` | Timeout in seconds for Claude analysis (default: 300 for PR analysis, 180 for retrospective) |
+| `GH_PR_ENRICH_MODEL` | Model for the analysis (default: `sonnet`) |
+| `GH_PR_ENRICH_CODE_ACCESS` | `false` disables repository read access |
+| `GH_PR_ENRICH_TRUNCATE_CHARS` | Per-comment / per-diff truncation limit (default: 5000) |
+| `GH_PR_ENRICH_SEMGREP_CONFIG` | `semgrep --config` value for `--sast` (default: `auto`) |
+| `GH_PR_ENRICH_SEMGREP_TIMEOUT` | Seconds allowed for the semgrep pre-pass (default: 180) |
+| `CLAUDE_TIMEOUT` | Timeout in seconds for Claude analysis (default: 600 for PR analysis, 180 for retrospective) |
+
+**Timeouts:** verifying against code takes longer than summarizing comments. A large PR analyzed with `--diff` can exceed the 600s default; raise `CLAUDE_TIMEOUT` rather than dropping code access, since a timed-out run produces no analysis at all.
 
 ## Output Files
 
@@ -240,40 +299,97 @@ Default location: `.reports/pr-reviews/pr-<NUMBER>/`
 | `issue-comments.json` | Top-level PR comments (part of the enrichment context) |
 | `comment-threads.json` | Thread data with GraphQL IDs and `isResolved` status |
 | `checks.json` | CI/CD status information |
+| `linked-issues.json` | Issues this PR closes (intent the diff cannot show) |
 | `claude-analysis.json` | (if --enrich) Structured AI analysis |
 | `claude-analysis.md` | (if --enrich) Human-readable AI report |
+| `claude-context.json` | (if --enrich) Exactly what the analyzer was shown, including its `coverage` block |
+| `claude-stderr.log` | (if --enrich) Analyzer stderr — read this first when an analysis comes back empty |
+| `context-coverage.md` | (if --enrich) Rendered table of what was truncated, dropped or omitted |
 | `pr-diff.txt` / `pr-diff.json` | (if --diff) Raw and per-file structured diff |
+| `sast-findings.json` | (if --sast) Normalized semgrep findings |
 
 ## Analyzing Output
 
 ### Reading the Claude Analysis
 
-When using `--enrich`, the AI analysis contains six key sections:
+When using `--enrich`, the AI analysis contains eight sections:
 
 #### 1. Issue Categories
 
-Groups unresolved comments by type with severity ratings:
+Each finding is verified, categorized, rated and anchored:
 
 ```json
 {
   "issue_categories": [
     {
-      "name": "Missing Request Correlation IDs",
-      "severity": "high",
-      "description": "Multiple Sentry captures lack request_id...",
-      "thread_ids": ["PRRT_xxx", "PRRT_yyy"]
+      "name": "Retry loop never terminates on 429",
+      "category": "logic_error",
+      "verdict": "confirmed",
+      "confidence": "high",
+      "severity": "critical",
+      "impact": "severe",
+      "likelihood": "likely",
+      "severity_rationale": "Upstream 429 keeps attempts at 0, so the loop never exits; happens on any rate-limited request.",
+      "description": "The attempt counter resets inside the catch block.",
+      "evidence": [
+        {"file": "src/retry.js", "line": 42, "detail": "attempts = 0 inside catch, resets the guard"}
+      ],
+      "thread_ids": ["PRRT_xxx"]
     }
   ]
 }
 ```
 
-**Severity levels (each must cite evidence):**
-- `critical` - Security vulnerabilities, data loss, breaking changes — because [specific thread citing exploitable issue]
-- `high` - Bugs, performance issues, architectural problems — because [specific thread with reproduction steps or impact]
-- `medium` - Code quality, maintainability, missing tests — because [thread citing measurable maintenance impact]
-- `low` - Style, documentation, minor improvements — because [thread citing convention or standard]
+**Verdict** — what verification concluded:
+- `confirmed` — the defect was traced in the code
+- `plausible` — consistent with the visible evidence, but the deciding code was not reachable
+- `refuted` — checked and found wrong (also listed in `disputed_comments`)
 
-Severity without evidence from the actual thread content is guessing, not analysis.
+**Severity is derived, not assigned by category.** It comes from `impact` × `likelihood`:
+
+| | certain | likely | possible | unlikely |
+|---|---|---|---|---|
+| **severe** | critical | critical | high | medium |
+| **moderate** | high | high | medium | low |
+| **minor** | medium | low | low | low |
+
+A style comment can be critical and a security comment can be low. `severity_rationale` must name the consequence and the trigger — severity without that is guessing.
+
+**The 16 categories** are fixed: `logic_error`, `boundary_condition`, `concurrency`, `error_handling`, `resource_lifecycle`, `security`, `secrets_exposure`, `data_integrity`, `api_contract`, `performance`, `test_gap`, `observability`, `maintainability`, `documentation`, `build_ci`, `dependency_risk`.
+
+#### 1b. Disputed Comments
+
+Reviewer or bot claims that were checked and found incorrect:
+
+```json
+{
+  "disputed_comments": [
+    {
+      "thread_id": "PRRT_yyy",
+      "claim": "This leaks the file handle",
+      "why_incorrect": "The handle is closed by the defer on line 88.",
+      "confidence": "high"
+    }
+  ]
+}
+```
+
+**Use these to:** reply to the thread with the reason instead of making a pointless change. Do not resolve a disputed thread unilaterally — reply, then let the reviewer close it.
+
+#### 1c. Category Coverage
+
+One entry per category, so an unswept axis is visible:
+
+```json
+{
+  "category_coverage": [
+    {"category": "concurrency", "verdict": "reviewed_none_found", "note": "No shared mutable state in the diff."},
+    {"category": "data_integrity", "verdict": "not_reviewable", "note": "Migration files were not included in the context."}
+  ]
+}
+```
+
+**Use these to:** find where the review is blind. `not_reviewable` is a to-do for you, not a clean bill of health.
 
 #### 2. Systemic Issues
 
@@ -322,24 +438,31 @@ Related areas that may have similar issues:
 
 #### 4. Task List
 
-Prioritized actions linked to thread IDs:
+Prioritized actions, each anchored to code and provable:
 
 ```json
 {
   "task_list": [
     {
       "priority": "critical",
-      "task": "Add request_id to all captureException calls",
-      "thread_ids": ["PRRT_xxx", "PRRT_yyy"]
+      "task": "Move the attempt counter reset outside the catch block",
+      "thread_ids": ["PRRT_xxx"],
+      "file": "src/retry.js",
+      "line": 42,
+      "suggested_fix": "Delete `attempts = 0` from the catch; reset only on success.",
+      "verification": "npm test -- retry.test.js"
     }
   ]
 }
 ```
 
 **Use these to:**
-- Create TODO list for addressing feedback
+- Create a TODO list for addressing feedback
 - Prioritize work by severity
 - Track which threads each fix addresses
+- Run the stated `verification` after each fix — a task is not done until its check passes
+
+Tasks with no single code site use `file: "n/a"` and `line: 0`.
 
 #### 5. Process Improvements
 
@@ -503,16 +626,17 @@ gh api graphql -f query='mutation($threadId: ID!, $body: String!) {
 gh pr-enrich resolve "$THREAD_ID"
 
 # 5. Final thread audit — verify no unresolved threads were missed
-gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
-query($owner: String!, $repo: String!, $number: Int!) {
+gh api graphql --paginate -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
+query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
         nodes { id isResolved comments(first: 1) { nodes { body } } }
       }
     }
   }
-}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+}' | jq -s '[.[].data.repository.pullRequest.reviewThreads.nodes[]
   | select(.isResolved == false)]'
 
 # 6. Verify all CI/CD checks pass
@@ -610,6 +734,13 @@ Never declare complete without verifying: (a) all addressed threads are resolved
 
 | Excuse | Reality |
 |--------|---------|
+| "A reviewer raised it, so it's a real bug" | Reviewers see only the diff and bots pattern-match. Check the `verdict` before you change code; `disputed_comments` exists because claims are wrong regularly. |
+| "The analysis found nothing in that category, so it's clean" | Check `category_coverage`. `not_reviewable` means unchecked, and it looks exactly like clean in a task list. |
+| "The report covers the whole PR" | Check the coverage block. Truncated comments, dropped diffs and omitted files are listed there, and nothing in them was analyzed. |
+| "It's only a style comment, so it's low priority" | Severity is impact × likelihood, not category. Read `severity_rationale` — a critical bug can arrive inside a nit. |
+| "The task says what to do, that's enough" | If a task has no `file`, `line` and `verification`, you cannot prove the fix worked. Re-derive them before starting. |
+| "Adjacent problems were listed, so they were checked" | `checked: false` means the analyzer could not search. That one is yours. |
+| "The analysis came back empty, the PR must be clean" | Read `claude-stderr.log`. An empty analysis is usually a failed or timed-out run, not a clean PR. |
 | "I'll resolve threads after fixing everything" | You'll forget. Resolve as you go — progress should be visible to reviewers immediately. |
 | "CI was passing before my changes" | CI tests your changes against the full suite. Run `gh pr checks` after every push. |
 | "I already read the comments" | Reading ≠ systematic analysis. Run `--enrich` and follow the workflow. Systemic issues hide in individually-innocuous comments. |
@@ -623,6 +754,12 @@ Never declare complete without verifying: (a) all addressed threads are resolved
 
 ## Red Flags — STOP
 
+- Changing code for a finding whose `verdict` is `refuted`, or that appears in `disputed_comments`
+- Treating a `plausible` finding as confirmed without checking the code yourself
+- Reporting a category as clean when its coverage verdict is `not_reviewable`
+- Concluding "no issues" from an empty analysis without reading `claude-stderr.log`
+- Ranking a finding by its category instead of its `severity` / `severity_rationale`
+- Marking a task done without running its `verification`
 - About to declare work complete without running the completion gate
 - Addressing tasks without first reading systemic issues and adjacent problems
 - Resolving threads without replying first (silent resolves are dismissive)
@@ -695,16 +832,17 @@ Before declaring any PR feedback session complete, Claude MUST pass this checkli
 
 ```bash
 # Query remaining unresolved threads (assumes $OWNER/$REPO/$PR_NUMBER were resolved earlier)
-UNRESOLVED=$(gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
-query($owner: String!, $repo: String!, $number: Int!) {
+UNRESOLVED=$(gh api graphql --paginate -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
+query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
         nodes { id isResolved }
       }
     }
   }
-}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length')
+}' | jq -s '[.[].data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length')
 
 echo "Unresolved threads remaining: $UNRESOLVED"
 ```

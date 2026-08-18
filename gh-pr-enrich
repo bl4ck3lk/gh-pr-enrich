@@ -716,9 +716,11 @@ Your task is to:
 Focus on actionable, specific insights. Prioritize items that would have the highest impact."
 
         # Build prompt and pipe via stdin to avoid arg length limits
+        local context_payload
+        context_payload="$(cat "$context_file")"
         local user_prompt="Analyze this aggregated PR retrospective data and provide meta-analysis:
 
-$(cat "$context_file")"
+$context_payload"
 
         echo "🧠 Running retrospective Claude analysis (timeout: ${timeout_secs}s)..." >&2
 
@@ -1706,7 +1708,6 @@ if [ -z "$TEST_CALL_FN" ]; then
     OUTPUT_FORMAT="combined"
     DEFAULT_OUTPUT_ROOT="${PR_REVIEW_OUTPUT_ROOT:-.reports/pr-reviews}"
     OUTPUT_DIR="$DEFAULT_OUTPUT_ROOT/pr-$PR_NUMBER"
-    CUSTOM_OUTPUT_DIR=false
     ENRICH_WITH_CLAUDE=false
     INCLUDE_DIFF=false
     RUN_SAST=false
@@ -1778,7 +1779,6 @@ if [ -z "$TEST_CALL_FN" ]; then
                 echo "Error: --output-dir requires a directory path."
                 exit 1
             fi
-            CUSTOM_OUTPUT_DIR=true
             OUTPUT_DIR="$2"
             shift 2
             ;;
@@ -2409,11 +2409,13 @@ run_claude_analysis() {
 
     local schema_content="$CLAUDE_ANALYSIS_SCHEMA"
 
+    local context_payload
+    context_payload="$(cat "$context_file")"
     local user_prompt="Analyze these unresolved PR comment threads and issue comments (including CI/bot reports) and provide structured analysis.
 
 Verify each claim against the code before reporting it, sweep every category in the taxonomy, and anchor every finding and task to a file and line.
 
-$(cat "$context_file")"
+$context_payload"
 
     # Read-only tools: the analyzer verifies claims against the repository but must
     # never modify it or run commands. Bash, Write and Edit are deliberately absent.
@@ -2431,7 +2433,12 @@ $(cat "$context_file")"
     # CLAUDECODE is unset so this can run nested inside a Claude Code session.
     # stderr goes to a log rather than /dev/null: a discarded error message is the
     # difference between a diagnosable failure and a mysterious empty analysis.
-    if echo "$user_prompt" | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+    #
+    # Run in the background and poll, so a verification pass that reads code for
+    # several minutes reports progress instead of looking like a hang. With
+    # --output-format json nothing is written until the run completes, so elapsed
+    # time is the only signal the caller can get.
+    echo "$user_prompt" | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
         timeout --signal=KILL --foreground "$timeout_secs" claude --print \
         --setting-sources "" \
         --model "$model" \
@@ -2439,8 +2446,20 @@ $(cat "$context_file")"
         --json-schema "$schema_content" \
         --system-prompt "$system_prompt" \
         "${tool_args[@]+"${tool_args[@]}"}" \
-        > "$output_file" 2> "$stderr_log"; then
-        echo "✅ Claude analysis complete" >&2
+        > "$output_file" 2> "$stderr_log" &
+    local claude_pid=$!
+
+    local elapsed=0
+    while kill -0 "$claude_pid" 2>/dev/null; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+        if [ "$((elapsed % 60))" -eq 0 ]; then
+            echo "   ⏳ still analyzing — ${elapsed}s elapsed of ${timeout_secs}s" >&2
+        fi
+    done
+
+    if wait "$claude_pid"; then
+        echo "✅ Claude analysis complete (${elapsed}s)" >&2
     else
         exit_code=$?
         # 124 = timeout with SIGTERM, 137 = timeout with SIGKILL (128 + 9)

@@ -56,6 +56,14 @@ not a failure — a task list that fixes a non-bug wastes more time than it save
 Every finding needs at least one evidence entry naming a file and line you
 actually inspected. A finding you cannot anchor to code is a "plausible" at best.
 
+Budget your reading. Start with the files the PR changed and the files cited in
+comments, and follow at most one hop from there (the direct callers or callees
+that decide the claim). Do not survey the whole repository, and do not re-read a
+file you have already read. When a claim needs more than that to settle, stop and
+report it as "plausible", naming in the evidence what you checked and what you
+would need to check next. An unfinished analysis returns nothing at all, so
+finishing within the budget matters more than resolving every claim.
+
 ## Rule 2 — sweep every category, then say what you found
 
 These are the categories. The list is closed; use no others:
