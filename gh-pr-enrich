@@ -6,7 +6,7 @@
 #   gh extension install bl4ck3lk/gh-pr-enrich
 #
 # Usage:
-#   gh pr-enrich <PR_NUMBER> [--json] [--markdown] [--output-dir <DIR>] [--enrich] [--diff]
+#   gh pr-enrich <PR_NUMBER> [--json] [--markdown] [--output-dir <DIR>] [--enrich] [--diff] [--sast]
 #   gh pr-enrich resolve <THREAD_ID> [THREAD_ID...]
 #   gh pr-enrich watch <PR_NUMBER> [--interval MIN] [--enrich] [--notify]
 #   gh pr-enrich address <PR_NUMBER>
@@ -16,6 +16,7 @@
 #   gh pr-enrich 123                    # Fetch PR details
 #   gh pr-enrich 123 --enrich           # Fetch + Claude analysis
 #   gh pr-enrich 123 --enrich --diff    # Analysis with code context
+#   gh pr-enrich 123 --enrich --sast    # Analysis with a semgrep pre-pass
 #   gh pr-enrich 123 --json             # Output JSON only
 #   gh pr-enrich resolve PRRT_xxx       # Resolve a comment thread
 #   gh pr-enrich watch 123 --enrich     # Monitor PR for changes
@@ -23,7 +24,7 @@
 
 set -e
 
-VERSION="1.1.0"
+VERSION="2.0.0"
 
 # Handle --version flag
 if [ "$1" = "--version" ] || [ "$1" = "-v" ]; then
@@ -57,6 +58,96 @@ canonicalize_path() {
         # Path doesn't exist, just normalize it
         echo "$path"
     fi
+}
+
+# Invoke the Claude CLI for a structured-output analysis.
+#
+# Shared by the PR analysis and the retrospective meta-analysis. Both need the
+# same handling for nested invocation, plugin bypass, timeouts, stderr capture
+# and progress reporting; keeping one implementation means a fix to any of that
+# reaches both.
+#
+# Usage: invoke_claude LABEL TIMEOUT OUT_FILE SYSTEM_PROMPT SCHEMA USER_PROMPT [TOOL...]
+invoke_claude() {
+    local label="$1"
+    local timeout_secs="$2"
+    local output_file="$3"
+    local system_prompt="$4"
+    local schema="$5"
+    local user_prompt="$6"
+    shift 6
+    local -a tools=("$@")
+
+    local model="${GH_PR_ENRICH_MODEL:-sonnet}"
+    local stderr_log
+    stderr_log="$(dirname "$output_file")/claude-stderr.log"
+
+    local -a tool_args=()
+    if [ "${#tools[@]}" -gt 0 ]; then
+        tool_args=(--allowedTools "${tools[@]}")
+    fi
+
+    # Elapsed time is the only progress signal available: --output-format json
+    # writes nothing until the run completes. The heartbeat is the background job
+    # and the analyzer runs in the foreground, because backgrounding the analyzer
+    # makes the shell print its own job-death notice on an external kill.
+    local heartbeat_interval="${GH_PR_ENRICH_HEARTBEAT_SECONDS:-60}"
+    local start_ts=$SECONDS
+    (
+        # The sleep runs as a killable child: terminating only the subshell would
+        # orphan a sleeping process that still holds this function's stderr open,
+        # which stalls any caller reading the output through a pipe.
+        sleep_pid=""
+        # Guard the empty case explicitly: `kill 0` signals the entire process
+        # group, which would take the parent script and the analyzer with it.
+        trap '[ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null; exit 0' TERM
+        waited=0
+        while true; do
+            sleep "$heartbeat_interval" &
+            sleep_pid=$!
+            wait "$sleep_pid" 2>/dev/null || true
+            waited=$((waited + heartbeat_interval))
+            echo "   ⏳ still running ${label} — ${waited}s elapsed of ${timeout_secs}s" >&2
+        done
+    ) &
+    local heartbeat_pid=$!
+    disown "$heartbeat_pid" 2>/dev/null || true
+
+    local exit_code=0
+    # --setting-sources "" bypasses plugin loading, which can hang.
+    # --signal=KILL --foreground because claude --print ignores SIGTERM during init.
+    # CLAUDECODE is unset so this can run nested inside a Claude Code session.
+    # stderr goes to a log rather than /dev/null: a discarded error message is the
+    # difference between a diagnosable failure and a mysterious empty analysis.
+    # The subshell's own stderr is dropped so the shell's job-death diagnostic
+    # ("Killed: 9" plus the whole command line) never reaches the user.
+    if ( echo "$user_prompt" | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+        timeout --signal=KILL --foreground "$timeout_secs" claude --print \
+        --setting-sources "" \
+        --model "$model" \
+        --output-format json \
+        --json-schema "$schema" \
+        --system-prompt "$system_prompt" \
+        "${tool_args[@]+"${tool_args[@]}"}" \
+        > "$output_file" 2> "$stderr_log" ) 2>/dev/null; then
+        kill "$heartbeat_pid" 2>/dev/null || true
+        echo "✅ ${label} complete ($((SECONDS - start_ts))s)" >&2
+    else
+        exit_code=$?
+        kill "$heartbeat_pid" 2>/dev/null || true
+        # 124 = timeout with SIGTERM, 137 = timeout with SIGKILL (128 + 9)
+        if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
+            echo "⏱️  ${label} timed out after ${timeout_secs}s (set CLAUDE_TIMEOUT to increase)" >&2
+        else
+            echo "❌ ${label} failed (exit code: $exit_code)" >&2
+        fi
+        if [ -s "$stderr_log" ]; then
+            echo "   Analyzer stderr (tail): $(tail -3 "$stderr_log" | tr '\n' ' ')" >&2
+            echo "   Full log: $stderr_log" >&2
+        fi
+    fi
+
+    return $exit_code
 }
 
 # Handle install-skill subcommand
@@ -364,6 +455,7 @@ RETRO_HELP
         local skipped_no_analysis=0
         local skipped_date=0
         local skipped_author=0
+        local legacy_reports=()
 
         # Find all PR directories
         for pr_dir in "$reports_dir"/pr-*/; do
@@ -408,6 +500,16 @@ RETRO_HELP
                 fi
             fi
 
+            # Reports written before the finding taxonomy existed carry no
+            # .category. Mixing them in would collapse every one of their findings
+            # into a single "uncategorized" hotspot — a confident, useless answer.
+            # Name them and leave them out instead.
+            if jq -e '(.issue_categories // []) | length > 0 and (map(has("category")) | any | not)' \
+                    "$analysis_file" > /dev/null 2>&1; then
+                legacy_reports+=("$(basename "$pr_dir")")
+                continue
+            fi
+
             PR_REPORTS+=("$analysis_file")
             ((pr_count++)) || true
         done
@@ -416,6 +518,10 @@ RETRO_HELP
         [ "$skipped_no_analysis" -gt 0 ] && echo "  Skipped $skipped_no_analysis PRs without claude-analysis.json" >&2 || true
         [ "$skipped_date" -gt 0 ] && echo "  Skipped $skipped_date PRs before $since_date" >&2 || true
         [ "$skipped_author" -gt 0 ] && echo "  Skipped $skipped_author PRs by other authors" >&2 || true
+        if [ "${#legacy_reports[@]}" -gt 0 ]; then
+            echo "  Excluded ${#legacy_reports[@]} report(s) in the older format (no finding categories): ${legacy_reports[*]}" >&2
+            echo "  Re-run 'gh pr-enrich <PR> --enrich' on those PRs to include them." >&2
+        fi
     }
 
     # Aggregate data from all PR reports
@@ -497,13 +603,16 @@ RETRO_HELP
         local aggregated="$1"
 
         echo "$aggregated" | jq '
-            # Collect all issue-category and task-category references across PRs
+            # Collect all issue-category and task-category references across PRs.
+            # Group on the taxonomy category, not the free-text finding name:
+            # "Missing error handling in parse" and "Swallowed exception in sync"
+            # are one hotspot, and grouping by name would report them as two.
             [.prs[] |
                 .pr_meta.number as $pr_num |
                 (
                     # From issue categories
                     ((.issue_categories // [])[] | {
-                        category: .name,
+                        category: (.category // "uncategorized"),
                         severity: .severity,
                         pr: $pr_num
                     }),
@@ -715,36 +824,18 @@ Your task is to:
 Focus on actionable, specific insights. Prioritize items that would have the highest impact."
 
         # Build prompt and pipe via stdin to avoid arg length limits
+        local context_payload
+        context_payload="$(cat "$context_file")"
         local user_prompt="Analyze this aggregated PR retrospective data and provide meta-analysis:
 
-$(cat "$context_file")"
+$context_payload"
 
         echo "🧠 Running retrospective Claude analysis (timeout: ${timeout_secs}s)..." >&2
 
-        local exit_code=0
-        # Use --setting-sources "" to bypass plugin loading which can cause hangs
-        # Use --signal=KILL --foreground because claude --print doesn't respond gracefully to SIGTERM during init
-        # Unset CLAUDECODE to allow nested invocation from within a Claude Code session
-        if echo "$user_prompt" | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
-            timeout --signal=KILL --foreground "$timeout_secs" claude --print \
-            --setting-sources "" \
-            --model sonnet \
-            --output-format json \
-            --json-schema "$RETRO_CLAUDE_SCHEMA" \
-            --system-prompt "$system_prompt" \
-            > "$output_file" 2>/dev/null; then
-            echo "✅ Retrospective analysis complete" >&2
-        else
-            exit_code=$?
-            # 124 = timeout with SIGTERM, 137 = timeout with SIGKILL (128 + 9)
-            if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
-                echo "⏱️  Retrospective analysis timed out after ${timeout_secs}s (set CLAUDE_TIMEOUT to increase)" >&2
-            else
-                echo "❌ Retrospective analysis failed (exit code: $exit_code)" >&2
-            fi
-        fi
-
-        return $exit_code
+        # No tools: the retrospective reasons over reports that are already on
+        # disk, so there is nothing in the repository for it to verify.
+        invoke_claude "Retrospective analysis" "$timeout_secs" "$output_file" \
+            "$system_prompt" "$RETRO_CLAUDE_SCHEMA" "$user_prompt"
     }
 
     # Generate markdown report from retrospective data
@@ -1478,7 +1569,11 @@ if [ "$1" = "address" ]; then
         TASK=$(jq -r ".task_list[$CURRENT]" "$ANALYSIS_FILE")
         PRIORITY=$(echo "$TASK" | jq -r '.priority')
         DESCRIPTION=$(echo "$TASK" | jq -r '.task')
-        THREAD_IDS=$(echo "$TASK" | jq -r '.thread_ids | join(", ")')
+        THREAD_IDS=$(echo "$TASK" | jq -r '(.thread_ids // []) | join(", ")')
+        TASK_FILE=$(echo "$TASK" | jq -r '.file // ""')
+        TASK_LINE=$(echo "$TASK" | jq -r '.line // 0')
+        TASK_FIX=$(echo "$TASK" | jq -r '.suggested_fix // ""')
+        TASK_VERIFY=$(echo "$TASK" | jq -r '.verification // ""')
 
         # Color based on priority
         case $PRIORITY in
@@ -1494,6 +1589,15 @@ if [ "$1" = "address" ]; then
         echo ""
         echo "$DESCRIPTION"
         echo ""
+        if [ -n "$TASK_FILE" ] && [ "$TASK_FILE" != "n/a" ] && [ "$TASK_FILE" != "null" ]; then
+            echo "Location: $TASK_FILE:$TASK_LINE"
+        fi
+        if [ -n "$TASK_FIX" ]; then
+            echo "Suggested fix: $TASK_FIX"
+        fi
+        if [ -n "$TASK_VERIFY" ]; then
+            echo "Verify with:   $TASK_VERIFY"
+        fi
         if [ -n "$THREAD_IDS" ] && [ "$THREAD_IDS" != "null" ]; then
             echo "Threads: $THREAD_IDS"
         fi
@@ -1610,6 +1714,13 @@ OPTIONS:
   --output-dir DIR  Directory to save output (default: .reports/pr-reviews/pr-<N>)
   --enrich          Run Claude AI analysis on unresolved threads and issue comments
   --diff            Include code diffs in Claude context (richer analysis)
+  --sast            Run a semgrep pre-pass on changed files and feed the findings
+                    to the analysis as deterministic ground truth
+  --no-code-access  Do not let the analyzer read the repository. Findings can then
+                    only be 'plausible', never verified. For sandboxed runs.
+  --code-access     Read the working tree even when it is not at the PR head.
+                    Findings may cite code this PR does not contain.
+  --model NAME      Model for the analysis (default: sonnet)
   --prompt FILE     Custom prompt file for Claude analysis (overrides defaults)
   -h, --help        Show this help message
   -v, --version     Show version
@@ -1619,6 +1730,7 @@ EXAMPLES:
   gh pr-enrich 123                        # Basic PR report
   gh pr-enrich 123 --enrich               # With Claude AI analysis
   gh pr-enrich 123 --enrich --diff        # Analysis with code context
+  gh pr-enrich 123 --enrich --diff --sast # Analysis with diffs and semgrep
   gh pr-enrich 123 --output-dir ./pr      # Custom output directory
   gh pr-enrich 123 --json                 # JSON output only
   gh pr-enrich resolve PRRT_xxx PRRT_yyy  # Resolve multiple threads
@@ -1635,30 +1747,45 @@ PROMPT CUSTOMIZATION:
   See default-prompt.txt in the extension directory for format.
 
 ENVIRONMENT VARIABLES:
-  PR_REVIEW_OUTPUT_ROOT   Override default output directory root
-  GH_PR_ENRICH_PROMPT     Path to custom prompt file for Claude analysis
+  PR_REVIEW_OUTPUT_ROOT        Override default output directory root
+  GH_PR_ENRICH_PROMPT          Path to custom prompt file for Claude analysis
+  GH_PR_ENRICH_MODEL           Model for the analysis (default: sonnet)
+  GH_PR_ENRICH_CODE_ACCESS     'false' to run without repository read access
+  GH_PR_ENRICH_TRUNCATE_CHARS  Per-comment/diff truncation limit (default: 5000)
+  GH_PR_ENRICH_SEMGREP_CONFIG  semgrep --config value for --sast (default: auto)
+  GH_PR_ENRICH_SEMGREP_TIMEOUT Seconds allowed for the semgrep pre-pass (default: 180)
+  CLAUDE_TIMEOUT               Seconds allowed for the analysis (default: 600)
 
 DEPENDENCIES:
   Required: gh (GitHub CLI), jq
-  Optional: claude (Claude CLI, for --enrich)
+  Optional: claude (Claude CLI, for --enrich), semgrep (for --sast)
 
 For more info: https://github.com/bl4ck3lk/gh-pr-enrich
 HELP
     exit 0
 fi
 
-# Early check for test-build-context mode (before PR_NUMBER validation)
-if [ "$1" = "--test-build-context" ]; then
+# Hidden test dispatcher (checked before PR_NUMBER validation).
+#
+#   gh-pr-enrich --test-call <function> [args...]
+#
+# Invokes one internal function directly so test suites exercise shipped code
+# instead of a copy. Only functions named in TEST_CALLABLE_FUNCTIONS are
+# dispatchable — argv must never be able to call arbitrary shell functions.
+TEST_CALL_FN=""
+TEST_CALL_ARGS=()
+if [ "${1:-}" = "--test-call" ]; then
     if [ -z "${2:-}" ]; then
-        echo "Error: --test-build-context requires a directory path."
+        echo "Error: --test-call requires a function name." >&2
         exit 1
     fi
-    TEST_BUILD_CONTEXT_DIR="$2"
-    # Will be handled after function definitions
+    TEST_CALL_FN="$2"
+    shift 2
+    TEST_CALL_ARGS=("$@")
 fi
 
-# Skip main logic if in test mode - will be handled after function definitions
-if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
+# Skip CLI argument handling in test-call mode ($1 is not a PR number there)
+if [ -z "$TEST_CALL_FN" ]; then
     PR_NUMBER=$1
 
     # Validate PR_NUMBER is a positive integer (prevent path traversal)
@@ -1671,9 +1798,9 @@ if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
     OUTPUT_FORMAT="combined"
     DEFAULT_OUTPUT_ROOT="${PR_REVIEW_OUTPUT_ROOT:-.reports/pr-reviews}"
     OUTPUT_DIR="$DEFAULT_OUTPUT_ROOT/pr-$PR_NUMBER"
-    CUSTOM_OUTPUT_DIR=false
     ENRICH_WITH_CLAUDE=false
     INCLUDE_DIFF=false
+    RUN_SAST=false
     CUSTOM_PROMPT_FILE=""
     REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "current-repo")
 fi
@@ -1725,8 +1852,8 @@ If there are no systemic issues or adjacent problems, return empty arrays for th
     fi
 }
 
-# Parse options (skip in test mode)
-if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
+# Parse options (skipped in test-call mode)
+if [ -z "$TEST_CALL_FN" ]; then
     while [[ $# -gt 0 ]]; do
     case $1 in
         --json)
@@ -1742,7 +1869,6 @@ if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
                 echo "Error: --output-dir requires a directory path."
                 exit 1
             fi
-            CUSTOM_OUTPUT_DIR=true
             OUTPUT_DIR="$2"
             shift 2
             ;;
@@ -1753,6 +1879,30 @@ if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
         --diff)
             INCLUDE_DIFF=true
             shift
+            ;;
+        --sast)
+            RUN_SAST=true
+            shift
+            ;;
+        --no-code-access)
+            # For sandboxed or offline runs: the analyzer reasons from the supplied
+            # context only and cannot open the repository to verify claims.
+            export GH_PR_ENRICH_CODE_ACCESS=false
+            shift
+            ;;
+        --code-access)
+            # Analyze the working tree even when it is not the PR's revision.
+            # Findings may then cite code this PR does not contain.
+            export GH_PR_ENRICH_CODE_ACCESS=true
+            shift
+            ;;
+        --model)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --model requires a model name."
+                exit 1
+            fi
+            export GH_PR_ENRICH_MODEL="$2"
+            shift 2
             ;;
         --prompt)
             if [ -z "${2:-}" ]; then
@@ -1773,7 +1923,7 @@ if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
             ;;
     esac
 done
-fi  # End of: if [ -z "$TEST_BUILD_CONTEXT_DIR" ] for argument parsing
+fi  # End of: if [ -z "$TEST_CALL_FN" ] for argument parsing
 
 # Ensure jq is available
 if ! command -v jq &> /dev/null; then
@@ -1795,8 +1945,915 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
     fi
 fi
 
-# Main PR logic (skip in test mode)
-if [ -z "$TEST_BUILD_CONTEXT_DIR" ]; then
+# ============================================================================
+# Enrichment Functions
+#
+# Defined at top level (not inside the main-flow guard) so that the CLI path and
+# the --test-call dispatcher execute the same code. Never inline a copy of these.
+# ============================================================================
+
+# Function to add GraphQL IDs to comments
+create_comments_with_graphql_ids() {
+    local input_file="$1"
+    local output_file="$2"
+    local comment_type="$3"
+
+    jq --rawfile id_map "$OUTPUT_DIR/id-mapping.txt" '
+        map(. as $comment |
+            . + {
+                graphql_id: (
+                    if ($comment.id and ($comment.id | type == "number")) then
+                        ($id_map | split("\n") | map(select(length > 0) | split(":")) | map({key: .[0], value: .[1]}) | from_entries | .[$comment.id|tostring])
+                    else
+                        null
+                    end
+                ),
+                comment_type: $comment_type
+            }
+        )
+    ' "$input_file" --arg comment_type "$comment_type" > "$output_file"
+}
+
+# ============================================================================
+# Claude Enrichment Functions
+# ============================================================================
+
+# Fetch every review thread, following pagination.
+#
+# A single page silently caps a PR at 100 threads: the 101st comment simply does
+# not exist as far as the analysis is concerned. gh --paginate walks the cursor
+# and emits one JSON document per page; the pages are merged back into the single
+# document shape the rest of the pipeline reads.
+# Per-thread reply cap used by the GraphQL fetch. Coverage reports how many
+# threads hit it, since a thread at the cap has replies the analyzer never saw.
+THREAD_COMMENT_LIMIT=20
+LINKED_ISSUE_LIMIT=10
+
+fetch_review_threads() {
+    local owner="$1"
+    local repo_name="$2"
+    local pr_number="$3"
+    local output_file="$4"
+
+    local query='
+    query($owner: String!, $name: String!, $prNumber: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $prNumber) {
+          reviewThreads(first: 100, after: $endCursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              isResolved
+              isOutdated
+              path
+              line
+              originalLine
+              diffSide
+              comments(first: '"$THREAD_COMMENT_LIMIT"') {
+                nodes {
+                  id
+                  databaseId
+                  body
+                  author { login }
+                  createdAt
+                  url
+                }
+              }
+            }
+          }
+        }
+      }
+    }'
+
+    local pages_file="${output_file}.pages"
+    if ! gh api graphql --paginate \
+            -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
+            -f query="$query" > "$pages_file" 2>/dev/null; then
+        rm -f "$pages_file"
+        return 1
+    fi
+
+    # Merge every page's nodes into one document, recording how many pages were read.
+    jq -s '{
+        data: {
+            repository: {
+                pullRequest: {
+                    reviewThreads: {
+                        nodes: (map(.data.repository.pullRequest.reviewThreads.nodes // []) | add // []),
+                        pages_fetched: length
+                    }
+                }
+            }
+        }
+    }' "$pages_file" > "$output_file"
+    local rc=$?
+    rm -f "$pages_file"
+    return $rc
+}
+
+# Fetch the issues this PR closes, for the intent the diff cannot show.
+fetch_linked_issues() {
+    local owner="$1"
+    local repo_name="$2"
+    local pr_number="$3"
+    local output_file="$4"
+
+    local query='
+    query($owner: String!, $name: String!, $prNumber: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $prNumber) {
+          closingIssuesReferences(first: '"$LINKED_ISSUE_LIMIT"') {
+            nodes { number title body url }
+          }
+        }
+      }
+    }'
+
+    # Fetch first, then transform. Piping gh straight into jq would report jq's
+    # exit status: a failed gh leaves jq reading an empty stream, exiting 0, and
+    # the caller believing it wrote a valid file when the file is zero bytes.
+    local raw_file="${output_file}.raw"
+    if ! gh api graphql -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
+            -f query="$query" > "$raw_file" 2>/dev/null; then
+        rm -f "$raw_file"
+        echo '[]' > "$output_file"
+        return 1
+    fi
+
+    if ! jq '[.data.repository.pullRequest.closingIssuesReferences.nodes[]?]' \
+            "$raw_file" > "$output_file" 2>/dev/null; then
+        rm -f "$raw_file"
+        echo '[]' > "$output_file"
+        return 1
+    fi
+
+    rm -f "$raw_file"
+    return 0
+}
+
+extract_unresolved_threads() {
+    local threads_file="$1"
+    local output_file="$2"
+
+    # is_outdated matters: an outdated thread points at code that has since
+    # changed, so the issue may already be fixed. Dropping the flag turns those
+    # threads into phantom tasks.
+    jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved == false)
+        | {
+            thread_id: .id,
+            is_outdated: (.isOutdated // false),
+            path: (.path // null),
+            line: (.line // .originalLine // null),
+            comments: [.comments.nodes[] | {
+                author: (.author.login // "unknown"),
+                body: .body,
+                url: .url
+            }]
+        }]' "$threads_file" > "$output_file"
+}
+
+# Bots repost their whole report on every push. Keeping all revisions burns the
+# context budget and double-counts the same finding. Keep the newest revision of
+# each bot report; never touch human comments, where repetition is signal.
+dedupe_bot_comments() {
+    local input_file="$1"
+    local output_file="$2"
+
+    jq '
+    def is_bot: (.user // "") | test("\\[bot\\]$") or (ascii_downcase | IN("github-actions", "greptile", "codecov", "sonarcloud", "coderabbitai", "dependabot", "renovate"));
+
+    # Report identity: the bot plus the opening of its body, with digits removed
+    # so successive revisions of one report ("72% covered" then "84% covered")
+    # collapse while distinct reports stay apart.
+    #
+    # The first line alone is not enough to identify a report: bots routinely
+    # prefix every comment with the same HTML marker or status heading, so
+    # "### Job failed / unit-tests" and "### Job failed / e2e" would collapse and
+    # a real finding would be dropped as a duplicate. HTML comments are stripped
+    # and several lines are considered so unrelated reports diverge early.
+    def signature: ((.user // "") + "::" +
+        (((.body // "")
+          | gsub("<!--(?:[\\s\\S]*?)-->"; "")
+          | split("\n")
+          | map(select(test("\\S")))
+          | .[0:4]
+          | join(" "))
+         | ascii_downcase | gsub("[0-9]"; "") | gsub("[^a-z ]"; "") | .[0:200]));
+
+    (map(select(is_bot | not))) as $humans
+    | (map(select(is_bot))) as $bots
+    | ($bots | group_by(signature) | map(sort_by(.created_at // "")) ) as $grouped
+    | {
+        kept: (($humans + ($grouped | map(.[-1]))) | sort_by(.created_at // "")),
+        superseded: ($grouped | map(.[0:-1]) | add // [])
+      }
+    ' "$input_file" > "$output_file"
+}
+
+# Fetch the PR diff and create both raw and structured versions
+# Args:
+#   $1 - output_dir: Directory to save diff files
+#   $2 - pr_num: PR number to fetch diff for
+# Creates:
+#   pr-diff.txt - Raw unified diff
+#   pr-diff.json - Structured diff with file-level separation
+fetch_pr_diff() {
+    local output_dir="$1"
+    local pr_num="$2"
+
+    # Fetch the unified diff for the PR
+    if ! gh pr diff "$pr_num" > "$output_dir/pr-diff.txt" 2>/dev/null; then
+        echo "⚠️  Could not fetch PR diff (binary files only, empty PR, or access denied)"
+        echo "   Analysis will proceed without code context."
+        echo "" > "$output_dir/pr-diff.txt"
+    fi
+
+    # Also create a structured version with file-level diffs
+    # Truncate large diffs to avoid token limits in Claude API
+    # 5000 chars per file balances context richness with API constraints
+    jq -n --arg diff "$(<"$output_dir/pr-diff.txt")" \
+        '{
+            raw_diff: $diff,
+            file_diffs: ($diff | split("diff --git ") | .[1:] | map(
+                . as $chunk |
+                ($chunk | split("\n") | .[0] | split(" ") | .[-1] | ltrimstr("b/")) as $filepath |
+                {
+                    file: $filepath,
+                    content: ("diff --git " + $chunk)
+                }
+            ))
+        }' > "$output_dir/pr-diff.json" 2>/dev/null || {
+            echo '{"raw_diff": "", "file_diffs": []}' > "$output_dir/pr-diff.json"
+        }
+}
+
+build_claude_context() {
+    local output_dir="$1"
+    local include_diff="${2:-false}"
+    local truncate_at="${GH_PR_ENRICH_TRUNCATE_CHARS:-5000}"
+
+    # Missing optional inputs degrade to empty, never to a hard failure.
+    if [ ! -f "$output_dir/issue-comments.json" ]; then
+        echo '[]' > "$output_dir/issue-comments.json"
+    fi
+    if [ ! -f "$output_dir/unresolved-threads.json" ]; then
+        echo '[]' > "$output_dir/unresolved-threads.json"
+    fi
+
+    # Required inputs are validated up front. Without this, a missing or corrupt
+    # file surfaces as a raw jq argument error with no indication of which file
+    # was at fault.
+    local required_file
+    for required_file in pr-summary.json unresolved-threads.json issue-comments.json; do
+        if [ ! -f "$output_dir/$required_file" ]; then
+            echo "❌ Cannot build analysis context: $output_dir/$required_file is missing." >&2
+            return 1
+        fi
+        if ! jq -e . "$output_dir/$required_file" > /dev/null 2>&1; then
+            echo "❌ Cannot build analysis context: $output_dir/$required_file is not valid JSON." >&2
+            return 1
+        fi
+    done
+
+    dedupe_bot_comments "$output_dir/issue-comments.json" "$output_dir/issue-comments-deduped.json"
+
+    # Optional inputs are read from disk by jq, never passed through argv: a large
+    # PR diff runs to several megabytes and would fail with E2BIG ("Argument list
+    # too long") on exactly the PRs that most need analysis. Absent or unreadable
+    # files are replaced with an empty document so one missing input cannot take
+    # the whole context down.
+    local optional
+    for optional in checks.json linked-issues.json sast-findings.json; do
+        if [ ! -s "$output_dir/$optional" ] || ! jq -e 'type == "array"' "$output_dir/$optional" > /dev/null 2>&1; then
+            echo '[]' > "$output_dir/$optional"
+        fi
+    done
+
+    local with_diff=false
+    if [ "$include_diff" = "true" ] && [ -s "$output_dir/pr-diff.json" ] \
+       && jq -e '.file_diffs? // empty | type == "array"' "$output_dir/pr-diff.json" > /dev/null 2>&1; then
+        with_diff=true
+    fi
+    if [ ! -s "$output_dir/pr-diff.json" ] || ! jq -e . "$output_dir/pr-diff.json" > /dev/null 2>&1; then
+        echo '{"raw_diff": "", "file_diffs": []}' > "$output_dir/pr-diff.json"
+    fi
+
+    # Whether reading the working tree is meaningful depends on the revision it
+    # holds, so the decision is made here and recorded in the context the
+    # analyzer receives.
+    local pr_head_sha
+    pr_head_sha="$(jq -r '.headRefOid // ""' "$output_dir/pr-summary.json" 2>/dev/null || echo "")"
+    local local_head=""
+    if command -v git > /dev/null 2>&1; then
+        local_head="$(git rev-parse HEAD 2>/dev/null || echo "")"
+    fi
+    local access_line access_state access_reason
+    access_line="$(resolve_code_access "$pr_head_sha")"
+    access_state="${access_line%%:*}"
+    access_reason="${access_line#*: }"
+
+    # One jq program builds the whole context. The coverage block records what was
+    # dropped or shortened, so a truncated input can never read as a complete one.
+    jq -n \
+        --slurpfile pr_doc "$output_dir/pr-summary.json" \
+        --slurpfile threads "$output_dir/unresolved-threads.json" \
+        --slurpfile raw_comments "$output_dir/issue-comments.json" \
+        --slurpfile deduped "$output_dir/issue-comments-deduped.json" \
+        --slurpfile checks_doc "$output_dir/checks.json" \
+        --slurpfile linked_doc "$output_dir/linked-issues.json" \
+        --slurpfile sast_doc "$output_dir/sast-findings.json" \
+        --slurpfile diff_doc "$output_dir/pr-diff.json" \
+        --argjson with_diff "$with_diff" \
+        --argjson limit "$truncate_at" \
+        --arg pr_head_sha "$pr_head_sha" \
+        --arg local_head "$local_head" \
+        --arg access_state "$access_state" \
+        --arg access_reason "$access_reason" \
+        --argjson thread_comment_limit "$THREAD_COMMENT_LIMIT" \
+        --argjson linked_issue_limit "$LINKED_ISSUE_LIMIT" \
+        '
+        def trunc($text): if (($text // "") | length) > $limit
+            then (($text // "")[0:$limit] + "\n... (truncated)")
+            else ($text // "") end;
+        def was_truncated($text): (($text // "") | length) > $limit;
+
+        ($pr_doc[0] // {}) as $pr
+        | ($checks_doc[0] // []) as $checks
+        | ($linked_doc[0] // []) as $linked
+        | ($sast_doc[0] // []) as $sast
+        | ($diff_doc[0] // {}) as $diff
+        | ($threads[0] // []) as $thread_list
+        | ($raw_comments[0] // []) as $raw
+        | (($deduped[0] // {}) | (.kept // [])) as $kept
+        | (($deduped[0] // {}) | (.superseded // [])) as $superseded
+        | ($diff.file_diffs // []) as $files
+        | {
+            pr: {
+                title: $pr.title,
+                body: ($pr.body // "No description"),
+                author: ($pr.author.login // "unknown"),
+                files_changed: [($pr.files // [])[].path],
+                commits: [($pr.commits // [])[] | {
+                    sha: ((.oid // "") | .[0:7]),
+                    message: ((.messageHeadline // "") +
+                        (if ((.messageBody // "") | length) > 0 then "\n" + (.messageBody | .[0:1000]) else "" end))
+                }],
+                linked_issues: [($linked // [])[] | {
+                    number: .number,
+                    title: .title,
+                    url: .url,
+                    body: trunc(.body)
+                }]
+            },
+            unresolved_threads: $thread_list,
+            issue_comments: [$kept[] | {
+                user: .user,
+                body: trunc(.body),
+                url: .html_url,
+                created_at: .created_at
+            }],
+            failing_checks: [($checks // [])[] | select(.bucket == "fail") | {
+                name: .name,
+                state: .state,
+                description: (.description // ""),
+                link: (.link // "")
+            }],
+            sast_findings: $sast,
+            coverage: {
+                truncation_limit_chars: $limit,
+                code_access: {
+                    state: $access_state,
+                    reason: $access_reason,
+                    pr_head_sha: (if $pr_head_sha == "" then null else $pr_head_sha end),
+                    inspected_sha: (if $local_head == "" then null else $local_head end),
+                    revision_matches: ($pr_head_sha != "" and $pr_head_sha == $local_head)
+                },
+                issue_comments: {
+                    total: ($raw | length),
+                    included: ($kept | length),
+                    superseded_bot_duplicates: ($superseded | length),
+                    truncated: [$kept[] | select(was_truncated(.body)) | .html_url]
+                },
+                unresolved_threads: {
+                    total: ($thread_list | length),
+                    included: ($thread_list | length),
+                    outdated: ([$thread_list[] | select(.is_outdated == true)] | length),
+                    comments_per_thread_limit: $thread_comment_limit,
+                    threads_at_comment_limit: ([$thread_list[]
+                        | select((.comments // []) | length >= $thread_comment_limit)] | length)
+                },
+                diff: {
+                    included: $with_diff,
+                    files_total: ($files | length),
+                    files_included: (if $with_diff then ($files | length) else 0 end),
+                    files_truncated: (if $with_diff
+                        then [$files[] | select(was_truncated(.content)) | .file]
+                        else [] end)
+                },
+                inputs: {
+                    commits: (($pr.commits // []) | length),
+                    linked_issues: (($linked // []) | length),
+                    linked_issues_limit: $linked_issue_limit,
+                    failing_checks: ([($checks // [])[] | select(.bucket == "fail")] | length),
+                    sast_findings: (($sast // []) | length)
+                }
+            }
+          }
+        + (if $with_diff then {
+            code_changes: {
+                summary: "Diff included for context. Each file_diff contains the actual code changes.",
+                file_diffs: [$files[] | {file: .file, diff: trunc(.content)}]
+            }
+          } else {} end)
+        ' > "$output_dir/claude-context.json"
+}
+
+# Closed taxonomy for findings. Kept in sync with default-prompt.txt by
+# tests/test-analysis-contract.sh -- the analyzer must return an explicit verdict
+# for every category, so "no finding" is a decision on record rather than a gap.
+ANALYSIS_CATEGORIES='["logic_error", "boundary_condition", "concurrency", "error_handling", "resource_lifecycle", "security", "secrets_exposure", "data_integrity", "api_contract", "performance", "test_gap", "observability", "maintainability", "documentation", "build_ci", "dependency_risk"]'
+
+CLAUDE_ANALYSIS_SCHEMA='{
+  "type": "object",
+  "properties": {
+    "issue_categories": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "category": { "enum": '"$ANALYSIS_CATEGORIES"' },
+          "severity": { "enum": ["critical", "high", "medium", "low"] },
+          "impact": { "enum": ["severe", "moderate", "minor"] },
+          "likelihood": { "enum": ["certain", "likely", "possible", "unlikely"] },
+          "severity_rationale": { "type": "string" },
+          "verdict": { "enum": ["confirmed", "plausible", "refuted"] },
+          "confidence": { "enum": ["high", "medium", "low"] },
+          "description": { "type": "string" },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "file": { "type": "string" },
+                "line": { "type": "integer" },
+                "detail": { "type": "string" }
+              },
+              "required": ["file", "line", "detail"]
+            }
+          },
+          "thread_ids": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["name", "category", "severity", "impact", "likelihood", "severity_rationale", "verdict", "confidence", "description", "evidence", "thread_ids"]
+      }
+    },
+    "category_coverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "category": { "enum": '"$ANALYSIS_CATEGORIES"' },
+          "verdict": { "enum": ["findings_reported", "reviewed_none_found", "not_applicable", "not_reviewable"] },
+          "note": { "type": "string" }
+        },
+        "required": ["category", "verdict", "note"]
+      }
+    },
+    "disputed_comments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "thread_id": { "type": "string" },
+          "claim": { "type": "string" },
+          "why_incorrect": { "type": "string" },
+          "confidence": { "enum": ["high", "medium", "low"] }
+        },
+        "required": ["thread_id", "claim", "why_incorrect", "confidence"]
+      }
+    },
+    "systemic_issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "pattern": { "type": "string" },
+          "evidence": { "type": "array", "items": { "type": "string" } },
+          "recommendation": { "type": "string" }
+        },
+        "required": ["pattern", "evidence", "recommendation"]
+      }
+    },
+    "adjacent_problems": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "area": { "type": "string" },
+          "risk": { "type": "string" },
+          "investigation_hint": { "type": "string" },
+          "checked": { "type": "boolean" }
+        },
+        "required": ["area", "risk", "investigation_hint", "checked"]
+      }
+    },
+    "task_list": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "priority": { "enum": ["critical", "high", "medium", "low"] },
+          "task": { "type": "string" },
+          "thread_ids": { "type": "array", "items": { "type": "string" } },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "suggested_fix": { "type": "string" },
+          "verification": { "type": "string" }
+        },
+        "required": ["priority", "task", "thread_ids", "file", "line", "suggested_fix", "verification"]
+      }
+    },
+    "process_improvements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "category": { "enum": ["documentation", "automation", "testing", "review_process", "tooling"] },
+          "suggestion": { "type": "string" },
+          "rationale": { "type": "string" },
+          "implementation_hint": { "type": "string" }
+        },
+        "required": ["category", "suggestion", "rationale"]
+      }
+    },
+    "pr_template_suggestions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "section": { "type": "string" },
+          "checkbox_or_question": { "type": "string" },
+          "why": { "type": "string" }
+        },
+        "required": ["section", "checkbox_or_question", "why"]
+      }
+    }
+  },
+  "required": ["issue_categories", "category_coverage", "disputed_comments", "systemic_issues", "adjacent_problems", "task_list", "process_improvements", "pr_template_suggestions"]
+}'
+
+# Emit the analysis schema (used by tests to pin the analysis contract)
+emit_analysis_schema() {
+    printf '%s' "$CLAUDE_ANALYSIS_SCHEMA"
+}
+
+# Optional static-analysis pre-pass over the files the PR touches.
+#
+# Semgrep is deterministic where the model is not: its findings enter the context
+# as ground truth the analyzer can confirm or refute, rather than as another
+# opinion. A missing semgrep is a warning, never a failed run.
+collect_sast_findings() {
+    local output_dir="$1"
+    local config="${GH_PR_ENRICH_SEMGREP_CONFIG:-auto}"
+    local timeout_secs="${GH_PR_ENRICH_SEMGREP_TIMEOUT:-180}"
+    local output_file="$output_dir/sast-findings.json"
+
+    echo '[]' > "$output_file"
+
+    if ! command -v semgrep > /dev/null 2>&1; then
+        echo "⚠️  semgrep not found — skipping the static-analysis pre-pass." >&2
+        echo "   Install it (pip install semgrep) or drop --sast." >&2
+        return 0
+    fi
+
+    # Scan only the files this PR touches that still exist in the working tree.
+    local -a targets=()
+    local path
+    while IFS= read -r path; do
+        [ -n "$path" ] && [ -f "$path" ] && targets+=("$path")
+    done < <(jq -r '(.files // [])[].path' "$output_dir/pr-summary.json" 2>/dev/null)
+
+    if [ "${#targets[@]}" -eq 0 ]; then
+        echo "ℹ️  No changed files present in the working tree — skipping semgrep." >&2
+        return 0
+    fi
+
+    local raw_file="$output_dir/semgrep-raw.json"
+    local rc=0
+    if command -v timeout > /dev/null 2>&1; then
+        timeout --signal=KILL --foreground "$timeout_secs" \
+            semgrep --config "$config" --json --quiet "${targets[@]}" \
+            > "$raw_file" 2> "$output_dir/semgrep-stderr.log" || rc=$?
+    else
+        semgrep --config "$config" --json --quiet "${targets[@]}" \
+            > "$raw_file" 2> "$output_dir/semgrep-stderr.log" || rc=$?
+    fi
+
+    if [ "$rc" -ne 0 ] && [ ! -s "$raw_file" ]; then
+        echo "⚠️  semgrep failed (exit $rc). See $output_dir/semgrep-stderr.log" >&2
+        return 0
+    fi
+
+    jq '[(.results // [])[] | {
+        check_id: .check_id,
+        path: .path,
+        line: (.start.line // 0),
+        severity: (.extra.severity // "INFO"),
+        message: (.extra.message // ""),
+        cwe: ((.extra.metadata.cwe // []) | if type == "array" then . else [.] end)
+    }]' "$raw_file" > "$output_file" 2>/dev/null || echo '[]' > "$output_file"
+
+    local count
+    count=$(jq 'length' "$output_file" 2>/dev/null || echo 0)
+    echo "🔍 semgrep: $count finding(s) across ${#targets[@]} changed file(s)" >&2
+    return 0
+}
+
+# Decide whether the analyzer may read the working tree.
+#
+# Reading files only helps if those files are the PR's files. Analyzing PR #123
+# from `main` would let the model "verify" against code the PR does not contain
+# and emit confirmed verdicts with file:line anchors that point at the wrong
+# revision — worse than not reading at all, because the output looks verified.
+#
+# Prints "enabled" or "disabled" followed by the reason. Honors an explicit
+# GH_PR_ENRICH_CODE_ACCESS setting in both directions.
+resolve_code_access() {
+    local pr_head_sha="${1:-}"
+    local explicit="${GH_PR_ENRICH_CODE_ACCESS:-}"
+
+    if [ "$explicit" = "false" ]; then
+        echo "disabled: repository access turned off by --no-code-access"
+        return 0
+    fi
+
+    local local_head=""
+    if command -v git > /dev/null 2>&1; then
+        local_head="$(git rev-parse HEAD 2>/dev/null || echo "")"
+    fi
+
+    if [ -z "$local_head" ]; then
+        if [ "$explicit" = "true" ]; then
+            echo "enabled: not a git checkout, but access was requested explicitly"
+            return 0
+        fi
+        echo "disabled: not a git checkout, so the working tree cannot be matched to the PR"
+        return 0
+    fi
+
+    if [ -z "$pr_head_sha" ] || [ "$pr_head_sha" = "null" ]; then
+        if [ "$explicit" = "true" ]; then
+            echo "enabled: PR head revision unknown, but access was requested explicitly"
+            return 0
+        fi
+        echo "disabled: PR head revision unknown, so the working tree cannot be matched to the PR"
+        return 0
+    fi
+
+    if [ "$local_head" = "$pr_head_sha" ]; then
+        echo "enabled: working tree is at the PR head (${local_head:0:7})"
+        return 0
+    fi
+
+    # Addressing feedback means committing locally, so the tree is usually ahead
+    # of the PR head rather than unrelated to it. That code is still this PR's
+    # code — plus the fixes in progress — so reading it is meaningful.
+    if git merge-base --is-ancestor "$pr_head_sha" HEAD 2>/dev/null; then
+        local ahead
+        ahead="$(git rev-list --count "$pr_head_sha..HEAD" 2>/dev/null || echo "?")"
+        echo "enabled: working tree is ${ahead} commit(s) ahead of the PR head (${pr_head_sha:0:7}); findings may reflect local changes not yet pushed"
+        return 0
+    fi
+
+    if [ "$explicit" = "true" ]; then
+        echo "enabled: working tree is at ${local_head:0:7}, not the PR head ${pr_head_sha:0:7} — findings may cite the wrong revision (override in effect)"
+        return 0
+    fi
+
+    echo "disabled: working tree is at ${local_head:0:7} but the PR head is ${pr_head_sha:0:7}. Run 'gh pr checkout <PR>' first, or pass --code-access to analyze the tree as it is."
+    return 0
+}
+
+run_claude_analysis() {
+    local context_file="$1"
+    local output_file="$2"
+
+    # Decide here rather than trusting what the context recorded: the tree may
+    # have moved since it was built, and --no-code-access must apply either way.
+    local pr_head_sha
+    pr_head_sha="$(jq -r '.coverage.code_access.pr_head_sha // ""' "$context_file" 2>/dev/null || echo "")"
+    local access_line access_state access_reason
+    access_line="$(resolve_code_access "$pr_head_sha")"
+    access_state="${access_line%%:*}"
+    access_reason="${access_line#*: }"
+    local code_access="true"
+    [ "$access_state" = "disabled" ] && code_access="false"
+    # Reading and verifying against the repository takes longer than paraphrasing
+    # comments; a 300s budget truncated that work.
+    local timeout_secs="${CLAUDE_TIMEOUT:-600}"
+    local model="${GH_PR_ENRICH_MODEL:-sonnet}"
+
+    local system_prompt
+    system_prompt="$(load_system_prompt)"
+
+    local context_payload
+    context_payload="$(cat "$context_file")"
+    local user_prompt="Analyze these unresolved PR comment threads and issue comments (including CI/bot reports) and provide structured analysis.
+
+Verify each claim against the code before reporting it, sweep every category in the taxonomy, and anchor every finding and task to a file and line.
+
+$context_payload"
+
+    # Read-only tools: the analyzer verifies claims against the repository but must
+    # never modify it or run commands. Bash, Write and Edit are deliberately absent.
+    local -a tools=()
+    if [ "$code_access" = "true" ]; then
+        tools=("Read" "Grep" "Glob")
+        echo "🧠 Running Claude analysis with read-only repository access (model: $model, timeout: ${timeout_secs}s)..." >&2
+    else
+        echo "🧠 Running Claude analysis WITHOUT repository access (model: $model, timeout: ${timeout_secs}s)..." >&2
+        echo "   Findings cannot be verified against code and will be reported as 'plausible' at best." >&2
+    fi
+    [ -n "$access_reason" ] && echo "   Code access: $access_reason" >&2
+
+    invoke_claude "Claude analysis" "$timeout_secs" "$output_file" \
+        "$system_prompt" "$CLAUDE_ANALYSIS_SCHEMA" "$user_prompt" \
+        "${tools[@]+"${tools[@]}"}"
+}
+
+# Render what the analyzer was and was not shown. A bounded input that reads as a
+# complete one is how a review misses things without anyone noticing.
+generate_coverage_section() {
+    local context_file="$1"
+    local output_file="$2"
+
+    jq -r '
+    (.coverage // {}) as $c
+    | "## 📥 Analysis Context Coverage\n\n" +
+      "_What the analyzer was shown. Anything listed as truncated or dropped was not fully analyzed._\n\n" +
+      "| Input | Included | Notes |\n|---|---|---|\n" +
+      "| Review threads | " + (($c.unresolved_threads.total // 0) | tostring) + " unresolved (all pages) | " +
+        (($c.unresolved_threads.outdated // 0) | tostring) + " outdated; " +
+        (($c.unresolved_threads.threads_at_comment_limit // 0) | tostring) + " at the " +
+        (($c.unresolved_threads.comments_per_thread_limit // 0) | tostring) + "-reply fetch limit (later replies not analyzed) |\n" +
+      "| Issue comments | " + (($c.issue_comments.included // 0) | tostring) + " of " + (($c.issue_comments.total // 0) | tostring) + " | " +
+        (($c.issue_comments.superseded_bot_duplicates // 0) | tostring) + " superseded bot reposts dropped; " +
+        ((($c.issue_comments.truncated // []) | length) | tostring) + " truncated |\n" +
+      "| Diff | " + (if ($c.diff.included // false) then (($c.diff.files_included // 0) | tostring) + " of " + (($c.diff.files_total // 0) | tostring) + " files" else "not included (run with --diff)" end) + " | " +
+        (if (($c.diff.files_truncated // []) | length) > 0
+            then "truncated: " + (($c.diff.files_truncated // []) | join(", "))
+            else "no files truncated" end) + " |\n" +
+      "| Commits | " + (($c.inputs.commits // 0) | tostring) + " | commit messages supplied as intent |\n" +
+      "| Linked issues | " + (($c.inputs.linked_issues // 0) | tostring) + " | issue bodies supplied as intent (fetch limit " + (($c.inputs.linked_issues_limit // 0) | tostring) + ") |\n" +
+      "| Failing checks | " + (($c.inputs.failing_checks // 0) | tostring) + " | CI failures supplied as evidence |\n" +
+      "| SAST findings | " + (($c.inputs.sast_findings // 0) | tostring) + " | static-analysis results (run with --sast) |\n" +
+      "| Code access | " + (($c.code_access.state // "unknown")) + " | " + (($c.code_access.reason // "") | gsub("\\|"; "\\\\|")) + " |\n\n" +
+      (if ($c.code_access.revision_matches // false) then ""
+       else "**The working tree was not at the PR head**, so findings were not verified against the code in this PR. Run `gh pr checkout <PR>` and re-run to verify against the right revision.\n\n" end) +
+      "_Truncation limit: " + (($c.truncation_limit_chars // 0) | tostring) + " characters per comment, issue body and file diff._\n"
+    ' "$context_file" > "$output_file" 2>/dev/null || echo "" > "$output_file"
+}
+
+generate_analysis_report() {
+    local analysis_file="$1"
+    local output_file="$2"
+
+    # Findings lead with verdict, severity and its derivation so a reader can tell
+    # a traced defect from a repeated reviewer opinion without opening the JSON.
+    jq -r '
+    def anchor(e): (if (e.file // "") == "" or e.file == "n/a" then "" else e.file + ":" + ((e.line // 0) | tostring) end);
+    def verdict_mark(v): (if v == "confirmed" then "✅ confirmed" elif v == "refuted" then "❌ refuted" else "🟡 plausible" end);
+    # Evidence is strings in systemic_issues and objects in issue_categories.
+    # Render either shape rather than aborting the report over a type mismatch:
+    # by this point the analysis has already been paid for.
+    def evidence_line: (if type == "object"
+        then ((if anchor(.) == "" then "" else "`" + anchor(.) + "` — " end) + (.detail // ""))
+        else tostring end);
+
+    "# 🤖 Claude Analysis Report\n\n" +
+    "## Issue Categories\n\n" +
+    (if (.issue_categories | length) == 0 then
+        "_No issue categories identified._\n\n"
+    else
+        (.issue_categories | map(
+            "### " + .name + "\n\n" +
+            "**Verdict:** " + verdict_mark(.verdict // "plausible") +
+            " · **Confidence:** " + (.confidence // "unknown") +
+            " · **Severity:** " + (.severity // "unknown") +
+            " (" + (.impact // "?") + " impact × " + (.likelihood // "?") + " likelihood)" +
+            " · **Category:** `" + (.category // "uncategorized") + "`\n\n" +
+            (.description // "") + "\n\n" +
+            (if (.severity_rationale // "") != "" then "**Why this severity:** " + .severity_rationale + "\n\n" else "" end) +
+            (if ((.evidence // []) | length) > 0 then
+                "**Evidence:**\n" + ((.evidence // []) | map("- " + evidence_line) | join("\n")) + "\n\n"
+            else "" end) +
+            "**Threads:** " + (if ((.thread_ids // []) | length) > 0 then (.thread_ids | join(", ")) else "N/A" end) + "\n"
+        ) | join("\n"))
+    end) +
+    "\n## Disputed Review Comments\n\n" +
+    "_Reviewer or bot claims that did not survive verification:_\n\n" +
+    (if ((.disputed_comments // []) | length) == 0 then
+        "_No claims were refuted._\n"
+    else
+        ((.disputed_comments // []) | map(
+            "- **" + (.thread_id // "unknown thread") + "** (confidence: " + (.confidence // "unknown") + ")\n" +
+            "  - Claim: " + (.claim // "") + "\n" +
+            "  - Why it is incorrect: " + (.why_incorrect // "")
+        ) | join("\n"))
+    end) +
+    "\n\n## Category Coverage\n\n" +
+    "_Every category the analyzer swept, and what it concluded:_\n\n" +
+    (if ((.category_coverage // []) | length) == 0 then
+        "_No coverage reported — treat this analysis as incomplete._\n"
+    else
+        ("| Category | Verdict | Note |\n|---|---|---|\n" +
+         ((.category_coverage // []) | map(
+            "| `" + (.category // "?") + "` | " + (.verdict // "?") + " | " + ((.note // "") | gsub("\\|"; "\\\\|")) + " |"
+         ) | join("\n")))
+    end) +
+    "\n\n## Systemic Issues\n\n" +
+    (if ((.systemic_issues // []) | length) == 0 then
+        "_No systemic patterns identified._\n"
+    else
+        ((.systemic_issues // []) | map(
+            "### " + (.pattern // "") + "\n\n" +
+            "**Evidence:**\n" + ((.evidence // []) | map("- " + evidence_line) | join("\n")) + "\n\n" +
+            "**Recommendation:** " + (.recommendation // "") + "\n"
+        ) | join("\n"))
+    end) +
+    "\n## Adjacent Problems to Investigate\n\n" +
+    (if ((.adjacent_problems // []) | length) == 0 then
+        "_No adjacent problem areas identified._\n"
+    else
+        ((.adjacent_problems // []) | map(
+            "- " + (if .checked == true then "🔎 **checked**" else "⬜ **not checked — investigate**" end) +
+            " **" + (.area // "") + "** (" + (.risk // "") + "): " + (.investigation_hint // "")
+        ) | join("\n"))
+    end) +
+    "\n\n## Task List\n\n" +
+    (if ((.task_list // []) | length) == 0 then
+        "_No tasks generated._\n"
+    else
+        ((.task_list // []) | map(
+            "### [" + (.priority // "?") + "] " + (.task // "") + "\n" +
+            (if anchor(.) == "" then "" else "- **Location:** `" + anchor(.) + "`\n" end) +
+            (if (.suggested_fix // "") != "" then "- **Suggested fix:** " + .suggested_fix + "\n" else "" end) +
+            (if (.verification // "") != "" then "- **Verify with:** `" + .verification + "`\n" else "" end) +
+            (if ((.thread_ids // []) | length) > 0 then "- **Threads:** " + (.thread_ids | join(", ")) + "\n" else "" end)
+        ) | join("\n"))
+    end) +
+    "\n\n## Process Improvements\n\n" +
+    "_Suggestions to prevent similar issues in future PRs:_\n\n" +
+    (if ((.process_improvements // []) | length) == 0 then
+        "_No process improvements suggested._\n"
+    else
+        ((.process_improvements // []) | map(
+            "### " + (.suggestion // "") + "\n" +
+            "**Category:** " + (.category // "") + "\n\n" +
+            (.rationale // "") + "\n" +
+            (if .implementation_hint then "\n**How to implement:** " + .implementation_hint + "\n" else "" end)
+        ) | join("\n"))
+    end) +
+    "\n\n## PR Template Suggestions\n\n" +
+    "_Additions to the PR template that would catch these issues earlier:_\n\n" +
+    (if ((.pr_template_suggestions // []) | length) == 0 then
+        "_No PR template changes suggested._\n"
+    else
+        ((.pr_template_suggestions // []) | map(
+            "### " + (.section // "") + "\n" +
+            "```\n" + (.checkbox_or_question // "") + "\n```\n" +
+            "_Why:_ " + (.why // "") + "\n"
+        ) | join("\n"))
+    end)
+    ' "$analysis_file" > "$output_file"
+}
+
+# ============================================================================
+# Test dispatcher
+#
+# Runs after every definition above and exits before the CLI flow. Keeps the
+# test suites pointed at shipped functions rather than at copies.
+# ============================================================================
+TEST_CALLABLE_FUNCTIONS="resolve_code_access build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema fetch_review_threads fetch_linked_issues"
+
+if [ -n "$TEST_CALL_FN" ]; then
+    case " $TEST_CALLABLE_FUNCTIONS " in
+        *" $TEST_CALL_FN "*)
+            "$TEST_CALL_FN" "${TEST_CALL_ARGS[@]+"${TEST_CALL_ARGS[@]}"}"
+            exit $?
+            ;;
+        *)
+            echo "Error: '$TEST_CALL_FN' is not test-callable." >&2
+            echo "Allowed: $TEST_CALLABLE_FUNCTIONS" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+# ============================================================================
+# Main PR logic
+# ============================================================================
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
@@ -1851,43 +2908,19 @@ gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/comments" \
         html_url: .html_url
     })' > "$OUTPUT_DIR/inline-comments.json"
 
-# 3. Fetch comment threads with GraphQL IDs
+# 3. Fetch comment threads with GraphQL IDs (paginated)
 echo "Fetching comment threads with GraphQL IDs..."
 OWNER=$(echo "$REPO" | cut -d'/' -f1)
 REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
 
-GRAPHQL_QUERY='
-query($owner: String!, $name: String!, $prNumber: Int!) {
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $prNumber) {
-      reviewThreads(last: 100) {
-        nodes {
-          id
-          isResolved
-          comments(first: 10) {
-            nodes {
-              id
-              databaseId
-              body
-              author {
-                login
-              }
-              createdAt
-              url
-            }
-          }
-        }
-      }
-    }
-  }
-}
-'
+if ! fetch_review_threads "$OWNER" "$REPO_NAME" "$PR_NUMBER" "$OUTPUT_DIR/comment-threads.json"; then
+    echo "Note: Could not fetch comment threads with GraphQL IDs."
+    echo '{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [], "pages_fetched": 0}}}}}' \
+        > "$OUTPUT_DIR/comment-threads.json"
+fi
 
-gh api graphql -F owner="$OWNER" -F name="$REPO_NAME" -F prNumber="$PR_NUMBER" -f query="$GRAPHQL_QUERY" \
-    > "$OUTPUT_DIR/comment-threads.json" 2>/dev/null || {
-        echo "Note: Could not fetch comment threads with GraphQL IDs."
-        echo '{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}' > "$OUTPUT_DIR/comment-threads.json"
-    }
+# Fetch the issues this PR closes, for intent the diff cannot show
+fetch_linked_issues "$OWNER" "$REPO_NAME" "$PR_NUMBER" "$OUTPUT_DIR/linked-issues.json" || true
 
 # Process comment threads to create ID mapping
 jq -r '.data.repository.pullRequest.reviewThreads.nodes[] |
@@ -1898,351 +2931,9 @@ jq -r '.data.repository.pullRequest.reviewThreads.nodes[] |
         echo "" > "$OUTPUT_DIR/id-mapping.txt"
     }
 
-# Function to add GraphQL IDs to comments
-create_comments_with_graphql_ids() {
-    local input_file="$1"
-    local output_file="$2"
-    local comment_type="$3"
-
-    jq --rawfile id_map "$OUTPUT_DIR/id-mapping.txt" '
-        map(. as $comment |
-            . + {
-                graphql_id: (
-                    if ($comment.id and ($comment.id | type == "number")) then
-                        ($id_map | split("\n") | map(select(length > 0) | split(":")) | map({key: .[0], value: .[1]}) | from_entries | .[$comment.id|tostring])
-                    else
-                        null
-                    end
-                ),
-                comment_type: $comment_type
-            }
-        )
-    ' "$input_file" --arg comment_type "$comment_type" > "$output_file"
-}
 
 # ============================================================================
-# Claude Enrichment Functions
-# ============================================================================
-
-extract_unresolved_threads() {
-    local threads_file="$1"
-    local output_file="$2"
-
-    jq '[.data.repository.pullRequest.reviewThreads.nodes[]
-        | select(.isResolved == false)
-        | {
-            thread_id: .id,
-            comments: [.comments.nodes[] | {
-                author: (.author.login // "unknown"),
-                body: .body,
-                url: .url
-            }]
-        }]' "$threads_file" > "$output_file"
-}
-
-# Fetch the PR diff and create both raw and structured versions
-# Args:
-#   $1 - output_dir: Directory to save diff files
-#   $2 - pr_num: PR number to fetch diff for
-# Creates:
-#   pr-diff.txt - Raw unified diff
-#   pr-diff.json - Structured diff with file-level separation
-fetch_pr_diff() {
-    local output_dir="$1"
-    local pr_num="$2"
-
-    # Fetch the unified diff for the PR
-    if ! gh pr diff "$pr_num" > "$output_dir/pr-diff.txt" 2>/dev/null; then
-        echo "⚠️  Could not fetch PR diff (binary files only, empty PR, or access denied)"
-        echo "   Analysis will proceed without code context."
-        echo "" > "$output_dir/pr-diff.txt"
-    fi
-
-    # Also create a structured version with file-level diffs
-    # Truncate large diffs to avoid token limits in Claude API
-    # 5000 chars per file balances context richness with API constraints
-    jq -n --arg diff "$(<"$output_dir/pr-diff.txt")" \
-        '{
-            raw_diff: $diff,
-            file_diffs: ($diff | split("diff --git ") | .[1:] | map(
-                . as $chunk |
-                ($chunk | split("\n") | .[0] | split(" ") | .[-1] | ltrimstr("b/")) as $filepath |
-                {
-                    file: $filepath,
-                    content: ("diff --git " + $chunk)
-                }
-            ))
-        }' > "$output_dir/pr-diff.json" 2>/dev/null || {
-            echo '{"raw_diff": "", "file_diffs": []}' > "$output_dir/pr-diff.json"
-        }
-}
-
-build_claude_context() {
-    local output_dir="$1"
-    local include_diff="${2:-false}"
-
-    # Ensure issue-comments.json exists (avoids --slurpfile error)
-    if [ ! -f "$output_dir/issue-comments.json" ]; then
-        echo '[]' > "$output_dir/issue-comments.json"
-    fi
-
-    # Shared jq filter for mapping/truncating issue comments (single definition)
-    local issue_comments_filter='($issue_comments[0] | map({
-        user: .user,
-        body: (if (.body | length) > 5000 then
-            (.body | .[0:5000] + "\n... (truncated)")
-        else
-            .body
-        end),
-        url: .html_url,
-        created_at: .created_at
-    }))'
-
-    if [ "$include_diff" = "true" ] && [ -f "$output_dir/pr-diff.json" ]; then
-        # Include diff in context for richer analysis
-        # Use --slurpfile to avoid ARG_MAX limits on large comment payloads
-        jq -n \
-            --argjson pr "$(<"$output_dir/pr-summary.json")" \
-            --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
-            --slurpfile issue_comments "$output_dir/issue-comments.json" \
-            --argjson diff "$(<"$output_dir/pr-diff.json")" \
-            '{
-                pr: {
-                    title: $pr.title,
-                    body: ($pr.body // "No description"),
-                    author: $pr.author.login,
-                    files_changed: [$pr.files[].path]
-                },
-                unresolved_threads: $unresolved,
-                issue_comments: '"$issue_comments_filter"',
-                code_changes: {
-                    summary: "Diff included for context. Each file_diff contains the actual code changes.",
-                    file_diffs: ($diff.file_diffs | map({
-                        file: .file,
-                        diff: (if (.content | length) > 5000 then
-                            (.content | .[0:5000] + "\n... (truncated)")
-                        else
-                            .content
-                        end)
-                    }))
-                }
-            }' > "$output_dir/claude-context.json"
-    else
-        # Use --slurpfile to avoid ARG_MAX limits on large comment payloads
-        jq -n \
-            --argjson pr "$(<"$output_dir/pr-summary.json")" \
-            --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
-            --slurpfile issue_comments "$output_dir/issue-comments.json" \
-            '{
-                pr: {
-                    title: $pr.title,
-                    body: ($pr.body // "No description"),
-                    author: $pr.author.login,
-                    files_changed: [$pr.files[].path]
-                },
-                unresolved_threads: $unresolved,
-                issue_comments: '"$issue_comments_filter"'
-            }' > "$output_dir/claude-context.json"
-    fi
-}
-
-CLAUDE_ANALYSIS_SCHEMA='{
-  "type": "object",
-  "properties": {
-    "issue_categories": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "name": { "type": "string" },
-          "severity": { "enum": ["critical", "high", "medium", "low"] },
-          "description": { "type": "string" },
-          "thread_ids": { "type": "array", "items": { "type": "string" } }
-        },
-        "required": ["name", "severity", "description", "thread_ids"]
-      }
-    },
-    "systemic_issues": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "pattern": { "type": "string" },
-          "evidence": { "type": "array", "items": { "type": "string" } },
-          "recommendation": { "type": "string" }
-        },
-        "required": ["pattern", "evidence", "recommendation"]
-      }
-    },
-    "adjacent_problems": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "area": { "type": "string" },
-          "risk": { "type": "string" },
-          "investigation_hint": { "type": "string" }
-        },
-        "required": ["area", "risk", "investigation_hint"]
-      }
-    },
-    "task_list": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "priority": { "enum": ["critical", "high", "medium", "low"] },
-          "task": { "type": "string" },
-          "thread_ids": { "type": "array", "items": { "type": "string" } }
-        },
-        "required": ["priority", "task", "thread_ids"]
-      }
-    },
-    "process_improvements": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "category": { "enum": ["documentation", "automation", "testing", "review_process", "tooling"] },
-          "suggestion": { "type": "string" },
-          "rationale": { "type": "string" },
-          "implementation_hint": { "type": "string" }
-        },
-        "required": ["category", "suggestion", "rationale"]
-      }
-    },
-    "pr_template_suggestions": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "section": { "type": "string" },
-          "checkbox_or_question": { "type": "string" },
-          "why": { "type": "string" }
-        },
-        "required": ["section", "checkbox_or_question", "why"]
-      }
-    }
-  },
-  "required": ["issue_categories", "systemic_issues", "adjacent_problems", "task_list", "process_improvements", "pr_template_suggestions"]
-}'
-
-run_claude_analysis() {
-    local context_file="$1"
-    local output_file="$2"
-    local timeout_secs="${CLAUDE_TIMEOUT:-300}"  # Default 5 minutes, configurable via env
-
-    # Load system prompt from configurable file
-    local system_prompt
-    system_prompt="$(load_system_prompt)"
-
-    # Store schema in variable for direct use
-    local schema_content="$CLAUDE_ANALYSIS_SCHEMA"
-
-    # Build prompt and pipe via stdin to avoid arg length limits
-    local user_prompt="Analyze these unresolved PR comment threads and issue comments (including CI/bot reports) and provide structured analysis:
-
-$(cat "$context_file")"
-
-    echo "🧠 Running Claude analysis (timeout: ${timeout_secs}s)..." >&2
-
-    local exit_code=0
-    # Use --setting-sources "" to bypass plugin loading which can cause hangs
-    # Use --signal=KILL --foreground because claude --print doesn't respond gracefully to SIGTERM during init
-    # Unset CLAUDECODE to allow nested invocation from within a Claude Code session
-    if echo "$user_prompt" | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
-        timeout --signal=KILL --foreground "$timeout_secs" claude --print \
-        --setting-sources "" \
-        --model sonnet \
-        --output-format json \
-        --json-schema "$schema_content" \
-        --system-prompt "$system_prompt" \
-        > "$output_file" 2>/dev/null; then
-        echo "✅ Claude analysis complete" >&2
-    else
-        exit_code=$?
-        # 124 = timeout with SIGTERM, 137 = timeout with SIGKILL (128 + 9)
-        if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
-            echo "⏱️  Claude analysis timed out after ${timeout_secs}s (set CLAUDE_TIMEOUT to increase)" >&2
-        else
-            echo "❌ Claude analysis failed (exit code: $exit_code)" >&2
-        fi
-    fi
-
-    return $exit_code
-}
-
-generate_analysis_report() {
-    local analysis_file="$1"
-    local output_file="$2"
-
-    jq -r '
-    "# 🤖 Claude Analysis Report\n\n" +
-    "## Issue Categories\n\n" +
-    (if (.issue_categories | length) == 0 then
-        "_No issue categories identified._\n\n"
-    else
-        (.issue_categories | map(
-            "### " + .name + " (" + .severity + ")\n" +
-            .description + "\n\n" +
-            "**Threads:** " + (if (.thread_ids | length) > 0 then (.thread_ids | join(", ")) else "N/A" end) + "\n"
-        ) | join("\n"))
-    end) +
-    "\n## Systemic Issues\n\n" +
-    (if (.systemic_issues | length) == 0 then
-        "_No systemic patterns identified._\n\n"
-    else
-        (.systemic_issues | map(
-            "### " + .pattern + "\n\n" +
-            "**Evidence:**\n" + (.evidence | map("- " + .) | join("\n")) + "\n\n" +
-            "**Recommendation:** " + .recommendation + "\n"
-        ) | join("\n"))
-    end) +
-    "\n## Adjacent Problems to Investigate\n\n" +
-    (if (.adjacent_problems | length) == 0 then
-        "_No adjacent problem areas identified._\n"
-    else
-        (.adjacent_problems | map(
-            "- **" + .area + "** (" + .risk + "): " + .investigation_hint
-        ) | join("\n"))
-    end) +
-    "\n\n## Task List\n\n" +
-    (if (.task_list | length) == 0 then
-        "_No tasks generated._\n"
-    else
-        (.task_list | map(
-            "- [" + .priority + "] " + .task +
-            (if (.thread_ids | length) > 0 then " _(threads: " + (.thread_ids | join(", ")) + ")_" else "" end)
-        ) | join("\n"))
-    end) +
-    "\n\n## Process Improvements\n\n" +
-    "_Suggestions to prevent similar issues in future PRs:_\n\n" +
-    (if (.process_improvements | length) == 0 then
-        "_No process improvements suggested._\n"
-    else
-        (.process_improvements | map(
-            "### " + .suggestion + "\n" +
-            "**Category:** " + .category + "\n\n" +
-            .rationale + "\n" +
-            (if .implementation_hint then "\n**How to implement:** " + .implementation_hint + "\n" else "" end)
-        ) | join("\n"))
-    end) +
-    "\n\n## PR Template Suggestions\n\n" +
-    "_Additions to the PR template that would catch these issues earlier:_\n\n" +
-    (if (.pr_template_suggestions | length) == 0 then
-        "_No PR template changes suggested._\n"
-    else
-        (.pr_template_suggestions | map(
-            "### " + .section + "\n" +
-            "```\n" + .checkbox_or_question + "\n```\n" +
-            "_Why:_ " + .why + "\n"
-        ) | join("\n"))
-    end)
-    ' "$analysis_file" > "$output_file"
-}
-
-# ============================================================================
-# Main Processing (continuation of main logic block started above)
+# Main Processing
 # ============================================================================
 
 # Add GraphQL IDs to all comment types
@@ -2275,10 +2966,20 @@ jq -s 'add | sort_by(.created_at // .submitted_at // "")' \
 
 # 4. Fetch checks and status
 echo "Fetching checks and status..."
-gh pr checks "$PR_NUMBER" --json name,state,bucket,workflow,startedAt,completedAt,event,link,description > "$OUTPUT_DIR/checks.json" 2>/dev/null || {
-    echo "Note: Could not fetch checks (may require additional permissions or no checks configured)."
-    echo '[]' > "$OUTPUT_DIR/checks.json"
-}
+# `gh pr checks` exits non-zero for states that still produce valid output —
+# notably a non-zero exit while checks are pending or failing. Keep whatever it
+# wrote if it parses; only fall back to an empty set when there is nothing usable.
+# Otherwise a PR with pending or failing checks reports "no checks", exactly when
+# the failing-checks input matters most.
+if ! gh pr checks "$PR_NUMBER" --json name,state,bucket,workflow,startedAt,completedAt,event,link,description \
+        > "$OUTPUT_DIR/checks.json" 2>/dev/null; then
+    if jq -e 'type == "array"' "$OUTPUT_DIR/checks.json" > /dev/null 2>&1; then
+        echo "Note: gh pr checks exited non-zero (checks pending or failing); using the results it returned."
+    else
+        echo "Note: Could not fetch checks (may require additional permissions or no checks configured)."
+        echo '[]' > "$OUTPUT_DIR/checks.json"
+    fi
+fi
 
 # 5. Generate statistics
 echo "Generating statistics..."
@@ -2414,11 +3115,15 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
             fetch_pr_diff "$OUTPUT_DIR" "$PR_NUMBER"
         fi
 
+        # Deterministic findings first, so the analyzer can confirm or refute them
+        if [ "$RUN_SAST" = true ]; then
+            echo "Running static-analysis pre-pass on changed files..."
+            collect_sast_findings "$OUTPUT_DIR"
+        fi
+
         build_claude_context "$OUTPUT_DIR" "$INCLUDE_DIFF"
 
         if run_claude_analysis "$OUTPUT_DIR/claude-context.json" "$OUTPUT_DIR/claude-raw-response.json"; then
-            echo "✅ Claude analysis complete"
-
             if jq -e '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" > /dev/null 2>&1; then
                 jq '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" > "$OUTPUT_DIR/claude-analysis.json"
             else
@@ -2426,9 +3131,11 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
             fi
 
             generate_analysis_report "$OUTPUT_DIR/claude-analysis.json" "$OUTPUT_DIR/claude-analysis.md"
+            generate_coverage_section "$OUTPUT_DIR/claude-context.json" "$OUTPUT_DIR/context-coverage.md"
 
             jq --argjson analysis "$(<"$OUTPUT_DIR/claude-analysis.json")" \
-               '. + {claude_analysis: $analysis}' \
+               --argjson coverage "$(jq '.coverage // {}' "$OUTPUT_DIR/claude-context.json")" \
+               '. + {claude_analysis: $analysis, analysis_context_coverage: $coverage}' \
                "$OUTPUT_DIR/combined-data.json" > "$OUTPUT_DIR/combined-data.tmp.json" && \
                mv "$OUTPUT_DIR/combined-data.tmp.json" "$OUTPUT_DIR/combined-data.json"
 
@@ -2438,6 +3145,8 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
 
 ANALYSIS_SECTION
             cat "$OUTPUT_DIR/claude-analysis.md" >> "$OUTPUT_DIR/comprehensive-report.md"
+            printf '\n---\n\n' >> "$OUTPUT_DIR/comprehensive-report.md"
+            cat "$OUTPUT_DIR/context-coverage.md" >> "$OUTPUT_DIR/comprehensive-report.md"
         else
             echo "⚠️  Claude analysis failed. Continuing without enrichment."
         fi
@@ -2464,52 +3173,3 @@ case $OUTPUT_FORMAT in
         fi
         ;;
 esac
-
-fi  # End of: if [ -z "$TEST_BUILD_CONTEXT_DIR" ]
-
-# Test mode: build context and exit (for integration testing)
-# Inlined version of build_claude_context to avoid function scoping issues
-if [ -n "$TEST_BUILD_CONTEXT_DIR" ]; then
-    if [ ! -d "$TEST_BUILD_CONTEXT_DIR" ]; then
-        echo "Error: Directory not found: $TEST_BUILD_CONTEXT_DIR"
-        exit 1
-    fi
-
-    output_dir="$TEST_BUILD_CONTEXT_DIR"
-    include_diff="false"
-
-    # Ensure issue-comments.json exists (avoids --slurpfile error)
-    if [ ! -f "$output_dir/issue-comments.json" ]; then
-        echo '[]' > "$output_dir/issue-comments.json"
-    fi
-
-    # Shared jq filter for mapping/truncating issue comments
-    issue_comments_filter='($issue_comments[0] | map({
-        user: .user,
-        body: (if (.body | length) > 5000 then
-            (.body | .[0:5000] + "\n... (truncated)")
-        else
-            .body
-        end),
-        url: .html_url,
-        created_at: .created_at
-    }))'
-
-    # Build claude-context.json without diff
-    jq -n \
-        --argjson pr "$(<"$output_dir/pr-summary.json")" \
-        --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
-        --slurpfile issue_comments "$output_dir/issue-comments.json" \
-        '{
-            pr: {
-                title: $pr.title,
-                body: ($pr.body // "No description"),
-                author: $pr.author.login,
-                files_changed: [$pr.files[].path]
-            },
-            unresolved_threads: $unresolved,
-            issue_comments: '"$issue_comments_filter"'
-        }' > "$output_dir/claude-context.json"
-
-    exit 0
-fi

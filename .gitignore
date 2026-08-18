@@ -1,6 +1,9 @@
 # Reports directory (generated output)
 .reports/
 
+# Test scratch output (suites create and delete this on every run)
+tests/test-output/
+
 # Git worktrees (per-task isolated checkouts)
 .worktrees/
 

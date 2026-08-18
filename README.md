@@ -9,7 +9,8 @@ A GitHub CLI extension for comprehensive PR analysis with optional Claude AI enr
 - 🧵 **Thread Tracking**: GraphQL IDs for programmatic thread resolution
 - ✅ **CI/CD Status**: Check runs and status information
 - 📊 **Statistics**: Comment counts by type/user, recent activity
-- 🤖 **Claude AI Analysis** (optional): Analyze unresolved review threads and issue comments (including bot/CI reports) to categorize issues, identify systemic patterns, and generate task lists
+- 🤖 **Claude AI Analysis** (optional): Verifies each review claim against the code, sweeps a fixed 16-category checklist, and returns findings with verdicts, evidence and executable tasks
+- 🔬 **Static Analysis Pre-pass** (optional): `--sast` runs semgrep over the changed files so the analysis starts from deterministic findings
 - 🔧 **Thread Resolution**: Resolve comment threads directly from CLI
 - 👀 **Watch Mode**: Monitor PRs for new comments with auto-analysis
 - 🎯 **Interactive Mode**: Work through issues one by one with guided fixing
@@ -32,6 +33,9 @@ gh pr-enrich 123 --enrich
 
 # Include code diffs in analysis for richer context
 gh pr-enrich 123 --enrich --diff
+
+# Full bug hunt: diffs, semgrep pre-pass, repository access for verification
+gh pr-enrich 123 --enrich --diff --sast
 
 # Output JSON only (for scripting)
 gh pr-enrich 123 --json
@@ -58,6 +62,10 @@ gh pr-enrich address 123
 | `--output-dir DIR` | Custom output directory |
 | `--enrich` | Run Claude AI analysis on unresolved threads and issue comments |
 | `--diff` | Include code diffs in Claude context (richer analysis) |
+| `--sast` | Run a semgrep pre-pass over changed files and feed the findings to the analysis |
+| `--no-code-access` | Deny the analyzer repository access (sandboxed runs); findings can then only be `plausible` |
+| `--code-access` | Read the working tree even when it is not at the PR head |
+| `--model NAME` | Model for the analysis (default: `sonnet`) |
 | `--prompt FILE` | Custom prompt file for Claude analysis |
 | `-h, --help` | Show help |
 | `-v, --version` | Show version |
@@ -86,13 +94,20 @@ When run, the extension creates a directory with:
 ├── issue-comments.json          # Top-level PR comments (part of enrichment context)
 ├── comment-threads.json         # Thread data with GraphQL IDs
 ├── checks.json                  # CI/CD status
+├── linked-issues.json           # Issues this PR closes
 ├── claude-analysis.json         # (if --enrich) AI analysis
 ├── claude-analysis.md           # (if --enrich) AI report
+├── claude-context.json          # (if --enrich) Exactly what the analyzer was shown
+├── claude-stderr.log            # (if --enrich) Analyzer stderr
+├── context-coverage.md          # (if --enrich) What was truncated, dropped or omitted
+├── sast-findings.json           # (if --sast) Normalized semgrep findings
 ├── pr-diff.txt                  # (if --diff) Raw unified diff
 └── pr-diff.json                 # (if --diff) Structured diff by file
 ```
 
-Intermediate artifacts (`review-comments.json`, `inline-comments.json`, `unresolved-threads.json`, `claude-context.json`, `claude-raw-response.json`, `id-mapping.txt`) are also kept in the same directory for debugging.
+Intermediate artifacts (`review-comments.json`, `inline-comments.json`, `unresolved-threads.json`, `issue-comments-deduped.json`, `claude-raw-response.json`, `id-mapping.txt`) are also kept in the same directory for debugging.
+
+When an analysis comes back empty, read `claude-stderr.log` first — an empty result is usually a failed or timed-out run, not a clean PR.
 
 ## Retrospective Analysis
 
@@ -150,20 +165,35 @@ With `--enrich`, Claude provides additional meta-analysis:
 
 ## Claude AI Analysis
 
-When using `--enrich`, Claude analyzes unresolved review threads **and** top-level issue comments — including bot/CI reports from github-actions, security scanners, and similar tools — and provides:
+When using `--enrich`, Claude reads the PR context — unresolved review threads, top-level issue comments (including bot/CI reports), commit messages, linked issue bodies and failing checks — and, by default, reads the repository itself to check claims against the code.
 
-- **Issue Categories**: Groups issues by type (security, performance, architecture, etc.)
-- **Systemic Issues**: Identifies patterns across multiple comments
-- **Adjacent Problems**: Suggests related areas to investigate
-- **Task List**: Prioritized actions linked to thread IDs
+The result is a verification pass, not a summary:
+
+- **Issue Categories**: Each finding carries a `verdict` (`confirmed` / `plausible` / `refuted`), a `confidence`, and `evidence` naming the file and line that was inspected
+- **Disputed Comments**: Reviewer or bot claims that were checked and found wrong, with the reason
+- **Category Coverage**: An explicit verdict for each of the 16 categories, so "not checked" never looks like "clean"
+- **Systemic Issues**: Patterns behind several findings, with the evidence that links them
+- **Adjacent Problems**: Related areas, flagged with whether the analyzer actually searched them
+- **Task List**: Prioritized actions, each with `file`, `line`, `suggested_fix` and a `verification` command
 - **Process Improvements**: Automation, documentation, and review-process suggestions to prevent recurrence
 - **PR Template Suggestions**: Checklist items that would catch these issues before review
 
+Severity is derived from **impact × likelihood**, never from the category — a bug raised inside a style nit still ranks as a bug.
+
 The analysis runs when the PR has unresolved threads or issue comments; if it has neither, enrichment is skipped.
+
+### The 16 categories
+
+`logic_error`, `boundary_condition`, `concurrency`, `error_handling`, `resource_lifecycle`, `security`, `secrets_exposure`, `data_integrity`, `api_contract`, `performance`, `test_gap`, `observability`, `maintainability`, `documentation`, `build_ci`, `dependency_risk`
+
+The list is closed, and the analysis must return a verdict for every one of them.
 
 ### Requirements for `--enrich`
 
 - [Claude CLI](https://claude.ai/code) must be installed and authenticated
+- The analyzer is granted **read-only** tools (Read, Grep, Glob). It never runs commands and never edits files. Use `--no-code-access` to withhold even that.
+- Access is granted only when your working tree holds the PR's code — at the PR head, or ahead of it with your local fixes. On an unrelated revision (reviewing someone else's PR from `main`) access is denied, because "verifying" against the wrong revision produces confident, wrong anchors. Run `gh pr checkout <N>` first, or pass `--code-access` to accept the mismatch.
+- Verification takes longer than summarizing. The default timeout is 600s; raise `CLAUDE_TIMEOUT` for large PRs.
 
 ### Customizing the Analysis Prompt
 
@@ -199,6 +229,7 @@ export GH_PR_ENRICH_PROMPT="$HOME/.config/gh-pr-enrich-prompt.txt"
 | `gh` | ✅ Yes | `brew install gh` |
 | `jq` | ✅ Yes | `brew install jq` |
 | `claude` | Only for `--enrich` | [claude.ai/code](https://claude.ai/code) |
+| `semgrep` | Only for `--sast` | `pip install semgrep` |
 
 ## Environment Variables
 
@@ -209,8 +240,21 @@ export PR_REVIEW_OUTPUT_ROOT="./custom-reports"
 # Custom prompt file for Claude analysis
 export GH_PR_ENRICH_PROMPT="$HOME/.config/gh-pr-enrich-prompt.txt"
 
-# Timeout for Claude analysis (default: 300s for PR analysis, 180s for retrospective)
-export CLAUDE_TIMEOUT=600  # 10 minutes
+# Timeout for Claude analysis (default: 600s for PR analysis, 180s for retrospective)
+export CLAUDE_TIMEOUT=1200  # 20 minutes, for large PRs
+
+# Model used for the analysis (default: sonnet)
+export GH_PR_ENRICH_MODEL=opus
+
+# Run the analysis without repository read access (sandboxed/offline)
+export GH_PR_ENRICH_CODE_ACCESS=false
+
+# Per-comment and per-file-diff truncation limit (default: 5000 characters)
+export GH_PR_ENRICH_TRUNCATE_CHARS=8000
+
+# semgrep configuration and time budget for --sast
+export GH_PR_ENRICH_SEMGREP_CONFIG="p/ci"
+export GH_PR_ENRICH_SEMGREP_TIMEOUT=300
 ```
 
 ## Examples

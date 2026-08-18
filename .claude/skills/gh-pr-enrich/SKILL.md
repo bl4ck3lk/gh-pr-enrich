@@ -1,11 +1,11 @@
 ---
 name: gh-pr-enrich
-description: Fetch comprehensive PR details and optionally run Claude AI analysis on unresolved comment threads and issue comments (including bot/CI reports). Use when reviewing PRs, addressing PR feedback, investigating review comments, or when users request PR analysis. Produces structured JSON and Markdown reports with issue categorization, systemic patterns, and prioritized task lists. Enforces mandatory thread resolution after addressing feedback and CI/CD check verification before declaring work complete.
+description: Use when reviewing a PR, addressing PR review feedback, investigating review comments or bot/CI reports on a PR, auditing a PR for bugs before merge, or looking for recurring issues across past PRs.
 ---
 
 # gh-pr-enrich Skill
 
-Comprehensive PR analysis using the `gh pr-enrich` GitHub CLI extension. Fetches complete PR context (comments, threads, checks, files) and optionally enriches with Claude AI analysis to categorize issues, identify patterns, and generate actionable task lists.
+Comprehensive PR analysis using the `gh pr-enrich` GitHub CLI extension. Fetches complete PR context (comments, threads, checks, commits, linked issues) and optionally runs a verification pass with Claude that checks each claim against the code, sweeps a fixed category list, and produces anchored, executable tasks.
 
 ## Why This Skill Exists (RED Baseline)
 
@@ -13,14 +13,19 @@ Without this skill, agents addressing PR feedback fall into predictable failure 
 
 | What agents do without gh-pr-enrich | What gh-pr-enrich prevents |
 |--------------------------------------|---------------------------|
+| Treat every review comment as correct | Each finding carries a verdict; refuted claims land in `disputed_comments` |
+| Fix only what reviewers noticed | Fixed category sweep with an explicit verdict per category |
+| Rank a bug as "low" because it arrived as a style note | Severity derives from impact × likelihood, never from category |
+| Produce vague tasks ("improve error handling") | Every task carries file, line, suggested fix and a verification step |
 | Read comments one at a time, miss patterns | Groups issues by category, surfaces systemic root causes |
-| Fix symptoms without investigating adjacent code | Adjacent problems section flags related areas proactively |
+| Fix symptoms without investigating adjacent code | Adjacent problems are checked, and marked when they were not |
 | Address tasks then forget to resolve threads | Mandatory thread resolution workflow with final audit |
 | Declare "done" without verifying CI | Completion gate requires `gh pr checks` evidence |
 | Miss non-thread comments entirely | Explicit non-thread comment check in workflow |
+| Trust a truncated report as a complete one | Coverage block records every dropped or shortened input |
 | Treat each PR in isolation | Retrospective analysis connects patterns across PRs |
 
-**The gap:** A general-purpose agent addressing PR feedback will fix individual comments without seeing the systemic pattern, forget to resolve threads, skip CI verification, and miss non-thread comments. This skill makes all four impossible to skip.
+**The gap:** A general-purpose agent addressing PR feedback accepts reviewer claims as facts, fixes only what was pointed out, forgets to resolve threads, and skips CI verification. This skill makes each of those failures visible.
 
 ## When to Use This Skill
 
@@ -39,6 +44,41 @@ Use this skill when:
 
 **IMPORTANT:** After running `gh pr-enrich --enrich`, you MUST complete these steps before addressing individual tasks:
 
+### 0. Separate Verified Findings from Claims (REQUIRED)
+
+Every finding carries a `verdict`. Read it before you plan any work:
+
+```bash
+ANALYSIS=.reports/pr-reviews/pr-<NUMBER>/claude-analysis.json
+
+# Findings that were traced in the code
+jq '[.issue_categories[] | select(.verdict == "confirmed")]' "$ANALYSIS"
+
+# Findings that could not be verified — investigate before fixing
+jq '[.issue_categories[] | select(.verdict == "plausible")]' "$ANALYSIS"
+
+# Reviewer or bot claims that were checked and found wrong
+jq '.disputed_comments' "$ANALYSIS"
+```
+
+**Why this matters:** A review comment is a claim, not a fact. Fixing a refuted claim changes working code for no reason and closes the thread with a false explanation.
+
+- `confirmed` → fix it.
+- `plausible` → verify it yourself first, then fix or dispute.
+- `refuted` / listed in `disputed_comments` → **do not fix.** Reply on the thread with the reason it does not apply, and resolve only after the reviewer agrees.
+
+### 0b. Check What Was Actually Swept (REQUIRED)
+
+```bash
+# Categories the analyzer could not check, and why
+jq '[.category_coverage[] | select(.verdict == "not_reviewable")]' "$ANALYSIS"
+
+# What the analyzer was and was not shown
+jq '.analysis_context_coverage' .reports/pr-reviews/pr-<NUMBER>/combined-data.json
+```
+
+**Why this matters:** "No findings" and "not checked" look identical in a task list. `not_reviewable` categories and truncated inputs are the gaps where bugs survive a clean-looking review. If a category you care about is `not_reviewable`, review it yourself or re-run with `--diff` and repository access.
+
 ### 1. Review Systemic Issues (REQUIRED)
 
 Always check `systemic_issues` first. These reveal root causes that may affect multiple tasks:
@@ -55,12 +95,17 @@ Always review `adjacent_problems` to identify related areas that need attention:
 
 ```bash
 jq '.adjacent_problems' .reports/pr-reviews/pr-<NUMBER>/claude-analysis.json
+
+# The ones the analyzer could not search itself — these are yours to check
+jq '[.adjacent_problems[] | select(.checked != true)]' .reports/pr-reviews/pr-<NUMBER>/claude-analysis.json
 ```
 
 **Why this matters:** PR reviewers see only the changed code. Adjacent problems highlight areas with similar issues that weren't in the PR diff. Investigating these prevents:
 - Incomplete fixes that miss related code
 - Future PRs with the same feedback
 - Whack-a-mole debugging cycles
+
+`checked: true` means the analyzer searched and reported what it found. `checked: false` means it could not search — treat that as an open investigation, not a clean result.
 
 ### 3. Then Address Tasks in Priority Order
 
@@ -91,20 +136,22 @@ gh pr-enrich resolve "$THREAD_ID"
 **After all tasks are complete**, verify no threads were missed (assumes `$OWNER`, `$REPO`, `$PR_NUMBER` were resolved earlier — see "Resolving Owner, Repo, and PR Number"):
 
 ```bash
-# Re-fetch thread status and check for any still-unresolved threads
-gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
-query($owner: String!, $repo: String!, $number: Int!) {
+# Re-fetch thread status and check for any still-unresolved threads.
+# --paginate follows the cursor: a PR with more than 100 threads must not lose the rest.
+gh api graphql --paginate -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
+query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
         nodes { id isResolved }
       }
     }
   }
-}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
+}' | jq -s '[.[].data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
 ```
 
-**Thread pagination warning:** The `first: 100` limit means PRs with >100 review threads will silently miss threads. If the thread count returned equals exactly 100, assume truncation — increase the limit or paginate with cursors.
+**Always use `--paginate` with `jq -s`.** A single page silently caps the audit at 100 threads, and a missed thread reads exactly like a resolved one.
 
 If any threads remain unresolved, investigate whether they were:
 - **Addressed but not resolved** — resolve them now
@@ -160,409 +207,6 @@ PR_NUMBER=123
 
 **Always resolve these first.** Do not use literal placeholder strings in GraphQL queries.
 
-## Prerequisites
-
-- GitHub CLI (`gh`) authenticated with repo access
-- `jq` installed for JSON processing
-- `gh pr-enrich` extension installed: `gh extension install bl4ck3lk/gh-pr-enrich`
-- For AI enrichment: [Claude CLI](https://claude.ai/code) installed and authenticated
-
-## Quick Start
-
-```bash
-# Install the extension (one-time)
-gh extension install bl4ck3lk/gh-pr-enrich
-
-# Basic PR analysis
-gh pr-enrich 123
-
-# With Claude AI enrichment (analyzes unresolved threads and issue comments)
-gh pr-enrich 123 --enrich
-
-# Enrichment with code diffs included in the Claude context
-gh pr-enrich 123 --enrich --diff
-
-# JSON output for scripting
-gh pr-enrich 123 --json
-```
-
-## Command Reference
-
-### Syntax
-
-```bash
-gh pr-enrich <PR_NUMBER> [OPTIONS]
-gh pr-enrich <SUBCOMMAND> [ARGS]
-```
-
-### Subcommands
-
-| Subcommand | Description |
-|------------|-------------|
-| `install-skill` | Symlink this skill into `~/.claude/skills/` |
-| `uninstall-skill` | Remove the skill symlink |
-| `resolve <ID...>` | Resolve one or more review threads by GraphQL ID |
-| `watch <PR>` | Monitor a PR for new comments (`--interval MIN`, `--enrich`, `--notify`) |
-| `address <PR>` | Interactive mode to work through analyzed issues one by one (requires a prior `--enrich` run) |
-| `retrospective` | Cross-PR pattern analysis (see "Retrospective Analysis" below) |
-
-### Options
-
-| Option | Description |
-|--------|-------------|
-| `--json` | Output only JSON (for scripting) |
-| `--markdown` | Output only Markdown report |
-| `--output-dir DIR` | Custom output directory |
-| `--enrich` | Run Claude AI analysis on unresolved threads and issue comments |
-| `--diff` | Include code diffs in Claude context (richer analysis) |
-| `--prompt FILE` | Custom prompt file for AI analysis |
-| `-h, --help` | Show help |
-| `-v, --version` | Show version |
-
-### Environment Variables
-
-| Variable | Purpose |
-|----------|---------|
-| `PR_REVIEW_OUTPUT_ROOT` | Override default output directory root |
-| `GH_PR_ENRICH_PROMPT` | Path to custom prompt file for Claude analysis |
-| `CLAUDE_TIMEOUT` | Timeout in seconds for Claude analysis (default: 300 for PR analysis, 180 for retrospective) |
-
-## Output Files
-
-Default location: `.reports/pr-reviews/pr-<NUMBER>/`
-
-| File | Description |
-|------|-------------|
-| `comprehensive-report.md` | Human-readable summary of PR |
-| `combined-data.json` | Complete machine-readable data |
-| `pr-summary.json` | PR metadata (title, body, author, files) |
-| `all-comments.json` | All comments combined |
-| `issue-comments.json` | Top-level PR comments (part of the enrichment context) |
-| `comment-threads.json` | Thread data with GraphQL IDs and `isResolved` status |
-| `checks.json` | CI/CD status information |
-| `claude-analysis.json` | (if --enrich) Structured AI analysis |
-| `claude-analysis.md` | (if --enrich) Human-readable AI report |
-| `pr-diff.txt` / `pr-diff.json` | (if --diff) Raw and per-file structured diff |
-
-## Analyzing Output
-
-### Reading the Claude Analysis
-
-When using `--enrich`, the AI analysis contains six key sections:
-
-#### 1. Issue Categories
-
-Groups unresolved comments by type with severity ratings:
-
-```json
-{
-  "issue_categories": [
-    {
-      "name": "Missing Request Correlation IDs",
-      "severity": "high",
-      "description": "Multiple Sentry captures lack request_id...",
-      "thread_ids": ["PRRT_xxx", "PRRT_yyy"]
-    }
-  ]
-}
-```
-
-**Severity levels (each must cite evidence):**
-- `critical` - Security vulnerabilities, data loss, breaking changes — because [specific thread citing exploitable issue]
-- `high` - Bugs, performance issues, architectural problems — because [specific thread with reproduction steps or impact]
-- `medium` - Code quality, maintainability, missing tests — because [thread citing measurable maintenance impact]
-- `low` - Style, documentation, minor improvements — because [thread citing convention or standard]
-
-Severity without evidence from the actual thread content is guessing, not analysis.
-
-#### 2. Systemic Issues
-
-Patterns that appear across multiple comments:
-
-```json
-{
-  "systemic_issues": [
-    {
-      "pattern": "Incomplete Error Handling Pattern",
-      "evidence": [
-        "Thread PRRT_xxx: missing error context",
-        "Thread PRRT_yyy: silent failure in catch block"
-      ],
-      "recommendation": "Create standard error wrapper..."
-    }
-  ]
-}
-```
-
-**Use these to:**
-- Identify root causes vs symptoms
-- Prioritize fixes that address multiple issues
-- Improve codebase-wide patterns
-
-#### 3. Adjacent Problems
-
-Related areas that may have similar issues:
-
-```json
-{
-  "adjacent_problems": [
-    {
-      "area": "Other API endpoints",
-      "risk": "Same error handling pattern may exist",
-      "investigation_hint": "Search for similar try/catch blocks..."
-    }
-  ]
-}
-```
-
-**Use these to:**
-- Proactively find related bugs
-- Scope follow-up investigations
-- Prevent whack-a-mole debugging
-
-#### 4. Task List
-
-Prioritized actions linked to thread IDs:
-
-```json
-{
-  "task_list": [
-    {
-      "priority": "critical",
-      "task": "Add request_id to all captureException calls",
-      "thread_ids": ["PRRT_xxx", "PRRT_yyy"]
-    }
-  ]
-}
-```
-
-**Use these to:**
-- Create TODO list for addressing feedback
-- Prioritize work by severity
-- Track which threads each fix addresses
-
-#### 5. Process Improvements
-
-Suggestions to prevent similar issues in future PRs:
-
-```json
-{
-  "process_improvements": [
-    {
-      "category": "automation",
-      "suggestion": "Add ESLint rule for error handling patterns",
-      "rationale": "Multiple comments about inconsistent error handling could be caught automatically",
-      "implementation_hint": "Configure eslint-plugin-promise with consistent-return rule"
-    }
-  ]
-}
-```
-
-**Categories:**
-- `documentation` - README, code comments, ADRs
-- `automation` - Linting, CI checks, pre-commit hooks
-- `testing` - Unit tests, integration tests, test coverage
-- `review_process` - Review checklists, required reviewers
-- `tooling` - Development tools, IDE configurations
-
-**Use these to:**
-- Systematically prevent recurring issues
-- Build institutional knowledge
-- Improve team velocity over time
-
-#### 6. PR Template Suggestions
-
-Additions to your PR template that would catch issues earlier:
-
-```json
-{
-  "pr_template_suggestions": [
-    {
-      "section": "Testing Checklist",
-      "checkbox_or_question": "- [ ] Error handling follows project patterns (see docs/error-handling.md)",
-      "why": "3 of 5 issues related to inconsistent error handling"
-    }
-  ]
-}
-```
-
-**Use these to:**
-- Evolve your PR template based on real feedback patterns
-- Shift issue detection left (author catches before reviewer)
-- Document team standards incrementally
-
-### Working with Thread IDs
-
-Thread IDs (format: `PRRT_xxx`) are GraphQL identifiers for review threads. Use them to:
-
-**Find specific threads:**
-```bash
-jq '.data.repository.pullRequest.reviewThreads.nodes[]
-    | select(.id == "PRRT_xxx")' comment-threads.json
-```
-
-**Get all unresolved threads:**
-```bash
-jq '[.data.repository.pullRequest.reviewThreads.nodes[]
-    | select(.isResolved == false)]' comment-threads.json
-```
-
-**Resolve threads programmatically:**
-```bash
-# Built-in subcommand (accepts one or more IDs)
-gh pr-enrich resolve "$THREAD_ID"
-
-# Equivalent raw GraphQL
-gh api graphql -f query='mutation($threadId: ID!) {
-  resolveReviewThread(input: {threadId: $threadId}) {
-    thread { isResolved }
-  }
-}' -f threadId="$THREAD_ID"
-```
-
-### Extracting Actionable Data
-
-**Get high-priority tasks:**
-```bash
-jq '.task_list | map(select(.priority == "critical" or .priority == "high"))' \
-  claude-analysis.json
-```
-
-**List all issue categories by severity:**
-```bash
-jq '.issue_categories | sort_by(.severity) | reverse | .[] | "\(.severity): \(.name)"' \
-  claude-analysis.json
-```
-
-**Get thread count per category:**
-```bash
-jq '.issue_categories | map({name, count: (.thread_ids | length)})' \
-  claude-analysis.json
-```
-
-**Export tasks as markdown checklist:**
-```bash
-jq -r '.task_list[] | "- [ ] [\(.priority)] \(.task)"' claude-analysis.json
-```
-
-## Workflow Examples
-
-### Workflow 1: Comprehensive PR Review
-
-```bash
-# 1. Resolve context (current branch's PR; for a specific PR override
-#    PR_NUMBER manually as documented in "Resolving Owner, Repo, and PR Number")
-OWNER=$(gh repo view --json owner -q '.owner.login')
-REPO=$(gh repo view --json name -q '.name')
-PR_NUMBER=$(gh pr view --json number -q '.number')
-
-# 2. Fetch and analyze the PR
-gh pr-enrich "$PR_NUMBER" --enrich
-
-# 3. Read the analysis
-cat .reports/pr-reviews/pr-$PR_NUMBER/claude-analysis.md
-
-# 4. Check systemic issues and adjacent problems
-jq '.systemic_issues' .reports/pr-reviews/pr-$PR_NUMBER/claude-analysis.json
-jq '.adjacent_problems' .reports/pr-reviews/pr-$PR_NUMBER/claude-analysis.json
-
-# 5. Check for non-thread comments (general PR comments not on code lines)
-jq '[.[] | select(.type == "issue_comment")]' \
-  .reports/pr-reviews/pr-$PR_NUMBER/all-comments.json
-
-# 6. Work through tasks, reply+resolve threads, verify CI
-# (see Required Analysis Workflow steps 3-5)
-```
-
-### Workflow 2: Address PR Feedback Systematically
-
-```bash
-# 1. Fetch and enrich
-gh pr-enrich 123 --enrich
-
-# 2. Review systemic issues and adjacent problems FIRST
-jq '.systemic_issues' .reports/pr-reviews/pr-123/claude-analysis.json
-jq '.adjacent_problems' .reports/pr-reviews/pr-123/claude-analysis.json
-
-# 3. Create working checklist from critical/high tasks
-jq -r '.task_list[]
-  | select(.priority == "critical" or .priority == "high")
-  | "- [ ] \(.task)"' .reports/pr-reviews/pr-123/claude-analysis.json > todo.md
-
-# 4. Work through each task. After each fix, REPLY first then RESOLVE
-#    (see "Resolve Addressed Threads" — Step A reply, Step B resolve).
-# Step A: reply with the fix commit
-THREAD_ID="PRRT_xxx"
-gh api graphql -f query='mutation($threadId: ID!, $body: String!) {
-  addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
-    comment { id }
-  }
-}' -f threadId="$THREAD_ID" -f body="Fixed in $(git rev-parse --short HEAD) — [brief description of the fix]"
-
-# Step B: then resolve the thread (same variable as Step A; accepts multiple IDs)
-gh pr-enrich resolve "$THREAD_ID"
-
-# 5. Final thread audit — verify no unresolved threads were missed
-gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
-query($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      reviewThreads(first: 100) {
-        nodes { id isResolved comments(first: 1) { nodes { body } } }
-      }
-    }
-  }
-}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
-  | select(.isResolved == false)]'
-
-# 6. Verify all CI/CD checks pass
-gh pr checks "$PR_NUMBER"
-# If any fail: gh run view <RUN_ID> --log-failed
-```
-
-### Workflow 3: Investigate Patterns Before Fixing
-
-```bash
-# Run analysis
-gh pr-enrich 123 --enrich
-
-# Check for systemic issues first
-jq '.systemic_issues[] | {pattern, recommendation}' \
-  .reports/pr-reviews/pr-123/claude-analysis.json
-
-# Look at adjacent problems to scope investigation
-jq '.adjacent_problems[] | {area, investigation_hint}' \
-  .reports/pr-reviews/pr-123/claude-analysis.json
-```
-
-### Workflow 4: Custom Analysis Focus
-
-Create a security-focused prompt:
-
-```bash
-# Create custom prompt
-cat > ~/.config/security-pr-prompt.txt << 'EOF'
-You are a security engineer analyzing unresolved PR comment threads.
-
-Focus on:
-1. Security vulnerabilities (injection, auth bypass, data exposure)
-2. Input validation gaps
-3. Error handling that leaks information
-4. Authentication/authorization issues
-
-Severity ratings:
-- critical: Exploitable vulnerabilities
-- high: Security gaps requiring immediate attention
-- medium: Defense-in-depth improvements
-- low: Security best practices
-
-Be specific about attack vectors and remediation steps.
-EOF
-
-# Use custom prompt
-gh pr-enrich 123 --enrich --prompt ~/.config/security-pr-prompt.txt
-```
-
 ## Integration with Claude Code
 
 ### Addressing PR Comments in Session
@@ -583,22 +227,28 @@ gh pr-enrich 123 --enrich
 **Claude MUST follow this sequence (no steps may be skipped):**
 
 1. **Resolve context** - Extract `OWNER`, `REPO`, `PR_NUMBER` from git context (see "Resolving Owner, Repo, and PR Number")
-2. **Read systemic_issues first** - Understand the underlying patterns before making any changes
-3. **Read adjacent_problems** - Identify related areas that may need the same fixes
-4. **Investigate adjacent areas** - Search the codebase for similar issues flagged in adjacent_problems
-5. **Check non-thread comments** - Review general PR comments for actionable feedback not captured in review threads
-6. **Work through task_list** - Address tasks with full context of patterns and related code
-7. **Reply and resolve threads as each task completes** - After fixing each task, reply with the fix commit, then resolve its thread IDs. Track resolved vs remaining threads.
-8. **Final thread audit** - After all tasks are done, query the PR for any remaining unresolved threads. Resolve any that were addressed. Leave a reply on any intentionally left open.
-9. **Verify all CI/CD checks pass** - Run `gh pr checks "$PR_NUMBER"` and confirm all checks are green. If any fail, investigate and fix before declaring work complete.
-10. **Re-request review** - Notify original reviewers that feedback has been addressed.
+2. **Split findings by verdict** - Separate `confirmed` from `plausible`, and read `disputed_comments`. Refuted claims are replied to, never "fixed".
+3. **Check coverage** - Note every `not_reviewable` category and every truncated input; those are the parts of the PR nobody reviewed.
+4. **Read systemic_issues** - Understand the underlying patterns before making any changes
+5. **Read adjacent_problems** - Identify related areas that may need the same fixes
+6. **Investigate adjacent areas** - Search the codebase for the areas marked `checked: false`
+7. **Check non-thread comments** - Review general PR comments for actionable feedback not captured in review threads
+8. **Verify each `plausible` finding** - Read the cited code before changing it; promote it to a fix or move it to a dispute
+9. **Work through task_list** - Address tasks with full context of patterns and related code, and run each task's `verification`
+10. **Reply and resolve threads as each task completes** - After fixing each task, reply with the fix commit, then resolve its thread IDs. Track resolved vs remaining threads.
+11. **Final thread audit** - After all tasks are done, query the PR for any remaining unresolved threads. Resolve any that were addressed. Leave a reply on any intentionally left open.
+12. **Verify all CI/CD checks pass** - Run `gh pr checks "$PR_NUMBER"` and confirm all checks are green. If any fail, investigate and fix before declaring work complete.
+13. **Re-request review** - Notify original reviewers that feedback has been addressed.
 
 **Example prompt for Claude:**
-> "Read the claude-analysis.json. First summarize the systemic issues and adjacent problems you found. Investigate the adjacent areas mentioned. Check non-thread PR comments for additional feedback. Then address each critical and high priority task in order, applying fixes consistently across all affected areas. After fixing each task, reply with the fix commit and resolve its thread IDs. When all tasks are done, verify no threads were missed, confirm all CI checks pass, and re-request review."
+> "Read the claude-analysis.json. Start by listing which findings are confirmed, which are only plausible, and which reviewer claims were disputed — then tell me which categories came back not_reviewable. Investigate the adjacent areas marked checked:false. Check non-thread PR comments for additional feedback. Verify each plausible finding against the code before changing anything. Then address each critical and high priority task in order, running each task's stated verification. After fixing each task, reply with the fix commit and resolve its thread IDs. For disputed claims, reply with the reason instead of changing code. When all tasks are done, verify no threads were missed, confirm all CI checks pass, and re-request review."
 
 **Anti-patterns to avoid:**
 > ~~"Read the claude-analysis.json and address each task in order."~~
 This skips the critical analysis steps and leads to incomplete, symptom-focused fixes.
+
+> ~~"The analysis found 6 issues, I'll fix all 6."~~
+Some of those may be refuted claims or unverified guesses. Read the verdicts first.
 
 > ~~"Fix all the issues, then I'll resolve the threads myself."~~
 This leads to forgotten thread resolutions. Claude MUST resolve threads as it goes.
@@ -610,6 +260,13 @@ Never declare complete without verifying: (a) all addressed threads are resolved
 
 | Excuse | Reality |
 |--------|---------|
+| "A reviewer raised it, so it's a real bug" | Reviewers see only the diff and bots pattern-match. Check the `verdict` before you change code; `disputed_comments` exists because claims are wrong regularly. |
+| "The analysis found nothing in that category, so it's clean" | Check `category_coverage`. `not_reviewable` means unchecked, and it looks exactly like clean in a task list. |
+| "The report covers the whole PR" | Check the coverage block. Truncated comments, dropped diffs and omitted files are listed there, and nothing in them was analyzed. |
+| "It's only a style comment, so it's low priority" | Severity is impact × likelihood, not category. Read `severity_rationale` — a critical bug can arrive inside a nit. |
+| "The task says what to do, that's enough" | If a task has no `file`, `line` and `verification`, you cannot prove the fix worked. Re-derive them before starting. |
+| "Adjacent problems were listed, so they were checked" | `checked: false` means the analyzer could not search. That one is yours. |
+| "The analysis came back empty, the PR must be clean" | Read `claude-stderr.log`. An empty analysis is usually a failed or timed-out run, not a clean PR. |
 | "I'll resolve threads after fixing everything" | You'll forget. Resolve as you go — progress should be visible to reviewers immediately. |
 | "CI was passing before my changes" | CI tests your changes against the full suite. Run `gh pr checks` after every push. |
 | "I already read the comments" | Reading ≠ systematic analysis. Run `--enrich` and follow the workflow. Systemic issues hide in individually-innocuous comments. |
@@ -623,6 +280,12 @@ Never declare complete without verifying: (a) all addressed threads are resolved
 
 ## Red Flags — STOP
 
+- Changing code for a finding whose `verdict` is `refuted`, or that appears in `disputed_comments`
+- Treating a `plausible` finding as confirmed without checking the code yourself
+- Reporting a category as clean when its coverage verdict is `not_reviewable`
+- Concluding "no issues" from an empty analysis without reading `claude-stderr.log`
+- Ranking a finding by its category instead of its `severity` / `severity_rationale`
+- Marking a task done without running its `verification`
 - About to declare work complete without running the completion gate
 - Addressing tasks without first reading systemic issues and adjacent problems
 - Resolving threads without replying first (silent resolves are dismissive)
@@ -646,7 +309,7 @@ After making fixes, the local `.reports/` files are **stale snapshots** from whe
 
 General PR comments (not attached to a code line) are NOT tracked as review threads and have no `isResolved` status. They can still contain actionable feedback.
 
-Since v1.1.0, `--enrich` includes these issue comments (including bot/CI reports from github-actions, security scanners, etc.) in the Claude analysis context, so their findings appear in `claude-analysis.json`. Still check them live at completion — new comments may have arrived after the report was generated.
+`--enrich` includes these issue comments (including bot/CI reports from github-actions and security scanners) in the analysis context, so their findings appear in `claude-analysis.json`. Superseded bot reposts are collapsed to the newest revision, and the count of dropped duplicates appears in the coverage block. Still check them live at completion — new comments may have arrived after the report was generated.
 
 **Check for them:**
 ```bash
@@ -695,16 +358,17 @@ Before declaring any PR feedback session complete, Claude MUST pass this checkli
 
 ```bash
 # Query remaining unresolved threads (assumes $OWNER/$REPO/$PR_NUMBER were resolved earlier)
-UNRESOLVED=$(gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
-query($owner: String!, $repo: String!, $number: Int!) {
+UNRESOLVED=$(gh api graphql --paginate -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
+query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
         nodes { id isResolved }
       }
     }
   }
-}' | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length')
+}' | jq -s '[.[].data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length')
 
 echo "Unresolved threads remaining: $UNRESOLVED"
 ```
@@ -751,8 +415,10 @@ When finishing a PR feedback session, Claude MUST output a summary in this forma
 ```
 ## PR Feedback Session Complete
 
-**Tasks addressed:** X of Y
+**Tasks addressed:** X of Y (each verified with its stated verification step)
 **Threads resolved:** A of B (C intentionally deferred)
+**Claims disputed:** D (replied with reasoning, not "fixed")
+**Categories not reviewable:** [list, or none] — these were not checked by anyone
 **Non-thread comments reviewed:** N
 **CI/CD status:** all passing | X failing (details below)
 **Review re-requested from:** [reviewer list] | not yet (reason)
@@ -773,176 +439,22 @@ When finishing a PR feedback session, Claude MUST output a summary in this forma
 
 **Why this gate exists:** PR authors commonly address feedback but forget to resolve threads, don't check CI, skip non-thread comments, or forget to re-request review. This wastes reviewer time and delays merges. The completion gate makes all four impossible to skip.
 
-## Customizing the Analysis Prompt
+## Reference Files
 
-The prompt is loaded from (in priority order):
-1. `--prompt FILE` argument
-2. `GH_PR_ENRICH_PROMPT` environment variable
-3. `.gh-pr-enrich-prompt.txt` in repo root
-4. `default-prompt.txt` bundled with extension
+Read these when you need them; the workflow above does not depend on them.
 
-**Prompt file format:**
-- Lines starting with `#` are comments (ignored)
-- Remaining text becomes the system prompt
-- Must work with the JSON schema (issue_categories, systemic_issues, adjacent_problems, task_list)
-
-**Example custom prompts:**
-
-| Focus | Key Instructions |
-|-------|------------------|
-| Security | Focus on OWASP Top 10, auth issues, input validation |
-| Performance | Focus on N+1 queries, memory leaks, render cycles |
-| Architecture | Focus on coupling, abstraction layers, patterns |
-| Documentation | Focus on missing docs, incorrect comments, API clarity |
-
-## Troubleshooting
-
-### Extension Not Found
-
-```bash
-# Install or upgrade
-gh extension install bl4ck3lk/gh-pr-enrich
-gh extension upgrade pr-enrich
-```
-
-### Claude Analysis Skipped
-
-If `--enrich` reports "No unresolved threads or issue comments found":
-- Enrichment runs when the PR has unresolved review threads OR top-level issue comments; with neither, it is skipped
-- All review threads may already be resolved — check `comment-threads.json` to verify thread status
-- Check `issue-comments.json` to confirm the PR has no top-level comments
-
-### Claude Analysis Empty
-
-If analysis returns empty arrays:
-- Verify Claude CLI is authenticated: `claude --version`
-- Check the context file was created: `cat claude-context.json`
-- Try with a custom, simpler prompt to debug
-
-### Thread Resolution Fails
-
-**Common failure modes and recovery:**
-
-| Error | Cause | Recovery |
-|-------|-------|----------|
-| `NOT_FOUND` | Thread ID is wrong or from a different PR | Re-fetch `comment-threads.json` and verify the ID |
-| `FORBIDDEN` | Insufficient permissions | Check you have write access to the repo |
-| Already resolved | Thread was resolved by another actor | Safe to skip — verify with a fresh query |
-| Network error | Transient failure | Retry once. If persistent, check `gh auth status` |
-
-```bash
-# Verify thread ID exists
-jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.id == "PRRT_xxx")' \
-  comment-threads.json
-
-# Check if already resolved
-jq '.data.repository.pullRequest.reviewThreads.nodes[]
-    | select(.id == "PRRT_xxx") | .isResolved' comment-threads.json
-```
-
-## Retrospective Analysis
-
-The `retrospective` subcommand analyzes patterns across all PR reports to identify systemic issues and generate actionable insights.
-
-### When to Use Retrospective
-
-- After completing a sprint or milestone
-- When noticing recurring PR feedback
-- To generate CLAUDE.md additions from lessons learned
-- To create team-wide implementation checklists
-- Before starting a new feature to review past patterns
-
-### Retrospective Command
-
-```bash
-# Basic retrospective
-gh pr-enrich retrospective
-
-# Last 30 days with Claude meta-analysis
-gh pr-enrich retrospective --since 30d --enrich
-
-# Filter by author
-gh pr-enrich retrospective --author alice,bob
-
-# Output formats for integration
-gh pr-enrich retrospective --format claude-md    # CLAUDE.md section
-gh pr-enrich retrospective --format checklist    # Implementation checklist
-gh pr-enrich retrospective --format pr-template  # PR template additions
-```
-
-### Retrospective Options
-
-| Option | Description |
-|--------|-------------|
-| `--since DATE` | Filter PRs from date (ISO 8601 or `30d`, `2w`, `3m`) |
-| `--author LOGIN` | Filter by author(s), comma-separated |
-| `--reports-dir DIR` | Path to reports directory |
-| `--output-dir DIR` | Where to save output |
-| `--enrich` | Use Claude for meta-analysis |
-| `--min-prs N` | Warn if fewer PRs found |
-| `--format TYPE` | Output: `claude-md`, `pr-template`, `checklist` |
-| `--json` | Output JSON only |
-| `--markdown` | Output Markdown only |
-
-### Retrospective Output
-
-The retrospective generates several files in `.reports/retrospectives/`:
-
-| File | Description |
-|------|-------------|
-| `retrospective-report.md` | Human-readable summary |
-| `retrospective-data.json` | Complete machine-readable data |
-| `cross-pr-patterns.json` | Patterns with occurrence counts |
-| `hotspots.json` | Components by issue frequency |
-| `guiding-questions.json` | Generated checklists |
-| `claude-meta-analysis.json` | (if --enrich) Deep analysis |
-
-### Interpreting Retrospective Output
-
-**Cross-PR Patterns**: Issues appearing in multiple PRs indicate systemic problems. High occurrence + high severity = priority fix.
-
-```bash
-# Find patterns appearing 3+ times
-jq '.cross_pr_patterns[] | select(.occurrences >= 3)' \
-  .reports/retrospectives/retrospective-data.json
-```
-
-**Hotspots**: Components with many issues need architectural review or better test coverage.
-
-**Guiding Questions**: Use these as pre-implementation checklists to prevent recurring issues.
-
-**Connection to entropy ENFORCEMENT-GAP:** Cross-PR patterns that show monotonic increase (e.g., hardcoded strings: 9 → 11 → 18 across PRs) are ENFORCEMENT-GAP findings — the root cause is a missing lint rule or CI check, not developer negligence. When retrospective reveals growing patterns, recommend the specific enforcement mechanism (pre-commit hook, CI rule, build check) that would prevent new occurrences. See `skills/entropy/references/cross-cutting-anti-patterns.md` Protocol 5 for the full escalation pattern.
-
-### Workflow: Sprint Retrospective
-
-```bash
-# 1. Generate retrospective for the sprint
-gh pr-enrich retrospective --since 2w --enrich
-
-# 2. Review the report
-cat .reports/retrospectives/retrospective-report.md
-
-# 3. Extract CLAUDE.md additions
-gh pr-enrich retrospective --since 2w --format claude-md >> .claude/CLAUDE.md
-
-# 4. Update PR template
-gh pr-enrich retrospective --since 2w --format pr-template
-```
-
-### Workflow: Pre-Implementation Review
-
-```bash
-# Before starting a new feature, review past patterns
-gh pr-enrich retrospective --format checklist > implementation-checklist.md
-
-# Use the checklist during development
-cat implementation-checklist.md
-```
+| File | Contents |
+|------|----------|
+| [`references/command-reference.md`](references/command-reference.md) | Syntax, subcommands, options, environment variables, output files, prompt customization, troubleshooting |
+| [`references/analysis-output.md`](references/analysis-output.md) | Every field of `claude-analysis.json`, jq recipes, worked workflows |
+| [`references/retrospective.md`](references/retrospective.md) | Cross-PR retrospective analysis |
 
 ## Integration
 
 | Pair with | When | How |
 |-----------|------|-----|
+| `xray` | A PR needs more depth than one analysis pass | `xray` fans out specialist reviewers and verifies findings adversarially. Use this skill for the fetch, the single verification pass, thread resolution and the completion gate; use `xray` when you want many independent lenses over the same PR |
+| `semgrep-scanning` | Before the analysis | `--sast` already runs semgrep over changed files; use `semgrep-scanning` directly for a whole-repository scan or custom rule authoring |
 | `review-tribunal` | Phase 0 (Scope & Context) | Tribunal invokes `gh pr-enrich --enrich` to gather PR diff, threads, and context for all 6 agents |
 | `product-reviewer` | Phase 1 (Intent Discovery) | Product-reviewer uses enriched PR data as the primary source for intent extraction |
 | `rationalist-master-reviewer` | Default PR mode | Rationalist invokes `gh pr-enrich` when reviewing the current branch's PR |
