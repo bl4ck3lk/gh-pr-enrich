@@ -70,13 +70,30 @@ assert_jq "$SCHEMA_FILE" '.required | index("category_coverage") != null' \
 assert_jq "$SCHEMA_FILE" '.properties.category_coverage.items.properties.verdict.enum | index("reviewed_none_found") != null' \
     "coverage verdict can record an explicit 'reviewed, none found'"
 
-# Prompt and schema must not drift apart.
-schema_cats=$(jq -r "$IC.properties.category.enum[]" "$SCHEMA_FILE" 2>/dev/null | sort | tr '\n' ' ')
+# Prompt and schema must not drift apart, in either direction. The prompt's own
+# category list is the block of "- name: description" lines, so a category named
+# only in a comment or in prose does not count as documented.
+schema_cats=$(jq -r "$IC.properties.category.enum[]" "$SCHEMA_FILE" 2>/dev/null | sort)
+# Only the closed category list counts — the prompt uses "- name: ..." bullets
+# for other things (impact levels, input fields) that are not categories.
+prompt_cats=$(awk '/^These are the categories/{inlist=1; next} inlist && /^## /{exit} inlist' "$PROMPT_FILE" \
+    | grep -oE '^- [a-z_]+:' | sed 's/^- //; s/:$//' | sort -u)
+
 missing_in_prompt=""
 for cat in $schema_cats; do
-    grep -qF "$cat" "$PROMPT_FILE" || missing_in_prompt="$missing_in_prompt $cat"
+    printf '%s\n' "$prompt_cats" | grep -qx "$cat" || missing_in_prompt="$missing_in_prompt $cat"
 done
-assert_eq "" "$missing_in_prompt" "every schema category appears in the default prompt"
+assert_eq "" "$missing_in_prompt" "every schema category is documented in the default prompt"
+
+missing_in_schema=""
+for cat in $prompt_cats; do
+    printf '%s\n' "$schema_cats" | grep -qx "$cat" || missing_in_schema="$missing_in_schema $cat"
+done
+assert_eq "" "$missing_in_schema" "every prompt category exists in the schema enum"
+
+assert_eq "$(printf '%s\n' "$schema_cats" | wc -l | tr -d ' ')" \
+          "$(printf '%s\n' "$prompt_cats" | wc -l | tr -d ' ')" \
+          "prompt and schema list the same number of categories"
 assert_not_contains "$PROMPT_TEXT" "etc.)" "prompt category list is closed (no open-ended 'etc.')"
 
 # ---------------------------------------------------------------------------
@@ -170,5 +187,45 @@ assert_contains "$REPORT_TEXT" "npm test -- parse.test.js" "report renders the t
 # A finding whose category is cosmetic can still be critical: severity must come
 # from impact/likelihood, and the renderer must not re-derive it from category.
 assert_contains "$REPORT_TEXT" "critical" "report renders severity independent of category"
+
+# ---------------------------------------------------------------------------
+# 6. The renderer must not die on a shape the model can still emit
+#
+# issue_categories[].evidence is objects; systemic_issues[].evidence is strings.
+# A model that returns objects in both places used to abort the renderer with
+# "string and object cannot be added" — after the expensive analysis was paid for.
+# ---------------------------------------------------------------------------
+ODD="$TEST_OUTPUT_DIR/odd-shapes.json"
+cat > "$ODD" << 'EOF'
+{
+  "issue_categories": [],
+  "disputed_comments": [],
+  "category_coverage": [],
+  "systemic_issues": [
+    {
+      "pattern": "Inconsistent error handling",
+      "evidence": [
+        {"file": "src/a.js", "line": 10, "detail": "empty catch"},
+        "Thread PRRT_zzz: swallowed error"
+      ],
+      "recommendation": "Adopt one error wrapper."
+    }
+  ],
+  "adjacent_problems": [],
+  "task_list": [],
+  "process_improvements": [],
+  "pr_template_suggestions": []
+}
+EOF
+
+ODD_REPORT="$TEST_OUTPUT_DIR/odd-shapes.md"
+rc=0
+"$GH_PR_ENRICH" --test-call generate_analysis_report "$ODD" "$ODD_REPORT" >/dev/null 2>&1 || rc=$?
+assert_true "$rc" "renderer survives object-shaped systemic evidence"
+
+ODD_TEXT=$(cat "$ODD_REPORT" 2>/dev/null || echo "")
+assert_contains "$ODD_TEXT" "Inconsistent error handling" "the systemic pattern still renders"
+assert_contains "$ODD_TEXT" "empty catch" "object-shaped evidence is rendered, not dropped"
+assert_contains "$ODD_TEXT" "swallowed error" "string-shaped evidence still renders alongside it"
 
 suite_end

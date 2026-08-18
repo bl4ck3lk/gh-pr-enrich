@@ -287,6 +287,56 @@ test_hotspots_group_by_taxonomy() {
     fi
 }
 
+test_legacy_reports_are_reported_not_mixed_in() {
+    # Reports written before the taxonomy existed have no .category. Folding them
+    # into an "uncategorized" hotspot produces a confident, useless answer:
+    # "Have I checked uncategorized for similar issues?". They must be named and
+    # excluded instead, so the user knows to re-enrich them.
+    local legacy_root="$TEST_OUTPUT_DIR/legacy/pr-77"
+    mkdir -p "$legacy_root"
+    cat > "$legacy_root/pr-summary.json" << 'EOF'
+{"number": 77, "title": "Legacy PR", "author": {"login": "alice"}, "createdAt": "2026-01-01T00:00:00Z"}
+EOF
+    cat > "$legacy_root/claude-analysis.json" << 'EOF'
+{
+  "issue_categories": [
+    {"name": "ARG_MAX overflow risk", "severity": "high",
+     "description": "Old-format finding with no category field", "thread_ids": ["PRRT_old"]}
+  ],
+  "systemic_issues": [],
+  "adjacent_problems": [],
+  "task_list": [],
+  "process_improvements": [],
+  "pr_template_suggestions": []
+}
+EOF
+
+    local output
+    output=$("$GH_PR_ENRICH" retrospective --reports-dir "$TEST_OUTPUT_DIR/legacy" \
+        --output-dir "$TEST_OUTPUT_DIR/legacy-out" --min-prs 1 2>&1) || true
+
+    if echo "$output" | grep -qi "re-run\|re-enrich\|older format\|pre-2"; then
+        pass "legacy reports are called out with what to do about them"
+    else
+        fail "legacy reports are called out with what to do about them" \
+            "got: $(echo "$output" | tail -5 | tr '\n' '|')"
+    fi
+
+    if echo "$output" | grep -q "pr-77"; then
+        pass "the specific legacy report is named"
+    else
+        fail "the specific legacy report is named" "expected pr-77 in the output"
+    fi
+
+    local hotspots
+    hotspots=$(jq -c '[.hotspots[]?.category]' "$TEST_OUTPUT_DIR/legacy-out/retrospective-data.json" 2>/dev/null || echo "[]")
+    if echo "$hotspots" | grep -q "uncategorized"; then
+        fail "legacy findings do not become an 'uncategorized' hotspot" "hotspots: $hotspots"
+    else
+        pass "legacy findings do not become an 'uncategorized' hotspot"
+    fi
+}
+
 test_improvement_tracking() {
     "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" --output-dir "$TEST_OUTPUT_DIR/retro" --min-prs 1 >/dev/null 2>&1
 
@@ -328,6 +378,7 @@ test_format_pr_template
 test_invalid_format
 test_guiding_questions
 test_hotspots_group_by_taxonomy
+test_legacy_reports_are_reported_not_mixed_in
 test_improvement_tracking
 
 # Summary

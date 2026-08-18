@@ -64,6 +64,7 @@ gh pr-enrich address 123
 | `--diff` | Include code diffs in Claude context (richer analysis) |
 | `--sast` | Run a semgrep pre-pass over changed files and feed the findings to the analysis |
 | `--no-code-access` | Deny the analyzer repository access (sandboxed runs); findings can then only be `plausible` |
+| `--code-access` | Read the working tree even when it is not at the PR head |
 | `--model NAME` | Model for the analysis (default: `sonnet`) |
 | `--prompt FILE` | Custom prompt file for Claude analysis |
 | `-h, --help` | Show help |
@@ -191,6 +192,7 @@ The list is closed, and the analysis must return a verdict for every one of them
 
 - [Claude CLI](https://claude.ai/code) must be installed and authenticated
 - The analyzer is granted **read-only** tools (Read, Grep, Glob). It never runs commands and never edits files. Use `--no-code-access` to withhold even that.
+- Access is granted only when your working tree holds the PR's code — at the PR head, or ahead of it with your local fixes. On an unrelated revision (reviewing someone else's PR from `main`) access is denied, because "verifying" against the wrong revision produces confident, wrong anchors. Run `gh pr checkout <N>` first, or pass `--code-access` to accept the mismatch.
 - Verification takes longer than summarizing. The default timeout is 600s; raise `CLAUDE_TIMEOUT` for large PRs.
 
 ### Customizing the Analysis Prompt

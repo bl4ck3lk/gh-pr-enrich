@@ -31,20 +31,37 @@ suite_start "gh pr-enrich context inputs suite"
 # ---------------------------------------------------------------------------
 cat > "$STUB_DIR/gh" << 'STUB'
 #!/bin/bash
-# Minimal gh stub: emits two pages of reviewThreads for `gh api graphql --paginate`.
+# gh stub that behaves like the real one: it only walks pages when asked to.
+# Without --paginate it returns the first page alone, so dropping pagination
+# from fetch_review_threads makes the test fail instead of passing quietly.
 if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+    printf '%s\n' "$@" > "${GH_STUB_ARG_LOG:-/dev/null}"
+    paginate=false
+    query=""
+    for arg in "$@"; do
+        [ "$arg" = "--paginate" ] && paginate=true
+        case "$arg" in query=*) query="$arg" ;; esac
+    done
+    # The real `gh api graphql --paginate` requires the query to declare
+    # pageInfo and accept an $endCursor variable; without them it cannot page.
+    case "$query" in
+        *pageInfo*endCursor*|*endCursor*pageInfo*) ;;
+        *) paginate=false ;;
+    esac
     cat << 'PAGE1'
 {"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":true,"endCursor":"CUR1"},"nodes":[
   {"id":"PRRT_page1","isResolved":false,"isOutdated":false,"path":"src/a.js","line":10,
    "comments":{"nodes":[{"id":"c1","databaseId":1,"body":"first page thread","author":{"login":"rev1"},"createdAt":"2026-01-01T00:00:00Z","url":"u1"}]}}
 ]}}}}}
 PAGE1
-    cat << 'PAGE2'
+    if [ "$paginate" = true ]; then
+        cat << 'PAGE2'
 {"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
   {"id":"PRRT_page2","isResolved":false,"isOutdated":true,"path":"src/b.js","line":20,
    "comments":{"nodes":[{"id":"c2","databaseId":2,"body":"second page thread","author":{"login":"rev2"},"createdAt":"2026-01-02T00:00:00Z","url":"u2"}]}}
 ]}}}}}
 PAGE2
+    fi
     exit 0
 fi
 exit 1
@@ -52,7 +69,14 @@ STUB
 chmod +x "$STUB_DIR/gh"
 
 THREADS="$TEST_OUTPUT_DIR/comment-threads.json"
-PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call fetch_review_threads owner repo 1 "$THREADS" >/dev/null 2>&1 || true
+GH_ARGS_LOG="$TEST_OUTPUT_DIR/gh-args.txt"
+env GH_STUB_ARG_LOG="$GH_ARGS_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call fetch_review_threads owner repo 1 "$THREADS" >/dev/null 2>&1 || true
+
+GH_ARGS=$(cat "$GH_ARGS_LOG" 2>/dev/null || echo "")
+assert_contains "$GH_ARGS" "--paginate" "the thread fetch asks gh to follow pages"
+assert_contains "$GH_ARGS" "pageInfo" "the query declares pageInfo so gh can page"
+assert_contains "$GH_ARGS" "endCursor" "the query accepts an endCursor variable"
 
 assert_jq_eq "$THREADS" '[.data.repository.pullRequest.reviewThreads.nodes[]] | length' "2" \
     "review threads from both pages are merged (pagination works)"
@@ -142,6 +166,37 @@ assert_jq_eq "$DEDUPED" '[.kept[] | select(.user == "human-reviewer")] | length'
     "repeated human comments are never deduplicated"
 assert_jq_eq "$DEDUPED" '.superseded | length' "2" "superseded comments are recorded"
 
+# Distinct reports that share an opening line must survive. Bots commonly prefix
+# every comment with the same marker or status heading, so a first-line-only
+# signature silently discards unrelated findings.
+SHARED_PREFIX="$TEST_OUTPUT_DIR/shared-prefix.json"
+cat > "$SHARED_PREFIX" << 'EOF'
+[
+  {"id":1,"body":"### Job failed\n\nunit-tests: 3 assertions failed","user":"github-actions[bot]",
+   "created_at":"2026-01-01T10:00:00Z","type":"issue_comment","html_url":"h1"},
+  {"id":2,"body":"### Job failed\n\ne2e: login flow timed out","user":"github-actions[bot]",
+   "created_at":"2026-01-01T11:00:00Z","type":"issue_comment","html_url":"h2"},
+  {"id":3,"body":"<!-- auto-generated -->\n\nSQL injection risk in db.js","user":"coderabbitai[bot]",
+   "created_at":"2026-01-01T12:00:00Z","type":"issue_comment","html_url":"h3"},
+  {"id":4,"body":"<!-- auto-generated -->\n\nWalkthrough of the changes","user":"coderabbitai[bot]",
+   "created_at":"2026-01-01T13:00:00Z","type":"issue_comment","html_url":"h4"}
+]
+EOF
+
+SHARED_OUT="$TEST_OUTPUT_DIR/shared-prefix-deduped.json"
+"$GH_PR_ENRICH" --test-call dedupe_bot_comments "$SHARED_PREFIX" "$SHARED_OUT" >/dev/null 2>&1 || true
+
+assert_jq_eq "$SHARED_OUT" '.kept | length' "4" \
+    "distinct bot reports sharing an opening line are all kept"
+assert_jq_eq "$SHARED_OUT" '[.kept[] | select(.body | contains("SQL injection"))] | length' "1" \
+    "a security finding is not discarded as a duplicate of a walkthrough"
+assert_jq_eq "$SHARED_OUT" '[.kept[] | select(.body | contains("unit-tests"))] | length' "1" \
+    "two different CI failures are not collapsed into one"
+
+# Whatever is dropped must be auditable, not merely counted.
+assert_jq "$DEDUPED" '[.superseded[] | select(.html_url != null)] | length == 2' \
+    "superseded comments keep their URLs so a drop can be reviewed"
+
 # ---------------------------------------------------------------------------
 # Context inputs: commits, linked issues, failing checks, coverage
 # ---------------------------------------------------------------------------
@@ -218,6 +273,32 @@ assert_jq_eq "$CTX" '.coverage.diff.files_truncated | length' "1" "coverage name
 assert_jq "$CTX" '.coverage.diff.files_truncated | index("src/retry.js") != null' \
     "coverage names which file was truncated"
 assert_jq_eq "$CTX" '.coverage.truncation_limit_chars' "5000" "coverage states the truncation limit"
+
+# A thread's replies are fetched with a per-thread cap. A thread that hits the
+# cap has lost replies, and the coverage block is the only place that can say so.
+CAP_DIR="$TEST_OUTPUT_DIR/capped"
+mkdir -p "$CAP_DIR"
+cp "$CTX_DIR/pr-summary.json" "$CAP_DIR/pr-summary.json"
+echo '[]' > "$CAP_DIR/issue-comments.json"
+python3 - "$CAP_DIR/unresolved-threads.json" << 'PY'
+import json, sys
+# One thread at the 20-comment fetch cap, one comfortably under it.
+threads = [
+    {"thread_id": "PRRT_full", "is_outdated": False, "path": "a.js", "line": 1,
+     "comments": [{"author": "r", "body": "reply %d" % i, "url": "u%d" % i} for i in range(20)]},
+    {"thread_id": "PRRT_small", "is_outdated": False, "path": "b.js", "line": 2,
+     "comments": [{"author": "r", "body": "only reply", "url": "u"}]},
+]
+json.dump(threads, open(sys.argv[1], "w"))
+PY
+
+"$GH_PR_ENRICH" --test-call build_claude_context "$CAP_DIR" false >/dev/null 2>&1 || true
+CAP_CTX="$CAP_DIR/claude-context.json"
+
+assert_jq_eq "$CAP_CTX" '.coverage.unresolved_threads.comments_per_thread_limit' "20" \
+    "coverage states the per-thread comment limit"
+assert_jq_eq "$CAP_CTX" '.coverage.unresolved_threads.threads_at_comment_limit' "1" \
+    "coverage counts threads whose replies may have been cut off"
 
 # ---------------------------------------------------------------------------
 # Coverage is rendered for humans, not just stored

@@ -61,12 +61,24 @@ gh pr-enrich <SUBCOMMAND> [ARGS]
 | `--diff` | Include code diffs in Claude context (richer analysis) |
 | `--sast` | Run a semgrep pre-pass on changed files; findings enter the analysis as deterministic ground truth |
 | `--no-code-access` | Deny the analyzer repository access (sandboxed runs). Findings can then only be `plausible` |
+| `--code-access` | Read the working tree even when it is not at the PR head. Findings may cite code this PR does not contain |
 | `--model NAME` | Model for the analysis (default: `sonnet`) |
 | `--prompt FILE` | Custom prompt file for AI analysis |
 | `-h, --help` | Show help |
 | `-v, --version` | Show version |
 
-**Recommended for a real bug hunt:** `gh pr-enrich <N> --enrich --diff --sast`. The analyzer reads the repository by default, so it can verify claims rather than paraphrase them.
+**Recommended for a real bug hunt:** `gh pr checkout <N>` first, then `gh pr-enrich <N> --enrich --diff --sast`.
+
+**Repository access depends on the revision you have checked out.** Verifying a claim means reading the PR's code, so the extension compares your working tree to the PR head:
+
+| Working tree | Behavior |
+|---|---|
+| At the PR head | Access granted; findings can be `confirmed` |
+| Ahead of the PR head (your local fixes) | Access granted, with a note that findings may reflect unpushed changes |
+| An unrelated revision (e.g. you are on `main`) | Access **denied**; run `gh pr checkout <N>`, or pass `--code-access` to analyze the tree as it is |
+| Not a git checkout | Access denied |
+
+Analyzing PR #123 from `main` without this check produced confident verdicts and `file:line` anchors for code the PR does not contain. The decision, both revisions and the reason are recorded in the coverage block and the report.
 
 ### Environment Variables
 
@@ -75,7 +87,7 @@ gh pr-enrich <SUBCOMMAND> [ARGS]
 | `PR_REVIEW_OUTPUT_ROOT` | Override default output directory root |
 | `GH_PR_ENRICH_PROMPT` | Path to custom prompt file for Claude analysis |
 | `GH_PR_ENRICH_MODEL` | Model for the analysis (default: `sonnet`) |
-| `GH_PR_ENRICH_CODE_ACCESS` | `false` disables repository read access |
+| `GH_PR_ENRICH_CODE_ACCESS` | `false` disables repository read access; `true` forces it on a revision mismatch |
 | `GH_PR_ENRICH_TRUNCATE_CHARS` | Per-comment / per-diff truncation limit (default: 5000) |
 | `GH_PR_ENRICH_SEMGREP_CONFIG` | `semgrep --config` value for `--sast` (default: `auto`) |
 | `GH_PR_ENRICH_SEMGREP_TIMEOUT` | Seconds allowed for the semgrep pre-pass (default: 180) |

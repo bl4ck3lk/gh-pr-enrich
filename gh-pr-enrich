@@ -98,7 +98,9 @@ invoke_claude() {
         # orphan a sleeping process that still holds this function's stderr open,
         # which stalls any caller reading the output through a pipe.
         sleep_pid=""
-        trap 'kill "${sleep_pid:-0}" 2>/dev/null; exit 0' TERM
+        # Guard the empty case explicitly: `kill 0` signals the entire process
+        # group, which would take the parent script and the analyzer with it.
+        trap '[ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null; exit 0' TERM
         waited=0
         while true; do
             sleep "$heartbeat_interval" &
@@ -453,6 +455,7 @@ RETRO_HELP
         local skipped_no_analysis=0
         local skipped_date=0
         local skipped_author=0
+        local legacy_reports=()
 
         # Find all PR directories
         for pr_dir in "$reports_dir"/pr-*/; do
@@ -497,6 +500,16 @@ RETRO_HELP
                 fi
             fi
 
+            # Reports written before the finding taxonomy existed carry no
+            # .category. Mixing them in would collapse every one of their findings
+            # into a single "uncategorized" hotspot — a confident, useless answer.
+            # Name them and leave them out instead.
+            if jq -e '(.issue_categories // []) | length > 0 and (map(has("category")) | any | not)' \
+                    "$analysis_file" > /dev/null 2>&1; then
+                legacy_reports+=("$(basename "$pr_dir")")
+                continue
+            fi
+
             PR_REPORTS+=("$analysis_file")
             ((pr_count++)) || true
         done
@@ -505,6 +518,10 @@ RETRO_HELP
         [ "$skipped_no_analysis" -gt 0 ] && echo "  Skipped $skipped_no_analysis PRs without claude-analysis.json" >&2 || true
         [ "$skipped_date" -gt 0 ] && echo "  Skipped $skipped_date PRs before $since_date" >&2 || true
         [ "$skipped_author" -gt 0 ] && echo "  Skipped $skipped_author PRs by other authors" >&2 || true
+        if [ "${#legacy_reports[@]}" -gt 0 ]; then
+            echo "  Excluded ${#legacy_reports[@]} report(s) in the older format (no finding categories): ${legacy_reports[*]}" >&2
+            echo "  Re-run 'gh pr-enrich <PR> --enrich' on those PRs to include them." >&2
+        fi
     }
 
     # Aggregate data from all PR reports
@@ -1701,6 +1718,8 @@ OPTIONS:
                     to the analysis as deterministic ground truth
   --no-code-access  Do not let the analyzer read the repository. Findings can then
                     only be 'plausible', never verified. For sandboxed runs.
+  --code-access     Read the working tree even when it is not at the PR head.
+                    Findings may cite code this PR does not contain.
   --model NAME      Model for the analysis (default: sonnet)
   --prompt FILE     Custom prompt file for Claude analysis (overrides defaults)
   -h, --help        Show this help message
@@ -1871,6 +1890,12 @@ if [ -z "$TEST_CALL_FN" ]; then
             export GH_PR_ENRICH_CODE_ACCESS=false
             shift
             ;;
+        --code-access)
+            # Analyze the working tree even when it is not the PR's revision.
+            # Findings may then cite code this PR does not contain.
+            export GH_PR_ENRICH_CODE_ACCESS=true
+            shift
+            ;;
         --model)
             if [ -z "${2:-}" ]; then
                 echo "Error: --model requires a model name."
@@ -1959,6 +1984,11 @@ create_comments_with_graphql_ids() {
 # not exist as far as the analysis is concerned. gh --paginate walks the cursor
 # and emits one JSON document per page; the pages are merged back into the single
 # document shape the rest of the pipeline reads.
+# Per-thread reply cap used by the GraphQL fetch. Coverage reports how many
+# threads hit it, since a thread at the cap has replies the analyzer never saw.
+THREAD_COMMENT_LIMIT=20
+LINKED_ISSUE_LIMIT=10
+
 fetch_review_threads() {
     local owner="$1"
     local repo_name="$2"
@@ -1979,7 +2009,7 @@ fetch_review_threads() {
               line
               originalLine
               diffSide
-              comments(first: 20) {
+              comments(first: '"$THREAD_COMMENT_LIMIT"') {
                 nodes {
                   id
                   databaseId
@@ -2032,7 +2062,7 @@ fetch_linked_issues() {
     query($owner: String!, $name: String!, $prNumber: Int!) {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $prNumber) {
-          closingIssuesReferences(first: 10) {
+          closingIssuesReferences(first: '"$LINKED_ISSUE_LIMIT"') {
             nodes { number title body url }
           }
         }
@@ -2092,11 +2122,24 @@ dedupe_bot_comments() {
 
     jq '
     def is_bot: (.user // "") | test("\\[bot\\]$") or (ascii_downcase | IN("github-actions", "greptile", "codecov", "sonarcloud", "coderabbitai", "dependabot", "renovate"));
-    # Report identity: the bot plus its first meaningful line, with digits removed
-    # so "72% covered" and "84% covered" collapse to the same report.
+
+    # Report identity: the bot plus the opening of its body, with digits removed
+    # so successive revisions of one report ("72% covered" then "84% covered")
+    # collapse while distinct reports stay apart.
+    #
+    # The first line alone is not enough to identify a report: bots routinely
+    # prefix every comment with the same HTML marker or status heading, so
+    # "### Job failed / unit-tests" and "### Job failed / e2e" would collapse and
+    # a real finding would be dropped as a duplicate. HTML comments are stripped
+    # and several lines are considered so unrelated reports diverge early.
     def signature: ((.user // "") + "::" +
-        (((.body // "") | split("\n") | map(select(length > 0)) | (.[0] // ""))
-         | ascii_downcase | gsub("[0-9]"; "") | gsub("[^a-z ]"; "") | .[0:80]));
+        (((.body // "")
+          | gsub("<!--(?:[\\s\\S]*?)-->"; "")
+          | split("\n")
+          | map(select(test("\\S")))
+          | .[0:4]
+          | join(" "))
+         | ascii_downcase | gsub("[0-9]"; "") | gsub("[^a-z ]"; "") | .[0:200]));
 
     (map(select(is_bot | not))) as $humans
     | (map(select(is_bot))) as $bots
@@ -2227,6 +2270,8 @@ build_claude_context() {
         --arg local_head "$local_head" \
         --arg access_state "$access_state" \
         --arg access_reason "$access_reason" \
+        --argjson thread_comment_limit "$THREAD_COMMENT_LIMIT" \
+        --argjson linked_issue_limit "$LINKED_ISSUE_LIMIT" \
         '
         def trunc($text): if (($text // "") | length) > $limit
             then (($text // "")[0:$limit] + "\n... (truncated)")
@@ -2293,7 +2338,10 @@ build_claude_context() {
                 unresolved_threads: {
                     total: ($thread_list | length),
                     included: ($thread_list | length),
-                    outdated: [$thread_list[] | select(.is_outdated == true)] | length
+                    outdated: ([$thread_list[] | select(.is_outdated == true)] | length),
+                    comments_per_thread_limit: $thread_comment_limit,
+                    threads_at_comment_limit: ([$thread_list[]
+                        | select((.comments // []) | length >= $thread_comment_limit)] | length)
                 },
                 diff: {
                     included: $with_diff,
@@ -2306,6 +2354,7 @@ build_claude_context() {
                 inputs: {
                     commits: (($pr.commits // []) | length),
                     linked_issues: (($linked // []) | length),
+                    linked_issues_limit: $linked_issue_limit,
                     failing_checks: ([($checks // [])[] | select(.bucket == "fail")] | length),
                     sast_findings: (($sast // []) | length)
                 }
@@ -2644,8 +2693,10 @@ generate_coverage_section() {
     | "## 📥 Analysis Context Coverage\n\n" +
       "_What the analyzer was shown. Anything listed as truncated or dropped was not fully analyzed._\n\n" +
       "| Input | Included | Notes |\n|---|---|---|\n" +
-      "| Review threads | " + (($c.unresolved_threads.included // 0) | tostring) + " of " + (($c.unresolved_threads.total // 0) | tostring) + " unresolved | " +
-        (($c.unresolved_threads.outdated // 0) | tostring) + " outdated (code has changed since the comment) |\n" +
+      "| Review threads | " + (($c.unresolved_threads.total // 0) | tostring) + " unresolved (all pages) | " +
+        (($c.unresolved_threads.outdated // 0) | tostring) + " outdated; " +
+        (($c.unresolved_threads.threads_at_comment_limit // 0) | tostring) + " at the " +
+        (($c.unresolved_threads.comments_per_thread_limit // 0) | tostring) + "-reply fetch limit (later replies not analyzed) |\n" +
       "| Issue comments | " + (($c.issue_comments.included // 0) | tostring) + " of " + (($c.issue_comments.total // 0) | tostring) + " | " +
         (($c.issue_comments.superseded_bot_duplicates // 0) | tostring) + " superseded bot reposts dropped; " +
         ((($c.issue_comments.truncated // []) | length) | tostring) + " truncated |\n" +
@@ -2654,7 +2705,7 @@ generate_coverage_section() {
             then "truncated: " + (($c.diff.files_truncated // []) | join(", "))
             else "no files truncated" end) + " |\n" +
       "| Commits | " + (($c.inputs.commits // 0) | tostring) + " | commit messages supplied as intent |\n" +
-      "| Linked issues | " + (($c.inputs.linked_issues // 0) | tostring) + " | issue bodies supplied as intent |\n" +
+      "| Linked issues | " + (($c.inputs.linked_issues // 0) | tostring) + " | issue bodies supplied as intent (fetch limit " + (($c.inputs.linked_issues_limit // 0) | tostring) + ") |\n" +
       "| Failing checks | " + (($c.inputs.failing_checks // 0) | tostring) + " | CI failures supplied as evidence |\n" +
       "| SAST findings | " + (($c.inputs.sast_findings // 0) | tostring) + " | static-analysis results (run with --sast) |\n" +
       "| Code access | " + (($c.code_access.state // "unknown")) + " | " + (($c.code_access.reason // "") | gsub("\\|"; "\\\\|")) + " |\n\n" +
@@ -2673,6 +2724,12 @@ generate_analysis_report() {
     jq -r '
     def anchor(e): (if (e.file // "") == "" or e.file == "n/a" then "" else e.file + ":" + ((e.line // 0) | tostring) end);
     def verdict_mark(v): (if v == "confirmed" then "✅ confirmed" elif v == "refuted" then "❌ refuted" else "🟡 plausible" end);
+    # Evidence is strings in systemic_issues and objects in issue_categories.
+    # Render either shape rather than aborting the report over a type mismatch:
+    # by this point the analysis has already been paid for.
+    def evidence_line: (if type == "object"
+        then ((if anchor(.) == "" then "" else "`" + anchor(.) + "` — " end) + (.detail // ""))
+        else tostring end);
 
     "# 🤖 Claude Analysis Report\n\n" +
     "## Issue Categories\n\n" +
@@ -2689,9 +2746,7 @@ generate_analysis_report() {
             (.description // "") + "\n\n" +
             (if (.severity_rationale // "") != "" then "**Why this severity:** " + .severity_rationale + "\n\n" else "" end) +
             (if ((.evidence // []) | length) > 0 then
-                "**Evidence:**\n" + ((.evidence // []) | map(
-                    "- " + (if anchor(.) == "" then "" else "`" + anchor(.) + "` — " end) + (.detail // "")
-                ) | join("\n")) + "\n\n"
+                "**Evidence:**\n" + ((.evidence // []) | map("- " + evidence_line) | join("\n")) + "\n\n"
             else "" end) +
             "**Threads:** " + (if ((.thread_ids // []) | length) > 0 then (.thread_ids | join(", ")) else "N/A" end) + "\n"
         ) | join("\n"))
@@ -2723,7 +2778,7 @@ generate_analysis_report() {
     else
         ((.systemic_issues // []) | map(
             "### " + (.pattern // "") + "\n\n" +
-            "**Evidence:**\n" + ((.evidence // []) | map("- " + .) | join("\n")) + "\n\n" +
+            "**Evidence:**\n" + ((.evidence // []) | map("- " + evidence_line) | join("\n")) + "\n\n" +
             "**Recommendation:** " + (.recommendation // "") + "\n"
         ) | join("\n"))
     end) +
@@ -2911,10 +2966,20 @@ jq -s 'add | sort_by(.created_at // .submitted_at // "")' \
 
 # 4. Fetch checks and status
 echo "Fetching checks and status..."
-gh pr checks "$PR_NUMBER" --json name,state,bucket,workflow,startedAt,completedAt,event,link,description > "$OUTPUT_DIR/checks.json" 2>/dev/null || {
-    echo "Note: Could not fetch checks (may require additional permissions or no checks configured)."
-    echo '[]' > "$OUTPUT_DIR/checks.json"
-}
+# `gh pr checks` exits non-zero for states that still produce valid output —
+# notably a non-zero exit while checks are pending or failing. Keep whatever it
+# wrote if it parses; only fall back to an empty set when there is nothing usable.
+# Otherwise a PR with pending or failing checks reports "no checks", exactly when
+# the failing-checks input matters most.
+if ! gh pr checks "$PR_NUMBER" --json name,state,bucket,workflow,startedAt,completedAt,event,link,description \
+        > "$OUTPUT_DIR/checks.json" 2>/dev/null; then
+    if jq -e 'type == "array"' "$OUTPUT_DIR/checks.json" > /dev/null 2>&1; then
+        echo "Note: gh pr checks exited non-zero (checks pending or failing); using the results it returned."
+    else
+        echo "Note: Could not fetch checks (may require additional permissions or no checks configured)."
+        echo '[]' > "$OUTPUT_DIR/checks.json"
+    fi
+fi
 
 # 5. Generate statistics
 echo "Generating statistics..."
