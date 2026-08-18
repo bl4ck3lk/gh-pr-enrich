@@ -1850,20 +1850,146 @@ create_comments_with_graphql_ids() {
 # Claude Enrichment Functions
 # ============================================================================
 
+# Fetch every review thread, following pagination.
+#
+# A single page silently caps a PR at 100 threads: the 101st comment simply does
+# not exist as far as the analysis is concerned. gh --paginate walks the cursor
+# and emits one JSON document per page; the pages are merged back into the single
+# document shape the rest of the pipeline reads.
+fetch_review_threads() {
+    local owner="$1"
+    local repo_name="$2"
+    local pr_number="$3"
+    local output_file="$4"
+
+    local query='
+    query($owner: String!, $name: String!, $prNumber: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $prNumber) {
+          reviewThreads(first: 100, after: $endCursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              isResolved
+              isOutdated
+              path
+              line
+              originalLine
+              diffSide
+              comments(first: 20) {
+                nodes {
+                  id
+                  databaseId
+                  body
+                  author { login }
+                  createdAt
+                  url
+                }
+              }
+            }
+          }
+        }
+      }
+    }'
+
+    local pages_file="${output_file}.pages"
+    if ! gh api graphql --paginate \
+            -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
+            -f query="$query" > "$pages_file" 2>/dev/null; then
+        rm -f "$pages_file"
+        return 1
+    fi
+
+    # Merge every page's nodes into one document, recording how many pages were read.
+    jq -s '{
+        data: {
+            repository: {
+                pullRequest: {
+                    reviewThreads: {
+                        nodes: (map(.data.repository.pullRequest.reviewThreads.nodes // []) | add // []),
+                        pages_fetched: length
+                    }
+                }
+            }
+        }
+    }' "$pages_file" > "$output_file"
+    local rc=$?
+    rm -f "$pages_file"
+    return $rc
+}
+
+# Fetch the issues this PR closes, for the intent the diff cannot show.
+fetch_linked_issues() {
+    local owner="$1"
+    local repo_name="$2"
+    local pr_number="$3"
+    local output_file="$4"
+
+    local query='
+    query($owner: String!, $name: String!, $prNumber: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $prNumber) {
+          closingIssuesReferences(first: 10) {
+            nodes { number title body url }
+          }
+        }
+      }
+    }'
+
+    if gh api graphql -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
+            -f query="$query" 2>/dev/null \
+            | jq '[.data.repository.pullRequest.closingIssuesReferences.nodes[]?]' > "$output_file" 2>/dev/null; then
+        return 0
+    fi
+    echo '[]' > "$output_file"
+    return 1
+}
+
 extract_unresolved_threads() {
     local threads_file="$1"
     local output_file="$2"
 
+    # is_outdated matters: an outdated thread points at code that has since
+    # changed, so the issue may already be fixed. Dropping the flag turns those
+    # threads into phantom tasks.
     jq '[.data.repository.pullRequest.reviewThreads.nodes[]
         | select(.isResolved == false)
         | {
             thread_id: .id,
+            is_outdated: (.isOutdated // false),
+            path: (.path // null),
+            line: (.line // .originalLine // null),
             comments: [.comments.nodes[] | {
                 author: (.author.login // "unknown"),
                 body: .body,
                 url: .url
             }]
         }]' "$threads_file" > "$output_file"
+}
+
+# Bots repost their whole report on every push. Keeping all revisions burns the
+# context budget and double-counts the same finding. Keep the newest revision of
+# each bot report; never touch human comments, where repetition is signal.
+dedupe_bot_comments() {
+    local input_file="$1"
+    local output_file="$2"
+
+    jq '
+    def is_bot: (.user // "") | test("\\[bot\\]$") or (ascii_downcase | IN("github-actions", "greptile", "codecov", "sonarcloud", "coderabbitai", "dependabot", "renovate"));
+    # Report identity: the bot plus its first meaningful line, with digits removed
+    # so "72% covered" and "84% covered" collapse to the same report.
+    def signature: ((.user // "") + "::" +
+        (((.body // "") | split("\n") | map(select(length > 0)) | (.[0] // ""))
+         | ascii_downcase | gsub("[0-9]"; "") | gsub("[^a-z ]"; "") | .[0:80]));
+
+    (map(select(is_bot | not))) as $humans
+    | (map(select(is_bot))) as $bots
+    | ($bots | group_by(signature) | map(sort_by(.created_at // "")) ) as $grouped
+    | {
+        kept: (($humans + ($grouped | map(.[-1]))) | sort_by(.created_at // "")),
+        superseded: ($grouped | map(.[0:-1]) | add // [])
+      }
+    ' "$input_file" > "$output_file"
 }
 
 # Fetch the PR diff and create both raw and structured versions
@@ -1906,70 +2032,132 @@ fetch_pr_diff() {
 build_claude_context() {
     local output_dir="$1"
     local include_diff="${2:-false}"
+    local truncate_at="${GH_PR_ENRICH_TRUNCATE_CHARS:-5000}"
 
-    # Ensure issue-comments.json exists (avoids --slurpfile error)
+    # Missing optional inputs degrade to empty, never to a hard failure.
     if [ ! -f "$output_dir/issue-comments.json" ]; then
         echo '[]' > "$output_dir/issue-comments.json"
     fi
-
-    # Shared jq filter for mapping/truncating issue comments (single definition)
-    local issue_comments_filter='($issue_comments[0] | map({
-        user: .user,
-        body: (if (.body | length) > 5000 then
-            (.body | .[0:5000] + "\n... (truncated)")
-        else
-            .body
-        end),
-        url: .html_url,
-        created_at: .created_at
-    }))'
-
-    if [ "$include_diff" = "true" ] && [ -f "$output_dir/pr-diff.json" ]; then
-        # Include diff in context for richer analysis
-        # Use --slurpfile to avoid ARG_MAX limits on large comment payloads
-        jq -n \
-            --argjson pr "$(<"$output_dir/pr-summary.json")" \
-            --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
-            --slurpfile issue_comments "$output_dir/issue-comments.json" \
-            --argjson diff "$(<"$output_dir/pr-diff.json")" \
-            '{
-                pr: {
-                    title: $pr.title,
-                    body: ($pr.body // "No description"),
-                    author: $pr.author.login,
-                    files_changed: [$pr.files[].path]
-                },
-                unresolved_threads: $unresolved,
-                issue_comments: '"$issue_comments_filter"',
-                code_changes: {
-                    summary: "Diff included for context. Each file_diff contains the actual code changes.",
-                    file_diffs: ($diff.file_diffs | map({
-                        file: .file,
-                        diff: (if (.content | length) > 5000 then
-                            (.content | .[0:5000] + "\n... (truncated)")
-                        else
-                            .content
-                        end)
-                    }))
-                }
-            }' > "$output_dir/claude-context.json"
-    else
-        # Use --slurpfile to avoid ARG_MAX limits on large comment payloads
-        jq -n \
-            --argjson pr "$(<"$output_dir/pr-summary.json")" \
-            --argjson unresolved "$(<"$output_dir/unresolved-threads.json")" \
-            --slurpfile issue_comments "$output_dir/issue-comments.json" \
-            '{
-                pr: {
-                    title: $pr.title,
-                    body: ($pr.body // "No description"),
-                    author: $pr.author.login,
-                    files_changed: [$pr.files[].path]
-                },
-                unresolved_threads: $unresolved,
-                issue_comments: '"$issue_comments_filter"'
-            }' > "$output_dir/claude-context.json"
+    if [ ! -f "$output_dir/unresolved-threads.json" ]; then
+        echo '[]' > "$output_dir/unresolved-threads.json"
     fi
+
+    dedupe_bot_comments "$output_dir/issue-comments.json" "$output_dir/issue-comments-deduped.json"
+
+    local diff_json='{"raw_diff": "", "file_diffs": []}'
+    local with_diff=false
+    if [ "$include_diff" = "true" ] && [ -f "$output_dir/pr-diff.json" ]; then
+        diff_json="$(<"$output_dir/pr-diff.json")"
+        with_diff=true
+    fi
+
+    local checks_json='[]'
+    if [ -f "$output_dir/checks.json" ]; then
+        checks_json="$(<"$output_dir/checks.json")"
+    fi
+
+    local linked_json='[]'
+    if [ -f "$output_dir/linked-issues.json" ]; then
+        linked_json="$(<"$output_dir/linked-issues.json")"
+    fi
+
+    local sast_json='[]'
+    if [ -f "$output_dir/sast-findings.json" ]; then
+        sast_json="$(<"$output_dir/sast-findings.json")"
+    fi
+
+    # One jq program builds the whole context. The coverage block records what was
+    # dropped or shortened, so a truncated input can never read as a complete one.
+    jq -n \
+        --argjson pr "$(<"$output_dir/pr-summary.json")" \
+        --slurpfile threads "$output_dir/unresolved-threads.json" \
+        --slurpfile raw_comments "$output_dir/issue-comments.json" \
+        --slurpfile deduped "$output_dir/issue-comments-deduped.json" \
+        --argjson checks "$checks_json" \
+        --argjson linked "$linked_json" \
+        --argjson sast "$sast_json" \
+        --argjson diff "$diff_json" \
+        --argjson with_diff "$with_diff" \
+        --argjson limit "$truncate_at" \
+        '
+        def trunc($text): if (($text // "") | length) > $limit
+            then (($text // "")[0:$limit] + "\n... (truncated)")
+            else ($text // "") end;
+        def was_truncated($text): (($text // "") | length) > $limit;
+
+        ($threads[0] // []) as $thread_list
+        | ($raw_comments[0] // []) as $raw
+        | (($deduped[0] // {}) | (.kept // [])) as $kept
+        | (($deduped[0] // {}) | (.superseded // [])) as $superseded
+        | ($diff.file_diffs // []) as $files
+        | {
+            pr: {
+                title: $pr.title,
+                body: ($pr.body // "No description"),
+                author: ($pr.author.login // "unknown"),
+                files_changed: [($pr.files // [])[].path],
+                commits: [($pr.commits // [])[] | {
+                    sha: ((.oid // "") | .[0:7]),
+                    message: ((.messageHeadline // "") +
+                        (if ((.messageBody // "") | length) > 0 then "\n" + (.messageBody | .[0:1000]) else "" end))
+                }],
+                linked_issues: [($linked // [])[] | {
+                    number: .number,
+                    title: .title,
+                    url: .url,
+                    body: trunc(.body)
+                }]
+            },
+            unresolved_threads: $thread_list,
+            issue_comments: [$kept[] | {
+                user: .user,
+                body: trunc(.body),
+                url: .html_url,
+                created_at: .created_at
+            }],
+            failing_checks: [($checks // [])[] | select(.bucket == "fail") | {
+                name: .name,
+                state: .state,
+                description: (.description // ""),
+                link: (.link // "")
+            }],
+            sast_findings: $sast,
+            coverage: {
+                truncation_limit_chars: $limit,
+                issue_comments: {
+                    total: ($raw | length),
+                    included: ($kept | length),
+                    superseded_bot_duplicates: ($superseded | length),
+                    truncated: [$kept[] | select(was_truncated(.body)) | .html_url]
+                },
+                unresolved_threads: {
+                    total: ($thread_list | length),
+                    included: ($thread_list | length),
+                    outdated: [$thread_list[] | select(.is_outdated == true)] | length
+                },
+                diff: {
+                    included: $with_diff,
+                    files_total: ($files | length),
+                    files_included: (if $with_diff then ($files | length) else 0 end),
+                    files_truncated: (if $with_diff
+                        then [$files[] | select(was_truncated(.content)) | .file]
+                        else [] end)
+                },
+                inputs: {
+                    commits: (($pr.commits // []) | length),
+                    linked_issues: (($linked // []) | length),
+                    failing_checks: ([($checks // [])[] | select(.bucket == "fail")] | length),
+                    sast_findings: (($sast // []) | length)
+                }
+            }
+          }
+        + (if $with_diff then {
+            code_changes: {
+                summary: "Diff included for context. Each file_diff contains the actual code changes.",
+                file_diffs: [$files[] | {file: .file, diff: trunc(.content)}]
+            }
+          } else {} end)
+        ' > "$output_dir/claude-context.json"
 }
 
 # Closed taxonomy for findings. Kept in sync with default-prompt.txt by
@@ -2156,6 +2344,34 @@ $(cat "$context_file")"
     return $exit_code
 }
 
+# Render what the analyzer was and was not shown. A bounded input that reads as a
+# complete one is how a review misses things without anyone noticing.
+generate_coverage_section() {
+    local context_file="$1"
+    local output_file="$2"
+
+    jq -r '
+    (.coverage // {}) as $c
+    | "## 📥 Analysis Context Coverage\n\n" +
+      "_What the analyzer was shown. Anything listed as truncated or dropped was not fully analyzed._\n\n" +
+      "| Input | Included | Notes |\n|---|---|---|\n" +
+      "| Review threads | " + (($c.unresolved_threads.included // 0) | tostring) + " of " + (($c.unresolved_threads.total // 0) | tostring) + " unresolved | " +
+        (($c.unresolved_threads.outdated // 0) | tostring) + " outdated (code has changed since the comment) |\n" +
+      "| Issue comments | " + (($c.issue_comments.included // 0) | tostring) + " of " + (($c.issue_comments.total // 0) | tostring) + " | " +
+        (($c.issue_comments.superseded_bot_duplicates // 0) | tostring) + " superseded bot reposts dropped; " +
+        ((($c.issue_comments.truncated // []) | length) | tostring) + " truncated |\n" +
+      "| Diff | " + (if ($c.diff.included // false) then (($c.diff.files_included // 0) | tostring) + " of " + (($c.diff.files_total // 0) | tostring) + " files" else "not included (run with --diff)" end) + " | " +
+        (if (($c.diff.files_truncated // []) | length) > 0
+            then "truncated: " + (($c.diff.files_truncated // []) | join(", "))
+            else "no files truncated" end) + " |\n" +
+      "| Commits | " + (($c.inputs.commits // 0) | tostring) + " | commit messages supplied as intent |\n" +
+      "| Linked issues | " + (($c.inputs.linked_issues // 0) | tostring) + " | issue bodies supplied as intent |\n" +
+      "| Failing checks | " + (($c.inputs.failing_checks // 0) | tostring) + " | CI failures supplied as evidence |\n" +
+      "| SAST findings | " + (($c.inputs.sast_findings // 0) | tostring) + " | static-analysis results (run with --sast) |\n\n" +
+      "_Truncation limit: " + (($c.truncation_limit_chars // 0) | tostring) + " characters per comment, issue body and file diff._\n"
+    ' "$context_file" > "$output_file" 2>/dev/null || echo "" > "$output_file"
+}
+
 generate_analysis_report() {
     local analysis_file="$1"
     local output_file="$2"
@@ -2272,7 +2488,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis generate_analysis_report dedupe_bot_comments collect_sast_findings emit_analysis_schema fetch_review_threads"
+TEST_CALLABLE_FUNCTIONS="build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema fetch_review_threads fetch_linked_issues"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in
@@ -2345,43 +2561,19 @@ gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/comments" \
         html_url: .html_url
     })' > "$OUTPUT_DIR/inline-comments.json"
 
-# 3. Fetch comment threads with GraphQL IDs
+# 3. Fetch comment threads with GraphQL IDs (paginated)
 echo "Fetching comment threads with GraphQL IDs..."
 OWNER=$(echo "$REPO" | cut -d'/' -f1)
 REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
 
-GRAPHQL_QUERY='
-query($owner: String!, $name: String!, $prNumber: Int!) {
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $prNumber) {
-      reviewThreads(last: 100) {
-        nodes {
-          id
-          isResolved
-          comments(first: 10) {
-            nodes {
-              id
-              databaseId
-              body
-              author {
-                login
-              }
-              createdAt
-              url
-            }
-          }
-        }
-      }
-    }
-  }
-}
-'
+if ! fetch_review_threads "$OWNER" "$REPO_NAME" "$PR_NUMBER" "$OUTPUT_DIR/comment-threads.json"; then
+    echo "Note: Could not fetch comment threads with GraphQL IDs."
+    echo '{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [], "pages_fetched": 0}}}}}' \
+        > "$OUTPUT_DIR/comment-threads.json"
+fi
 
-gh api graphql -F owner="$OWNER" -F name="$REPO_NAME" -F prNumber="$PR_NUMBER" -f query="$GRAPHQL_QUERY" \
-    > "$OUTPUT_DIR/comment-threads.json" 2>/dev/null || {
-        echo "Note: Could not fetch comment threads with GraphQL IDs."
-        echo '{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}' > "$OUTPUT_DIR/comment-threads.json"
-    }
+# Fetch the issues this PR closes, for intent the diff cannot show
+fetch_linked_issues "$OWNER" "$REPO_NAME" "$PR_NUMBER" "$OUTPUT_DIR/linked-issues.json" || true
 
 # Process comment threads to create ID mapping
 jq -r '.data.repository.pullRequest.reviewThreads.nodes[] |
@@ -2578,9 +2770,11 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
             fi
 
             generate_analysis_report "$OUTPUT_DIR/claude-analysis.json" "$OUTPUT_DIR/claude-analysis.md"
+            generate_coverage_section "$OUTPUT_DIR/claude-context.json" "$OUTPUT_DIR/context-coverage.md"
 
             jq --argjson analysis "$(<"$OUTPUT_DIR/claude-analysis.json")" \
-               '. + {claude_analysis: $analysis}' \
+               --argjson coverage "$(jq '.coverage // {}' "$OUTPUT_DIR/claude-context.json")" \
+               '. + {claude_analysis: $analysis, analysis_context_coverage: $coverage}' \
                "$OUTPUT_DIR/combined-data.json" > "$OUTPUT_DIR/combined-data.tmp.json" && \
                mv "$OUTPUT_DIR/combined-data.tmp.json" "$OUTPUT_DIR/combined-data.json"
 
@@ -2590,6 +2784,8 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
 
 ANALYSIS_SECTION
             cat "$OUTPUT_DIR/claude-analysis.md" >> "$OUTPUT_DIR/comprehensive-report.md"
+            printf '\n---\n\n' >> "$OUTPUT_DIR/comprehensive-report.md"
+            cat "$OUTPUT_DIR/context-coverage.md" >> "$OUTPUT_DIR/comprehensive-report.md"
         else
             echo "⚠️  Claude analysis failed. Continuing without enrichment."
         fi

@@ -43,10 +43,10 @@ assert_eq "1" "$def_count" "build_claude_context is defined exactly once"
 inline_marker=$(grep -c 'Inlined version of build_claude_context' "$GH_PR_ENRICH" || true)
 assert_eq "0" "$inline_marker" "no inlined copy of build_claude_context remains"
 
-# The issue-comment mapping filter was duplicated between the real function and
-# the inlined copy. It must appear once.
-filter_count=$(grep -c 'issue_comments_filter=' "$GH_PR_ENRICH" || true)
-assert_eq "1" "$filter_count" "issue-comment mapping filter defined exactly once"
+# The context document must be assembled in exactly one place. Two writers means
+# one of them is a copy that will drift.
+writer_count=$(grep -c '> "$output_dir/claude-context.json"' "$GH_PR_ENRICH" || true)
+assert_eq "1" "$writer_count" "claude-context.json is written by exactly one code path"
 
 # ---------------------------------------------------------------------------
 # Generic test dispatcher replaces the special-cased --test-build-context hook
