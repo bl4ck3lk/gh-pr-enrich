@@ -227,22 +227,28 @@ gh pr-enrich 123 --enrich
 **Claude MUST follow this sequence (no steps may be skipped):**
 
 1. **Resolve context** - Extract `OWNER`, `REPO`, `PR_NUMBER` from git context (see "Resolving Owner, Repo, and PR Number")
-2. **Read systemic_issues first** - Understand the underlying patterns before making any changes
-3. **Read adjacent_problems** - Identify related areas that may need the same fixes
-4. **Investigate adjacent areas** - Search the codebase for similar issues flagged in adjacent_problems
-5. **Check non-thread comments** - Review general PR comments for actionable feedback not captured in review threads
-6. **Work through task_list** - Address tasks with full context of patterns and related code
-7. **Reply and resolve threads as each task completes** - After fixing each task, reply with the fix commit, then resolve its thread IDs. Track resolved vs remaining threads.
-8. **Final thread audit** - After all tasks are done, query the PR for any remaining unresolved threads. Resolve any that were addressed. Leave a reply on any intentionally left open.
-9. **Verify all CI/CD checks pass** - Run `gh pr checks "$PR_NUMBER"` and confirm all checks are green. If any fail, investigate and fix before declaring work complete.
-10. **Re-request review** - Notify original reviewers that feedback has been addressed.
+2. **Split findings by verdict** - Separate `confirmed` from `plausible`, and read `disputed_comments`. Refuted claims are replied to, never "fixed".
+3. **Check coverage** - Note every `not_reviewable` category and every truncated input; those are the parts of the PR nobody reviewed.
+4. **Read systemic_issues** - Understand the underlying patterns before making any changes
+5. **Read adjacent_problems** - Identify related areas that may need the same fixes
+6. **Investigate adjacent areas** - Search the codebase for the areas marked `checked: false`
+7. **Check non-thread comments** - Review general PR comments for actionable feedback not captured in review threads
+8. **Verify each `plausible` finding** - Read the cited code before changing it; promote it to a fix or move it to a dispute
+9. **Work through task_list** - Address tasks with full context of patterns and related code, and run each task's `verification`
+10. **Reply and resolve threads as each task completes** - After fixing each task, reply with the fix commit, then resolve its thread IDs. Track resolved vs remaining threads.
+11. **Final thread audit** - After all tasks are done, query the PR for any remaining unresolved threads. Resolve any that were addressed. Leave a reply on any intentionally left open.
+12. **Verify all CI/CD checks pass** - Run `gh pr checks "$PR_NUMBER"` and confirm all checks are green. If any fail, investigate and fix before declaring work complete.
+13. **Re-request review** - Notify original reviewers that feedback has been addressed.
 
 **Example prompt for Claude:**
-> "Read the claude-analysis.json. First summarize the systemic issues and adjacent problems you found. Investigate the adjacent areas mentioned. Check non-thread PR comments for additional feedback. Then address each critical and high priority task in order, applying fixes consistently across all affected areas. After fixing each task, reply with the fix commit and resolve its thread IDs. When all tasks are done, verify no threads were missed, confirm all CI checks pass, and re-request review."
+> "Read the claude-analysis.json. Start by listing which findings are confirmed, which are only plausible, and which reviewer claims were disputed — then tell me which categories came back not_reviewable. Investigate the adjacent areas marked checked:false. Check non-thread PR comments for additional feedback. Verify each plausible finding against the code before changing anything. Then address each critical and high priority task in order, running each task's stated verification. After fixing each task, reply with the fix commit and resolve its thread IDs. For disputed claims, reply with the reason instead of changing code. When all tasks are done, verify no threads were missed, confirm all CI checks pass, and re-request review."
 
 **Anti-patterns to avoid:**
 > ~~"Read the claude-analysis.json and address each task in order."~~
 This skips the critical analysis steps and leads to incomplete, symptom-focused fixes.
+
+> ~~"The analysis found 6 issues, I'll fix all 6."~~
+Some of those may be refuted claims or unverified guesses. Read the verdicts first.
 
 > ~~"Fix all the issues, then I'll resolve the threads myself."~~
 This leads to forgotten thread resolutions. Claude MUST resolve threads as it goes.
@@ -409,8 +415,10 @@ When finishing a PR feedback session, Claude MUST output a summary in this forma
 ```
 ## PR Feedback Session Complete
 
-**Tasks addressed:** X of Y
+**Tasks addressed:** X of Y (each verified with its stated verification step)
 **Threads resolved:** A of B (C intentionally deferred)
+**Claims disputed:** D (replied with reasoning, not "fixed")
+**Categories not reviewable:** [list, or none] — these were not checked by anyone
 **Non-thread comments reviewed:** N
 **CI/CD status:** all passing | X failing (details below)
 **Review re-requested from:** [reviewer list] | not yet (reason)
