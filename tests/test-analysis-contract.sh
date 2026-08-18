@@ -59,16 +59,20 @@ assert_contains "$PROMPT_TEXT" "refuted" "prompt allows refuting a reviewer clai
 # ---------------------------------------------------------------------------
 # 2. Closed taxonomy + forced coverage
 # ---------------------------------------------------------------------------
-assert_jq "$SCHEMA_FILE" "$IC.properties.category.enum | length >= 12" \
-    "category taxonomy is a closed enum"
+assert_jq "$SCHEMA_FILE" "$IC.properties.category.enum | length == 16" \
+    "category taxonomy is exactly the documented 16 categories"
 assert_jq "$SCHEMA_FILE" "$IC.required | index(\"category\") != null" \
     "category is required on every finding"
 assert_jq "$SCHEMA_FILE" '.properties.category_coverage.type == "array"' \
     "schema has a category_coverage section"
 assert_jq "$SCHEMA_FILE" '.required | index("category_coverage") != null' \
     "category_coverage is required"
-assert_jq "$SCHEMA_FILE" '.properties.category_coverage.items.properties.verdict.enum | index("reviewed_none_found") != null' \
-    "coverage verdict can record an explicit 'reviewed, none found'"
+for verdict in findings_reported reviewed_none_found not_applicable not_reviewable; do
+    assert_jq "$SCHEMA_FILE" ".properties.category_coverage.items.properties.verdict.enum | index(\"$verdict\") != null" \
+        "coverage verdict '$verdict' is available"
+done
+assert_jq "$SCHEMA_FILE" '.properties.category_coverage.items.properties.verdict.enum | length == 4' \
+    "coverage verdicts are exactly those four"
 
 # Prompt and schema must not drift apart, in either direction. The prompt's own
 # category list is the block of "- name: description" lines, so a category named
@@ -227,5 +231,34 @@ ODD_TEXT=$(cat "$ODD_REPORT" 2>/dev/null || echo "")
 assert_contains "$ODD_TEXT" "Inconsistent error handling" "the systemic pattern still renders"
 assert_contains "$ODD_TEXT" "empty catch" "object-shaped evidence is rendered, not dropped"
 assert_contains "$ODD_TEXT" "swallowed error" "string-shaped evidence still renders alongside it"
+
+# ---------------------------------------------------------------------------
+# 7. Prompt loading
+#
+# The prompt and the schema are one contract. A fallback prompt that describes a
+# different contract is worse than no prompt at all: the model is steered one way
+# and validated another, and the drift is invisible until output degrades.
+# ---------------------------------------------------------------------------
+BROKEN_INSTALL="$TEST_OUTPUT_DIR/broken-install"
+mkdir -p "$BROKEN_INSTALL"
+cp "$GH_PR_ENRICH" "$BROKEN_INSTALL/gh-pr-enrich"   # copied without default-prompt.txt
+
+rc=0
+BROKEN_OUT=$( (cd "$BROKEN_INSTALL" && ./gh-pr-enrich --test-call load_system_prompt 2>&1) ) || rc=$?
+assert_eq "1" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)" "a missing bundled prompt is an error, not a silent fallback"
+assert_contains "$BROKEN_OUT" "default-prompt.txt" "the error names the missing file"
+assert_not_contains "$BROKEN_OUT" "architecture, style, documentation, etc." \
+    "no built-in prompt contradicts the schema"
+
+# A repo-root override is found even when the tool runs from a subdirectory,
+# which is what the documentation promises.
+ROOT_OVERRIDE="$TEST_OUTPUT_DIR/root-override"
+mkdir -p "$ROOT_OVERRIDE/sub"
+(cd "$ROOT_OVERRIDE" && git init -q . && git config user.email t@t && git config user.name t)
+echo "CUSTOM PROMPT FROM REPO ROOT" > "$ROOT_OVERRIDE/.gh-pr-enrich-prompt.txt"
+
+SUB_PROMPT=$( (cd "$ROOT_OVERRIDE/sub" && "$GH_PR_ENRICH" --test-call load_system_prompt 2>&1) || true)
+assert_contains "$SUB_PROMPT" "CUSTOM PROMPT FROM REPO ROOT" \
+    "a repo-root prompt override is used from a subdirectory"
 
 suite_end

@@ -130,4 +130,39 @@ assert_eq "no" "$(claude_ran both-empty)" "no analysis runs when there is nothin
 assert_contains "$OUT" "Skipping Claude analysis" "the skip is reported"
 assert_contains "$OUT" "Report generated successfully" "the run still completes"
 
+# ---------------------------------------------------------------------------
+# An incomplete category sweep is reported
+#
+# The prompt demands a verdict for all 16 categories, but a JSON schema cannot
+# require "all of them present". An analysis that skips categories while looking
+# complete is the exact failure the coverage section exists to prevent.
+# ---------------------------------------------------------------------------
+cat > "$STUB_DIR/claude" << 'STUB'
+#!/bin/bash
+echo "invoked" >> "$CLAUDE_INVOKED_LOG"
+cat > /dev/null
+echo '{"structured_output": {"issue_categories": [], "category_coverage": [{"category": "security", "verdict": "reviewed_none_found", "note": "n"}], "disputed_comments": [], "systemic_issues": [], "adjacent_problems": [], "task_list": [], "process_improvements": [], "pr_template_suggestions": []}}'
+STUB
+chmod +x "$STUB_DIR/claude"
+
+OUT=$(run_scenario "partial-coverage" "$THREAD_JSON" '[]')
+assert_contains "$OUT" "Category coverage is incomplete" "an incomplete sweep is reported"
+assert_contains "$OUT" "1 of 16" "the report says how many categories were swept"
+assert_contains "$OUT" "logic_error" "the unswept categories are named"
+
+# ---------------------------------------------------------------------------
+# Structured output missing entirely (clean exit, unusable result)
+# ---------------------------------------------------------------------------
+cat > "$STUB_DIR/claude" << 'STUB'
+#!/bin/bash
+echo "invoked" >> "$CLAUDE_INVOKED_LOG"
+cat > /dev/null
+echo '{"is_error": false, "result": "I could not produce structured output."}'
+STUB
+chmod +x "$STUB_DIR/claude"
+
+OUT=$(run_scenario "no-structured-output" "$THREAD_JSON" '[]')
+assert_contains "$OUT" "no structured output" "a missing analysis is called out, not passed off as empty"
+assert_contains "$OUT" "claude-stderr.log" "the user is pointed at the analyzer log"
+
 suite_end

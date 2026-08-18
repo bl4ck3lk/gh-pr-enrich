@@ -120,7 +120,8 @@ Related areas that may have similar issues:
     {
       "area": "Other API endpoints",
       "risk": "Same error handling pattern may exist",
-      "investigation_hint": "Search for similar try/catch blocks..."
+      "investigation_hint": "Search for similar try/catch blocks...",
+      "checked": false
     }
   ]
 }

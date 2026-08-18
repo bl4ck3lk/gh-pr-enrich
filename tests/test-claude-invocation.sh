@@ -147,8 +147,13 @@ assert_not_contains "$INVOKER_FN" '> "$output_file" 2>/dev/null' \
 
 # One invoker, two callers: the PR analysis and the retrospective must not grow
 # separate copies of the CLI invocation, or a fix to one will miss the other.
-assert_eq "1" "$(grep -v '^\s*#' "$GH_PR_ENRICH" | grep -c 'claude --print')" \
-    "the Claude CLI is invoked from exactly one place"
+# Count any invocation of the claude binary, not just the `claude --print` spelling:
+# a second call site written differently would otherwise slip past this guard.
+claude_calls=$(grep -v '^[[:space:]]*#' "$GH_PR_ENRICH" \
+    | grep -E '(^|[|&;( ])claude([[:space:]]|$)' \
+    | grep -vE 'command -v claude|--argjson claude|Optional:' \
+    | wc -l | tr -d ' ')
+assert_eq "1" "$claude_calls" "the Claude CLI is invoked from exactly one place"
 assert_contains "$(sed -n '/^run_claude_analysis() {/,/^}/p' "$GH_PR_ENRICH")" 'invoke_claude' \
     "PR analysis delegates to the shared invoker"
 assert_contains "$(sed -n '/run_retrospective_claude_analysis() {/,/^    }/p' "$GH_PR_ENRICH")" 'invoke_claude' \

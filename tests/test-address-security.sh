@@ -108,4 +108,56 @@ OUT=$(run_address "PRRT_benign" "https://evil.example/phish")
 OPENED=$(cat "$OPENED_LOG" 2>/dev/null || echo "")
 assert_eq "" "$OPENED" "a URL outside GitHub is never handed to the browser"
 
+# ---------------------------------------------------------------------------
+# Terminal escape sequences in analyzer output
+#
+# Task text is printed straight to the user's terminal. Escape sequences there
+# can repaint the screen, hide text, or fake the tool's own prompts — so an
+# injected analysis could misrepresent what the user is approving.
+# ---------------------------------------------------------------------------
+run_address_with_task() {
+    local task_json="$1"
+    local ws="$TEST_OUTPUT_DIR/ws-term"
+
+    rm -rf "$ws"
+    mkdir -p "$ws/.reports/pr-reviews/pr-999"
+    jq -n --argjson task "$task_json" '{
+        issue_categories: [], category_coverage: [], disputed_comments: [],
+        systemic_issues: [], adjacent_problems: [], task_list: [$task],
+        process_improvements: [], pr_template_suggestions: []
+    }' > "$ws/.reports/pr-reviews/pr-999/claude-analysis.json"
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}' \
+        > "$ws/.reports/pr-reviews/pr-999/comment-threads.json"
+
+    printf 'q' | (cd "$ws" && env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" address 999 2>&1) || true
+}
+
+#  is a real escape byte once jq -r decodes it.
+HOSTILE_TASK=$(jq -n '{
+    priority: "high[2J[H",
+    task: "Harmless looking[31m FAKE PROMPT: [y]es to grant admin",
+    thread_ids: [],
+    file: "a.js", line: 1,
+    suggested_fix: "fix[1;32m",
+    verification: "npm test[0m"
+}')
+
+TERM_OUT=$(run_address_with_task "$HOSTILE_TASK")
+
+# The payload's printable remainder ("[2J") is harmless; what matters is that no
+# ESC byte survives to be interpreted by the terminal.
+if printf '%s' "$TERM_OUT" | grep -q $'\033\\[2J'; then
+    fail "screen-clearing escape from analyzer output is neutralized" "a raw ESC[2J reached the terminal"
+else
+    pass "screen-clearing escape from analyzer output is neutralized"
+fi
+
+if printf '%s' "$TERM_OUT" | grep -q $'\033\\[31m FAKE PROMPT'; then
+    fail "color escapes in task text are neutralized" "a raw ESC[31m reached the terminal"
+else
+    pass "color escapes in task text are neutralized"
+fi
+
+assert_contains "$TERM_OUT" "FAKE PROMPT" "the task text itself is still shown to the user"
+
 suite_end

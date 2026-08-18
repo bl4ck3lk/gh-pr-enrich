@@ -60,6 +60,16 @@ canonicalize_path() {
     fi
 }
 
+# Strip terminal control sequences from analyzer-controlled text.
+#
+# Task text, priorities and fixes come from claude-analysis.json, which is shaped
+# by PR content. Escape sequences printed straight to a terminal can repaint the
+# screen or fake this tool's own prompts, misrepresenting what the user is
+# approving. Newlines and tabs are kept; every other control byte is dropped.
+sanitize_for_terminal() {
+    printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037\177'
+}
+
 # Invoke the Claude CLI for a structured-output analysis.
 #
 # Shared by the PR analysis and the retrospective meta-analysis. Both need the
@@ -1567,25 +1577,28 @@ if [ "$1" = "address" ]; then
 
     while [ $CURRENT -lt $TASK_COUNT ]; do
         TASK=$(jq -r ".task_list[$CURRENT]" "$ANALYSIS_FILE")
-        PRIORITY=$(echo "$TASK" | jq -r '.priority')
-        DESCRIPTION=$(echo "$TASK" | jq -r '.task')
-        THREAD_IDS=$(echo "$TASK" | jq -r '(.thread_ids // []) | join(", ")')
-        TASK_FILE=$(echo "$TASK" | jq -r '.file // ""')
-        TASK_LINE=$(echo "$TASK" | jq -r '.line // 0')
-        TASK_FIX=$(echo "$TASK" | jq -r '.suggested_fix // ""')
-        TASK_VERIFY=$(echo "$TASK" | jq -r '.verification // ""')
+        PRIORITY=$(sanitize_for_terminal "$(echo "$TASK" | jq -r '.priority')")
+        DESCRIPTION=$(sanitize_for_terminal "$(echo "$TASK" | jq -r '.task')")
+        THREAD_IDS=$(sanitize_for_terminal "$(echo "$TASK" | jq -r '(.thread_ids // []) | join(", ")')")
+        TASK_FILE=$(sanitize_for_terminal "$(echo "$TASK" | jq -r '.file // ""')")
+        TASK_LINE=$(sanitize_for_terminal "$(echo "$TASK" | jq -r '.line // 0')")
+        TASK_FIX=$(sanitize_for_terminal "$(echo "$TASK" | jq -r '.suggested_fix // ""')")
+        TASK_VERIFY=$(sanitize_for_terminal "$(echo "$TASK" | jq -r '.verification // ""')")
 
         # Color based on priority
+        # Literal escape constants, printed with plain `echo`: `echo -e` would
+        # decode escape sequences embedded in the analyzer-controlled priority.
         case $PRIORITY in
-            critical) PRIORITY_COLOR="\033[1;31m" ;;  # Bold red
-            high)     PRIORITY_COLOR="\033[0;31m" ;;  # Red
-            medium)   PRIORITY_COLOR="\033[0;33m" ;;  # Yellow
-            low)      PRIORITY_COLOR="\033[0;32m" ;;  # Green
-            *)        PRIORITY_COLOR="\033[0m" ;;
+            critical) PRIORITY_COLOR=$'\033[1;31m' ;;  # Bold red
+            high)     PRIORITY_COLOR=$'\033[0;31m' ;;  # Red
+            medium)   PRIORITY_COLOR=$'\033[0;33m' ;;  # Yellow
+            low)      PRIORITY_COLOR=$'\033[0;32m' ;;  # Green
+            *)        PRIORITY_COLOR=$'\033[0m' ;;
         esac
+        COLOR_RESET=$'\033[0m'
 
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo -e "Task $((CURRENT + 1))/$TASK_COUNT [${PRIORITY_COLOR}${PRIORITY}\033[0m]"
+        echo "Task $((CURRENT + 1))/$TASK_COUNT [${PRIORITY_COLOR}${PRIORITY}${COLOR_RESET}]"
         echo ""
         echo "$DESCRIPTION"
         echo ""
@@ -1849,29 +1862,31 @@ load_system_prompt() {
     # Check environment variable
     elif [ -n "${GH_PR_ENRICH_PROMPT:-}" ] && [ -f "$GH_PR_ENRICH_PROMPT" ]; then
         prompt_file="$GH_PR_ENRICH_PROMPT"
-    # Check for local repo override
+    # Check for a repo override, in the current directory or at the repo root.
+    # Both are checked because the documented location is the repo root, while
+    # the tool is often run from a subdirectory.
     elif [ -f ".gh-pr-enrich-prompt.txt" ]; then
         prompt_file=".gh-pr-enrich-prompt.txt"
+    elif [ -n "$(git rev-parse --show-toplevel 2>/dev/null)" ] \
+         && [ -f "$(git rev-parse --show-toplevel 2>/dev/null)/.gh-pr-enrich-prompt.txt" ]; then
+        prompt_file="$(git rev-parse --show-toplevel)/.gh-pr-enrich-prompt.txt"
     # Fall back to bundled default
     elif [ -f "$extension_dir/default-prompt.txt" ]; then
         prompt_file="$extension_dir/default-prompt.txt"
     fi
 
-    if [ -n "$prompt_file" ]; then
-        # Filter out comment lines and leading blank lines (portable: works on BSD and GNU)
-        grep -v '^#' "$prompt_file" | awk 'NF{found=1} found'
-    else
-        # Fallback if no file found (shouldn't happen normally)
-        echo "You are a senior code reviewer analyzing unresolved PR comment threads.
-Your task is to:
-1. Categorize issues by type (security, performance, architecture, style, documentation, etc.)
-2. Identify systemic patterns that appear across multiple comments
-3. Suggest adjacent areas that may have similar problems worth investigating
-4. Create a prioritized task list for addressing the issues
-
-Focus on actionable insights. Be specific about file paths and patterns.
-If there are no systemic issues or adjacent problems, return empty arrays for those fields."
+    if [ -z "$prompt_file" ]; then
+        # No inline fallback: the prompt and the JSON schema are one contract, and
+        # a built-in prompt describing a different one would steer the model one
+        # way while validating it another. A missing bundled prompt means a broken
+        # install, which is worth failing on.
+        echo "❌ No analysis prompt found: $extension_dir/default-prompt.txt is missing." >&2
+        echo "   Reinstall the extension (gh extension upgrade pr-enrich), or pass --prompt FILE." >&2
+        return 1
     fi
+
+    # Filter out comment lines and leading blank lines (portable: works on BSD and GNU)
+    grep -v '^#' "$prompt_file" | awk 'NF{found=1} found'
 }
 
 # Parse options (skipped in test-call mode)
@@ -2611,6 +2626,7 @@ collect_sast_findings() {
     return 0
 }
 
+
 # Decide whether the analyzer may read the working tree.
 #
 # Reading files only helps if those files are the PR's files. Analyzing PR #123
@@ -2696,7 +2712,9 @@ run_claude_analysis() {
     local model="${GH_PR_ENRICH_MODEL:-sonnet}"
 
     local system_prompt
-    system_prompt="$(load_system_prompt)"
+    if ! system_prompt="$(load_system_prompt)"; then
+        return 1
+    fi
 
     local context_payload
     context_payload="$(cat "$context_file")"
@@ -2877,7 +2895,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="resolve_code_access build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema fetch_review_threads fetch_linked_issues"
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema fetch_review_threads fetch_linked_issues"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in
@@ -3169,7 +3187,30 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
             if jq -e '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" > /dev/null 2>&1; then
                 jq '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" > "$OUTPUT_DIR/claude-analysis.json"
             else
+                # The CLI exited cleanly but returned no structured output. Copying
+                # the envelope through yields an empty report that reads like a
+                # clean PR, so say plainly that this is a failure, not a result.
+                echo "⚠️  The analyzer returned no structured output; the analysis is not usable." >&2
+                echo "   Raw response: $OUTPUT_DIR/claude-raw-response.json" >&2
+                echo "   Analyzer stderr: $OUTPUT_DIR/claude-stderr.log" >&2
                 cp "$OUTPUT_DIR/claude-raw-response.json" "$OUTPUT_DIR/claude-analysis.json"
+            fi
+
+            # The prompt requires a verdict for every category. The schema cannot
+            # express "all 16 present", so it is checked here — an incomplete
+            # sweep reported as complete is the failure this section exists to
+            # prevent.
+            EXPECTED_CATEGORIES=$(printf '%s' "$ANALYSIS_CATEGORIES" | jq 'length')
+            REPORTED_CATEGORIES=$(jq '[(.category_coverage // [])[].category] | unique | length' \
+                "$OUTPUT_DIR/claude-analysis.json" 2>/dev/null || echo 0)
+            if [ "$REPORTED_CATEGORIES" -lt "$EXPECTED_CATEGORIES" ]; then
+                echo "⚠️  Category coverage is incomplete: $REPORTED_CATEGORIES of $EXPECTED_CATEGORIES categories reported." >&2
+                MISSING_CATEGORIES=$(jq -r --argjson all "$ANALYSIS_CATEGORIES" \
+                    '([(.category_coverage // [])[].category] | unique) as $seen
+                     | [$all[] | . as $c | select(($seen | index($c)) == null)] | join(", ")' \
+                    "$OUTPUT_DIR/claude-analysis.json" 2>/dev/null || echo "")
+                [ -n "$MISSING_CATEGORIES" ] && echo "   Not swept: $MISSING_CATEGORIES" >&2
+                echo "   Treat those categories as unreviewed." >&2
             fi
 
             generate_analysis_report "$OUTPUT_DIR/claude-analysis.json" "$OUTPUT_DIR/claude-analysis.md"

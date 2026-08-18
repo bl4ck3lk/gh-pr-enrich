@@ -301,6 +301,52 @@ assert_jq_eq "$CAP_CTX" '.coverage.unresolved_threads.threads_at_comment_limit' 
     "coverage counts threads whose replies may have been cut off"
 
 # ---------------------------------------------------------------------------
+# Truncation: the marker, the boundary, and the configured limit
+# ---------------------------------------------------------------------------
+assert_jq "$CTX" '[.code_changes.file_diffs[] | select(.diff | contains("(truncated)"))] | length == 1' \
+    "an oversized file diff carries the truncation marker"
+assert_jq "$CTX" '[.code_changes.file_diffs[] | select(.file == "src/small.js" and (.diff | contains("(truncated)")))] | length == 0' \
+    "a small file diff is not marked truncated"
+
+# A comment of exactly the limit must not be truncated; one byte more must be.
+BOUNDARY_DIR="$TEST_OUTPUT_DIR/boundary"
+mkdir -p "$BOUNDARY_DIR"
+cp "$CTX_DIR/pr-summary.json" "$BOUNDARY_DIR/pr-summary.json"
+echo '[]' > "$BOUNDARY_DIR/unresolved-threads.json"
+python3 - "$BOUNDARY_DIR/issue-comments.json" << 'PY'
+import json, sys
+json.dump([
+    {"id": 1, "body": "a" * 5000, "user": "h", "created_at": "2026-01-01T00:00:00Z",
+     "type": "issue_comment", "html_url": "at-limit"},
+    {"id": 2, "body": "b" * 5001, "user": "h", "created_at": "2026-01-02T00:00:00Z",
+     "type": "issue_comment", "html_url": "over-limit"},
+], open(sys.argv[1], "w"))
+PY
+
+"$GH_PR_ENRICH" --test-call build_claude_context "$BOUNDARY_DIR" false >/dev/null 2>&1 || true
+BOUNDARY_CTX="$BOUNDARY_DIR/claude-context.json"
+
+assert_jq "$BOUNDARY_CTX" '[.issue_comments[] | select(.url == "at-limit" and (.body | contains("(truncated)")))] | length == 0' \
+    "a comment exactly at the limit is not truncated"
+assert_jq "$BOUNDARY_CTX" '[.issue_comments[] | select(.url == "over-limit" and (.body | contains("(truncated)")))] | length == 1' \
+    "a comment one byte over the limit is truncated"
+assert_jq "$BOUNDARY_CTX" '.coverage.issue_comments.truncated == ["over-limit"]' \
+    "coverage names exactly the truncated comment"
+
+# The limit is configurable, and the coverage block reports the configured value.
+CUSTOM_DIR="$TEST_OUTPUT_DIR/custom-limit"
+mkdir -p "$CUSTOM_DIR"
+cp "$BOUNDARY_DIR/pr-summary.json" "$CUSTOM_DIR/pr-summary.json"
+cp "$BOUNDARY_DIR/issue-comments.json" "$CUSTOM_DIR/issue-comments.json"
+echo '[]' > "$CUSTOM_DIR/unresolved-threads.json"
+
+GH_PR_ENRICH_TRUNCATE_CHARS=100 "$GH_PR_ENRICH" --test-call build_claude_context "$CUSTOM_DIR" false >/dev/null 2>&1 || true
+assert_jq_eq "$CUSTOM_DIR/claude-context.json" '.coverage.truncation_limit_chars' "100" \
+    "GH_PR_ENRICH_TRUNCATE_CHARS changes the reported limit"
+assert_jq "$CUSTOM_DIR/claude-context.json" '[.issue_comments[] | select(.body | contains("(truncated)"))] | length == 2' \
+    "a lower limit truncates comments that were previously untouched"
+
+# ---------------------------------------------------------------------------
 # Coverage is rendered for humans, not just stored
 # ---------------------------------------------------------------------------
 COV_MD="$TEST_OUTPUT_DIR/coverage.md"

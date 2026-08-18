@@ -78,6 +78,10 @@ gh pr-enrich <SUBCOMMAND> [ARGS]
 | An unrelated revision (e.g. you are on `main`) | Access **denied**; run `gh pr checkout <N>`, or pass `--code-access` to analyze the tree as it is |
 | Not a git checkout | Access denied |
 
+`--code-access` (or `GH_PR_ENRICH_CODE_ACCESS=true`) overrides every denial above,
+including a missing checkout and an unknown PR head. `--no-code-access` wins over
+all of them.
+
 Analyzing PR #123 from `main` without this check produced confident verdicts and `file:line` anchors for code the PR does not contain. The decision, both revisions and the reason are recorded in the coverage block and the report.
 
 ### Environment Variables
@@ -91,6 +95,7 @@ Analyzing PR #123 from `main` without this check produced confident verdicts and
 | `GH_PR_ENRICH_TRUNCATE_CHARS` | Per-comment / per-diff truncation limit (default: 5000) |
 | `GH_PR_ENRICH_SEMGREP_CONFIG` | `semgrep --config` value for `--sast` (default: `auto`) |
 | `GH_PR_ENRICH_SEMGREP_TIMEOUT` | Seconds allowed for the semgrep pre-pass (default: 180) |
+| `GH_PR_ENRICH_HEARTBEAT_SECONDS` | Seconds between "still analyzing" progress lines (default: 60) |
 | `CLAUDE_TIMEOUT` | Timeout in seconds for Claude analysis (default: 600 for PR analysis, 180 for retrospective) |
 
 **Timeouts:** verifying against code takes longer than summarizing comments. A large PR analyzed with `--diff` can exceed the 600s default; raise `CLAUDE_TIMEOUT` rather than dropping code access, since a timed-out run produces no analysis at all.
@@ -122,13 +127,23 @@ Default location: `.reports/pr-reviews/pr-<NUMBER>/`
 The prompt is loaded from (in priority order):
 1. `--prompt FILE` argument
 2. `GH_PR_ENRICH_PROMPT` environment variable
-3. `.gh-pr-enrich-prompt.txt` in repo root
-4. `default-prompt.txt` bundled with extension
+3. `.gh-pr-enrich-prompt.txt` in the current directory, then at the repository root
+4. `default-prompt.txt` bundled with the extension
+
+If none is found the run fails rather than falling back to a built-in prompt: the
+prompt and the JSON schema are one contract, and a prompt describing a different
+contract steers the model one way while validating it another.
 
 **Prompt file format:**
 - Lines starting with `#` are comments (ignored)
 - Remaining text becomes the system prompt
-- Must work with the JSON schema (issue_categories, systemic_issues, adjacent_problems, task_list)
+- Must produce every section the schema requires: `issue_categories`,
+  `category_coverage`, `disputed_comments`, `systemic_issues`,
+  `adjacent_problems`, `task_list`, `process_improvements`,
+  `pr_template_suggestions`
+- Must use the closed 16-category list; a category outside the enum is rejected
+- Must instruct verdicts, confidence and file:line evidence, or findings arrive
+  unverified
 
 **Example custom prompts:**
 

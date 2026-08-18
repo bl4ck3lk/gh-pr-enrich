@@ -252,6 +252,9 @@ export GH_PR_ENRICH_CODE_ACCESS=false
 # Per-comment and per-file-diff truncation limit (default: 5000 characters)
 export GH_PR_ENRICH_TRUNCATE_CHARS=8000
 
+# Seconds between "still analyzing" progress lines during a long analysis
+export GH_PR_ENRICH_HEARTBEAT_SECONDS=30
+
 # semgrep configuration and time budget for --sast
 export GH_PR_ENRICH_SEMGREP_CONFIG="p/ci"
 export GH_PR_ENRICH_SEMGREP_TIMEOUT=300
