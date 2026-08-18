@@ -6,7 +6,7 @@
 #   gh extension install bl4ck3lk/gh-pr-enrich
 #
 # Usage:
-#   gh pr-enrich <PR_NUMBER> [--json] [--markdown] [--output-dir <DIR>] [--enrich] [--diff]
+#   gh pr-enrich <PR_NUMBER> [--json] [--markdown] [--output-dir <DIR>] [--enrich] [--diff] [--sast]
 #   gh pr-enrich resolve <THREAD_ID> [THREAD_ID...]
 #   gh pr-enrich watch <PR_NUMBER> [--interval MIN] [--enrich] [--notify]
 #   gh pr-enrich address <PR_NUMBER>
@@ -16,6 +16,7 @@
 #   gh pr-enrich 123                    # Fetch PR details
 #   gh pr-enrich 123 --enrich           # Fetch + Claude analysis
 #   gh pr-enrich 123 --enrich --diff    # Analysis with code context
+#   gh pr-enrich 123 --enrich --sast    # Analysis with a semgrep pre-pass
 #   gh pr-enrich 123 --json             # Output JSON only
 #   gh pr-enrich resolve PRRT_xxx       # Resolve a comment thread
 #   gh pr-enrich watch 123 --enrich     # Monitor PR for changes
@@ -1623,6 +1624,11 @@ OPTIONS:
   --output-dir DIR  Directory to save output (default: .reports/pr-reviews/pr-<N>)
   --enrich          Run Claude AI analysis on unresolved threads and issue comments
   --diff            Include code diffs in Claude context (richer analysis)
+  --sast            Run a semgrep pre-pass on changed files and feed the findings
+                    to the analysis as deterministic ground truth
+  --no-code-access  Do not let the analyzer read the repository. Findings can then
+                    only be 'plausible', never verified. For sandboxed runs.
+  --model NAME      Model for the analysis (default: sonnet)
   --prompt FILE     Custom prompt file for Claude analysis (overrides defaults)
   -h, --help        Show this help message
   -v, --version     Show version
@@ -1632,6 +1638,7 @@ EXAMPLES:
   gh pr-enrich 123                        # Basic PR report
   gh pr-enrich 123 --enrich               # With Claude AI analysis
   gh pr-enrich 123 --enrich --diff        # Analysis with code context
+  gh pr-enrich 123 --enrich --diff --sast # Analysis with diffs and semgrep
   gh pr-enrich 123 --output-dir ./pr      # Custom output directory
   gh pr-enrich 123 --json                 # JSON output only
   gh pr-enrich resolve PRRT_xxx PRRT_yyy  # Resolve multiple threads
@@ -1648,12 +1655,18 @@ PROMPT CUSTOMIZATION:
   See default-prompt.txt in the extension directory for format.
 
 ENVIRONMENT VARIABLES:
-  PR_REVIEW_OUTPUT_ROOT   Override default output directory root
-  GH_PR_ENRICH_PROMPT     Path to custom prompt file for Claude analysis
+  PR_REVIEW_OUTPUT_ROOT        Override default output directory root
+  GH_PR_ENRICH_PROMPT          Path to custom prompt file for Claude analysis
+  GH_PR_ENRICH_MODEL           Model for the analysis (default: sonnet)
+  GH_PR_ENRICH_CODE_ACCESS     'false' to run without repository read access
+  GH_PR_ENRICH_TRUNCATE_CHARS  Per-comment/diff truncation limit (default: 5000)
+  GH_PR_ENRICH_SEMGREP_CONFIG  semgrep --config value for --sast (default: auto)
+  GH_PR_ENRICH_SEMGREP_TIMEOUT Seconds allowed for the semgrep pre-pass (default: 180)
+  CLAUDE_TIMEOUT               Seconds allowed for the analysis (default: 600)
 
 DEPENDENCIES:
   Required: gh (GitHub CLI), jq
-  Optional: claude (Claude CLI, for --enrich)
+  Optional: claude (Claude CLI, for --enrich), semgrep (for --sast)
 
 For more info: https://github.com/bl4ck3lk/gh-pr-enrich
 HELP
@@ -1696,6 +1709,7 @@ if [ -z "$TEST_CALL_FN" ]; then
     CUSTOM_OUTPUT_DIR=false
     ENRICH_WITH_CLAUDE=false
     INCLUDE_DIFF=false
+    RUN_SAST=false
     CUSTOM_PROMPT_FILE=""
     REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "current-repo")
 fi
@@ -1775,6 +1789,24 @@ if [ -z "$TEST_CALL_FN" ]; then
         --diff)
             INCLUDE_DIFF=true
             shift
+            ;;
+        --sast)
+            RUN_SAST=true
+            shift
+            ;;
+        --no-code-access)
+            # For sandboxed or offline runs: the analyzer reasons from the supplied
+            # context only and cannot open the repository to verify claims.
+            export GH_PR_ENRICH_CODE_ACCESS=false
+            shift
+            ;;
+        --model)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --model requires a model name."
+                exit 1
+            fi
+            export GH_PR_ENRICH_MODEL="$2"
+            shift 2
             ;;
         --prompt)
             if [ -z "${2:-}" ]; then
@@ -2299,37 +2331,115 @@ emit_analysis_schema() {
     printf '%s' "$CLAUDE_ANALYSIS_SCHEMA"
 }
 
+# Optional static-analysis pre-pass over the files the PR touches.
+#
+# Semgrep is deterministic where the model is not: its findings enter the context
+# as ground truth the analyzer can confirm or refute, rather than as another
+# opinion. A missing semgrep is a warning, never a failed run.
+collect_sast_findings() {
+    local output_dir="$1"
+    local config="${GH_PR_ENRICH_SEMGREP_CONFIG:-auto}"
+    local timeout_secs="${GH_PR_ENRICH_SEMGREP_TIMEOUT:-180}"
+    local output_file="$output_dir/sast-findings.json"
+
+    echo '[]' > "$output_file"
+
+    if ! command -v semgrep > /dev/null 2>&1; then
+        echo "⚠️  semgrep not found — skipping the static-analysis pre-pass." >&2
+        echo "   Install it (pip install semgrep) or drop --sast." >&2
+        return 0
+    fi
+
+    # Scan only the files this PR touches that still exist in the working tree.
+    local -a targets=()
+    local path
+    while IFS= read -r path; do
+        [ -n "$path" ] && [ -f "$path" ] && targets+=("$path")
+    done < <(jq -r '(.files // [])[].path' "$output_dir/pr-summary.json" 2>/dev/null)
+
+    if [ "${#targets[@]}" -eq 0 ]; then
+        echo "ℹ️  No changed files present in the working tree — skipping semgrep." >&2
+        return 0
+    fi
+
+    local raw_file="$output_dir/semgrep-raw.json"
+    local rc=0
+    if command -v timeout > /dev/null 2>&1; then
+        timeout --signal=KILL --foreground "$timeout_secs" \
+            semgrep --config "$config" --json --quiet "${targets[@]}" \
+            > "$raw_file" 2> "$output_dir/semgrep-stderr.log" || rc=$?
+    else
+        semgrep --config "$config" --json --quiet "${targets[@]}" \
+            > "$raw_file" 2> "$output_dir/semgrep-stderr.log" || rc=$?
+    fi
+
+    if [ "$rc" -ne 0 ] && [ ! -s "$raw_file" ]; then
+        echo "⚠️  semgrep failed (exit $rc). See $output_dir/semgrep-stderr.log" >&2
+        return 0
+    fi
+
+    jq '[(.results // [])[] | {
+        check_id: .check_id,
+        path: .path,
+        line: (.start.line // 0),
+        severity: (.extra.severity // "INFO"),
+        message: (.extra.message // ""),
+        cwe: ((.extra.metadata.cwe // []) | if type == "array" then . else [.] end)
+    }]' "$raw_file" > "$output_file" 2>/dev/null || echo '[]' > "$output_file"
+
+    local count
+    count=$(jq 'length' "$output_file" 2>/dev/null || echo 0)
+    echo "🔍 semgrep: $count finding(s) across ${#targets[@]} changed file(s)" >&2
+    return 0
+}
+
 run_claude_analysis() {
     local context_file="$1"
     local output_file="$2"
-    local timeout_secs="${CLAUDE_TIMEOUT:-300}"  # Default 5 minutes, configurable via env
+    local code_access="${GH_PR_ENRICH_CODE_ACCESS:-true}"
+    # Reading and verifying against the repository takes longer than paraphrasing
+    # comments; a 300s budget truncated that work.
+    local timeout_secs="${CLAUDE_TIMEOUT:-600}"
+    local model="${GH_PR_ENRICH_MODEL:-sonnet}"
+    local stderr_log
+    stderr_log="$(dirname "$output_file")/claude-stderr.log"
 
-    # Load system prompt from configurable file
     local system_prompt
     system_prompt="$(load_system_prompt)"
 
-    # Store schema in variable for direct use
     local schema_content="$CLAUDE_ANALYSIS_SCHEMA"
 
-    # Build prompt and pipe via stdin to avoid arg length limits
-    local user_prompt="Analyze these unresolved PR comment threads and issue comments (including CI/bot reports) and provide structured analysis:
+    local user_prompt="Analyze these unresolved PR comment threads and issue comments (including CI/bot reports) and provide structured analysis.
+
+Verify each claim against the code before reporting it, sweep every category in the taxonomy, and anchor every finding and task to a file and line.
 
 $(cat "$context_file")"
 
-    echo "🧠 Running Claude analysis (timeout: ${timeout_secs}s)..." >&2
+    # Read-only tools: the analyzer verifies claims against the repository but must
+    # never modify it or run commands. Bash, Write and Edit are deliberately absent.
+    local -a tool_args=()
+    if [ "$code_access" = "true" ]; then
+        tool_args=(--allowedTools "Read" "Grep" "Glob")
+        echo "🧠 Running Claude analysis with read-only repository access (model: $model, timeout: ${timeout_secs}s)..." >&2
+    else
+        echo "🧠 Running Claude analysis without repository access (model: $model, timeout: ${timeout_secs}s)..." >&2
+    fi
 
     local exit_code=0
-    # Use --setting-sources "" to bypass plugin loading which can cause hangs
-    # Use --signal=KILL --foreground because claude --print doesn't respond gracefully to SIGTERM during init
-    # Unset CLAUDECODE to allow nested invocation from within a Claude Code session
+    # --setting-sources "" bypasses plugin loading, which can hang.
+    # --signal=KILL --foreground because claude --print ignores SIGTERM during init.
+    # CLAUDECODE is unset so this can run nested inside a Claude Code session.
+    # stderr goes to a log rather than /dev/null: a discarded error message is the
+    # difference between a diagnosable failure and a mysterious empty analysis.
     if echo "$user_prompt" | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
         timeout --signal=KILL --foreground "$timeout_secs" claude --print \
         --setting-sources "" \
-        --model sonnet \
+        --model "$model" \
         --output-format json \
         --json-schema "$schema_content" \
         --system-prompt "$system_prompt" \
-        > "$output_file" 2>/dev/null; then
+        "${tool_args[@]+"${tool_args[@]}"}" \
+        > "$output_file" 2> "$stderr_log"; then
         echo "✅ Claude analysis complete" >&2
     else
         exit_code=$?
@@ -2338,6 +2448,10 @@ $(cat "$context_file")"
             echo "⏱️  Claude analysis timed out after ${timeout_secs}s (set CLAUDE_TIMEOUT to increase)" >&2
         else
             echo "❌ Claude analysis failed (exit code: $exit_code)" >&2
+        fi
+        if [ -s "$stderr_log" ]; then
+            echo "   Analyzer stderr (tail): $(tail -3 "$stderr_log" | tr '\n' ' ')" >&2
+            echo "   Full log: $stderr_log" >&2
         fi
     fi
 
@@ -2756,6 +2870,12 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
         if [ "$INCLUDE_DIFF" = true ]; then
             echo "Fetching PR diff for richer context..."
             fetch_pr_diff "$OUTPUT_DIR" "$PR_NUMBER"
+        fi
+
+        # Deterministic findings first, so the analyzer can confirm or refute them
+        if [ "$RUN_SAST" = true ]; then
+            echo "Running static-analysis pre-pass on changed files..."
+            collect_sast_findings "$OUTPUT_DIR"
         fi
 
         build_claude_context "$OUTPUT_DIR" "$INCLUDE_DIFF"
