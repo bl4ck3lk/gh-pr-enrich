@@ -783,7 +783,7 @@ After making fixes, the local `.reports/` files are **stale snapshots** from whe
 
 General PR comments (not attached to a code line) are NOT tracked as review threads and have no `isResolved` status. They can still contain actionable feedback.
 
-Since v1.1.0, `--enrich` includes these issue comments (including bot/CI reports from github-actions, security scanners, etc.) in the Claude analysis context, so their findings appear in `claude-analysis.json`. Still check them live at completion — new comments may have arrived after the report was generated.
+`--enrich` includes these issue comments (including bot/CI reports from github-actions and security scanners) in the analysis context, so their findings appear in `claude-analysis.json`. Superseded bot reposts are collapsed to the newest revision, and the count of dropped duplicates appears in the coverage block. Still check them live at completion — new comments may have arrived after the report was generated.
 
 **Check for them:**
 ```bash

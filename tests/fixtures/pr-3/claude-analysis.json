@@ -1,25 +1,66 @@
 {
   "issue_categories": [
     {
-      "name": "Error Handling",
-      "severity": "high",
-      "description": "Unhandled promise rejections",
-      "thread_ids": ["PRRT_test4"]
+      "name": "Unbounded query in the report endpoint",
+      "category": "performance",
+      "verdict": "plausible",
+      "confidence": "medium",
+      "severity": "medium",
+      "impact": "moderate",
+      "likelihood": "possible",
+      "severity_rationale": "Full-table scan grows with tenant size; not reproduced locally.",
+      "description": "listReports() selects without a limit.",
+      "evidence": [
+        {
+          "file": "src/reports.js",
+          "line": 14,
+          "detail": "SELECT with no LIMIT"
+        }
+      ],
+      "thread_ids": [
+        "PRRT_test3"
+      ]
     }
   ],
+  "category_coverage": [
+    {
+      "category": "performance",
+      "verdict": "findings_reported",
+      "note": "See findings above."
+    },
+    {
+      "category": "concurrency",
+      "verdict": "reviewed_none_found",
+      "note": "No shared mutable state in the diff."
+    },
+    {
+      "category": "secrets_exposure",
+      "verdict": "not_applicable",
+      "note": "No credentials or configuration touched."
+    }
+  ],
+  "disputed_comments": [],
   "systemic_issues": [
     {
       "pattern": "Inconsistent error handling",
-      "evidence": ["Thread PRRT_test4: unhandled rejection"],
+      "evidence": [
+        "Thread PRRT_test4: unhandled rejection"
+      ],
       "recommendation": "Add standardized error wrapper"
     }
   ],
   "adjacent_problems": [],
   "task_list": [
     {
-      "priority": "high",
-      "task": "Handle promise rejections",
-      "thread_ids": ["PRRT_test4"]
+      "priority": "medium",
+      "task": "Paginate listReports()",
+      "thread_ids": [
+        "PRRT_test3"
+      ],
+      "file": "src/reports.js",
+      "line": 14,
+      "suggested_fix": "Add limit/offset parameters with a default page size.",
+      "verification": "npm test -- reports.test.js"
     }
   ],
   "process_improvements": [],

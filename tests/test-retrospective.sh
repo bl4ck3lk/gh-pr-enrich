@@ -6,37 +6,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 FIXTURES_DIR="$SCRIPT_DIR/fixtures"
-TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output"
+TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output/retrospective"
 GH_PR_ENRICH="$PROJECT_DIR/gh-pr-enrich"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m' # No Color
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-# Test helper functions
-pass() {
-    echo -e "${GREEN}✓${NC} $1"
-    ((TESTS_PASSED++)) || true
-    ((TESTS_RUN++)) || true
-}
-
-fail() {
-    echo -e "${RED}✗${NC} $1"
-    echo "  $2"
-    ((TESTS_FAILED++)) || true
-    ((TESTS_RUN++)) || true
-}
-
-skip() {
-    echo -e "${YELLOW}○${NC} $1 (skipped)"
-    ((TESTS_RUN++)) || true
-}
+# shellcheck source=lib/assert.sh
+source "$SCRIPT_DIR/lib/assert.sh"
 
 cleanup() {
     rm -rf "$TEST_OUTPUT_DIR"
@@ -288,6 +262,31 @@ test_guiding_questions() {
     fi
 }
 
+test_hotspots_group_by_taxonomy() {
+    # pr-1 and pr-2 report error_handling findings under different names. Grouping
+    # by the free-text name would report two hotspots of one; grouping by the
+    # taxonomy category reports one hotspot spanning two PRs.
+    local output
+    output=$("$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+        --output-dir "$TEST_OUTPUT_DIR/hotspots" --json 2>/dev/null)
+
+    local hotspot_prs
+    hotspot_prs=$(echo "$output" | jq '[.hotspots[]? // empty | select(.category == "error_handling") | .prs | length] | first // 0')
+
+    if [ "${hotspot_prs:-0}" -ge 2 ]; then
+        pass "hotspots group by taxonomy category across PRs (error_handling spans $hotspot_prs PRs)"
+    else
+        fail "hotspots group by taxonomy category across PRs" \
+            "error_handling hotspot covered ${hotspot_prs:-0} PR(s); categories seen: $(echo "$output" | jq -c '[.hotspots[]?.category]')"
+    fi
+
+    if echo "$output" | jq -e '[.hotspots[]? | select(.category == "Error Handling")] | length == 0' > /dev/null 2>&1; then
+        pass "hotspots no longer keyed by free-text finding name"
+    else
+        fail "hotspots no longer keyed by free-text finding name" "found a name-keyed hotspot"
+    fi
+}
+
 test_improvement_tracking() {
     "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" --output-dir "$TEST_OUTPUT_DIR/retro" --min-prs 1 >/dev/null 2>&1
 
@@ -328,18 +327,9 @@ test_format_checklist
 test_format_pr_template
 test_invalid_format
 test_guiding_questions
+test_hotspots_group_by_taxonomy
 test_improvement_tracking
 
 # Summary
-echo ""
-echo "============================================"
-echo "Results: $TESTS_PASSED/$TESTS_RUN passed"
-if [ "$TESTS_FAILED" -gt 0 ]; then
-    echo -e "${RED}$TESTS_FAILED tests failed${NC}"
-    cleanup
-    exit 1
-else
-    echo -e "${GREEN}All tests passed!${NC}"
-    cleanup
-    exit 0
-fi
+trap cleanup EXIT
+suite_end

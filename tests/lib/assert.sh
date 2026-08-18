@@ -9,6 +9,7 @@
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
 NC='\033[0m'
 
 TESTS_RUN=0
@@ -25,6 +26,11 @@ fail() {
     echo -e "${RED}✗${NC} $1"
     [ -n "${2:-}" ] && echo "  $2"
     ((TESTS_FAILED++)) || true
+    ((TESTS_RUN++)) || true
+}
+
+skip() {
+    echo -e "${YELLOW}○${NC} $1 (skipped)"
     ((TESTS_RUN++)) || true
 }
 

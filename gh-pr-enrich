@@ -24,7 +24,7 @@
 
 set -e
 
-VERSION="1.1.0"
+VERSION="2.0.0"
 
 # Handle --version flag
 if [ "$1" = "--version" ] || [ "$1" = "-v" ]; then
@@ -498,13 +498,16 @@ RETRO_HELP
         local aggregated="$1"
 
         echo "$aggregated" | jq '
-            # Collect all issue-category and task-category references across PRs
+            # Collect all issue-category and task-category references across PRs.
+            # Group on the taxonomy category, not the free-text finding name:
+            # "Missing error handling in parse" and "Swallowed exception in sync"
+            # are one hotspot, and grouping by name would report them as two.
             [.prs[] |
                 .pr_meta.number as $pr_num |
                 (
                     # From issue categories
                     ((.issue_categories // [])[] | {
-                        category: .name,
+                        category: (.category // "uncategorized"),
                         severity: .severity,
                         pr: $pr_num
                     }),
@@ -2900,8 +2903,6 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
         build_claude_context "$OUTPUT_DIR" "$INCLUDE_DIFF"
 
         if run_claude_analysis "$OUTPUT_DIR/claude-context.json" "$OUTPUT_DIR/claude-raw-response.json"; then
-            echo "✅ Claude analysis complete"
-
             if jq -e '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" > /dev/null 2>&1; then
                 jq '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" > "$OUTPUT_DIR/claude-analysis.json"
             else
