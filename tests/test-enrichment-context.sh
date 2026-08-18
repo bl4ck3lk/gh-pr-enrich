@@ -232,47 +232,10 @@ test_long_issue_comment_truncation() {
     fi
 }
 
-test_enrichment_triggers_with_only_issue_comments() {
-    # When there are 0 unresolved threads but issue comments exist,
-    # enrichment should still proceed
-    local dir="$TEST_OUTPUT_DIR/only-issue-comments"
-    mkdir -p "$dir"
-    create_test_fixtures "$dir"
-    echo '[]' > "$dir/unresolved-threads.json"
-
-    local issue_count
-    issue_count=$(jq 'length' "$dir/issue-comments.json")
-
-    local unresolved_count
-    unresolved_count=$(jq 'length' "$dir/unresolved-threads.json")
-
-    # Simulate the trigger condition: should run if either has data
-    if [ "$unresolved_count" -gt 0 ] || [ "$issue_count" -gt 0 ]; then
-        pass "Enrichment triggers when only issue comments exist (no unresolved threads)"
-    else
-        fail "Enrichment triggers when only issue comments exist" "Neither condition met"
-    fi
-}
-
-test_no_enrichment_when_both_empty() {
-    local dir="$TEST_OUTPUT_DIR/both-empty"
-    mkdir -p "$dir"
-    create_test_fixtures "$dir"
-    echo '[]' > "$dir/unresolved-threads.json"
-    echo '[]' > "$dir/issue-comments.json"
-
-    local issue_count
-    issue_count=$(jq 'length' "$dir/issue-comments.json")
-
-    local unresolved_count
-    unresolved_count=$(jq 'length' "$dir/unresolved-threads.json")
-
-    if [ "$unresolved_count" -gt 0 ] || [ "$issue_count" -gt 0 ]; then
-        fail "No enrichment when both empty" "Condition unexpectedly true"
-    else
-        pass "No enrichment when both unresolved threads and issue comments are empty"
-    fi
-}
+# The enrichment trigger itself is tested end to end in test-enrichment-gate.sh,
+# which drives the real script against stubbed gh/claude. Re-implementing the
+# condition here proved nothing: the shipped gate could be inverted and a
+# self-contained copy of it would still agree with itself.
 
 # ============================================================================
 # Main
@@ -285,8 +248,6 @@ setup
 test_context_includes_issue_comments
 test_context_with_empty_issue_comments
 test_long_issue_comment_truncation
-test_enrichment_triggers_with_only_issue_comments
-test_no_enrichment_when_both_empty
 
 trap cleanup EXIT
 suite_end

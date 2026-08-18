@@ -312,6 +312,26 @@ assert_contains "$COV_TEXT" "src/retry.js" "coverage section names the truncated
 assert_contains "$COV_TEXT" "superseded bot reposts dropped" "coverage section reports dropped bot reposts"
 assert_contains "$COV_TEXT" "outdated" "coverage section reports outdated threads"
 
+# The "not verified against code" warning must key on whether access was denied,
+# not on strict revision equality. A tree ahead of the PR head — the normal state
+# while addressing feedback — does get access, and warning there trains users to
+# ignore the warning that matters.
+warning_for() {
+    local state="$1" matches="$2" ctx="$TEST_OUTPUT_DIR/warn-ctx.json" out="$TEST_OUTPUT_DIR/warn.md"
+    jq -n --arg state "$state" --argjson matches "$matches" '{
+        coverage: {code_access: {state: $state, reason: "test reason", revision_matches: $matches}}
+    }' > "$ctx"
+    "$GH_PR_ENRICH" --test-call generate_coverage_section "$ctx" "$out" >/dev/null 2>&1 || true
+    cat "$out" 2>/dev/null || echo ""
+}
+
+assert_not_contains "$(warning_for enabled false)" "could not read the repository" \
+    "no warning when access was granted on a tree ahead of the PR head"
+assert_contains "$(warning_for disabled false)" "could not read the repository" \
+    "a warning when access was actually denied"
+assert_not_contains "$(warning_for enabled true)" "could not read the repository" \
+    "no warning when the tree is exactly at the PR head"
+
 # ---------------------------------------------------------------------------
 # Large inputs: a big PR must not blow the argument list
 #

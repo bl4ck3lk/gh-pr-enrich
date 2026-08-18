@@ -1651,19 +1651,41 @@ if [ "$1" = "address" ]; then
                 echo ""
                 ;;
             o|O)
-                # Get first thread URL
+                # Get first thread URL.
+                #
+                # Everything here comes from claude-analysis.json, which is analyzer
+                # output derived from PR content: a PR author who prompt-injects the
+                # analyzer chooses these strings. The id is therefore validated
+                # before use and passed to jq as data (--arg), never interpolated
+                # into the program text — an id containing a quote would otherwise
+                # close the string literal and supply its own jq program, which can
+                # synthesize any URL and read $ENV.
                 FIRST_TID=$(echo "$TASK" | jq -r '.thread_ids[0] // empty')
                 if [ -n "$FIRST_TID" ]; then
+                    if [[ ! "$FIRST_TID" =~ ^PRRT_[A-Za-z0-9_-]+$ ]]; then
+                        echo "  ⚠️  Invalid thread ID format, refusing to open: $FIRST_TID"
+                        continue
+                    fi
                     # Find URL in comment threads
                     THREAD_FILE=".reports/pr-reviews/pr-$ADDRESS_PR/comment-threads.json"
                     if [ -f "$THREAD_FILE" ]; then
-                        URL=$(jq -r ".data.repository.pullRequest.reviewThreads.nodes[] | select(.id == \"$FIRST_TID\") | .comments.nodes[0].url // empty" "$THREAD_FILE")
+                        URL=$(jq -r --arg tid "$FIRST_TID" \
+                            '.data.repository.pullRequest.reviewThreads.nodes[]
+                             | select(.id == $tid) | .comments.nodes[0].url // empty' \
+                            "$THREAD_FILE")
+                        GITHUB_URL_RE='^https://github\.com/[A-Za-z0-9._/#?=&%~-]*$'
+                        if [ -n "$URL" ] && [[ ! "$URL" =~ $GITHUB_URL_RE ]]; then
+                            # Defense in depth: only ever hand a github.com https URL
+                            # to the browser, whatever the file claims.
+                            echo "  ⚠️  Refusing to open a non-GitHub URL: $URL"
+                            URL=""
+                        fi
                         if [ -n "$URL" ]; then
                             echo "  🌐 Opening: $URL"
                             # Try macOS 'open', then Linux 'xdg-open'; Windows not supported
                             open "$URL" 2>/dev/null || xdg-open "$URL" 2>/dev/null || echo "  Could not open browser (try manually: $URL)"
                         else
-                            echo "  Could not find URL for thread $FIRST_TID"
+                            echo "  Could not find a usable URL for thread $FIRST_TID"
                         fi
                     else
                         echo "  Thread details file not found: $THREAD_FILE"
@@ -2527,11 +2549,30 @@ collect_sast_findings() {
         return 0
     fi
 
+    # The scan reads the working tree, so it is bound by the same revision rule as
+    # the analyzer. Scanning an unrelated revision produces findings with line
+    # anchors for code the PR does not contain — and they enter the context
+    # labelled as deterministic ground truth, which is worse than having none.
+    local pr_head_sha access_line
+    pr_head_sha="$(jq -r '.headRefOid // ""' "$output_dir/pr-summary.json" 2>/dev/null || echo "")"
+    access_line="$(resolve_code_access "$pr_head_sha")"
+    if [ "${access_line%%:*}" = "disabled" ]; then
+        echo "⚠️  Skipping the semgrep pre-pass: ${access_line#*: }" >&2
+        return 0
+    fi
+
+    # Changed-file paths from GitHub are repository-relative, so they are resolved
+    # against the repository root. Resolving them against the current directory
+    # drops every target when the extension runs from a subdirectory, and a
+    # skipped scan is indistinguishable from a clean one.
+    local repo_root
+    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || echo ".")"
+
     # Scan only the files this PR touches that still exist in the working tree.
     local -a targets=()
     local path
     while IFS= read -r path; do
-        [ -n "$path" ] && [ -f "$path" ] && targets+=("$path")
+        [ -n "$path" ] && [ -f "$repo_root/$path" ] && targets+=("$repo_root/$path")
     done < <(jq -r '(.files // [])[].path' "$output_dir/pr-summary.json" 2>/dev/null)
 
     if [ "${#targets[@]}" -eq 0 ]; then
@@ -2543,10 +2584,10 @@ collect_sast_findings() {
     local rc=0
     if command -v timeout > /dev/null 2>&1; then
         timeout --signal=KILL --foreground "$timeout_secs" \
-            semgrep --config "$config" --json --quiet "${targets[@]}" \
+            semgrep --config "$config" --json --quiet -- "${targets[@]}" \
             > "$raw_file" 2> "$output_dir/semgrep-stderr.log" || rc=$?
     else
-        semgrep --config "$config" --json --quiet "${targets[@]}" \
+        semgrep --config "$config" --json --quiet -- "${targets[@]}" \
             > "$raw_file" 2> "$output_dir/semgrep-stderr.log" || rc=$?
     fi
 
@@ -2709,8 +2750,9 @@ generate_coverage_section() {
       "| Failing checks | " + (($c.inputs.failing_checks // 0) | tostring) + " | CI failures supplied as evidence |\n" +
       "| SAST findings | " + (($c.inputs.sast_findings // 0) | tostring) + " | static-analysis results (run with --sast) |\n" +
       "| Code access | " + (($c.code_access.state // "unknown")) + " | " + (($c.code_access.reason // "") | gsub("\\|"; "\\\\|")) + " |\n\n" +
-      (if ($c.code_access.revision_matches // false) then ""
-       else "**The working tree was not at the PR head**, so findings were not verified against the code in this PR. Run `gh pr checkout <PR>` and re-run to verify against the right revision.\n\n" end) +
+      (if ($c.code_access.state // "enabled") == "disabled"
+       then "**The analyzer could not read the repository**, so no finding was verified against code: " + ($c.code_access.reason // "") + "\n\n"
+       else "" end) +
       "_Truncation limit: " + (($c.truncation_limit_chars // 0) | tostring) + " characters per comment, issue body and file diff._\n"
     ' "$context_file" > "$output_file" 2>/dev/null || echo "" > "$output_file"
 }

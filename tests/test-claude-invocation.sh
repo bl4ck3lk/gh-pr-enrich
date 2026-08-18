@@ -183,6 +183,59 @@ OFF=$(env GH_PR_ENRICH_CODE_ACCESS=false PATH="$STUB_DIR:$PATH" \
     "$GH_PR_ENRICH" --test-call resolve_code_access "$LOCAL_HEAD" 2>&1 || true)
 assert_contains "$OFF" "disabled" "--no-code-access still wins over a matching revision"
 
+# --- the rest of the decision matrix ---------------------------------------
+# Ahead of the PR head: the normal state while addressing feedback, since fixing
+# review comments means committing locally. That code is still the PR's code plus
+# the fixes in progress, so access is granted and the report says so.
+AHEAD_REPO="$TEST_OUTPUT_DIR/ahead-repo"
+mkdir -p "$AHEAD_REPO"
+(cd "$AHEAD_REPO" && git init -q . && git config user.email t@t && git config user.name t \
+    && echo one > f.txt && git add -A && git commit -qm first \
+    && echo two >> f.txt && git commit -qam second)
+BASE_SHA=$(git -C "$AHEAD_REPO" rev-parse HEAD~1)
+
+AHEAD=$( (cd "$AHEAD_REPO" && "$GH_PR_ENRICH" --test-call resolve_code_access "$BASE_SHA" 2>&1) || true)
+assert_contains "$AHEAD" "enabled" "code access is enabled when the tree is ahead of the PR head"
+assert_contains "$AHEAD" "1 commit(s) ahead" "the report says how far ahead the tree is"
+
+# An unrelated repository is not "ahead" — it is a different history entirely.
+UNRELATED="$TEST_OUTPUT_DIR/unrelated-repo"
+mkdir -p "$UNRELATED"
+(cd "$UNRELATED" && git init -q . && git config user.email t@t && git config user.name t \
+    && echo other > g.txt && git add -A && git commit -qm only)
+UNRELATED_OUT=$( (cd "$UNRELATED" && "$GH_PR_ENRICH" --test-call resolve_code_access "$BASE_SHA" 2>&1) || true)
+assert_contains "$UNRELATED_OUT" "disabled" "an unrelated history does not count as ahead of the PR head"
+
+# Not a git checkout at all. This has to live outside the repository, or git
+# walks up and finds this checkout's HEAD.
+NOGIT=$(mktemp -d)
+trap 'rm -rf "$NOGIT"; cleanup' EXIT
+NOGIT_OUT=$( (cd "$NOGIT" && "$GH_PR_ENRICH" --test-call resolve_code_access "$LOCAL_HEAD" 2>&1) || true)
+assert_contains "$NOGIT_OUT" "disabled" "code access is disabled outside a git checkout"
+assert_contains "$NOGIT_OUT" "not a git checkout" "the reason names the missing checkout"
+
+NOGIT_FORCED=$( (cd "$NOGIT" && env GH_PR_ENRICH_CODE_ACCESS=true \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "$LOCAL_HEAD" 2>&1) || true)
+assert_contains "$NOGIT_FORCED" "enabled" "the override also applies outside a git checkout"
+
+# Unknown PR head (a summary without headRefOid).
+UNKNOWN=$(revision_state "")
+assert_contains "$UNKNOWN" "disabled" "code access is disabled when the PR head is unknown"
+assert_contains "$UNKNOWN" "unknown" "the reason names the unknown revision"
+
+UNKNOWN_FORCED=$(env GH_PR_ENRICH_CODE_ACCESS=true PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "" 2>&1 || true)
+assert_contains "$UNKNOWN_FORCED" "enabled" "the override applies when the PR head is unknown"
+
+# --- the CLI flags, not just the environment variable -----------------------
+flag_state() {
+    # Runs the real argument parser, then reports what the analyzer would be told.
+    env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" 1 "$1" --enrich --output-dir "$TEST_OUTPUT_DIR/flag" 2>&1 || true
+}
+assert_contains "$(flag_state --no-code-access)" "WITHOUT repository access" \
+    "--no-code-access reaches the analyzer"
+assert_contains "$("$GH_PR_ENRICH" --help 2>&1)" "--code-access" "--code-access is documented in help"
+
 # The whole run must record which revision was inspected.
 REV_DIR="$TEST_OUTPUT_DIR/revision"
 mkdir -p "$REV_DIR"
@@ -269,16 +322,21 @@ assert_contains "$MALFORMED_OUT" "unresolved-threads.json" "the malformed file i
 # ---------------------------------------------------------------------------
 # SAST pre-pass
 # ---------------------------------------------------------------------------
-# The collector scans changed files that exist in the working tree, so the
-# fixture is a small workspace rather than a bare report directory.
+# The collector scans changed files in the working tree, and only when that tree
+# holds the PR's code — so the fixture is a real checkout whose HEAD is the
+# declared PR head.
 WORKSPACE="$TEST_OUTPUT_DIR/workspace"
 SAST_DIR="$WORKSPACE/reports"
 mkdir -p "$SAST_DIR" "$WORKSPACE/src"
 echo "const x = 1;" > "$WORKSPACE/src/retry.js"
-cat > "$SAST_DIR/pr-summary.json" << 'EOF'
-{"number": 1, "title": "t", "body": "", "author": {"login": "u"},
- "files": [{"path": "src/retry.js"}, {"path": "src/deleted-by-this-pr.js"}]}
-EOF
+(cd "$WORKSPACE" && git init -q . && git config user.email t@t && git config user.name t \
+    && git add -A && git commit -qm init)
+WORKSPACE_HEAD=$(git -C "$WORKSPACE" rev-parse HEAD)
+jq -n --arg sha "$WORKSPACE_HEAD" '{
+    number: 1, title: "t", body: "", author: {login: "u"},
+    files: [{path: "src/retry.js"}, {path: "src/deleted-by-this-pr.js"}],
+    headRefOid: $sha
+}' > "$SAST_DIR/pr-summary.json"
 
 (cd "$WORKSPACE" && PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call collect_sast_findings "reports" >/dev/null 2>&1) || true
 SAST_FILE="$SAST_DIR/sast-findings.json"
@@ -289,6 +347,53 @@ assert_jq "$SAST_FILE" '.[0].line == 12' "finding carries its line"
 assert_jq "$SAST_FILE" '.[0].severity == "ERROR"' "finding carries its severity"
 assert_jq "$SAST_FILE" '.[0].check_id | contains("unsafe-exec")' "finding carries its rule id"
 assert_jq "$SAST_FILE" '.[0].message | contains("unsafe exec")' "finding carries its message"
+
+# The SAST pass reads the working tree, so it is governed by the same revision
+# rule as the analyzer. Scanning `main` while analyzing someone else's PR yields
+# findings with line anchors for code the PR does not contain — and those enter
+# the context labelled as deterministic ground truth.
+MISMATCH_WS="$TEST_OUTPUT_DIR/sast-mismatch"
+mkdir -p "$MISMATCH_WS/reports" "$MISMATCH_WS/src"
+echo "const x = 1;" > "$MISMATCH_WS/src/retry.js"
+# A real checkout whose HEAD is not the declared PR head — the "reviewing someone
+# else's PR from main" case, rather than the simpler not-a-repo case.
+(cd "$MISMATCH_WS" && git init -q . && git config user.email t@t && git config user.name t \
+    && git add -A && git commit -qm init)
+cat > "$MISMATCH_WS/reports/pr-summary.json" << 'EOF'
+{"number": 1, "title": "t", "body": "", "author": {"login": "u"},
+ "files": [{"path": "src/retry.js"}],
+ "headRefOid": "0000000000000000000000000000000000000000"}
+EOF
+
+MISMATCH_OUT=$( (cd "$MISMATCH_WS" && PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call collect_sast_findings "reports" 2>&1) || true)
+
+assert_contains "$MISMATCH_OUT" "Skipping the semgrep pre-pass" \
+    "the SAST pass is skipped when the tree is not the PR revision"
+assert_contains "$MISMATCH_OUT" "but the PR head is" \
+    "the skip message names the revision mismatch"
+assert_jq_eq "$MISMATCH_WS/reports/sast-findings.json" 'length' "0" \
+    "no SAST findings are fabricated from the wrong revision"
+
+# Changed-file paths from GitHub are repository-relative. Resolving them against
+# the current directory silently drops every target when the extension is run
+# from a subdirectory — a skipped scan that looks like a clean one.
+SUBDIR_WS="$TEST_OUTPUT_DIR/sast-subdir"
+mkdir -p "$SUBDIR_WS/src" "$SUBDIR_WS/reports"
+(cd "$SUBDIR_WS" && git init -q . && git config user.email t@t && git config user.name t)
+echo "const x = 1;" > "$SUBDIR_WS/src/retry.js"
+(cd "$SUBDIR_WS" && git add -A && git commit -qm init)
+SUBDIR_HEAD=$(git -C "$SUBDIR_WS" rev-parse HEAD)
+jq -n --arg sha "$SUBDIR_HEAD" '{number: 1, title: "t", body: "", author: {login: "u"},
+    files: [{path: "src/retry.js"}], headRefOid: $sha}' > "$SUBDIR_WS/reports/pr-summary.json"
+
+SUBDIR_OUT=$( (cd "$SUBDIR_WS/src" && PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call collect_sast_findings "../reports" 2>&1) || true)
+
+assert_jq_eq "$SUBDIR_WS/reports/sast-findings.json" 'length' "1" \
+    "changed files are found when running from a subdirectory"
+assert_not_contains "$SUBDIR_OUT" "No changed files present" \
+    "the scan is not silently skipped from a subdirectory"
 
 # Missing semgrep must warn and continue, never abort the run.
 EMPTY_STUBS="$TEST_OUTPUT_DIR/empty-stubs"
