@@ -2039,13 +2039,26 @@ fetch_linked_issues() {
       }
     }'
 
-    if gh api graphql -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
-            -f query="$query" 2>/dev/null \
-            | jq '[.data.repository.pullRequest.closingIssuesReferences.nodes[]?]' > "$output_file" 2>/dev/null; then
-        return 0
+    # Fetch first, then transform. Piping gh straight into jq would report jq's
+    # exit status: a failed gh leaves jq reading an empty stream, exiting 0, and
+    # the caller believing it wrote a valid file when the file is zero bytes.
+    local raw_file="${output_file}.raw"
+    if ! gh api graphql -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
+            -f query="$query" > "$raw_file" 2>/dev/null; then
+        rm -f "$raw_file"
+        echo '[]' > "$output_file"
+        return 1
     fi
-    echo '[]' > "$output_file"
-    return 1
+
+    if ! jq '[.data.repository.pullRequest.closingIssuesReferences.nodes[]?]' \
+            "$raw_file" > "$output_file" 2>/dev/null; then
+        rm -f "$raw_file"
+        echo '[]' > "$output_file"
+        return 1
+    fi
+
+    rm -f "$raw_file"
+    return 0
 }
 
 extract_unresolved_threads() {
@@ -2162,48 +2175,70 @@ build_claude_context() {
 
     dedupe_bot_comments "$output_dir/issue-comments.json" "$output_dir/issue-comments-deduped.json"
 
-    local diff_json='{"raw_diff": "", "file_diffs": []}'
+    # Optional inputs are read from disk by jq, never passed through argv: a large
+    # PR diff runs to several megabytes and would fail with E2BIG ("Argument list
+    # too long") on exactly the PRs that most need analysis. Absent or unreadable
+    # files are replaced with an empty document so one missing input cannot take
+    # the whole context down.
+    local optional
+    for optional in checks.json linked-issues.json sast-findings.json; do
+        if [ ! -s "$output_dir/$optional" ] || ! jq -e 'type == "array"' "$output_dir/$optional" > /dev/null 2>&1; then
+            echo '[]' > "$output_dir/$optional"
+        fi
+    done
+
     local with_diff=false
-    if [ "$include_diff" = "true" ] && [ -f "$output_dir/pr-diff.json" ]; then
-        diff_json="$(<"$output_dir/pr-diff.json")"
+    if [ "$include_diff" = "true" ] && [ -s "$output_dir/pr-diff.json" ] \
+       && jq -e '.file_diffs? // empty | type == "array"' "$output_dir/pr-diff.json" > /dev/null 2>&1; then
         with_diff=true
     fi
-
-    local checks_json='[]'
-    if [ -f "$output_dir/checks.json" ]; then
-        checks_json="$(<"$output_dir/checks.json")"
+    if [ ! -s "$output_dir/pr-diff.json" ] || ! jq -e . "$output_dir/pr-diff.json" > /dev/null 2>&1; then
+        echo '{"raw_diff": "", "file_diffs": []}' > "$output_dir/pr-diff.json"
     fi
 
-    local linked_json='[]'
-    if [ -f "$output_dir/linked-issues.json" ]; then
-        linked_json="$(<"$output_dir/linked-issues.json")"
+    # Whether reading the working tree is meaningful depends on the revision it
+    # holds, so the decision is made here and recorded in the context the
+    # analyzer receives.
+    local pr_head_sha
+    pr_head_sha="$(jq -r '.headRefOid // ""' "$output_dir/pr-summary.json" 2>/dev/null || echo "")"
+    local local_head=""
+    if command -v git > /dev/null 2>&1; then
+        local_head="$(git rev-parse HEAD 2>/dev/null || echo "")"
     fi
-
-    local sast_json='[]'
-    if [ -f "$output_dir/sast-findings.json" ]; then
-        sast_json="$(<"$output_dir/sast-findings.json")"
-    fi
+    local access_line access_state access_reason
+    access_line="$(resolve_code_access "$pr_head_sha")"
+    access_state="${access_line%%:*}"
+    access_reason="${access_line#*: }"
 
     # One jq program builds the whole context. The coverage block records what was
     # dropped or shortened, so a truncated input can never read as a complete one.
     jq -n \
-        --argjson pr "$(<"$output_dir/pr-summary.json")" \
+        --slurpfile pr_doc "$output_dir/pr-summary.json" \
         --slurpfile threads "$output_dir/unresolved-threads.json" \
         --slurpfile raw_comments "$output_dir/issue-comments.json" \
         --slurpfile deduped "$output_dir/issue-comments-deduped.json" \
-        --argjson checks "$checks_json" \
-        --argjson linked "$linked_json" \
-        --argjson sast "$sast_json" \
-        --argjson diff "$diff_json" \
+        --slurpfile checks_doc "$output_dir/checks.json" \
+        --slurpfile linked_doc "$output_dir/linked-issues.json" \
+        --slurpfile sast_doc "$output_dir/sast-findings.json" \
+        --slurpfile diff_doc "$output_dir/pr-diff.json" \
         --argjson with_diff "$with_diff" \
         --argjson limit "$truncate_at" \
+        --arg pr_head_sha "$pr_head_sha" \
+        --arg local_head "$local_head" \
+        --arg access_state "$access_state" \
+        --arg access_reason "$access_reason" \
         '
         def trunc($text): if (($text // "") | length) > $limit
             then (($text // "")[0:$limit] + "\n... (truncated)")
             else ($text // "") end;
         def was_truncated($text): (($text // "") | length) > $limit;
 
-        ($threads[0] // []) as $thread_list
+        ($pr_doc[0] // {}) as $pr
+        | ($checks_doc[0] // []) as $checks
+        | ($linked_doc[0] // []) as $linked
+        | ($sast_doc[0] // []) as $sast
+        | ($diff_doc[0] // {}) as $diff
+        | ($threads[0] // []) as $thread_list
         | ($raw_comments[0] // []) as $raw
         | (($deduped[0] // {}) | (.kept // [])) as $kept
         | (($deduped[0] // {}) | (.superseded // [])) as $superseded
@@ -2242,6 +2277,13 @@ build_claude_context() {
             sast_findings: $sast,
             coverage: {
                 truncation_limit_chars: $limit,
+                code_access: {
+                    state: $access_state,
+                    reason: $access_reason,
+                    pr_head_sha: (if $pr_head_sha == "" then null else $pr_head_sha end),
+                    inspected_sha: (if $local_head == "" then null else $local_head end),
+                    revision_matches: ($pr_head_sha != "" and $pr_head_sha == $local_head)
+                },
                 issue_comments: {
                     total: ($raw | length),
                     included: ($kept | length),
@@ -2479,10 +2521,85 @@ collect_sast_findings() {
     return 0
 }
 
+# Decide whether the analyzer may read the working tree.
+#
+# Reading files only helps if those files are the PR's files. Analyzing PR #123
+# from `main` would let the model "verify" against code the PR does not contain
+# and emit confirmed verdicts with file:line anchors that point at the wrong
+# revision — worse than not reading at all, because the output looks verified.
+#
+# Prints "enabled" or "disabled" followed by the reason. Honors an explicit
+# GH_PR_ENRICH_CODE_ACCESS setting in both directions.
+resolve_code_access() {
+    local pr_head_sha="${1:-}"
+    local explicit="${GH_PR_ENRICH_CODE_ACCESS:-}"
+
+    if [ "$explicit" = "false" ]; then
+        echo "disabled: repository access turned off by --no-code-access"
+        return 0
+    fi
+
+    local local_head=""
+    if command -v git > /dev/null 2>&1; then
+        local_head="$(git rev-parse HEAD 2>/dev/null || echo "")"
+    fi
+
+    if [ -z "$local_head" ]; then
+        if [ "$explicit" = "true" ]; then
+            echo "enabled: not a git checkout, but access was requested explicitly"
+            return 0
+        fi
+        echo "disabled: not a git checkout, so the working tree cannot be matched to the PR"
+        return 0
+    fi
+
+    if [ -z "$pr_head_sha" ] || [ "$pr_head_sha" = "null" ]; then
+        if [ "$explicit" = "true" ]; then
+            echo "enabled: PR head revision unknown, but access was requested explicitly"
+            return 0
+        fi
+        echo "disabled: PR head revision unknown, so the working tree cannot be matched to the PR"
+        return 0
+    fi
+
+    if [ "$local_head" = "$pr_head_sha" ]; then
+        echo "enabled: working tree is at the PR head (${local_head:0:7})"
+        return 0
+    fi
+
+    # Addressing feedback means committing locally, so the tree is usually ahead
+    # of the PR head rather than unrelated to it. That code is still this PR's
+    # code — plus the fixes in progress — so reading it is meaningful.
+    if git merge-base --is-ancestor "$pr_head_sha" HEAD 2>/dev/null; then
+        local ahead
+        ahead="$(git rev-list --count "$pr_head_sha..HEAD" 2>/dev/null || echo "?")"
+        echo "enabled: working tree is ${ahead} commit(s) ahead of the PR head (${pr_head_sha:0:7}); findings may reflect local changes not yet pushed"
+        return 0
+    fi
+
+    if [ "$explicit" = "true" ]; then
+        echo "enabled: working tree is at ${local_head:0:7}, not the PR head ${pr_head_sha:0:7} — findings may cite the wrong revision (override in effect)"
+        return 0
+    fi
+
+    echo "disabled: working tree is at ${local_head:0:7} but the PR head is ${pr_head_sha:0:7}. Run 'gh pr checkout <PR>' first, or pass --code-access to analyze the tree as it is."
+    return 0
+}
+
 run_claude_analysis() {
     local context_file="$1"
     local output_file="$2"
-    local code_access="${GH_PR_ENRICH_CODE_ACCESS:-true}"
+
+    # Decide here rather than trusting what the context recorded: the tree may
+    # have moved since it was built, and --no-code-access must apply either way.
+    local pr_head_sha
+    pr_head_sha="$(jq -r '.coverage.code_access.pr_head_sha // ""' "$context_file" 2>/dev/null || echo "")"
+    local access_line access_state access_reason
+    access_line="$(resolve_code_access "$pr_head_sha")"
+    access_state="${access_line%%:*}"
+    access_reason="${access_line#*: }"
+    local code_access="true"
+    [ "$access_state" = "disabled" ] && code_access="false"
     # Reading and verifying against the repository takes longer than paraphrasing
     # comments; a 300s budget truncated that work.
     local timeout_secs="${CLAUDE_TIMEOUT:-600}"
@@ -2506,8 +2623,10 @@ $context_payload"
         tools=("Read" "Grep" "Glob")
         echo "🧠 Running Claude analysis with read-only repository access (model: $model, timeout: ${timeout_secs}s)..." >&2
     else
-        echo "🧠 Running Claude analysis without repository access (model: $model, timeout: ${timeout_secs}s)..." >&2
+        echo "🧠 Running Claude analysis WITHOUT repository access (model: $model, timeout: ${timeout_secs}s)..." >&2
+        echo "   Findings cannot be verified against code and will be reported as 'plausible' at best." >&2
     fi
+    [ -n "$access_reason" ] && echo "   Code access: $access_reason" >&2
 
     invoke_claude "Claude analysis" "$timeout_secs" "$output_file" \
         "$system_prompt" "$CLAUDE_ANALYSIS_SCHEMA" "$user_prompt" \
@@ -2537,7 +2656,10 @@ generate_coverage_section() {
       "| Commits | " + (($c.inputs.commits // 0) | tostring) + " | commit messages supplied as intent |\n" +
       "| Linked issues | " + (($c.inputs.linked_issues // 0) | tostring) + " | issue bodies supplied as intent |\n" +
       "| Failing checks | " + (($c.inputs.failing_checks // 0) | tostring) + " | CI failures supplied as evidence |\n" +
-      "| SAST findings | " + (($c.inputs.sast_findings // 0) | tostring) + " | static-analysis results (run with --sast) |\n\n" +
+      "| SAST findings | " + (($c.inputs.sast_findings // 0) | tostring) + " | static-analysis results (run with --sast) |\n" +
+      "| Code access | " + (($c.code_access.state // "unknown")) + " | " + (($c.code_access.reason // "") | gsub("\\|"; "\\\\|")) + " |\n\n" +
+      (if ($c.code_access.revision_matches // false) then ""
+       else "**The working tree was not at the PR head**, so findings were not verified against the code in this PR. Run `gh pr checkout <PR>` and re-run to verify against the right revision.\n\n" end) +
       "_Truncation limit: " + (($c.truncation_limit_chars // 0) | tostring) + " characters per comment, issue body and file diff._\n"
     ' "$context_file" > "$output_file" 2>/dev/null || echo "" > "$output_file"
 }
@@ -2658,7 +2780,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema fetch_review_threads fetch_linked_issues"
+TEST_CALLABLE_FUNCTIONS="resolve_code_access build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema fetch_review_threads fetch_linked_issues"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in

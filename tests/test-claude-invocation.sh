@@ -69,7 +69,13 @@ STUB
 chmod +x "$STUB_DIR/semgrep"
 
 CONTEXT="$TEST_OUTPUT_DIR/claude-context.json"
-echo '{"pr": {"title": "t"}, "unresolved_threads": [], "issue_comments": []}' > "$CONTEXT"
+# The context records the PR head; the analyzer re-checks it against the working
+# tree before granting tools, so the fixture claims the revision under test.
+HEAD_SHA=$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo "")
+jq -n --arg sha "$HEAD_SHA" '{
+    pr: {title: "t"}, unresolved_threads: [], issue_comments: [],
+    coverage: {code_access: {pr_head_sha: $sha}}
+}' > "$CONTEXT"
 RESPONSE="$TEST_OUTPUT_DIR/response.json"
 
 run_analysis() {
@@ -147,6 +153,53 @@ assert_contains "$(sed -n '/^run_claude_analysis() {/,/^}/p' "$GH_PR_ENRICH")" '
     "PR analysis delegates to the shared invoker"
 assert_contains "$(sed -n '/run_retrospective_claude_analysis() {/,/^    }/p' "$GH_PR_ENRICH")" 'invoke_claude' \
     "retrospective analysis delegates to the shared invoker"
+
+# ---------------------------------------------------------------------------
+# Code access is only meaningful when the working tree holds the PR's code
+#
+# Reading `main` while analyzing PR #123 produces confident verdicts and
+# file:line anchors for code the PR does not contain. The revision must be
+# checked, not assumed.
+# ---------------------------------------------------------------------------
+revision_state() {
+    # resolve_code_access PR_HEAD_SHA -> prints "enabled"/"disabled" plus reason
+    env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call resolve_code_access "$1" 2>&1 || true
+}
+
+LOCAL_HEAD=$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo "nogit")
+
+MATCHED=$(revision_state "$LOCAL_HEAD")
+assert_contains "$MATCHED" "enabled" "code access is enabled when the tree is at the PR head"
+
+MISMATCHED=$(revision_state "0000000000000000000000000000000000000000")
+assert_contains "$MISMATCHED" "disabled" "code access is disabled when the tree is not at the PR head"
+assert_contains "$MISMATCHED" "gh pr checkout" "the user is told how to align the working tree"
+
+FORCED=$(env GH_PR_ENRICH_CODE_ACCESS=true PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "0000000000000000000000000000000000000000" 2>&1 || true)
+assert_contains "$FORCED" "enabled" "an explicit override re-enables code access on a mismatch"
+
+OFF=$(env GH_PR_ENRICH_CODE_ACCESS=false PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "$LOCAL_HEAD" 2>&1 || true)
+assert_contains "$OFF" "disabled" "--no-code-access still wins over a matching revision"
+
+# The whole run must record which revision was inspected.
+REV_DIR="$TEST_OUTPUT_DIR/revision"
+mkdir -p "$REV_DIR"
+cat > "$REV_DIR/pr-summary.json" << EOF
+{"number": 5, "title": "t", "body": "b", "author": {"login": "u"}, "files": [],
+ "headRefOid": "$LOCAL_HEAD"}
+EOF
+echo '[]' > "$REV_DIR/unresolved-threads.json"
+echo '[]' > "$REV_DIR/issue-comments.json"
+"$GH_PR_ENRICH" --test-call build_claude_context "$REV_DIR" false >/dev/null 2>&1 || true
+
+assert_jq "$REV_DIR/claude-context.json" '.coverage.code_access != null' \
+    "coverage records the code-access state"
+assert_jq "$REV_DIR/claude-context.json" '.coverage.code_access.pr_head_sha != null' \
+    "coverage records the PR head revision"
+assert_jq "$REV_DIR/claude-context.json" '.coverage.code_access.revision_matches == true' \
+    "coverage records whether the inspected tree matches the PR"
 
 # ---------------------------------------------------------------------------
 # Failure paths must be diagnosable, and must not leak shell internals

@@ -60,6 +60,39 @@ assert_jq "$THREADS" '[.data.repository.pullRequest.reviewThreads.nodes[].id] | 
     "thread from the second page is not dropped"
 
 # ---------------------------------------------------------------------------
+# A failing fetch must not leave an empty file behind
+#
+# `gh ... | jq ...` reports jq's exit status. When gh fails (missing scope,
+# transient 5xx), jq reads nothing, exits 0, and the caller sees success with a
+# zero-byte file — which then takes down the context build downstream.
+# ---------------------------------------------------------------------------
+FAIL_STUB_DIR="$TEST_OUTPUT_DIR/failing-gh"
+mkdir -p "$FAIL_STUB_DIR"
+cat > "$FAIL_STUB_DIR/gh" << 'STUB'
+#!/bin/bash
+echo "gh: HTTP 502 (Bad Gateway)" >&2
+exit 1
+STUB
+chmod +x "$FAIL_STUB_DIR/gh"
+
+LINKED_OUT="$TEST_OUTPUT_DIR/linked-from-failure.json"
+PATH="$FAIL_STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call fetch_linked_issues owner repo 1 "$LINKED_OUT" >/dev/null 2>&1 || true
+
+if [ -s "$LINKED_OUT" ]; then
+    assert_jq "$LINKED_OUT" 'type == "array" and length == 0' \
+        "a failed linked-issue fetch still writes a valid empty array"
+else
+    fail "a failed linked-issue fetch still writes a valid empty array" \
+        "file is zero bytes, which breaks the context build"
+fi
+
+# The same applies to the thread fetch.
+THREADS_OUT="$TEST_OUTPUT_DIR/threads-from-failure.json"
+rc=0
+PATH="$FAIL_STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call fetch_review_threads owner repo 1 "$THREADS_OUT" >/dev/null 2>&1 || rc=$?
+assert_eq "1" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)" "a failed thread fetch reports failure to its caller"
+
+# ---------------------------------------------------------------------------
 # Outdated threads are labelled and kept
 # ---------------------------------------------------------------------------
 UNRESOLVED="$TEST_OUTPUT_DIR/unresolved-threads.json"
@@ -197,5 +230,52 @@ assert_contains "$COV_TEXT" "Analysis Context Coverage" "coverage section has a 
 assert_contains "$COV_TEXT" "src/retry.js" "coverage section names the truncated file"
 assert_contains "$COV_TEXT" "superseded bot reposts dropped" "coverage section reports dropped bot reposts"
 assert_contains "$COV_TEXT" "outdated" "coverage section reports outdated threads"
+
+# ---------------------------------------------------------------------------
+# Large inputs: a big PR must not blow the argument list
+#
+# pr-diff.json carries the whole raw diff plus per-file copies, so on a large PR
+# it runs to megabytes. Passing it through argv fails with E2BIG ("Argument list
+# too long") — and it fails on exactly the PRs that most need analysis.
+# ---------------------------------------------------------------------------
+BIG_DIR="$TEST_OUTPUT_DIR/big"
+mkdir -p "$BIG_DIR"
+cp "$UNRESOLVED" "$BIG_DIR/unresolved-threads.json"
+echo '[]' > "$BIG_DIR/issue-comments.json"
+
+python3 - "$BIG_DIR" << 'PY'
+import json, sys, pathlib
+
+out = pathlib.Path(sys.argv[1])
+
+# ~4 MB of diff across many files, and a PR summary with many files and commits.
+chunk = "diff --git a/src/f%d.js b/src/f%d.js\n" + ("+ padding line to make this file diff large\n" * 900)
+file_diffs = [{"file": "src/f%d.js" % i, "content": chunk % (i, i)} for i in range(60)]
+raw = "".join(d["content"] for d in file_diffs)
+(out / "pr-diff.json").write_text(json.dumps({"raw_diff": raw, "file_diffs": file_diffs}))
+
+(out / "pr-summary.json").write_text(json.dumps({
+    "number": 500,
+    "title": "Large change",
+    "body": "x" * 20000,
+    "author": {"login": "dev"},
+    "files": [{"path": "src/f%d.js" % i} for i in range(60)],
+    "commits": [{"oid": "%040d" % i,
+                 "messageHeadline": "commit %d" % i,
+                 "messageBody": "body " * 200} for i in range(150)],
+}))
+PY
+
+BIG_BYTES=$(wc -c < "$BIG_DIR/pr-diff.json" | tr -d ' ')
+rc=0
+BIG_ERR=$("$GH_PR_ENRICH" --test-call build_claude_context "$BIG_DIR" true 2>&1) || rc=$?
+
+assert_true "$rc" "context builds from a multi-megabyte diff (${BIG_BYTES} bytes)" "$BIG_ERR"
+assert_jq "$BIG_DIR/claude-context.json" '.code_changes.file_diffs | length == 60' \
+    "every changed file reaches the context"
+assert_jq "$BIG_DIR/claude-context.json" '.pr.commits | length == 150' \
+    "every commit reaches the context"
+assert_jq "$BIG_DIR/claude-context.json" '.coverage.diff.files_truncated | length == 60' \
+    "oversized file diffs are recorded as truncated"
 
 suite_end
