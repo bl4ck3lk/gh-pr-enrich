@@ -1,6 +1,0 @@
-#!/bin/bash
-# Records the argv it was invoked with, drains stdin, emits a valid response.
-printf '%s\n' "$@" > "$CLAUDE_ARG_LOG"
-cat > /dev/null
-echo "stub claude stderr line" >&2
-echo '{"structured_output": {"issue_categories": [], "category_coverage": [], "disputed_comments": [], "systemic_issues": [], "adjacent_problems": [], "task_list": [], "process_improvements": [], "pr_template_suggestions": []}}'
