@@ -140,6 +140,71 @@ assert_not_contains "$ANALYSIS_FN" '> "$output_file" 2>/dev/null' \
     "analyzer output redirection no longer discards stderr"
 
 # ---------------------------------------------------------------------------
+# Failure paths must be diagnosable, and must not leak shell internals
+# ---------------------------------------------------------------------------
+FAIL_STUBS="$TEST_OUTPUT_DIR/fail-stubs"
+mkdir -p "$FAIL_STUBS"
+cp "$STUB_DIR/timeout" "$FAIL_STUBS/timeout"
+
+# Analyzer killed by a signal (what a real timeout looks like)
+cat > "$FAIL_STUBS/claude" << 'STUB'
+#!/bin/bash
+cat > /dev/null
+kill -9 $$
+STUB
+chmod +x "$FAIL_STUBS/claude"
+
+KILLED_OUT=$(env CLAUDE_ARG_LOG="$ARG_LOG" CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+    PATH="$FAIL_STUBS:$PATH" "$GH_PR_ENRICH" --test-call run_claude_analysis \
+    "$CONTEXT" "$TEST_OUTPUT_DIR/killed.json" 2>&1 || true)
+
+assert_contains "$KILLED_OUT" "timed out" "a killed analyzer is reported as a timeout"
+assert_not_contains "$KILLED_OUT" "Killed: 9" \
+    "shell job-control noise is not printed to the user"
+assert_not_contains "$KILLED_OUT" "--system-prompt" \
+    "the full analyzer command line is not dumped on failure"
+
+# Analyzer exits non-zero with a diagnostic
+cat > "$FAIL_STUBS/claude" << 'STUB'
+#!/bin/bash
+cat > /dev/null
+echo "API error: credit balance too low" >&2
+exit 3
+STUB
+chmod +x "$FAIL_STUBS/claude"
+
+rc=0
+FAILED_OUT=$(env CLAUDE_ARG_LOG="$ARG_LOG" CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+    PATH="$FAIL_STUBS:$PATH" "$GH_PR_ENRICH" --test-call run_claude_analysis \
+    "$CONTEXT" "$TEST_OUTPUT_DIR/failed.json" 2>&1) || rc=$?
+
+assert_eq "3" "$rc" "the analyzer's exit code is propagated to the caller"
+assert_contains "$FAILED_OUT" "credit balance too low" \
+    "the analyzer's own error message is surfaced, not swallowed"
+
+# ---------------------------------------------------------------------------
+# Missing and malformed context inputs fail clearly, not cryptically
+# ---------------------------------------------------------------------------
+MISSING_DIR="$TEST_OUTPUT_DIR/missing-summary"
+mkdir -p "$MISSING_DIR"
+rc=0
+MISSING_OUT=$("$GH_PR_ENRICH" --test-call build_claude_context "$MISSING_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "missing pr-summary.json is an error"
+assert_contains "$MISSING_OUT" "pr-summary.json" "the missing file is named in the error"
+assert_not_contains "$MISSING_OUT" "invalid JSON text passed to --argjson" \
+    "the user sees a clear error, not a raw jq argument error"
+
+MALFORMED_DIR="$TEST_OUTPUT_DIR/malformed"
+mkdir -p "$MALFORMED_DIR"
+echo '{"number":1,"title":"t","body":"b","author":{"login":"u"},"files":[]}' > "$MALFORMED_DIR/pr-summary.json"
+echo 'not json at all' > "$MALFORMED_DIR/unresolved-threads.json"
+echo '[]' > "$MALFORMED_DIR/issue-comments.json"
+rc=0
+MALFORMED_OUT=$("$GH_PR_ENRICH" --test-call build_claude_context "$MALFORMED_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "malformed input JSON is an error"
+assert_contains "$MALFORMED_OUT" "unresolved-threads.json" "the malformed file is named in the error"
+
+# ---------------------------------------------------------------------------
 # SAST pre-pass
 # ---------------------------------------------------------------------------
 # The collector scans changed files that exist in the working tree, so the

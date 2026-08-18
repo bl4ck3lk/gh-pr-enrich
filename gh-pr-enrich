@@ -2077,6 +2077,21 @@ build_claude_context() {
         echo '[]' > "$output_dir/unresolved-threads.json"
     fi
 
+    # Required inputs are validated up front. Without this, a missing or corrupt
+    # file surfaces as a raw jq argument error with no indication of which file
+    # was at fault.
+    local required_file
+    for required_file in pr-summary.json unresolved-threads.json issue-comments.json; do
+        if [ ! -f "$output_dir/$required_file" ]; then
+            echo "❌ Cannot build analysis context: $output_dir/$required_file is missing." >&2
+            return 1
+        fi
+        if ! jq -e . "$output_dir/$required_file" > /dev/null 2>&1; then
+            echo "❌ Cannot build analysis context: $output_dir/$required_file is not valid JSON." >&2
+            return 1
+        fi
+    done
+
     dedupe_bot_comments "$output_dir/issue-comments.json" "$output_dir/issue-comments-deduped.json"
 
     local diff_json='{"raw_diff": "", "file_diffs": []}'
@@ -2437,11 +2452,38 @@ $context_payload"
     # stderr goes to a log rather than /dev/null: a discarded error message is the
     # difference between a diagnosable failure and a mysterious empty analysis.
     #
-    # Run in the background and poll, so a verification pass that reads code for
-    # several minutes reports progress instead of looking like a hang. With
-    # --output-format json nothing is written until the run completes, so elapsed
-    # time is the only signal the caller can get.
-    echo "$user_prompt" | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+    # A verification pass that reads code runs for minutes, and --output-format
+    # json writes nothing until it finishes, so elapsed time is the only progress
+    # signal available. The heartbeat is the background job and the analyzer runs
+    # in the foreground: backgrounding the analyzer instead makes the shell print
+    # its own job-death notice ("Killed: 9" plus the entire command line) when a
+    # timeout kills it, which leaks the invocation into the user's terminal.
+    local heartbeat_interval="${GH_PR_ENRICH_HEARTBEAT_SECONDS:-60}"
+    local start_ts=$SECONDS
+    (
+        # The sleep runs as a killable child: terminating only the subshell would
+        # orphan a sleeping process that still holds this function's stderr open,
+        # which stalls any caller reading the output through a pipe.
+        sleep_pid=""
+        trap 'kill "${sleep_pid:-0}" 2>/dev/null; exit 0' TERM
+        waited=0
+        while true; do
+            sleep "$heartbeat_interval" &
+            sleep_pid=$!
+            wait "$sleep_pid" 2>/dev/null || true
+            waited=$((waited + heartbeat_interval))
+            echo "   ⏳ still analyzing — ${waited}s elapsed of ${timeout_secs}s" >&2
+        done
+    ) &
+    local heartbeat_pid=$!
+    disown "$heartbeat_pid" 2>/dev/null || true
+
+    # The invocation runs inside a subshell whose own stderr is discarded. The
+    # analyzer's stderr is already redirected to the log inside, so the only thing
+    # dropped is the shell's job-death diagnostic — "Killed: 9" followed by the
+    # entire command line — which appears when something kills the analyzer from
+    # outside (OOM killer, pkill) and is noise, not diagnosis.
+    if ( echo "$user_prompt" | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
         timeout --signal=KILL --foreground "$timeout_secs" claude --print \
         --setting-sources "" \
         --model "$model" \
@@ -2449,22 +2491,12 @@ $context_payload"
         --json-schema "$schema_content" \
         --system-prompt "$system_prompt" \
         "${tool_args[@]+"${tool_args[@]}"}" \
-        > "$output_file" 2> "$stderr_log" &
-    local claude_pid=$!
-
-    local elapsed=0
-    while kill -0 "$claude_pid" 2>/dev/null; do
-        sleep 1
-        elapsed=$((elapsed + 1))
-        if [ "$((elapsed % 60))" -eq 0 ]; then
-            echo "   ⏳ still analyzing — ${elapsed}s elapsed of ${timeout_secs}s" >&2
-        fi
-    done
-
-    if wait "$claude_pid"; then
-        echo "✅ Claude analysis complete (${elapsed}s)" >&2
+        > "$output_file" 2> "$stderr_log" ) 2>/dev/null; then
+        kill "$heartbeat_pid" 2>/dev/null || true
+        echo "✅ Claude analysis complete ($((SECONDS - start_ts))s)" >&2
     else
         exit_code=$?
+        kill "$heartbeat_pid" 2>/dev/null || true
         # 124 = timeout with SIGTERM, 137 = timeout with SIGKILL (128 + 9)
         if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
             echo "⏱️  Claude analysis timed out after ${timeout_secs}s (set CLAUDE_TIMEOUT to increase)" >&2
