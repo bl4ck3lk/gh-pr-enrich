@@ -1478,7 +1478,11 @@ if [ "$1" = "address" ]; then
         TASK=$(jq -r ".task_list[$CURRENT]" "$ANALYSIS_FILE")
         PRIORITY=$(echo "$TASK" | jq -r '.priority')
         DESCRIPTION=$(echo "$TASK" | jq -r '.task')
-        THREAD_IDS=$(echo "$TASK" | jq -r '.thread_ids | join(", ")')
+        THREAD_IDS=$(echo "$TASK" | jq -r '(.thread_ids // []) | join(", ")')
+        TASK_FILE=$(echo "$TASK" | jq -r '.file // ""')
+        TASK_LINE=$(echo "$TASK" | jq -r '.line // 0')
+        TASK_FIX=$(echo "$TASK" | jq -r '.suggested_fix // ""')
+        TASK_VERIFY=$(echo "$TASK" | jq -r '.verification // ""')
 
         # Color based on priority
         case $PRIORITY in
@@ -1494,6 +1498,15 @@ if [ "$1" = "address" ]; then
         echo ""
         echo "$DESCRIPTION"
         echo ""
+        if [ -n "$TASK_FILE" ] && [ "$TASK_FILE" != "n/a" ] && [ "$TASK_FILE" != "null" ]; then
+            echo "Location: $TASK_FILE:$TASK_LINE"
+        fi
+        if [ -n "$TASK_FIX" ]; then
+            echo "Suggested fix: $TASK_FIX"
+        fi
+        if [ -n "$TASK_VERIFY" ]; then
+            echo "Verify with:   $TASK_VERIFY"
+        fi
         if [ -n "$THREAD_IDS" ] && [ "$THREAD_IDS" != "null" ]; then
             echo "Threads: $THREAD_IDS"
         fi
@@ -1959,6 +1972,11 @@ build_claude_context() {
     fi
 }
 
+# Closed taxonomy for findings. Kept in sync with default-prompt.txt by
+# tests/test-analysis-contract.sh -- the analyzer must return an explicit verdict
+# for every category, so "no finding" is a decision on record rather than a gap.
+ANALYSIS_CATEGORIES='["logic_error", "boundary_condition", "concurrency", "error_handling", "resource_lifecycle", "security", "secrets_exposure", "data_integrity", "api_contract", "performance", "test_gap", "observability", "maintainability", "documentation", "build_ci", "dependency_risk"]'
+
 CLAUDE_ANALYSIS_SCHEMA='{
   "type": "object",
   "properties": {
@@ -1968,11 +1986,54 @@ CLAUDE_ANALYSIS_SCHEMA='{
         "type": "object",
         "properties": {
           "name": { "type": "string" },
+          "category": { "enum": '"$ANALYSIS_CATEGORIES"' },
           "severity": { "enum": ["critical", "high", "medium", "low"] },
+          "impact": { "enum": ["severe", "moderate", "minor"] },
+          "likelihood": { "enum": ["certain", "likely", "possible", "unlikely"] },
+          "severity_rationale": { "type": "string" },
+          "verdict": { "enum": ["confirmed", "plausible", "refuted"] },
+          "confidence": { "enum": ["high", "medium", "low"] },
           "description": { "type": "string" },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "file": { "type": "string" },
+                "line": { "type": "integer" },
+                "detail": { "type": "string" }
+              },
+              "required": ["file", "line", "detail"]
+            }
+          },
           "thread_ids": { "type": "array", "items": { "type": "string" } }
         },
-        "required": ["name", "severity", "description", "thread_ids"]
+        "required": ["name", "category", "severity", "impact", "likelihood", "severity_rationale", "verdict", "confidence", "description", "evidence", "thread_ids"]
+      }
+    },
+    "category_coverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "category": { "enum": '"$ANALYSIS_CATEGORIES"' },
+          "verdict": { "enum": ["findings_reported", "reviewed_none_found", "not_applicable", "not_reviewable"] },
+          "note": { "type": "string" }
+        },
+        "required": ["category", "verdict", "note"]
+      }
+    },
+    "disputed_comments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "thread_id": { "type": "string" },
+          "claim": { "type": "string" },
+          "why_incorrect": { "type": "string" },
+          "confidence": { "enum": ["high", "medium", "low"] }
+        },
+        "required": ["thread_id", "claim", "why_incorrect", "confidence"]
       }
     },
     "systemic_issues": {
@@ -1994,9 +2055,10 @@ CLAUDE_ANALYSIS_SCHEMA='{
         "properties": {
           "area": { "type": "string" },
           "risk": { "type": "string" },
-          "investigation_hint": { "type": "string" }
+          "investigation_hint": { "type": "string" },
+          "checked": { "type": "boolean" }
         },
-        "required": ["area", "risk", "investigation_hint"]
+        "required": ["area", "risk", "investigation_hint", "checked"]
       }
     },
     "task_list": {
@@ -2006,9 +2068,13 @@ CLAUDE_ANALYSIS_SCHEMA='{
         "properties": {
           "priority": { "enum": ["critical", "high", "medium", "low"] },
           "task": { "type": "string" },
-          "thread_ids": { "type": "array", "items": { "type": "string" } }
+          "thread_ids": { "type": "array", "items": { "type": "string" } },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "suggested_fix": { "type": "string" },
+          "verification": { "type": "string" }
         },
-        "required": ["priority", "task", "thread_ids"]
+        "required": ["priority", "task", "thread_ids", "file", "line", "suggested_fix", "verification"]
       }
     },
     "process_improvements": {
@@ -2037,8 +2103,13 @@ CLAUDE_ANALYSIS_SCHEMA='{
       }
     }
   },
-  "required": ["issue_categories", "systemic_issues", "adjacent_problems", "task_list", "process_improvements", "pr_template_suggestions"]
+  "required": ["issue_categories", "category_coverage", "disputed_comments", "systemic_issues", "adjacent_problems", "task_list", "process_improvements", "pr_template_suggestions"]
 }'
+
+# Emit the analysis schema (used by tests to pin the analysis contract)
+emit_analysis_schema() {
+    printf '%s' "$CLAUDE_ANALYSIS_SCHEMA"
+}
 
 run_claude_analysis() {
     local context_file="$1"
@@ -2089,66 +2160,107 @@ generate_analysis_report() {
     local analysis_file="$1"
     local output_file="$2"
 
+    # Findings lead with verdict, severity and its derivation so a reader can tell
+    # a traced defect from a repeated reviewer opinion without opening the JSON.
     jq -r '
+    def anchor(e): (if (e.file // "") == "" or e.file == "n/a" then "" else e.file + ":" + ((e.line // 0) | tostring) end);
+    def verdict_mark(v): (if v == "confirmed" then "✅ confirmed" elif v == "refuted" then "❌ refuted" else "🟡 plausible" end);
+
     "# 🤖 Claude Analysis Report\n\n" +
     "## Issue Categories\n\n" +
     (if (.issue_categories | length) == 0 then
         "_No issue categories identified._\n\n"
     else
         (.issue_categories | map(
-            "### " + .name + " (" + .severity + ")\n" +
-            .description + "\n\n" +
-            "**Threads:** " + (if (.thread_ids | length) > 0 then (.thread_ids | join(", ")) else "N/A" end) + "\n"
+            "### " + .name + "\n\n" +
+            "**Verdict:** " + verdict_mark(.verdict // "plausible") +
+            " · **Confidence:** " + (.confidence // "unknown") +
+            " · **Severity:** " + (.severity // "unknown") +
+            " (" + (.impact // "?") + " impact × " + (.likelihood // "?") + " likelihood)" +
+            " · **Category:** `" + (.category // "uncategorized") + "`\n\n" +
+            (.description // "") + "\n\n" +
+            (if (.severity_rationale // "") != "" then "**Why this severity:** " + .severity_rationale + "\n\n" else "" end) +
+            (if ((.evidence // []) | length) > 0 then
+                "**Evidence:**\n" + ((.evidence // []) | map(
+                    "- " + (if anchor(.) == "" then "" else "`" + anchor(.) + "` — " end) + (.detail // "")
+                ) | join("\n")) + "\n\n"
+            else "" end) +
+            "**Threads:** " + (if ((.thread_ids // []) | length) > 0 then (.thread_ids | join(", ")) else "N/A" end) + "\n"
         ) | join("\n"))
     end) +
-    "\n## Systemic Issues\n\n" +
-    (if (.systemic_issues | length) == 0 then
-        "_No systemic patterns identified._\n\n"
+    "\n## Disputed Review Comments\n\n" +
+    "_Reviewer or bot claims that did not survive verification:_\n\n" +
+    (if ((.disputed_comments // []) | length) == 0 then
+        "_No claims were refuted._\n"
     else
-        (.systemic_issues | map(
-            "### " + .pattern + "\n\n" +
-            "**Evidence:**\n" + (.evidence | map("- " + .) | join("\n")) + "\n\n" +
-            "**Recommendation:** " + .recommendation + "\n"
+        ((.disputed_comments // []) | map(
+            "- **" + (.thread_id // "unknown thread") + "** (confidence: " + (.confidence // "unknown") + ")\n" +
+            "  - Claim: " + (.claim // "") + "\n" +
+            "  - Why it is incorrect: " + (.why_incorrect // "")
+        ) | join("\n"))
+    end) +
+    "\n\n## Category Coverage\n\n" +
+    "_Every category the analyzer swept, and what it concluded:_\n\n" +
+    (if ((.category_coverage // []) | length) == 0 then
+        "_No coverage reported — treat this analysis as incomplete._\n"
+    else
+        ("| Category | Verdict | Note |\n|---|---|---|\n" +
+         ((.category_coverage // []) | map(
+            "| `" + (.category // "?") + "` | " + (.verdict // "?") + " | " + ((.note // "") | gsub("\\|"; "\\\\|")) + " |"
+         ) | join("\n")))
+    end) +
+    "\n\n## Systemic Issues\n\n" +
+    (if ((.systemic_issues // []) | length) == 0 then
+        "_No systemic patterns identified._\n"
+    else
+        ((.systemic_issues // []) | map(
+            "### " + (.pattern // "") + "\n\n" +
+            "**Evidence:**\n" + ((.evidence // []) | map("- " + .) | join("\n")) + "\n\n" +
+            "**Recommendation:** " + (.recommendation // "") + "\n"
         ) | join("\n"))
     end) +
     "\n## Adjacent Problems to Investigate\n\n" +
-    (if (.adjacent_problems | length) == 0 then
+    (if ((.adjacent_problems // []) | length) == 0 then
         "_No adjacent problem areas identified._\n"
     else
-        (.adjacent_problems | map(
-            "- **" + .area + "** (" + .risk + "): " + .investigation_hint
+        ((.adjacent_problems // []) | map(
+            "- " + (if .checked == true then "🔎 **checked**" else "⬜ **not checked — investigate**" end) +
+            " **" + (.area // "") + "** (" + (.risk // "") + "): " + (.investigation_hint // "")
         ) | join("\n"))
     end) +
     "\n\n## Task List\n\n" +
-    (if (.task_list | length) == 0 then
+    (if ((.task_list // []) | length) == 0 then
         "_No tasks generated._\n"
     else
-        (.task_list | map(
-            "- [" + .priority + "] " + .task +
-            (if (.thread_ids | length) > 0 then " _(threads: " + (.thread_ids | join(", ")) + ")_" else "" end)
+        ((.task_list // []) | map(
+            "### [" + (.priority // "?") + "] " + (.task // "") + "\n" +
+            (if anchor(.) == "" then "" else "- **Location:** `" + anchor(.) + "`\n" end) +
+            (if (.suggested_fix // "") != "" then "- **Suggested fix:** " + .suggested_fix + "\n" else "" end) +
+            (if (.verification // "") != "" then "- **Verify with:** `" + .verification + "`\n" else "" end) +
+            (if ((.thread_ids // []) | length) > 0 then "- **Threads:** " + (.thread_ids | join(", ")) + "\n" else "" end)
         ) | join("\n"))
     end) +
     "\n\n## Process Improvements\n\n" +
     "_Suggestions to prevent similar issues in future PRs:_\n\n" +
-    (if (.process_improvements | length) == 0 then
+    (if ((.process_improvements // []) | length) == 0 then
         "_No process improvements suggested._\n"
     else
-        (.process_improvements | map(
-            "### " + .suggestion + "\n" +
-            "**Category:** " + .category + "\n\n" +
-            .rationale + "\n" +
+        ((.process_improvements // []) | map(
+            "### " + (.suggestion // "") + "\n" +
+            "**Category:** " + (.category // "") + "\n\n" +
+            (.rationale // "") + "\n" +
             (if .implementation_hint then "\n**How to implement:** " + .implementation_hint + "\n" else "" end)
         ) | join("\n"))
     end) +
     "\n\n## PR Template Suggestions\n\n" +
     "_Additions to the PR template that would catch these issues earlier:_\n\n" +
-    (if (.pr_template_suggestions | length) == 0 then
+    (if ((.pr_template_suggestions // []) | length) == 0 then
         "_No PR template changes suggested._\n"
     else
-        (.pr_template_suggestions | map(
-            "### " + .section + "\n" +
-            "```\n" + .checkbox_or_question + "\n```\n" +
-            "_Why:_ " + .why + "\n"
+        ((.pr_template_suggestions // []) | map(
+            "### " + (.section // "") + "\n" +
+            "```\n" + (.checkbox_or_question // "") + "\n```\n" +
+            "_Why:_ " + (.why // "") + "\n"
         ) | join("\n"))
     end)
     ' "$analysis_file" > "$output_file"
@@ -2160,7 +2272,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis generate_analysis_report dedupe_bot_comments collect_sast_findings"
+TEST_CALLABLE_FUNCTIONS="build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis generate_analysis_report dedupe_bot_comments collect_sast_findings emit_analysis_schema fetch_review_threads"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in
