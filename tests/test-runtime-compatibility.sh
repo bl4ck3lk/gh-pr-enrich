@@ -343,9 +343,16 @@ assert_jq "$PREPARED/analysis-context.json" '.pr.repository == "o/r" and .pr.num
 assert_not_contains "$PREP_OUT" "Claude analysis" \
     "context preparation does not invoke an external analyzer"
 
-SAST_PREPARED="$TEST_OUTPUT_DIR/sast-prepared"
-env PATH="$STUB_DIR:$PATH" GH_PR_ENRICH_CODE_ACCESS=true \
-    "$GH_PR_ENRICH" 1 --prepare-analysis --sast --output-dir "$SAST_PREPARED" >/dev/null 2>&1
+SAST_WORKSPACE="$TEST_OUTPUT_DIR/sast-workspace"
+SAST_PREPARED="$SAST_WORKSPACE/reports"
+mkdir -p "$SAST_WORKSPACE"
+cp "$GH_PR_ENRICH" "$SAST_WORKSPACE/gh-pr-enrich"
+(cd "$SAST_WORKSPACE" && git init -q . && git config user.email t@t && \
+    git config user.name t && git add gh-pr-enrich && git commit -qm init)
+(cd "$SAST_WORKSPACE" && env PATH="$STUB_DIR:$PATH" \
+    GH_PR_ENRICH_CODE_ACCESS=true \
+    "$GH_PR_ENRICH" 1 --prepare-analysis --sast \
+    --output-dir reports >/dev/null 2>&1)
 assert_jq "$SAST_PREPARED/analysis-context.json" \
     '.sast_findings | length == 1' \
     "--prepare-analysis --sast includes fresh Semgrep findings in the shared context"
@@ -389,6 +396,159 @@ assert_true "$([ -s "$CLAUDE_LOG" ] && echo 0 || echo 1)" \
     "--allow-external authorizes Claude for a private repository"
 assert_jq "$AUTHORIZED_DIR/analysis.json" '._metadata.repository_visibility == "PRIVATE"' \
     "the analysis provenance records repository visibility"
+
+# The provider's combined-data publication uses the same no-clobber
+# transaction as selection/invalidation. A noncooperating destination that
+# appears after quarantine is preserved and aborts enrichment.
+PROVIDER_COLLISION_DIR="$TEST_OUTPUT_DIR/provider-collision"
+PROVIDER_COLLISION_STUBS="$TEST_OUTPUT_DIR/provider-collision-stubs"
+PROVIDER_COLLISION_MARKER="$TEST_OUTPUT_DIR/provider-collision-fired"
+mkdir -p "$PROVIDER_COLLISION_STUBS"
+cat > "$PROVIDER_COLLISION_STUBS/mv" << 'STUB'
+#!/bin/bash
+"$REAL_MV" "$@" || exit $?
+case "$1:$2" in
+    "$PROVIDER_COLLISION_REPORT/combined-data.json:"*\
+"/.selected-analysis-quarantine."*"/combined-data.json")
+        if [ -f "$PROVIDER_COLLISION_REPORT/claude-analysis.json" ] && \
+           [ ! -f "$PROVIDER_COLLISION_MARKER" ]; then
+            : > "$PROVIDER_COLLISION_MARKER"
+            printf '%s\n' '{"concurrent_provider_replacement":true}' \
+                > "$PROVIDER_COLLISION_REPORT/combined-data.json"
+        fi
+        ;;
+esac
+STUB
+chmod +x "$PROVIDER_COLLISION_STUBS/mv"
+rc=0
+env PATH="$PROVIDER_COLLISION_STUBS:$STUB_DIR:$PATH" \
+    REAL_MV="$(command -v mv)" REPO_VISIBILITY=PRIVATE \
+    GH_PR_ENRICH_CODE_ACCESS=false CLAUDE_INVOKED_LOG="$CLAUDE_LOG" \
+    PROVIDER_COLLISION_REPORT="$PROVIDER_COLLISION_DIR" \
+    PROVIDER_COLLISION_MARKER="$PROVIDER_COLLISION_MARKER" \
+    "$GH_PR_ENRICH" 1 --enrich --allow-external \
+    --output-dir "$PROVIDER_COLLISION_DIR" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -f "$PROVIDER_COLLISION_MARKER" ] && \
+    echo 0 || echo 1)" \
+    "provider combined-data publication aborts on a boundary collision"
+assert_jq "$PROVIDER_COLLISION_DIR/combined-data.json" \
+    '.concurrent_provider_replacement == true' \
+    "provider publication never clobbers a concurrent combined-data replacement"
+PROVIDER_COLLISION_QUARANTINE=$(find "$PROVIDER_COLLISION_DIR" -maxdepth 1 \
+    -name '.selected-analysis-quarantine.*' -print -quit)
+assert_true "$([ -n "$PROVIDER_COLLISION_QUARANTINE" ] && \
+    [ -f "$PROVIDER_COLLISION_QUARANTINE/combined-data.json" ] && \
+    echo 0 || echo 1)" \
+    "provider collision preserves the original combined view for reconciliation"
+
+# Read-only freezing binds each copied file to the initial baseline, not merely
+# to a later live value. A coherent A->B->A swap during cp cannot return B while
+# both outer identity checks observe A.
+READ_ABA_DIR="$TEST_OUTPUT_DIR/read-only-aba"
+READ_ABA_STUBS="$TEST_OUTPUT_DIR/read-only-aba-stubs"
+mkdir -p "$READ_ABA_DIR" "$READ_ABA_STUBS"
+cp "$AUTHORIZED_DIR/analysis.json" "$READ_ABA_DIR/analysis.json"
+cp "$AUTHORIZED_DIR/analysis-context.json" "$READ_ABA_DIR/analysis-context.json"
+cp "$AUTHORIZED_DIR/pr-summary.json" "$READ_ABA_DIR/pr-summary.json"
+cp "$READ_ABA_DIR/analysis.json" "$TEST_OUTPUT_DIR/read-aba-analysis-a.json"
+cp "$READ_ABA_DIR/analysis-context.json" "$TEST_OUTPUT_DIR/read-aba-context-a.json"
+jq 'del(.coverage.context_fingerprint)
+    | .issue_comments += [{user:"aba",body:"state-b",url:"u",created_at:"t"}]' \
+    "$READ_ABA_DIR/analysis-context.json" > "$TEST_OUTPUT_DIR/read-aba-context-b.tmp.json"
+READ_ABA_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+    "$TEST_OUTPUT_DIR/read-aba-context-b.tmp.json")
+jq --arg fingerprint "$READ_ABA_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$TEST_OUTPUT_DIR/read-aba-context-b.tmp.json" \
+    > "$TEST_OUTPUT_DIR/read-aba-context-b.json"
+jq --arg fingerprint "$READ_ABA_FINGERPRINT" \
+    '._metadata.context_fingerprint = $fingerprint
+     | .task_list = [{priority:"low",task:"state-b",thread_ids:[],file:"a.js",
+        line:1,suggested_fix:"b",verification:"b"}]' \
+    "$READ_ABA_DIR/analysis.json" > "$TEST_OUTPUT_DIR/read-aba-analysis-b.json"
+cat > "$READ_ABA_STUBS/cp" << 'STUB'
+#!/bin/bash
+copy_source=""
+previous=""
+for argument in "$@"; do
+    copy_source="$previous"
+    previous="$argument"
+done
+if [ "$copy_source" = "$READ_ABA_REPORT/analysis.json" ]; then
+    "$REAL_CP" "$READ_ABA_ANALYSIS_B" "$READ_ABA_REPORT/analysis.json"
+    "$REAL_CP" "$READ_ABA_CONTEXT_B" "$READ_ABA_REPORT/analysis-context.json"
+    "$REAL_CP" "$@" || exit $?
+    "$REAL_CP" "$READ_ABA_ANALYSIS_A" "$READ_ABA_REPORT/analysis.json"
+    "$REAL_CP" "$READ_ABA_CONTEXT_A" "$READ_ABA_REPORT/analysis-context.json"
+    exit 0
+fi
+exec "$REAL_CP" "$@"
+STUB
+chmod +x "$READ_ABA_STUBS/cp"
+rc=0
+READ_ABA_SELECTED=$(env PATH="$READ_ABA_STUBS:$PATH" \
+    REAL_CP="$(command -v cp)" READ_ABA_REPORT="$READ_ABA_DIR" \
+    READ_ABA_ANALYSIS_A="$TEST_OUTPUT_DIR/read-aba-analysis-a.json" \
+    READ_ABA_CONTEXT_A="$TEST_OUTPUT_DIR/read-aba-context-a.json" \
+    READ_ABA_ANALYSIS_B="$TEST_OUTPUT_DIR/read-aba-analysis-b.json" \
+    READ_ABA_CONTEXT_B="$TEST_OUTPUT_DIR/read-aba-context-b.json" \
+    "$GH_PR_ENRICH" --test-call select_analysis_file \
+    "$READ_ABA_DIR" read-only 2>/dev/null) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -z "$READ_ABA_SELECTED" ] && echo 0 || echo 1)" \
+    "read-only selection rejects a coherent analysis/context ABA during copy"
+assert_true "$(cmp -s "$READ_ABA_DIR/analysis.json" \
+    "$TEST_OUTPUT_DIR/read-aba-analysis-a.json" && \
+    cmp -s "$READ_ABA_DIR/analysis-context.json" \
+    "$TEST_OUTPUT_DIR/read-aba-context-a.json"; echo $?)" \
+    "the ABA fixture restores both live analysis and context to state A"
+
+# Root selection applies the same baseline/copy/live binding to the named
+# source artifact. It may accept later mutations, but never bytes observed only
+# during an A->B->A copy window.
+SELECT_ABA_DIR="$TEST_OUTPUT_DIR/select-source-aba"
+SELECT_ABA_STUBS="$TEST_OUTPUT_DIR/select-source-aba-stubs"
+mkdir -p "$SELECT_ABA_DIR" "$SELECT_ABA_STUBS"
+for SELECT_ABA_VIEW in analysis-context.json pr-summary.json combined-data.json \
+        comprehensive-report.md; do
+    cp "$AUTHORIZED_DIR/$SELECT_ABA_VIEW" "$SELECT_ABA_DIR/$SELECT_ABA_VIEW"
+done
+cp "$AUTHORIZED_DIR/analysis.json" "$SELECT_ABA_DIR/candidate.json"
+cp "$SELECT_ABA_DIR/candidate.json" "$TEST_OUTPUT_DIR/select-aba-a.json"
+jq '.task_list[0].task = "state-b-only"' \
+    "$SELECT_ABA_DIR/candidate.json" > "$TEST_OUTPUT_DIR/select-aba-b.json"
+cat > "$SELECT_ABA_STUBS/cp" << 'STUB'
+#!/bin/bash
+copy_source=""
+previous=""
+for argument in "$@"; do
+    copy_source="$previous"
+    previous="$argument"
+done
+if [ "$copy_source" = "$SELECT_ABA_SOURCE" ]; then
+    "$REAL_CP" "$SELECT_ABA_B" "$SELECT_ABA_SOURCE"
+    "$REAL_CP" "$@" || exit $?
+    "$REAL_CP" "$SELECT_ABA_A" "$SELECT_ABA_SOURCE"
+    exit 0
+fi
+exec "$REAL_CP" "$@"
+STUB
+chmod +x "$SELECT_ABA_STUBS/cp"
+rc=0
+SELECT_ABA_OUT=$(env PATH="$SELECT_ABA_STUBS:$STUB_DIR:$PATH" \
+    REAL_CP="$(command -v cp)" \
+    SELECT_ABA_SOURCE="$SELECT_ABA_DIR/candidate.json" \
+    SELECT_ABA_A="$TEST_OUTPUT_DIR/select-aba-a.json" \
+    SELECT_ABA_B="$TEST_OUTPUT_DIR/select-aba-b.json" \
+    "$GH_PR_ENRICH" select-analysis "$SELECT_ABA_DIR" \
+    "$SELECT_ABA_DIR/candidate.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "select-analysis rejects a source ABA during immutable copy"
+assert_contains "$SELECT_ABA_OUT" "source changed while its immutable copy" \
+    "source ABA rejection names the immutable-copy boundary"
+assert_true "$([ ! -e "$SELECT_ABA_DIR/analysis.json" ] && \
+    cmp -s "$SELECT_ABA_DIR/candidate.json" \
+        "$TEST_OUTPUT_DIR/select-aba-a.json" && echo 0 || echo 1)" \
+    "source ABA publishes nothing and restores the named state-A source"
 
 # The writer receives the values captured by run_claude_analysis; it must not
 # reread a context that may refresh in the narrow gap before publication.
@@ -461,6 +621,44 @@ assert_contains "$(cat "$AUTHORIZED_DIR/analysis.md")" "Hybrid-selected task" \
 assert_jq "$AUTHORIZED_DIR/combined-data.json" \
     '.analysis._metadata.provider == "hybrid" and .analysis.task_list[0].task == "Hybrid-selected task"' \
     "select-analysis refreshes the combined-data selected view"
+
+# Selection also treats writer-lock release as part of success. The first
+# owner removal fails; EXIT cleanup retries without hiding the nonzero result.
+SELECTION_RELEASE_STUBS="$TEST_OUTPUT_DIR/selection-lock-release-stubs"
+SELECTION_RELEASE_MARKER="$TEST_OUTPUT_DIR/selection-lock-release-fired"
+mkdir -p "$SELECTION_RELEASE_STUBS"
+cat > "$SELECTION_RELEASE_STUBS/rm" << 'STUB'
+#!/bin/bash
+for candidate in "$@"; do
+    case "$candidate" in
+        "$SELECTION_RELEASE_REPORT"/.selected-analysis-release.*/owner)
+            if [ ! -f "$SELECTION_RELEASE_MARKER" ]; then
+                : > "$SELECTION_RELEASE_MARKER"
+                exit 79
+            fi
+            ;;
+    esac
+done
+exec "$REAL_RM" "$@"
+STUB
+chmod +x "$SELECTION_RELEASE_STUBS/rm"
+rc=0
+SELECTION_RELEASE_OUT=$(env PATH="$SELECTION_RELEASE_STUBS:$PATH" \
+    REAL_RM="$(command -v rm)" \
+    SELECTION_RELEASE_REPORT="$AUTHORIZED_DIR" \
+    SELECTION_RELEASE_MARKER="$SELECTION_RELEASE_MARKER" \
+    "$GH_PR_ENRICH" select-analysis \
+    "$AUTHORIZED_DIR" "$HYBRID_SOURCE" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection propagates a writer-lock release failure"
+assert_contains "$SELECTION_RELEASE_OUT" \
+    "analysis was published, but its writer lock could not be released" \
+    "selection reports the post-publication lock-release failure"
+assert_true "$([ -f "$SELECTION_RELEASE_MARKER" ] && \
+    [ ! -e "$AUTHORIZED_DIR/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "selection EXIT cleanup retries and removes a transient failed lock"
+assert_jq "$AUTHORIZED_DIR/analysis.json" '._metadata.provider == "hybrid"' \
+    "selection release failure does not corrupt the published selected artifact"
 
 # Selection enforces the documented impact × likelihood matrix rather than
 # accepting independently valid enum values that contradict one another.
@@ -653,12 +851,20 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
 assert_contains "$LOCAL_CODE_MISMATCH_OUT" "Current local code access no longer matches" \
     "the provider-neutral selection error identifies the stale local workspace"
 
+chmod 555 "$SELECTION_REPORT"
 READ_ONLY_SELECTED=$(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" --test-call \
     select_analysis_file "$SELECTION_REPORT")
-assert_eq "$SELECTION_REPORT/analysis.json" "$READ_ONLY_SELECTED" \
-    "read-only consumers retain immutable historical analysis after workspace changes"
+assert_true "$([ "$READ_ONLY_SELECTED" != "$SELECTION_REPORT/analysis.json" ] && \
+    [ -f "$READ_ONLY_SELECTED" ] && cmp -s "$READ_ONLY_SELECTED" \
+        "$SELECTION_REPORT/analysis.json" && echo 0 || echo 1)" \
+    "read-only consumers receive a frozen historical analysis from an immutable archive"
 assert_true "$([ -e "$SELECTION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
     "read-only selection does not delete historical analysis"
+READ_ONLY_SNAPSHOT_ROOT=$(dirname "$(dirname "$READ_ONLY_SELECTED")")
+"$GH_PR_ENRICH" cleanup-analysis-snapshot "$READ_ONLY_SNAPSHOT_ROOT"
+assert_true "$([ ! -e "$READ_ONLY_SNAPSHOT_ROOT" ] && echo 0 || echo 1)" \
+    "read-only consumer explicitly cleans its private analysis snapshot"
+chmod 755 "$SELECTION_REPORT"
 
 rc=0
 (cd "$SELECTION_REPO" && "$GH_PR_ENRICH" --test-call \
@@ -882,11 +1088,19 @@ LEGACY_READ_ONLY_DIR="$TEST_OUTPUT_DIR/legacy-read-only"
 mkdir -p "$LEGACY_READ_ONLY_DIR"
 jq 'del(._metadata)' "$AUTHORIZED_DIR/claude-analysis.json" \
     > "$LEGACY_READ_ONLY_DIR/claude-analysis.json"
+chmod 555 "$LEGACY_READ_ONLY_DIR"
 rc=0
-"$GH_PR_ENRICH" --test-call select_analysis_file "$LEGACY_READ_ONLY_DIR" \
-    >/dev/null 2>&1 || rc=$?
+LEGACY_READ_ONLY_SELECTED=$("$GH_PR_ENRICH" --test-call \
+    select_analysis_file "$LEGACY_READ_ONLY_DIR" 2>/dev/null) || rc=$?
 assert_true "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" \
-    "read-only discovery retains metadata-less legacy reports"
+    "read-only discovery retains metadata-less legacy reports in immutable archives"
+assert_true "$([ -f "$LEGACY_READ_ONLY_SELECTED" ] && \
+    [ "$LEGACY_READ_ONLY_SELECTED" != \
+      "$LEGACY_READ_ONLY_DIR/claude-analysis.json" ] && echo 0 || echo 1)" \
+    "legacy read-only discovery returns a private frozen report"
+LEGACY_SNAPSHOT_ROOT=$(dirname "$(dirname "$LEGACY_READ_ONLY_SELECTED")")
+"$GH_PR_ENRICH" cleanup-analysis-snapshot "$LEGACY_SNAPSHOT_ROOT"
+chmod 755 "$LEGACY_READ_ONLY_DIR"
 rc=0
 "$GH_PR_ENRICH" --test-call select_analysis_file "$LEGACY_READ_ONLY_DIR" \
     require-current-workspace >/dev/null 2>&1 || rc=$?

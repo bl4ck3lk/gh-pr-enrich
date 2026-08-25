@@ -176,16 +176,21 @@ fetch_watch_state() {
 }
 
 watch_selected_analysis_identity() {
-    local report_dir="$1" repository="$2" pr_number="$3" selected_file
+    local report_dir="$1" repository="$2" pr_number="$3" selected_file digest
     selected_file="$(select_analysis_file "$report_dir" read-only 2>/dev/null)" || \
         return 1
-    [ "$(basename "$selected_file")" = "analysis.json" ] || return 1
-    jq -e --arg repository "$repository" --argjson pr_number "$pr_number" '
+    if [ "$(basename "$selected_file")" != "analysis.json" ] || \
+       ! jq -e --arg repository "$repository" --argjson pr_number "$pr_number" '
         ._metadata.repository == $repository
         and ._metadata.pr_number == $pr_number
         and (._metadata.context_fingerprint | type == "string" and length > 0)
-    ' "$selected_file" > /dev/null 2>&1 || return 1
-    sha256_file "$selected_file"
+    ' "$selected_file" > /dev/null 2>&1 || \
+       ! digest="$(sha256_file "$selected_file")"; then
+        cleanup_read_only_analysis_snapshot "$selected_file"
+        return 1
+    fi
+    cleanup_read_only_analysis_snapshot "$selected_file"
+    printf '%s\n' "$digest"
 }
 
 # Stable content identity for one analysis snapshot. Recompute this digest at
@@ -356,6 +361,7 @@ CODE_ACCESS_PREVIOUS_TERM_TRAP=""
 ANALYZER_CHILD_PID=""
 ANALYZER_HEARTBEAT_PID=""
 ANALYZER_PROMPT_FILE=""
+ANALYZER_CONTEXT_FILE=""
 
 terminate_analyzer_child() {
     local analyzer_pid="$ANALYZER_CHILD_PID"
@@ -375,7 +381,8 @@ terminate_analyzer_heartbeat() {
 is_private_code_snapshot_path() {
     local candidate="$1" parent expected_parent basename
     case "$candidate" in
-        /tmp/gh-pr-enrich-code-snapshot.*|/private/tmp/gh-pr-enrich-code-snapshot.*) ;;
+        /tmp/gh-pr-enrich-code-snapshot.*|/private/tmp/gh-pr-enrich-code-snapshot.*|\
+        /tmp/gh-pr-enrich-analysis-snapshot.*|/private/tmp/gh-pr-enrich-analysis-snapshot.*) ;;
         *) return 1 ;;
     esac
     [ -d "$candidate" ] && [ ! -L "$candidate" ] || return 1
@@ -383,7 +390,7 @@ is_private_code_snapshot_path() {
     expected_parent="$(cd /tmp && pwd -P)" || return 1
     basename="$(basename "$candidate")"
     [ "$parent" = "$expected_parent" ] && \
-        [[ "$basename" =~ ^gh-pr-enrich-code-snapshot\.[A-Za-z0-9]+$ ]]
+    [[ "$basename" =~ ^gh-pr-enrich-(code|analysis)-snapshot\.[A-Za-z0-9]+$ ]]
 }
 
 restore_code_access_cleanup_traps() {
@@ -413,9 +420,15 @@ cleanup_code_access_artifacts() {
             rm -f "$ANALYZER_PROMPT_FILE"
             ;;
     esac
+    case "$ANALYZER_CONTEXT_FILE" in
+        /tmp/gh-pr-enrich-claude-context.*|/private/tmp/gh-pr-enrich-claude-context.*)
+            rm -f "$ANALYZER_CONTEXT_FILE"
+            ;;
+    esac
     CODE_ACCESS_SNAPSHOT_DIR=""
     CODE_ACCESS_SETTINGS_FILE=""
     ANALYZER_PROMPT_FILE=""
+    ANALYZER_CONTEXT_FILE=""
 }
 
 handle_code_access_cleanup_signal() {
@@ -701,29 +714,602 @@ unresolve_review_thread_and_verify() {
     rm -f "$live_file"
 }
 
-invalidate_selected_analysis() {
-    local report_dir="$1" combined_tmp=""
-    if [ -L "$report_dir/combined-data.json" ] || \
-       path_is_git_tracked "$report_dir/combined-data.json"; then
-        echo "Error: Refusing unsafe combined-data artifact during invalidation." >&2
+SELECTED_ANALYSIS_LOCK_DIR=""
+SELECTED_ANALYSIS_LOCK_TOKEN=""
+SELECTED_ANALYSIS_LOCK_OWNED=false
+SELECTED_ANALYSIS_WORKER_PID=""
+
+selected_analysis_lock_mtime() {
+    local lock_dir="$1" value=""
+    value="$(stat -c '%Y' "$lock_dir" 2>/dev/null)" || \
+        value="$(stat -f '%m' "$lock_dir" 2>/dev/null)" || return 1
+    case "$value" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$value"
+}
+
+selected_analysis_worker_pid() {
+    local worker_pid="" pid_file=""
+    # Bash 3.2 keeps $$ fixed at the top-level shell inside function
+    # subshells. A direct child's PPID is the actual transaction worker. Do not
+    # capture the child through command substitution: that would report the
+    # short-lived command-substitution shell instead.
+    pid_file="$(mktemp "/tmp/gh-pr-enrich-writer-pid.XXXXXX")" || return 1
+    if ! /bin/sh -c 'printf "%s\n" "$PPID" > "$1"' sh "$pid_file" || \
+       ! IFS= read -r worker_pid < "$pid_file"; then
+        rm -f "$pid_file"
         return 1
     fi
-    rm -f "$report_dir/analysis.json" "$report_dir/analysis.md" \
-        "$report_dir/context-coverage.md"
-    if [ -f "$report_dir/combined-data.json" ]; then
-        combined_tmp="$(mktemp "$report_dir/.combined-data.XXXXXX")" || return 1
-        if jq 'del(.analysis, .analysis_context_coverage)' \
-                "$report_dir/combined-data.json" > "$combined_tmp" 2>/dev/null; then
-            mv "$combined_tmp" "$report_dir/combined-data.json"
+    rm -f "$pid_file"
+    case "$worker_pid" in ''|0|0*|*[!0-9]*) return 1 ;; esac
+    SELECTED_ANALYSIS_WORKER_PID="$worker_pid"
+}
+
+recover_empty_selected_analysis_residues() {
+    local report_dir="$1" candidate="" candidate_name=""
+    local restore_nullglob=false
+    local -a candidates=()
+    shopt -q nullglob || { shopt -s nullglob; restore_nullglob=true; }
+    candidates=("$report_dir"/.selected-analysis-stale.* \
+        "$report_dir"/.selected-analysis-release.*)
+    [ "$restore_nullglob" = false ] || shopt -u nullglob
+    for candidate in "${candidates[@]}"; do
+        candidate_name="$(basename "$candidate")"
+        [[ "$candidate_name" =~ ^\.selected-analysis-(stale|release)\.[1-9][0-9]*\.[0-9]+\.[0-9]+$ ]] || \
+            continue
+        [ -d "$candidate" ] && [ ! -L "$candidate" ] && \
+            ! path_has_symlink_component "$candidate" || continue
+        # rmdir is the ownership-safe recovery primitive here: it can remove
+        # only a completely empty claimed directory and cannot destroy an
+        # owner record or concurrent recovery data.
+        rmdir "$candidate" 2>/dev/null || true
+    done
+}
+
+acquire_selected_analysis_lock() {
+    local report_dir="$1" lock_dir="$1/.selected-analysis.lock"
+    local worker_pid="" token="" recovery_residue=""
+    local recorded_token="" recorded_pid="" recorded_rest=""
+    local recorded_random="" recorded_epoch="" stale_dir=""
+    local ownerless_lock=false lock_mtime="" current_time="" lock_entry=""
+    SELECTED_ANALYSIS_LOCK_OWNED=false
+    if [ "$SELECTED_ANALYSIS_LOCK_DIR" = "$lock_dir" ] && \
+       [ -n "$SELECTED_ANALYSIS_LOCK_TOKEN" ] && \
+       [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] && \
+       ! path_has_symlink_component "$lock_dir" && \
+       [ -f "$lock_dir/owner" ] && [ ! -L "$lock_dir/owner" ] && \
+       [ "$(cat "$lock_dir/owner" 2>/dev/null || echo "")" = \
+         "$SELECTED_ANALYSIS_LOCK_TOKEN" ]; then
+        return 0
+    fi
+    if [ -L "$lock_dir" ] || path_has_symlink_component "$lock_dir"; then
+        echo "Error: Another selected-analysis writer is active for $report_dir." >&2
+        return 1
+    fi
+    if [ -e "$lock_dir" ]; then
+        if [ ! -d "$lock_dir" ] || [ -L "$lock_dir/owner" ]; then
+            echo "Error: Selected-analysis writer lock is malformed: $lock_dir" >&2
+            return 1
+        fi
+        if [ -f "$lock_dir/owner" ]; then
+            recorded_token="$(cat "$lock_dir/owner" 2>/dev/null || echo "")"
+            recorded_pid="${recorded_token%%.*}"
+            recorded_rest="${recorded_token#*.}"
+            recorded_random="${recorded_rest%%.*}"
+            recorded_epoch="${recorded_rest#*.}"
+            case "$recorded_pid" in ''|0|0*|*[!0-9]*) recorded_pid="" ;; esac
+            case "$recorded_random" in ''|*[!0-9]*) recorded_pid="" ;; esac
+            case "$recorded_epoch" in ''|*[!0-9]*|*.*) recorded_pid="" ;; esac
+            if [ -z "$recorded_pid" ] || \
+               [ "$recorded_rest" = "$recorded_token" ] || \
+               [ "$recorded_epoch" = "$recorded_rest" ]; then
+                echo "Error: Selected-analysis writer lock has an invalid owner: $lock_dir" >&2
+                return 1
+            fi
+            # PID reuse conservatively keeps the lock live. A dead owner's lock
+            # is atomically moved aside and token-checked before removal.
+            if kill -0 "$recorded_pid" 2>/dev/null; then
+                echo "Error: Another selected-analysis writer is active for $report_dir." >&2
+                return 1
+            fi
         else
-            rm -f "$combined_tmp"
+            lock_entry="$(find "$lock_dir" -mindepth 1 -maxdepth 1 \
+                -print -quit 2>/dev/null || echo find-failed)"
+            if [ -n "$lock_entry" ]; then
+                echo "Error: Selected-analysis writer lock is malformed: $lock_dir" >&2
+                return 1
+            fi
+            lock_mtime="$(selected_analysis_lock_mtime "$lock_dir" 2>/dev/null || echo "")"
+            current_time="$(date +%s)"
+            case "$current_time" in ''|*[!0-9]*) current_time="" ;; esac
+            if [ -z "$lock_mtime" ] || [ -z "$current_time" ] || \
+               [ $((current_time - lock_mtime)) -lt 60 ]; then
+                echo "Error: Selected-analysis writer lock is awaiting its owner record: $lock_dir" >&2
+                return 1
+            fi
+            ownerless_lock=true
+        fi
+        stale_dir="$report_dir/.selected-analysis-stale.$$.$RANDOM.$(date +%s)"
+        if [ -e "$stale_dir" ] || [ -L "$stale_dir" ] || \
+           ! mv "$lock_dir" "$stale_dir"; then
+            echo "Error: Could not claim stale selected-analysis lock: $lock_dir" >&2
+            return 1
+        fi
+        if [ "$ownerless_lock" = true ]; then
+            lock_entry="$(find "$stale_dir" -mindepth 1 -maxdepth 1 \
+                -print -quit 2>/dev/null || echo find-failed)"
+            if [ -n "$lock_entry" ] || \
+               [ "$(selected_analysis_lock_mtime "$stale_dir" 2>/dev/null || echo "")" != \
+                 "$lock_mtime" ] || ! rmdir "$stale_dir"; then
+                echo "Error: Ownerless selected-analysis lock changed during stale recovery; preserved at $stale_dir." >&2
+                return 1
+            fi
+        else
+            if [ -L "$stale_dir/owner" ] || [ ! -f "$stale_dir/owner" ] || \
+               [ "$(cat "$stale_dir/owner" 2>/dev/null || echo "")" != \
+                 "$recorded_token" ]; then
+                echo "Error: Selected-analysis lock changed while stale recovery claimed it; preserved at $stale_dir." >&2
+                return 1
+            fi
+            if ! rm -f "$stale_dir/owner" || ! rmdir "$stale_dir"; then
+                echo "Error: Stale selected-analysis lock could not be removed: $stale_dir" >&2
+                return 1
+            fi
+        fi
+    fi
+    recover_empty_selected_analysis_residues "$report_dir"
+    recovery_residue="$(find "$report_dir" -mindepth 1 -maxdepth 1 \
+        \( -name '.selected-analysis-quarantine.*' \
+           -o -name '.selected-analysis-replacements.*' \
+           -o -name '.selected-analysis-release.*' \
+           -o -name '.selected-analysis-stale.*' \) \
+        -print -quit 2>/dev/null || echo find-failed)"
+    if [ -n "$recovery_residue" ]; then
+        echo "Error: Selected-analysis recovery residue requires manual reconciliation: $recovery_residue" >&2
+        return 1
+    fi
+    if ! (umask 077; mkdir "$lock_dir"); then
+        echo "Error: Another selected-analysis writer is active for $report_dir." >&2
+        return 1
+    fi
+    if ! selected_analysis_worker_pid; then
+        rmdir "$lock_dir" 2>/dev/null || true
+        return 1
+    fi
+    worker_pid="$SELECTED_ANALYSIS_WORKER_PID"
+    token="$worker_pid.$RANDOM.$(date +%s)"
+    if ! (set -C; umask 077; printf '%s\n' "$token" > "$lock_dir/owner") || \
+       [ -L "$lock_dir" ] || [ ! -d "$lock_dir" ] || \
+       path_has_symlink_component "$lock_dir" || \
+       [ -L "$lock_dir/owner" ] || [ ! -f "$lock_dir/owner" ] || \
+       [ "$(cat "$lock_dir/owner" 2>/dev/null || echo "")" != "$token" ]; then
+        echo "Error: Selected-analysis writer lock changed while its owner was recorded: $lock_dir" >&2
+        return 1
+    fi
+    SELECTED_ANALYSIS_LOCK_DIR="$lock_dir"
+    SELECTED_ANALYSIS_LOCK_TOKEN="$token"
+    SELECTED_ANALYSIS_LOCK_OWNED=true
+}
+
+release_selected_analysis_lock() {
+    local lock_dir="$1" token="$2"
+    local report_dir release_dir="" candidate="" candidate_token=""
+    local entry="" token_pid="" token_rest="" token_random="" token_epoch=""
+    local restore_nullglob=false
+    local -a release_candidates=()
+    [ -n "$lock_dir" ] || return 0
+    report_dir="$(dirname "$lock_dir")"
+    token_pid="${token%%.*}"
+    token_rest="${token#*.}"
+    token_random="${token_rest%%.*}"
+    token_epoch="${token_rest#*.}"
+    case "$token_pid" in ''|0|0*|*[!0-9]*) return 1 ;; esac
+    case "$token_random" in ''|*[!0-9]*) return 1 ;; esac
+    case "$token_epoch" in ''|*[!0-9]*|*.*) return 1 ;; esac
+    [ "$token_rest" != "$token" ] && [ "$token_epoch" != "$token_rest" ] || \
+        return 1
+    release_dir="$report_dir/.selected-analysis-release.$token"
+
+    # A prior transient cleanup failure may already have atomically claimed the
+    # lock. Its deterministic, token-authenticated pathname permits an EXIT
+    # retry after owner unlink without trusting an unrelated residue.
+    shopt -q nullglob || { shopt -s nullglob; restore_nullglob=true; }
+    release_candidates=("$report_dir"/.selected-analysis-release.*)
+    [ "$restore_nullglob" = false ] || shopt -u nullglob
+    for candidate in "${release_candidates[@]}"; do
+        if [ -L "$candidate" ] || [ ! -d "$candidate" ] || \
+           path_has_symlink_component "$candidate"; then
+            echo "Error: Unsafe selected-analysis release residue requires manual reconciliation: $candidate" >&2
+            return 1
+        fi
+        if [ "$candidate" != "$release_dir" ]; then
+            echo "Error: Selected-analysis release residue requires manual reconciliation: $candidate" >&2
+            return 1
+        fi
+        if [ -e "$lock_dir" ] || [ -L "$lock_dir" ]; then
+            echo "Error: Selected-analysis release residue exists beside the active writer lock; manual reconciliation is required: $candidate" >&2
+            return 1
+        fi
+        if [ ! -e "$candidate/owner" ] && [ ! -L "$candidate/owner" ]; then
+            entry="$(find "$candidate" -mindepth 1 -maxdepth 1 \
+                -print -quit 2>/dev/null || echo find-failed)"
+            if [ -n "$entry" ] || ! rmdir "$candidate"; then
+                echo "Error: Ownerless selected-analysis release could not be safely resumed: $candidate" >&2
+                return 1
+            fi
+            return 0
+        fi
+        if [ -L "$candidate/owner" ] || [ ! -f "$candidate/owner" ]; then
+            echo "Error: Unsafe selected-analysis release residue requires manual reconciliation: $candidate" >&2
+            return 1
+        fi
+        candidate_token="$(cat "$candidate/owner" 2>/dev/null || echo "")"
+        if [ "$candidate_token" != "$token" ]; then
+            echo "Error: Selected-analysis release residue requires manual reconciliation: $candidate" >&2
+            return 1
+        fi
+    done
+
+    if [ ! -d "$release_dir" ]; then
+        if [ -L "$lock_dir" ] || [ ! -d "$lock_dir" ] || \
+           [ -L "$lock_dir/owner" ] || [ ! -f "$lock_dir/owner" ] || \
+           [ "$(cat "$lock_dir/owner" 2>/dev/null || echo "")" != "$token" ]; then
+            echo "Error: Selected-analysis writer lock ownership changed: $lock_dir" >&2
+            return 1
+        fi
+        if [ -e "$release_dir" ] || [ -L "$release_dir" ] || \
+           ! mv "$lock_dir" "$release_dir"; then
+            echo "Error: Could not atomically claim selected-analysis writer lock for release: $lock_dir" >&2
+            return 1
+        fi
+        if [ -L "$release_dir" ] || [ ! -d "$release_dir" ] || \
+           path_has_symlink_component "$release_dir" || \
+           [ -L "$release_dir/owner" ] || [ ! -f "$release_dir/owner" ] || \
+           [ "$(cat "$release_dir/owner" 2>/dev/null || echo "")" != "$token" ]; then
+            echo "Error: Selected-analysis lock changed during release; preserved at $release_dir." >&2
             return 1
         fi
     fi
+
+    entry="$(find "$release_dir" -mindepth 1 -maxdepth 1 \
+        ! -name owner -print -quit 2>/dev/null || echo find-failed)"
+    if [ -n "$entry" ]; then
+        echo "Error: Selected-analysis release directory contains unexpected content; preserved at $release_dir." >&2
+        return 1
+    fi
+    if ! rm -f "$release_dir/owner"; then
+        echo "Error: Could not remove selected-analysis claimed lock owner: $release_dir/owner" >&2
+        return 1
+    fi
+    if ! rmdir "$release_dir"; then
+        echo "Error: Could not remove selected-analysis claimed lock directory: $release_dir" >&2
+        return 1
+    fi
 }
+
+# Replace or delete the five selected-analysis views as one recoverable
+# transaction. Live originals are atomically quarantined and verified against
+# the caller's capture. Hard-link publication and restoration fail rather than
+# clobbering a pathname that reappears at a boundary.
+publish_selected_analysis_transaction() (
+    local report_dir="$1" expected_dir="$2" replacement_dir="$3"
+    local quarantine_dir name destination expected replacement quarantine
+    local expected_digest quarantine_digest expected_mode quarantine_mode
+    local transaction_failed=false rollback_failed=false transaction_signal=""
+    local -a names=(
+        analysis.json analysis.md context-coverage.md
+        combined-data.json comprehensive-report.md
+    )
+    quarantine_dir="$(mktemp -d \
+        "$report_dir/.selected-analysis-quarantine.XXXXXX")" || return 1
+    trap 'transaction_signal=INT; transaction_failed=true' INT
+    trap 'transaction_signal=TERM; transaction_failed=true' TERM
+
+    rollback_selected_publication() {
+        local rollback_name rollback_destination rollback_replacement
+        local rollback_quarantine rollback_published
+        local index
+        for ((index=${#names[@]}-1; index>=0; index--)); do
+            rollback_name="${names[$index]}"
+            rollback_destination="$report_dir/$rollback_name"
+            rollback_replacement="$replacement_dir/$rollback_name"
+            if [ -f "$rollback_replacement" ] && \
+               [ -e "$rollback_destination" ]; then
+                rollback_published="$quarantine_dir/.published-$rollback_name"
+                if [ -e "$rollback_published" ] || [ -L "$rollback_published" ] || \
+                   ! mv "$rollback_destination" "$rollback_published"; then
+                    rollback_failed=true
+                elif [ "$rollback_published" -ef "$rollback_replacement" ]; then
+                    : # Owned publication is now safely quarantined for discard.
+                else
+                    # The destination changed before rollback could claim it.
+                    # Put that concurrent content back only if the pathname is
+                    # still absent, and retain every original for reconciliation.
+                    if [ -e "$rollback_destination" ] || \
+                       [ -L "$rollback_destination" ] || \
+                       ! ln "$rollback_published" "$rollback_destination"; then
+                        :
+                    fi
+                    rollback_failed=true
+                fi
+            fi
+        done
+        for rollback_name in "${names[@]}"; do
+            rollback_destination="$report_dir/$rollback_name"
+            rollback_quarantine="$quarantine_dir/$rollback_name"
+            [ -f "$rollback_quarantine" ] || continue
+            if [ -e "$rollback_destination" ] || [ -L "$rollback_destination" ] || \
+               ! ln "$rollback_quarantine" "$rollback_destination"; then
+                rollback_failed=true
+            fi
+        done
+        if [ "$rollback_failed" = false ]; then
+            if ! rm -rf "$quarantine_dir"; then
+                echo "Error: Rollback restored selected-analysis views, but quarantined copies could not be removed from $quarantine_dir; manual cleanup is required." >&2
+                rollback_failed=true
+            fi
+        else
+            echo "Error: Original selected-analysis artifacts were preserved at $quarantine_dir; manual reconciliation is required." >&2
+        fi
+        [ "$rollback_failed" = false ]
+    }
+
+    for name in "${names[@]}"; do
+        destination="$report_dir/$name"
+        expected="$expected_dir/$name"
+        quarantine="$quarantine_dir/$name"
+        if [ -f "$expected" ]; then
+            if [ -L "$destination" ] || path_is_git_tracked "$destination" || \
+               [ ! -f "$destination" ] || ! mv "$destination" "$quarantine"; then
+                transaction_failed=true
+                break
+            fi
+            expected_digest="$(sha256_file "$expected" 2>/dev/null || echo "")"
+            quarantine_digest="$(sha256_file "$quarantine" 2>/dev/null || echo "")"
+            expected_mode="$(workspace_file_mode "$expected" 2>/dev/null || echo "")"
+            quarantine_mode="$(workspace_file_mode "$quarantine" 2>/dev/null || echo "")"
+            if [ -z "$expected_digest" ] || \
+               [ "$quarantine_digest" != "$expected_digest" ] || \
+               [ -z "$expected_mode" ] || [ "$quarantine_mode" != "$expected_mode" ]; then
+                transaction_failed=true
+                break
+            fi
+        elif [ -e "$destination" ] || [ -L "$destination" ]; then
+            transaction_failed=true
+            break
+        fi
+        if [ -n "$transaction_signal" ]; then
+            transaction_failed=true
+            break
+        fi
+    done
+    if [ "$transaction_failed" = true ]; then
+        rollback_selected_publication || true
+        [ -z "$transaction_signal" ] || \
+            echo "Error: Selected-analysis publication was cancelled and rolled back." >&2
+        case "$transaction_signal" in
+            INT) return 130 ;;
+            TERM) return 143 ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    for name in "${names[@]}"; do
+        destination="$report_dir/$name"
+        replacement="$replacement_dir/$name"
+        if [ -f "$replacement" ]; then
+            if [ -e "$destination" ] || [ -L "$destination" ] || \
+               ! ln "$replacement" "$destination"; then
+                transaction_failed=true
+                break
+            fi
+        elif [ -e "$destination" ] || [ -L "$destination" ]; then
+            transaction_failed=true
+            break
+        fi
+        if [ -n "$transaction_signal" ]; then
+            transaction_failed=true
+            break
+        fi
+    done
+    if [ "$transaction_failed" = false ]; then
+        for name in "${names[@]}"; do
+            destination="$report_dir/$name"
+            replacement="$replacement_dir/$name"
+            if [ -f "$replacement" ]; then
+                [ -e "$destination" ] && \
+                    [ "$destination" -ef "$replacement" ] || \
+                    transaction_failed=true
+            elif [ -e "$destination" ] || [ -L "$destination" ]; then
+                transaction_failed=true
+            fi
+        done
+    fi
+    if [ "$transaction_failed" = true ]; then
+        rollback_selected_publication || true
+        [ -z "$transaction_signal" ] || \
+            echo "Error: Selected-analysis publication was cancelled and rolled back." >&2
+        case "$transaction_signal" in
+            INT) return 130 ;;
+            TERM) return 143 ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    if ! rm -rf "$quarantine_dir"; then
+        echo "Error: Published selected-analysis views, but stale originals could not be removed from $quarantine_dir; manual cleanup is required." >&2
+        return 1
+    fi
+    case "$transaction_signal" in
+        INT)
+            echo "Error: Selected-analysis publication completed coherently before interrupt cancellation." >&2
+            return 130
+            ;;
+        TERM)
+            echo "Error: Selected-analysis publication completed coherently before termination." >&2
+            return 143
+            ;;
+    esac
+    return 0
+)
+
+invalidate_selected_analysis() (
+    local report_dir="$1" invalidation_backup_dir="" replacement_dir=""
+    local selected_lock_dir="" selected_lock_token="" selected_lock_owned=false
+    local selected_writer_signal=""
+    local publication_rc=0
+    local artifact backup_file backup_digest source_digest source_mode
+    local -a invalidation_artifacts=(
+        "$report_dir/analysis.json"
+        "$report_dir/analysis.md"
+        "$report_dir/context-coverage.md"
+        "$report_dir/combined-data.json"
+        "$report_dir/comprehensive-report.md"
+    )
+    cleanup_invalidation_temps() {
+        [ -z "$invalidation_backup_dir" ] || \
+            rm -rf "$invalidation_backup_dir" 2>/dev/null || true
+        [ -z "$replacement_dir" ] || \
+            rm -rf "$replacement_dir" 2>/dev/null || true
+        if [ "$selected_lock_owned" = true ] && [ -n "$selected_lock_dir" ]; then
+            if ! release_selected_analysis_lock \
+                    "$selected_lock_dir" "$selected_lock_token"; then
+                echo "Error: Selected-analysis writer lock remains after invalidation cleanup." >&2
+            fi
+        fi
+    }
+    validate_invalidation_artifacts() {
+        for artifact in "${invalidation_artifacts[@]}"; do
+            if [ -L "$artifact" ] || path_has_symlink_component "$artifact" || \
+               path_is_git_tracked "$artifact" || \
+               { [ -e "$artifact" ] && [ ! -f "$artifact" ]; }; then
+                echo "Error: Refusing unsafe selected-analysis artifact during invalidation: $artifact" >&2
+                return 1
+            fi
+        done
+    }
+    trap cleanup_invalidation_temps EXIT
+    trap 'selected_writer_signal=INT' INT
+    trap 'selected_writer_signal=TERM' TERM
+    validate_invalidation_artifacts || return 1
+    acquire_selected_analysis_lock "$report_dir" || return 1
+    selected_lock_dir="$SELECTED_ANALYSIS_LOCK_DIR"
+    selected_lock_token="$SELECTED_ANALYSIS_LOCK_TOKEN"
+    selected_lock_owned="$SELECTED_ANALYSIS_LOCK_OWNED"
+
+    # Capture every current view before deriving replacements. Rendering from
+    # these verified backups ensures a source that changes before its own copy
+    # is never overwritten by output derived from older bytes.
+    invalidation_backup_dir="$(mktemp -d \
+        "/tmp/gh-pr-enrich-invalidation.XXXXXX")" || return 1
+    replacement_dir="$(mktemp -d \
+        "$report_dir/.selected-analysis-replacements.XXXXXX")" || return 1
+    chmod 700 "$replacement_dir" || return 1
+    for artifact in "${invalidation_artifacts[@]}"; do
+        [ -f "$artifact" ] || continue
+        source_digest="$(sha256_file "$artifact")" || return 1
+        backup_file="$invalidation_backup_dir/$(basename "$artifact")"
+        cp -p "$artifact" "$backup_file" || return 1
+        backup_digest="$(sha256_file "$backup_file")" || return 1
+        if [ "$backup_digest" != "$source_digest" ] || \
+           [ "$(sha256_file "$artifact" 2>/dev/null || echo "")" != \
+             "$source_digest" ]; then
+            echo "Error: Selected-analysis artifacts changed while invalidation was staged." >&2
+            return 1
+        fi
+    done
+
+    backup_file="$invalidation_backup_dir/comprehensive-report.md"
+    if [ -f "$backup_file" ]; then
+        if grep -Fxq -e '<!-- BEGIN SELECTED ANALYSIS -->' \
+                -e '<!-- END SELECTED ANALYSIS -->' "$backup_file"; then
+            if ! awk '
+            BEGIN { in_selected = 0; selected_blocks = 0 }
+            $0 == "<!-- BEGIN SELECTED ANALYSIS -->" {
+                if (in_selected || selected_blocks > 0) exit 2
+                in_selected = 1
+                selected_blocks++
+                next
+            }
+            $0 == "<!-- END SELECTED ANALYSIS -->" {
+                if (!in_selected) exit 2
+                in_selected = 0
+                next
+            }
+            !in_selected { print }
+            END { if (in_selected) exit 2 }
+            ' "$backup_file" > "$replacement_dir/comprehensive-report.md"; then
+                echo "Error: Comprehensive report has malformed selected-analysis markers." >&2
+                return 1
+            fi
+        elif ! cp -p "$backup_file" \
+                "$replacement_dir/comprehensive-report.md"; then
+            return 1
+        fi
+        source_mode="$(workspace_file_mode "$backup_file")" || return 1
+        chmod "$source_mode" "$replacement_dir/comprehensive-report.md" || return 1
+    fi
+
+    backup_file="$invalidation_backup_dir/combined-data.json"
+    if [ -f "$backup_file" ]; then
+        if ! jq 'del(.analysis, .analysis_context_coverage)' \
+                "$backup_file" > "$replacement_dir/combined-data.json" 2>/dev/null; then
+            return 1
+        fi
+        source_mode="$(workspace_file_mode "$backup_file")" || return 1
+        chmod "$source_mode" "$replacement_dir/combined-data.json" || return 1
+    fi
+
+    # Close the render-phase TOCTOU window and verify that paths which were
+    # absent when captured remain absent immediately before publication.
+    validate_invalidation_artifacts || return 1
+    for artifact in "${invalidation_artifacts[@]}"; do
+        backup_file="$invalidation_backup_dir/$(basename "$artifact")"
+        if [ -f "$backup_file" ]; then
+            if [ ! -f "$artifact" ] || \
+               [ "$(sha256_file "$artifact" 2>/dev/null || echo "")" != \
+                 "$(sha256_file "$backup_file" 2>/dev/null || echo "")" ]; then
+                echo "Error: Selected-analysis artifacts changed before invalidation was published." >&2
+                return 1
+            fi
+        elif [ -e "$artifact" ] || [ -L "$artifact" ]; then
+            echo "Error: A selected-analysis artifact appeared while invalidation was staged." >&2
+            return 1
+        fi
+    done
+    if [ -n "$selected_writer_signal" ]; then
+        echo "Error: Selected-analysis invalidation was cancelled before publication." >&2
+        case "$selected_writer_signal" in
+            INT) return 130 ;;
+            TERM) return 143 ;;
+        esac
+    fi
+    publish_selected_analysis_transaction \
+        "$report_dir" "$invalidation_backup_dir" "$replacement_dir" || \
+        publication_rc=$?
+    if [ "$publication_rc" -ne 0 ]; then
+        echo "Error: Selected-analysis invalidation could not be published safely." >&2
+        return "$publication_rc"
+    fi
+    if [ "$selected_lock_owned" = true ]; then
+        if ! release_selected_analysis_lock \
+                "$selected_lock_dir" "$selected_lock_token"; then
+            echo "Error: Selected-analysis invalidation was published, but its writer lock could not be released." >&2
+            return 1
+        fi
+        selected_lock_owned=false
+        selected_lock_dir=""
+        selected_lock_token=""
+    fi
+    case "$selected_writer_signal" in
+        INT) return 130 ;;
+        TERM) return 143 ;;
+    esac
+    return 0
+)
 
 is_generated_report_artifact() {
     case "$1" in
+        .selected-analysis.lock/owner|\
         pr-summary.json|comment-threads.json|comment-threads.json.pages|unresolved-threads.json|id-mapping.txt|\
         issue-comments.json|review-comments.json|inline-comments.json|\
         issue-comments.pages|review-comments.pages|inline-comments.pages|\
@@ -734,8 +1320,8 @@ is_generated_report_artifact() {
         sast-findings.json|semgrep-raw.json|\
         issue-comments-status.json|review-comments-status.json|inline-comments-status.json|\
         review-threads-status.json|checks-status.json|linked-issues-status.json|\
-        diff-status.json|sast-status.json|analysis-context.json|analysis-context.tmp.json|\
-        analysis-context.fingerprinted.tmp.json|claude-context.json|analysis-schema.json|\
+        diff-status.json|sast-status.json|analysis-context.json|\
+        claude-context.json|analysis-schema.json|\
         analysis.json|codex-analysis.json|claude-analysis.json|claude-analysis.raw.tmp.json|\
         claude-code-analysis.json|hybrid-analysis.json|analysis.md|codex-analysis.md|\
         claude-analysis.md|claude-code-analysis.md|hybrid-analysis.md|context-coverage.md|\
@@ -994,7 +1580,9 @@ materialize_analysis_snapshot() {
     local embedded_context_fingerprint current_context_fingerprint
     local expected_workspace_fingerprint current_workspace_fingerprint
     local captured_pr_head snapshot_path result
-    local snapshot_ttl_seconds="${GH_PR_ENRICH_SNAPSHOT_TTL_SECONDS:-3600}"
+    local snapshot_ttl_seconds
+    snapshot_ttl_seconds="$(positive_integer_or_default \
+        "${GH_PR_ENRICH_SNAPSHOT_TTL_SECONDS:-3600}" 3600 86400)"
     if [ ! -f "$context_file" ] || [ -L "$context_file" ] || \
        path_is_git_tracked "$context_file"; then
         echo "Error: A safe analysis-context.json is required to materialize a snapshot." >&2
@@ -1062,6 +1650,13 @@ cleanup_materialized_analysis_snapshot() {
     stop_analysis_snapshot_janitor "$snapshot_path"
     chmod -R u+w "$snapshot_path" 2>/dev/null || true
     rm -rf "$snapshot_path"
+}
+
+cleanup_read_only_analysis_snapshot() {
+    local selected_file="$1" report_copy snapshot_path
+    report_copy="$(dirname "$selected_file")"
+    snapshot_path="$(dirname "$report_copy")"
+    cleanup_materialized_analysis_snapshot "$snapshot_path"
 }
 
 validate_analysis_thread_ids() {
@@ -1162,49 +1757,123 @@ validate_address_selection_pair() {
 
 # Prefer the provider-neutral selected analysis while retaining compatibility
 # with reports generated before v2.1.
-select_analysis_file() {
+select_analysis_file() (
     local report_dir="$1"
     local selection_mode="${2:-read-only}"
     local expected_head="" expected_fingerprint="" expected_repository=""
     local expected_pr_number="" has_current_context=false
+    local selected_path="" reader_lock_dir="" reader_lock_token=""
+    local reader_lock_owned=false
+    local analysis_identity="" claude_identity="" context_identity=""
+    local summary_identity=""
+    local selection_root="$report_dir" read_snapshot_dir=""
+    local read_snapshot_report="" read_snapshot_handed_off=false
+    local snapshot_ttl_seconds=""
+    stable_read_identity() {
+        local path="$1" digest="" mode=""
+        if [ -L "$path" ] || path_has_symlink_component "$path" || \
+           { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+            return 1
+        fi
+        if [ ! -f "$path" ]; then
+            printf '%s\n' absent
+            return 0
+        fi
+        digest="$(sha256_file "$path" 2>/dev/null || echo "")"
+        mode="$(workspace_file_mode "$path" 2>/dev/null || echo "")"
+        [ -n "$digest" ] && [ -n "$mode" ] || return 1
+        printf '%s:%s\n' "$mode" "$digest"
+    }
+    cleanup_analysis_reader_lock() {
+        if [ -n "$read_snapshot_dir" ] && \
+           [ "$read_snapshot_handed_off" != true ]; then
+            rm -rf "$read_snapshot_dir" 2>/dev/null || true
+        fi
+        if [ "$reader_lock_owned" = true ]; then
+            if ! release_selected_analysis_lock \
+                    "$reader_lock_dir" "$reader_lock_token"; then
+                echo "Error: Selected-analysis reader lock remains after validation." >&2
+            fi
+        fi
+    }
+    trap cleanup_analysis_reader_lock EXIT
     case "$selection_mode" in
         read-only|require-current-workspace) ;;
         *) return 1 ;;
     esac
-    if [ -f "$report_dir/analysis-context.json" ]; then
+    if [ "$selection_mode" = "require-current-workspace" ]; then
+        acquire_selected_analysis_lock "$report_dir" || return 1
+        reader_lock_dir="$SELECTED_ANALYSIS_LOCK_DIR"
+        reader_lock_token="$SELECTED_ANALYSIS_LOCK_TOKEN"
+        reader_lock_owned="$SELECTED_ANALYSIS_LOCK_OWNED"
+    else
+        # Historical discovery must work in immutable archives. Bind the
+        # complete set of paths that can affect selection before validating,
+        # then require the same bytes/modes and absence states afterward.
+        analysis_identity="$(stable_read_identity \
+            "$report_dir/analysis.json")" || return 1
+        claude_identity="$(stable_read_identity \
+            "$report_dir/claude-analysis.json")" || return 1
+        context_identity="$(stable_read_identity \
+            "$report_dir/analysis-context.json")" || return 1
+        summary_identity="$(stable_read_identity \
+            "$report_dir/pr-summary.json")" || return 1
+        read_snapshot_dir="$(mktemp -d \
+            "/tmp/gh-pr-enrich-analysis-snapshot.XXXXXX")" || return 1
+        read_snapshot_report="$read_snapshot_dir/$(basename "${report_dir%/}")"
+        mkdir "$read_snapshot_report" || return 1
+        local snapshot_name snapshot_identity
+        for snapshot_name in analysis.json claude-analysis.json \
+                analysis-context.json pr-summary.json; do
+            case "$snapshot_name" in
+                analysis.json) snapshot_identity="$analysis_identity" ;;
+                claude-analysis.json) snapshot_identity="$claude_identity" ;;
+                analysis-context.json) snapshot_identity="$context_identity" ;;
+                pr-summary.json) snapshot_identity="$summary_identity" ;;
+            esac
+            [ "$snapshot_identity" != absent ] || continue
+            cp -p "$report_dir/$snapshot_name" \
+                "$read_snapshot_report/$snapshot_name" || return 1
+            [ "$(stable_read_identity \
+                "$read_snapshot_report/$snapshot_name")" = \
+              "$snapshot_identity" ] || return 1
+        done
+        selection_root="$read_snapshot_report"
+    fi
+    if [ -f "$selection_root/analysis-context.json" ]; then
         local embedded_fingerprint
         has_current_context=true
         expected_head="$(jq -r '.coverage.code_access.pr_head_sha // ""' \
-            "$report_dir/analysis-context.json" 2>/dev/null || echo "")"
+            "$selection_root/analysis-context.json" 2>/dev/null || echo "")"
         expected_repository="$(jq -r '.pr.repository // ""' \
-            "$report_dir/analysis-context.json" 2>/dev/null || echo "")"
+            "$selection_root/analysis-context.json" 2>/dev/null || echo "")"
         expected_pr_number="$(jq -r '.pr.number // ""' \
-            "$report_dir/analysis-context.json" 2>/dev/null || echo "")"
+            "$selection_root/analysis-context.json" 2>/dev/null || echo "")"
         embedded_fingerprint="$(jq -r '.coverage.context_fingerprint // ""' \
-            "$report_dir/analysis-context.json" 2>/dev/null || echo "")"
+            "$selection_root/analysis-context.json" 2>/dev/null || echo "")"
         expected_fingerprint="$(analysis_context_fingerprint \
-            "$report_dir/analysis-context.json" 2>/dev/null || echo "")"
+            "$selection_root/analysis-context.json" 2>/dev/null || echo "")"
         if [ -z "$embedded_fingerprint" ] || \
            [ "$embedded_fingerprint" != "$expected_fingerprint" ]; then
             return 1
         fi
-        if [ -f "$report_dir/pr-summary.json" ]; then
+        if [ -f "$selection_root/pr-summary.json" ]; then
             local summary_head
             summary_head="$(jq -r '.headRefOid // ""' \
-                "$report_dir/pr-summary.json" 2>/dev/null || echo "")"
+                "$selection_root/pr-summary.json" 2>/dev/null || echo "")"
             if [ -n "$summary_head" ] && [ "$summary_head" != "$expected_head" ]; then
                 return 1
             fi
         fi
-    elif [ -f "$report_dir/pr-summary.json" ]; then
+    elif [ -f "$selection_root/pr-summary.json" ]; then
         expected_head="$(jq -r '.headRefOid // ""' \
-            "$report_dir/pr-summary.json" 2>/dev/null || echo "")"
+            "$selection_root/pr-summary.json" 2>/dev/null || echo "")"
     fi
 
-    if [ -f "$report_dir/analysis.json" ]; then
+    if [ -f "$selection_root/analysis.json" ]; then
         local selected_has_metadata
         selected_has_metadata="$(jq -r 'type == "object" and has("_metadata")' \
-            "$report_dir/analysis.json" 2>/dev/null || echo false)"
+            "$selection_root/analysis.json" 2>/dev/null || echo false)"
         # Provider-neutral analysis.json exists only in the v2.1 selection
         # workflow. Context-free compatibility applies solely to the old
         # claude-analysis.json name below; otherwise a reviewed branch could
@@ -1225,11 +1894,12 @@ select_analysis_file() {
                 return 1
             fi
         elif ! validate_selected_provenance "$report_dir" \
-                "$report_dir/analysis.json"; then
+                "$selection_root/analysis.json" \
+                "$selection_root/analysis-context.json"; then
             return 1
         fi
-        printf '%s\n' "$report_dir/analysis.json"
-    elif [ -f "$report_dir/claude-analysis.json" ]; then
+        selected_path="$selection_root/analysis.json"
+    elif [ -f "$selection_root/claude-analysis.json" ]; then
         # Old Claude-only reports had no provider-neutral provenance metadata.
         # Read-only retrospective discovery may still inspect them, but strict
         # mutation consumers cannot prove their workspace or PR identity.
@@ -1242,14 +1912,35 @@ select_analysis_file() {
            [ -L "$report_dir/claude-analysis.json" ] || \
            path_is_git_tracked "$report_dir/claude-analysis.json" || \
            ! jq -e 'type == "object" and (has("_metadata") | not)' \
-                "$report_dir/claude-analysis.json" > /dev/null 2>&1; then
+                "$selection_root/claude-analysis.json" > /dev/null 2>&1; then
             return 1
         fi
-        printf '%s\n' "$report_dir/claude-analysis.json"
+        selected_path="$selection_root/claude-analysis.json"
     else
         return 1
     fi
-}
+    if [ "$selection_mode" = "read-only" ]; then
+        [ "$(stable_read_identity "$report_dir/analysis.json")" = \
+          "$analysis_identity" ] && \
+        [ "$(stable_read_identity "$report_dir/claude-analysis.json")" = \
+          "$claude_identity" ] && \
+        [ "$(stable_read_identity "$report_dir/analysis-context.json")" = \
+          "$context_identity" ] && \
+        [ "$(stable_read_identity "$report_dir/pr-summary.json")" = \
+          "$summary_identity" ] || return 1
+        snapshot_ttl_seconds="$(positive_integer_or_default \
+            "${GH_PR_ENRICH_SNAPSHOT_TTL_SECONDS:-3600}" 3600 86400)"
+        start_analysis_snapshot_janitor "$read_snapshot_dir" \
+            "$snapshot_ttl_seconds" || return 1
+        read_snapshot_handed_off=true
+    fi
+    if [ "$reader_lock_owned" = true ]; then
+        release_selected_analysis_lock \
+            "$reader_lock_dir" "$reader_lock_token" || return 1
+        reader_lock_owned=false
+    fi
+    printf '%s\n' "$selected_path"
+)
 
 # Invoke the Claude CLI for a structured-output analysis.
 #
@@ -1600,6 +2291,15 @@ if [ "$1" = "retrospective" ]; then
     RETRO_MIN_PRS=3
     RETRO_FORMAT=""
     RETRO_OUTPUT_FORMAT="combined"
+    PR_REPORTS=()
+    cleanup_retrospective_snapshots() {
+        local selected_file
+        for selected_file in "${PR_REPORTS[@]}"; do
+            cleanup_read_only_analysis_snapshot "$selected_file" \
+                2>/dev/null || true
+        done
+    }
+    trap cleanup_retrospective_snapshots EXIT
 
     # Show help
     if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
@@ -1837,7 +2537,7 @@ RETRO_HELP
 
             local analysis_file
             analysis_file="$(select_analysis_file "$pr_dir" 2>/dev/null || true)"
-            local summary_file="$pr_dir/pr-summary.json"
+            local summary_file="$(dirname "$analysis_file")/pr-summary.json"
 
             if [ -z "$analysis_file" ] || [ ! -f "$analysis_file" ]; then
                 ((skipped_no_analysis++)) || true
@@ -1849,6 +2549,7 @@ RETRO_HELP
                 local pr_date
                 pr_date=$(jq -r '.createdAt // .updatedAt // ""' "$summary_file" 2>/dev/null | cut -d'T' -f1)
                 if [ -n "$pr_date" ] && [[ "$pr_date" < "$since_date" ]]; then
+                    cleanup_read_only_analysis_snapshot "$analysis_file"
                     ((skipped_date++)) || true
                     continue
                 fi
@@ -1869,6 +2570,7 @@ RETRO_HELP
                     fi
                 done
                 if [ "$author_match" = false ]; then
+                    cleanup_read_only_analysis_snapshot "$analysis_file"
                     ((skipped_author++)) || true
                     continue
                 fi
@@ -1881,6 +2583,7 @@ RETRO_HELP
             if jq -e '(.issue_categories // []) | length > 0 and (map(has("category")) | any | not)' \
                     "$analysis_file" > /dev/null 2>&1; then
                 legacy_reports+=("$(basename "$pr_dir")")
+                cleanup_read_only_analysis_snapshot "$analysis_file"
                 continue
             fi
 
@@ -1912,8 +2615,6 @@ RETRO_HELP
         for report in "${PR_REPORTS[@]}"; do
             local pr_dir
             pr_dir=$(dirname "$report")
-            local pr_num
-            pr_num=$(basename "$pr_dir" | sed 's/pr-//')
             local summary_file="$pr_dir/pr-summary.json"
 
             local pr_meta="{}"
@@ -1985,7 +2686,7 @@ RETRO_HELP
                 .pr_meta.number as $pr_num |
                 (
                     # From issue categories
-                    ((.issue_categories // [])[] | {
+                    ((.issue_categories // [])[] | select(.verdict != "refuted") | {
                         category: (.category // "uncategorized"),
                         severity: .severity,
                         pr: $pr_num
@@ -2079,12 +2780,17 @@ RETRO_HELP
         {
             overview: {
                 total_prs_analyzed: $agg.total_prs,
-                total_issues: [$agg.prs[] | (.issue_categories // []) | length] | add,
+                total_issues: [
+                    $agg.prs[]
+                    | [(.issue_categories // [])[] | select(.verdict != "refuted")]
+                    | length
+                ] | add,
                 total_tasks: [$agg.prs[] | (.task_list // []) | length] | add,
                 total_patterns: ($patterns | length)
             },
             top_issue_categories: (
-                [$agg.prs[] | (.issue_categories // [])[]] |
+                [$agg.prs[] | (.issue_categories // [])[]
+                    | select(.verdict != "refuted")] |
                 sort_by(.name) |
                 group_by(.name) |
                 map({name: .[0].name, count: length, severities: (sort_by(.severity) | group_by(.severity) | map({s: .[0].severity, c: length}))}) |
@@ -2510,6 +3216,8 @@ CHECKLIST_HEADER
     # Aggregate data
     retro_log "Aggregating PR data..."
     AGGREGATED=$(aggregate_pr_data)
+    cleanup_retrospective_snapshots
+    PR_REPORTS=()
     echo "$AGGREGATED" > "$RETRO_OUTPUT_DIR/aggregated-data.json"
 
     # Calculate patterns
@@ -3963,17 +4671,38 @@ fetch_pr_diff() {
     write_input_status "$output_dir/diff-status.json" true "$diff_status" "$diff_reason"
 }
 
-build_analysis_context() {
+build_analysis_context() (
     local output_dir="$1"
     local include_diff="${2:-false}"
     local repository="${4:-${REPO:-unknown}}"
-    local include_sast
+    local include_sast sast_legacy_direct=false
+    local context_lock_dir="" context_lock_token="" context_lock_owned=false
+    local context_writer_signal=""
+    local context_invalidation_rc=0
+    local context_staging_dir="" context_tmp="" fingerprinted_tmp=""
+    local context_publish_tmp=""
+    cleanup_context_writer() {
+        [ -z "$context_staging_dir" ] || \
+            rm -rf "$context_staging_dir" 2>/dev/null || true
+        [ -z "$context_publish_tmp" ] || \
+            rm -f "$context_publish_tmp" 2>/dev/null || true
+        if [ "$context_lock_owned" = true ]; then
+            if ! release_selected_analysis_lock \
+                    "$context_lock_dir" "$context_lock_token"; then
+                echo "Error: Selected-analysis writer lock remains after context cleanup." >&2
+            fi
+        fi
+    }
+    trap cleanup_context_writer EXIT
+    trap 'context_writer_signal=INT' INT
+    trap 'context_writer_signal=TERM' TERM
     if [ "$#" -ge 3 ]; then
         include_sast="$3"
     elif [ -s "$output_dir/sast-findings.json" ]; then
         # Backward compatibility for direct v2.0 callers that prepared the
         # SAST file before invoking the two-argument context builder.
         include_sast=true
+        sast_legacy_direct=true
     else
         include_sast=false
     fi
@@ -3988,6 +4717,10 @@ build_analysis_context() {
     else
         truncate_at=5000
     fi
+    context_staging_dir="$(mktemp -d \
+        "/tmp/gh-pr-enrich-context.XXXXXX")" || return 1
+    context_tmp="$context_staging_dir/analysis-context.json"
+    fingerprinted_tmp="$context_staging_dir/analysis-context.fingerprinted.json"
 
     # Missing optional inputs degrade to empty, never to a hard failure.
     if [ ! -f "$output_dir/issue-comments.json" ]; then
@@ -4038,11 +4771,20 @@ build_analysis_context() {
     # files are replaced with an empty document so one missing input cannot take
     # the whole context down.
     local optional
-    for optional in review-comments.json inline-comments.json checks.json linked-issues.json sast-findings.json; do
+    for optional in review-comments.json inline-comments.json checks.json linked-issues.json; do
         if [ ! -s "$output_dir/$optional" ] || ! jq -e 'type == "array"' "$output_dir/$optional" > /dev/null 2>&1; then
             echo '[]' > "$output_dir/$optional"
         fi
     done
+    local sast_findings_parseable=true sast_findings_error=""
+    if [ ! -s "$output_dir/sast-findings.json" ]; then
+        sast_findings_parseable=false
+        sast_findings_error="SAST findings file is missing or empty"
+    elif ! jq -e 'type == "array"' \
+            "$output_dir/sast-findings.json" > /dev/null 2>&1; then
+        sast_findings_parseable=false
+        sast_findings_error="SAST findings file is not a valid JSON array"
+    fi
 
     if [ "$include_diff" != true ]; then
         write_input_status "$output_dir/diff-status.json" false "not_requested" ""
@@ -4058,15 +4800,24 @@ build_analysis_context() {
     fi
     if [ "$include_sast" != true ]; then
         write_input_status "$output_dir/sast-status.json" false "not_requested" ""
+    elif [ "$sast_findings_parseable" != true ]; then
+        write_input_status "$output_dir/sast-status.json" true "failed" \
+            "$sast_findings_error"
     elif [ ! -s "$output_dir/sast-status.json" ] || \
          ! jq -e 'type == "object"' "$output_dir/sast-status.json" > /dev/null 2>&1; then
-        if [ -s "$output_dir/sast-findings.json" ] && \
+        if [ "$sast_legacy_direct" = true ] && \
+           [ -s "$output_dir/sast-findings.json" ] && \
            jq -e 'type == "array"' "$output_dir/sast-findings.json" > /dev/null 2>&1; then
             write_input_status "$output_dir/sast-status.json" true "completed" \
                 "status inferred from prebuilt SAST findings"
         else
             write_input_status "$output_dir/sast-status.json" true "failed" "SAST status was not recorded"
         fi
+    fi
+    if [ "$sast_findings_parseable" != true ]; then
+        # Keep jq construction safe only after coverage records that the source
+        # was malformed; it must never become an inferred clean SAST result.
+        echo '[]' > "$output_dir/sast-findings.json"
     fi
 
     local with_diff=false
@@ -4109,6 +4860,46 @@ build_analysis_context() {
         fi
     fi
 
+    # Current CLI runs may use deterministic SAST findings only when their
+    # immutable-snapshot provenance is bound to this exact context workspace.
+    # The two-argument v2.0 entry point intentionally retains its historical
+    # prebuilt-findings behavior because those callers have no status artifact.
+    local with_sast=false sast_status_value="" sast_status_source=""
+    local sast_status_reason=""
+    local sast_status_fingerprint=""
+    if [ "$include_sast" = true ]; then
+        sast_status_value="$(jq -r '.status // ""' \
+            "$output_dir/sast-status.json" 2>/dev/null || echo "")"
+        sast_status_reason="$(jq -r '.reason // ""' \
+            "$output_dir/sast-status.json" 2>/dev/null || echo "")"
+        if [ "$sast_legacy_direct" = true ] && \
+           [ "$sast_status_value" = "completed" ]; then
+            with_sast=true
+        else
+            sast_status_source="$(jq -r '.workspace_source // ""' \
+                "$output_dir/sast-status.json" 2>/dev/null || echo "")"
+            sast_status_fingerprint="$(jq -r '.workspace_fingerprint // ""' \
+                "$output_dir/sast-status.json" 2>/dev/null || echo "")"
+            if [ "$sast_status_value" != "completed" ] && \
+               [ "$sast_status_value" != "completed_with_errors" ]; then
+                write_input_status "$output_dir/sast-status.json" true "failed" \
+                    "SAST scan status '$sast_status_value' is not completed: ${sast_status_reason:-no reason recorded}"
+            elif [ "$sast_status_source" != "immutable_snapshot" ] || \
+                 [ -z "$sast_status_fingerprint" ]; then
+                write_input_status "$output_dir/sast-status.json" true "failed" \
+                    "SAST findings do not record immutable workspace snapshot provenance"
+            elif [ "$access_state" != "enabled" ] || [ -z "$workspace_fingerprint" ]; then
+                write_input_status "$output_dir/sast-status.json" true "failed" \
+                    "SAST snapshot provenance cannot be matched to the current analysis workspace"
+            elif [ "$sast_status_fingerprint" != "$workspace_fingerprint" ]; then
+                write_input_status "$output_dir/sast-status.json" true "failed" \
+                    "SAST workspace fingerprint does not match the analysis context workspace fingerprint"
+            else
+                with_sast=true
+            fi
+        fi
+    fi
+
     # One jq program builds the whole context. The coverage block records what was
     # dropped or shortened, so a truncated input can never read as a complete one.
     jq -n \
@@ -4131,7 +4922,7 @@ build_analysis_context() {
         --slurpfile checks_status_doc "$output_dir/checks-status.json" \
         --slurpfile linked_issues_status_doc "$output_dir/linked-issues-status.json" \
         --argjson with_diff "$with_diff" \
-        --argjson with_sast "$include_sast" \
+        --argjson with_sast "$with_sast" \
         --argjson limit "$truncate_at" \
         --arg pr_head_sha "$pr_head_sha" \
         --arg local_head "$local_head" \
@@ -4286,20 +5077,50 @@ build_analysis_context() {
                 file_diffs: [$files[] | {file: .file, diff: trunc(.content)}]
             }
           } else {} end)
-        ' > "$output_dir/analysis-context.tmp.json"
+        ' > "$context_tmp"
     local context_fingerprint
-    context_fingerprint="$(analysis_context_fingerprint "$output_dir/analysis-context.tmp.json")"
+    context_fingerprint="$(analysis_context_fingerprint "$context_tmp")"
     jq --arg fingerprint "$context_fingerprint" \
         '.coverage.context_fingerprint = $fingerprint' \
-        "$output_dir/analysis-context.tmp.json" > "$output_dir/analysis-context.fingerprinted.tmp.json"
-    mv "$output_dir/analysis-context.fingerprinted.tmp.json" "$output_dir/analysis-context.json"
-    rm -f "$output_dir/analysis-context.tmp.json"
+        "$context_tmp" > "$fingerprinted_tmp"
+    acquire_selected_analysis_lock "$output_dir" || return 1
+    context_lock_dir="$SELECTED_ANALYSIS_LOCK_DIR"
+    context_lock_token="$SELECTED_ANALYSIS_LOCK_TOKEN"
+    context_lock_owned="$SELECTED_ANALYSIS_LOCK_OWNED"
+    if [ -n "$context_writer_signal" ]; then
+        echo "Error: Analysis-context publication was cancelled before commit." >&2
+        case "$context_writer_signal" in
+            INT) return 130 ;;
+            TERM) return 143 ;;
+        esac
+    fi
+    # A context refresh changes immutable provenance. Remove every selected
+    # view under the same lock before making the new context visible.
+    invalidate_selected_analysis "$output_dir" || context_invalidation_rc=$?
+    [ "$context_invalidation_rc" -eq 0 ] || return "$context_invalidation_rc"
+    context_publish_tmp="$(mktemp \
+        "$output_dir/.analysis-context-publish.XXXXXX")" || return 1
+    cp "$fingerprinted_tmp" "$context_publish_tmp" || return 1
+    mv "$context_publish_tmp" "$output_dir/analysis-context.json" || return 1
+    context_publish_tmp=""
 
     # Backward compatibility for consumers that predate the provider-neutral
     # artifact name. Both files contain the same immutable snapshot.
     copy_compatibility_file "$output_dir/analysis-context.json" "$output_dir/claude-context.json"
     emit_analysis_schema | jq . > "$output_dir/analysis-schema.json"
-}
+    if [ "$context_lock_owned" = true ]; then
+        if ! release_selected_analysis_lock \
+                "$context_lock_dir" "$context_lock_token"; then
+            echo "Error: Analysis context was published, but its writer lock could not be released." >&2
+            return 1
+        fi
+        context_lock_owned=false
+    fi
+    case "$context_writer_signal" in
+        INT) return 130 ;;
+        TERM) return 143 ;;
+    esac
+)
 
 # Closed taxonomy for findings. Kept in sync with default-prompt.txt by
 # tests/test-analysis-contract.sh -- the analyzer must return an explicit verdict
@@ -4457,7 +5278,8 @@ build_claude_context() {
 # children on completion or interruption.
 run_semgrep_with_watchdog() {
     local timeout_secs="$1" raw_file="$2" stderr_file="$3" config="$4"
-    shift 4
+    local working_directory="$5"
+    shift 5
     local -a targets=("$@")
     local semgrep_pid="" watchdog_pid="" semgrep_rc=0 semgrep_group_owned=false
     local launch_attempts=0
@@ -4507,6 +5329,7 @@ run_semgrep_with_watchdog() {
     }
     trap 'stop_semgrep_wrapper 143' TERM
     trap 'stop_semgrep_wrapper 130' INT
+    is_private_code_snapshot_path "$working_directory" || return 125
 
     # Keep the direct child behind a private launch gate while the wrapper proves
     # that Bash put it in the expected isolated process group. Never use a
@@ -4517,11 +5340,14 @@ run_semgrep_with_watchdog() {
     GH_PR_ENRICH_SEMGREP_TIMEOUT_SECONDS="$timeout_secs" \
         /bin/sh -c '
             launch_dir="$1"
-            shift
+            working_directory="$2"
+            shift 2
             : > "$launch_dir/ready"
             while [ ! -f "$launch_dir/go" ]; do :; done
+            cd "$working_directory" || exit 125
             exec "$@"
-        ' sh "$semgrep_launch_dir" semgrep --config "$config" --json --quiet -- "${targets[@]}" \
+        ' sh "$semgrep_launch_dir" "$working_directory" \
+            semgrep --config "$config" --json --quiet -- "${targets[@]}" \
         > "$raw_file" 2> "$stderr_file" &
     semgrep_pid=$!
     launch_attempts=0
@@ -4617,14 +5443,27 @@ collect_sast_findings() {
     fi
     local output_file="$output_dir/sast-findings.json"
     local status_file="$output_dir/sast-status.json"
+    local sast_workspace_fingerprint=""
+    write_sast_status() {
+        local requested="$1" status="$2" reason="$3"
+        jq -n --argjson requested "$requested" --arg status "$status" \
+            --arg reason "$reason" \
+            --arg workspace_fingerprint "$sast_workspace_fingerprint" '
+            {requested: $requested, status: $status, reason: $reason}
+            + if $workspace_fingerprint == "" then {}
+              else {workspace_source: "immutable_snapshot",
+                    workspace_fingerprint: $workspace_fingerprint}
+              end
+        ' > "$status_file"
+    }
 
     echo '[]' > "$output_file"
-    write_input_status "$status_file" true "running" ""
+    write_sast_status true "running" ""
 
     if ! command -v semgrep > /dev/null 2>&1; then
         echo "⚠️  semgrep not found — skipping the static-analysis pre-pass." >&2
         echo "   Install it (pip install semgrep) or drop --sast." >&2
-        write_input_status "$status_file" true "skipped" "semgrep executable not found"
+        write_sast_status true "skipped" "semgrep executable not found"
         return 0
     fi
 
@@ -4640,27 +5479,38 @@ collect_sast_findings() {
     access_line="$(resolve_code_access "$pr_head_sha" "$output_dir")"
     if [ "${access_line%%:*}" = "disabled" ]; then
         echo "⚠️  Skipping the semgrep pre-pass: ${access_line#*: }" >&2
-        write_input_status "$status_file" true "skipped" "${access_line#*: }"
+        write_sast_status true "skipped" "${access_line#*: }"
         return 0
     fi
 
-    # Changed-file paths from GitHub are repository-relative, so they are resolved
-    # against the repository root. Resolving them against the current directory
-    # drops every target when the extension runs from a subdirectory, and a
-    # skipped scan is indistinguishable from a clean one.
-    local repo_root
-    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || echo ".")"
+    # Freeze the exact granted workspace before Semgrep reads any code. Paths in
+    # the findings remain repository-relative, but every byte comes from this
+    # private read-only snapshot rather than the mutable checkout.
+    sast_workspace_fingerprint="$(code_access_workspace_fingerprint \
+        "$output_dir" 2>/dev/null || echo "")"
+    if [ -z "$sast_workspace_fingerprint" ] || \
+       ! create_code_access_snapshot "$output_dir" "$sast_workspace_fingerprint"; then
+        cleanup_code_access_snapshot
+        echo "⚠️  Could not create an immutable workspace snapshot for semgrep." >&2
+        write_sast_status true "failed" \
+            "immutable workspace snapshot could not be created"
+        return 0
+    fi
+    local sast_snapshot_path="$CODE_ACCESS_SNAPSHOT_DIR"
 
-    # Scan only the files this PR touches that still exist in the working tree.
+    # Scan only changed regular files represented by the captured manifest.
     local -a targets=()
     local path
     while IFS= read -r path; do
-        [ -n "$path" ] && [ -f "$repo_root/$path" ] && targets+=("$repo_root/$path")
+        case "$path" in ""|/*|../*|*/../*|*/..) continue ;; esac
+        [ -f "$sast_snapshot_path/$path" ] && targets+=("./$path")
     done < <(jq -r '(.files // [])[].path' "$output_dir/pr-summary.json" 2>/dev/null)
 
     if [ "${#targets[@]}" -eq 0 ]; then
-        echo "ℹ️  No changed files present in the working tree — skipping semgrep." >&2
-        write_input_status "$status_file" true "skipped" "no changed files were present in the matched working tree"
+        echo "ℹ️  No changed files present in the immutable workspace snapshot — skipping semgrep." >&2
+        write_sast_status true "skipped" \
+            "no changed files were present in the matched workspace snapshot"
+        cleanup_code_access_snapshot
         return 0
     fi
 
@@ -4678,33 +5528,74 @@ collect_sast_findings() {
     trap 'semgrep_signal=TERM; stop_owned_semgrep_wrapper' TERM
     trap 'semgrep_signal=INT; stop_owned_semgrep_wrapper' INT
     run_semgrep_with_watchdog "$timeout_secs" "$raw_file" \
-        "$output_dir/semgrep-stderr.log" "$config" "${targets[@]}" &
+        "$output_dir/semgrep-stderr.log" "$config" "$sast_snapshot_path" \
+        "${targets[@]}" &
     semgrep_wrapper_pid=$!
     wait "$semgrep_wrapper_pid" || rc=$?
     semgrep_wrapper_pid=""
     if [ -n "$previous_term_trap" ]; then eval "$previous_term_trap"; else trap - TERM; fi
     if [ -n "$previous_int_trap" ]; then eval "$previous_int_trap"; else trap - INT; fi
     case "$semgrep_signal" in
-        TERM) return 143 ;;
-        INT) return 130 ;;
+        TERM)
+            cleanup_code_access_snapshot
+            return 143
+            ;;
+        INT)
+            cleanup_code_access_snapshot
+            return 130
+            ;;
     esac
 
-    if [ "$rc" -ne 0 ] && [ ! -s "$raw_file" ]; then
-        echo "⚠️  semgrep failed (exit $rc). See $output_dir/semgrep-stderr.log" >&2
-        write_input_status "$status_file" true "failed" "semgrep exited $rc without usable JSON"
+    local current_workspace_fingerprint
+    current_workspace_fingerprint="$(code_access_workspace_fingerprint \
+        "$output_dir" 2>/dev/null || echo "")"
+    cleanup_code_access_snapshot
+    if [ -z "$current_workspace_fingerprint" ] || \
+       [ "$current_workspace_fingerprint" != "$sast_workspace_fingerprint" ]; then
+        rm -f "$raw_file"
+        echo "⚠️  Workspace changed during the semgrep pre-pass; discarding its output." >&2
+        write_sast_status true "failed" \
+            "workspace fingerprint changed during immutable snapshot scan"
         return 0
     fi
 
-    if ! jq '[(.results // [])[] | {
+    if [ "$rc" -ne 0 ] && [ ! -s "$raw_file" ]; then
+        echo "⚠️  semgrep failed (exit $rc). See $output_dir/semgrep-stderr.log" >&2
+        write_sast_status true "failed" "semgrep exited $rc without usable JSON"
+        return 0
+    fi
+
+    if ! jq -e 'type == "object" and has("results") and
+            (.results | type == "array")' \
+            "$raw_file" > /dev/null 2>&1; then
+        echo '[]' > "$output_file"
+        write_sast_status true "failed" \
+            "semgrep output root was not an object with a results array"
+        return 0
+    fi
+
+    if ! jq --arg snapshot_root "$sast_snapshot_path" '[
+        .results[] |
+        (.path // "") as $raw_path |
+        (if ($raw_path | startswith($snapshot_root + "/")) then
+            $raw_path[($snapshot_root | length) + 1:]
+         elif ($raw_path | startswith("./")) then
+            $raw_path[2:]
+         elif ($raw_path | startswith("/")) or
+              ($raw_path == "..") or ($raw_path | startswith("../")) or
+              ($raw_path | contains("/../")) then
+            error("semgrep returned a path outside the immutable snapshot")
+         else $raw_path end) as $repository_path |
+        {
         check_id: .check_id,
-        path: .path,
+        path: $repository_path,
         line: (.start.line // 0),
         severity: (.extra.severity // "INFO"),
         message: (.extra.message // ""),
         cwe: ((.extra.metadata.cwe // []) | if type == "array" then . else [.] end)
     }]' "$raw_file" > "$output_file" 2>/dev/null; then
         echo '[]' > "$output_file"
-        write_input_status "$status_file" true "failed" "semgrep output was not valid result JSON"
+        write_sast_status true "failed" "semgrep output was not valid snapshot-bound result JSON"
         return 0
     fi
 
@@ -4712,9 +5603,10 @@ collect_sast_findings() {
     count=$(jq 'length' "$output_file" 2>/dev/null || echo 0)
     echo "🔍 semgrep: $count finding(s) across ${#targets[@]} changed file(s)" >&2
     if [ "$rc" -eq 0 ]; then
-        write_input_status "$status_file" true "completed" ""
+        write_sast_status true "completed" ""
     else
-        write_input_status "$status_file" true "completed_with_errors" "semgrep exited $rc after returning parseable results"
+        write_sast_status true "completed_with_errors" \
+            "semgrep exited $rc after returning parseable results"
     fi
     return 0
 }
@@ -4884,6 +5776,7 @@ run_claude_analysis() {
     local context_file="$1"
     local output_file="$2"
     local analysis_output_file="$output_file"
+    local context_dir
     CLAUDE_CAPTURED_PR_HEAD=""
     CLAUDE_CAPTURED_CONTEXT_FINGERPRINT=""
     CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT=""
@@ -4891,39 +5784,85 @@ run_claude_analysis() {
     ANALYZER_SETTINGS_FILE=""
     cleanup_code_access_snapshot
 
+    local system_prompt
+    if ! system_prompt="$(load_system_prompt)"; then
+        return 1
+    fi
+
+    # The prompt and every captured grant field must come from one immutable
+    # context copy. Binding only the live fingerprint before and after prompt
+    # construction permits an A->B->A swap to feed B to Claude while the result
+    # is stamped with A's provenance.
+    local context_digest context_mode frozen_context_digest frozen_context_mode
+    local immediate_context_digest immediate_context_mode
+    context_dir="$(dirname "$context_file")"
+    if [ ! -f "$context_file" ] || [ -L "$context_file" ]; then
+        echo "Error: Analysis context is missing or unsafe before Claude analysis." >&2
+        return 1
+    fi
+    context_digest="$(sha256_file "$context_file" 2>/dev/null || echo "")"
+    context_mode="$(workspace_file_mode "$context_file" 2>/dev/null || echo "")"
+    if [ -z "$context_digest" ] || [ -z "$context_mode" ]; then
+        echo "Error: Analysis context identity could not be captured before Claude analysis." >&2
+        return 1
+    fi
+    ANALYZER_CONTEXT_FILE="$(mktemp "/tmp/gh-pr-enrich-claude-context.XXXXXX")" || \
+        return 1
+    install_code_access_cleanup_traps
+    if ! cp -p "$context_file" "$ANALYZER_CONTEXT_FILE"; then
+        cleanup_code_access_snapshot
+        echo "Error: Analysis context could not be frozen before Claude analysis." >&2
+        return 1
+    fi
+    frozen_context_digest="$(sha256_file "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
+    frozen_context_mode="$(workspace_file_mode "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
+    immediate_context_digest="$(sha256_file "$context_file" 2>/dev/null || echo "")"
+    immediate_context_mode="$(workspace_file_mode "$context_file" 2>/dev/null || echo "")"
+    if [ "$frozen_context_digest" != "$context_digest" ] || \
+       [ "$frozen_context_mode" != "$context_mode" ] || \
+       [ "$immediate_context_digest" != "$context_digest" ] || \
+       [ "$immediate_context_mode" != "$context_mode" ]; then
+        cleanup_code_access_snapshot
+        echo "Error: Analysis context changed while its immutable copy was captured." >&2
+        return 1
+    fi
+
     local context_access_state access_reason captured_pr_head
     local captured_context_fingerprint embedded_context_fingerprint
     context_access_state="$(jq -r '.coverage.code_access.state // "disabled"' \
-        "$context_file" 2>/dev/null || echo "disabled")"
+        "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "disabled")"
     access_reason="$(jq -r '.coverage.code_access.reason // ""' \
-        "$context_file" 2>/dev/null || echo "")"
+        "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
     captured_pr_head="$(jq -r '.coverage.code_access.pr_head_sha // ""' \
-        "$context_file" 2>/dev/null || echo "")"
+        "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
     embedded_context_fingerprint="$(jq -r '.coverage.context_fingerprint // ""' \
-        "$context_file" 2>/dev/null || echo "")"
+        "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
     captured_context_fingerprint="$(analysis_context_fingerprint \
-        "$context_file" 2>/dev/null || echo "")"
+        "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
     if [ -z "$captured_pr_head" ] || [ -z "$captured_context_fingerprint" ] || \
        [ "$embedded_context_fingerprint" != "$captured_context_fingerprint" ]; then
+        cleanup_code_access_snapshot
         echo "Error: Analysis context identity is missing or invalid before Claude analysis." >&2
         return 1
     fi
 
     local code_access="false"
     if [ "$context_access_state" = "enabled" ]; then
-        validate_code_access_grant "$context_file" "$(dirname "$context_file")" || return 1
+        if ! validate_code_access_grant "$ANALYZER_CONTEXT_FILE" "$context_dir"; then
+            cleanup_code_access_snapshot
+            return 1
+        fi
         code_access="true"
     fi
     local timeout_secs="${CLAUDE_TIMEOUT:-600}"
     local model="${GH_PR_ENRICH_MODEL:-sonnet}"
 
-    local system_prompt
-    if ! system_prompt="$(load_system_prompt)"; then
+    local context_payload
+    if ! context_payload="$(cat "$ANALYZER_CONTEXT_FILE")"; then
+        cleanup_code_access_snapshot
+        echo "Error: Immutable analysis context could not be read before Claude analysis." >&2
         return 1
     fi
-
-    local context_payload
-    context_payload="$(cat "$context_file")"
     local user_prompt="Analyze these unresolved PR comment threads and issue comments (including CI/bot reports) and provide structured analysis.
 
 Verify each claim against the code before reporting it, sweep every category in the taxonomy, and anchor every finding and task to a file and line.
@@ -4944,14 +5883,15 @@ $context_payload"
         local expected_workspace_fingerprint current_workspace_fingerprint repository_root
         expected_workspace_fingerprint="$(jq -r \
             '.coverage.code_access.workspace_fingerprint // ""' \
-            "$context_file" 2>/dev/null || echo "")"
-        if ! create_code_access_snapshot "$(dirname "$context_file")" \
+            "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
+        if ! create_code_access_snapshot "$context_dir" \
                 "$expected_workspace_fingerprint"; then
+            cleanup_code_access_snapshot
             echo "Error: Could not create a verified immutable repository snapshot for Claude analysis." >&2
             return 1
         fi
         current_workspace_fingerprint="$(code_access_workspace_fingerprint \
-            "$(dirname "$context_file")" 2>/dev/null || echo "")"
+            "$context_dir" 2>/dev/null || echo "")"
         if [ -z "$current_workspace_fingerprint" ] || \
            [ "$current_workspace_fingerprint" != "$expected_workspace_fingerprint" ]; then
             cleanup_code_access_snapshot
@@ -5065,6 +6005,8 @@ select_analysis_artifact() {
     local live_context_file="$report_dir/analysis-context.json"
     local frozen_source frozen_context frozen_path frozen_abs report_abs repo_root
     local captured_context_fingerprint rc=0
+    local source_digest="" source_mode="" frozen_digest="" frozen_mode=""
+    local live_digest="" live_mode=""
     if path_has_symlink_component "$report_dir" || [ -L "$source_file" ] || \
        [ -L "$live_context_file" ] || path_is_git_tracked "$source_file" || \
        path_is_git_tracked "$live_context_file" || [ ! -f "$source_file" ] || \
@@ -5072,6 +6014,9 @@ select_analysis_artifact() {
         echo "Error: Refusing unsafe analysis source artifact: $source_file" >&2
         return 1
     fi
+    source_digest="$(sha256_file "$source_file" 2>/dev/null || echo "")"
+    source_mode="$(workspace_file_mode "$source_file" 2>/dev/null || echo "")"
+    [ -n "$source_digest" ] && [ -n "$source_mode" ] || return 1
     frozen_source="$(mktemp "/tmp/gh-pr-enrich-analysis-source.XXXXXX")" || return 1
     frozen_context="$(mktemp "/tmp/gh-pr-enrich-analysis-context.XXXXXX")" || {
         rm -f "$frozen_source"
@@ -5098,9 +6043,21 @@ select_analysis_artifact() {
             esac
         fi
     done
-    if ! cp "$source_file" "$frozen_source" || \
-       ! cp "$live_context_file" "$frozen_context"; then
+    if ! cp -p "$source_file" "$frozen_source" || \
+       ! cp -p "$live_context_file" "$frozen_context"; then
         rm -f "$frozen_source" "$frozen_context"
+        return 1
+    fi
+    frozen_digest="$(sha256_file "$frozen_source" 2>/dev/null || echo "")"
+    frozen_mode="$(workspace_file_mode "$frozen_source" 2>/dev/null || echo "")"
+    live_digest="$(sha256_file "$source_file" 2>/dev/null || echo "")"
+    live_mode="$(workspace_file_mode "$source_file" 2>/dev/null || echo "")"
+    if [ "$frozen_digest" != "$source_digest" ] || \
+       [ "$frozen_mode" != "$source_mode" ] || \
+       [ "$live_digest" != "$source_digest" ] || \
+       [ "$live_mode" != "$source_mode" ]; then
+        rm -f "$frozen_source" "$frozen_context"
+        echo "Error: Analysis source changed while its immutable copy was captured." >&2
         return 1
     fi
     captured_context_fingerprint="$(analysis_context_fingerprint \
@@ -5111,7 +6068,7 @@ select_analysis_artifact() {
     return "$rc"
 }
 
-_select_analysis_artifact() {
+_select_analysis_artifact() (
     local report_dir="$1"
     local source_file="$2"
     local context_file="$3"
@@ -5119,6 +6076,25 @@ _select_analysis_artifact() {
     local live_context_file="$report_dir/analysis-context.json"
     local selected_file="$report_dir/analysis.json"
     local guarded_path
+    local selection_backup_dir="" replacement_dir=""
+    local selected_lock_dir="" selected_lock_token="" selected_lock_owned=false
+    local selected_writer_signal=""
+    local publication_rc=0
+    cleanup_selection_transaction() {
+        [ -z "$selection_backup_dir" ] || \
+            rm -rf "$selection_backup_dir" 2>/dev/null || true
+        [ -z "$replacement_dir" ] || \
+            rm -rf "$replacement_dir" 2>/dev/null || true
+        if [ "$selected_lock_owned" = true ] && [ -n "$selected_lock_dir" ]; then
+            if ! release_selected_analysis_lock \
+                    "$selected_lock_dir" "$selected_lock_token"; then
+                echo "Error: Selected-analysis writer lock remains after selection cleanup." >&2
+            fi
+        fi
+    }
+    trap cleanup_selection_transaction EXIT
+    trap 'selected_writer_signal=INT' INT
+    trap 'selected_writer_signal=TERM' TERM
 
     if path_has_symlink_component "$report_dir"; then
         echo "Error: Analysis report path contains a symbolic-link component: $report_dir" >&2
@@ -5294,44 +6270,66 @@ _select_analysis_artifact() {
         return 1
     fi
 
-    local tmp_tag=".$$.tmp"
-    local selected_tmp="$report_dir/analysis.json$tmp_tag"
-    local report_tmp="$report_dir/analysis.md$tmp_tag"
-    local coverage_tmp="$report_dir/context-coverage.md$tmp_tag"
-    local combined_tmp="$report_dir/combined-data.json$tmp_tag"
-    local comprehensive_base="$report_dir/comprehensive-report.base.md$tmp_tag"
-    local comprehensive_tmp="$report_dir/comprehensive-report.md$tmp_tag"
+    acquire_selected_analysis_lock "$report_dir" || return 1
+    selected_lock_dir="$SELECTED_ANALYSIS_LOCK_DIR"
+    selected_lock_token="$SELECTED_ANALYSIS_LOCK_TOKEN"
+    selected_lock_owned="$SELECTED_ANALYSIS_LOCK_OWNED"
+    selection_backup_dir="$(mktemp -d \
+        "/tmp/gh-pr-enrich-selection.XXXXXX")" || return 1
+    replacement_dir="$(mktemp -d \
+        "$report_dir/.selected-analysis-replacements.XXXXXX")" || return 1
+    chmod 700 "$replacement_dir" || return 1
 
-    cleanup_selection_temps() {
-        rm -f "$selected_tmp" "$report_tmp" "$coverage_tmp" "$combined_tmp" \
-            "$comprehensive_base" "$comprehensive_tmp"
-    }
+    local selection_artifact selection_backup source_digest backup_digest source_mode
+    local -a selection_artifacts=(
+        "$report_dir/analysis.json"
+        "$report_dir/analysis.md"
+        "$report_dir/context-coverage.md"
+        "$report_dir/combined-data.json"
+        "$report_dir/comprehensive-report.md"
+    )
+    for selection_artifact in "${selection_artifacts[@]}"; do
+        [ -f "$selection_artifact" ] || continue
+        source_digest="$(sha256_file "$selection_artifact")" || return 1
+        selection_backup="$selection_backup_dir/$(basename "$selection_artifact")"
+        cp -p "$selection_artifact" "$selection_backup" || return 1
+        backup_digest="$(sha256_file "$selection_backup")" || return 1
+        if [ "$backup_digest" != "$source_digest" ] || \
+           [ "$(sha256_file "$selection_artifact" 2>/dev/null || echo "")" != \
+             "$source_digest" ]; then
+            echo "Error: Selected-analysis views changed while selection was staged." >&2
+            return 1
+        fi
+    done
+
+    local selected_tmp="$replacement_dir/analysis.json"
+    local report_tmp="$replacement_dir/analysis.md"
+    local coverage_tmp="$replacement_dir/context-coverage.md"
+    local combined_tmp="$replacement_dir/combined-data.json"
+    local comprehensive_base="$replacement_dir/comprehensive-report.base.md"
+    local comprehensive_tmp="$replacement_dir/comprehensive-report.md"
 
     # Render and validate every derived view before replacing the trusted
     # selected artifact. A malformed candidate must leave the prior selection
     # and its reports untouched.
     if ! generate_analysis_report "$source_file" "$report_tmp"; then
-        cleanup_selection_temps
         return 1
     fi
     if ! generate_coverage_section "$context_file" "$coverage_tmp"; then
-        cleanup_selection_temps
         return 1
     fi
-    if [ -f "$report_dir/combined-data.json" ]; then
+    if [ -f "$selection_backup_dir/combined-data.json" ]; then
         if ! jq --slurpfile selected "$source_file" --slurpfile context "$context_file" \
             '.analysis = $selected[0]
              | .analysis_context_coverage = ($context[0].coverage // {})' \
-            "$report_dir/combined-data.json" > "$combined_tmp"; then
-            cleanup_selection_temps
+            "$selection_backup_dir/combined-data.json" > "$combined_tmp"; then
             return 1
         fi
     fi
 
-    if [ -f "$report_dir/comprehensive-report.md" ]; then
+    if [ -f "$selection_backup_dir/comprehensive-report.md" ]; then
         if ! awk '$0 == "<!-- BEGIN SELECTED ANALYSIS -->" {exit} {print}' \
-            "$report_dir/comprehensive-report.md" > "$comprehensive_base"; then
-            cleanup_selection_temps
+            "$selection_backup_dir/comprehensive-report.md" > "$comprehensive_base"; then
             return 1
         fi
         if ! {
@@ -5342,19 +6340,28 @@ _select_analysis_artifact() {
             cat "$coverage_tmp"
             printf '\n<!-- END SELECTED ANALYSIS -->\n'
         } > "$comprehensive_tmp"; then
-            cleanup_selection_temps
             return 1
         fi
     fi
 
-    local source_is_selected=false live_context_fingerprint live_embedded_fingerprint
-    if [ "$(canonicalize_path "$source_file")" = "$(canonicalize_path "$selected_file")" ]; then
-        source_is_selected=true
-    elif ! cp "$source_file" "$selected_tmp"; then
-        cleanup_selection_temps
+    if ! cp "$source_file" "$selected_tmp"; then
         return 1
     fi
+    for selection_artifact in analysis.json analysis.md context-coverage.md \
+            combined-data.json comprehensive-report.md; do
+        [ -f "$replacement_dir/$selection_artifact" ] || continue
+        if [ -f "$selection_backup_dir/$selection_artifact" ]; then
+            source_mode="$(workspace_file_mode \
+                "$selection_backup_dir/$selection_artifact")" || return 1
+        elif [ "$selection_artifact" = "analysis.json" ]; then
+            source_mode="$(workspace_file_mode "$source_file")" || return 1
+        else
+            continue
+        fi
+        chmod "$source_mode" "$replacement_dir/$selection_artifact" || return 1
+    done
 
+    local live_context_fingerprint live_embedded_fingerprint
     live_context_fingerprint="$(analysis_context_fingerprint \
         "$live_context_file" 2>/dev/null || echo "")"
     live_embedded_fingerprint="$(jq -r '.coverage.context_fingerprint // ""' \
@@ -5363,20 +6370,43 @@ _select_analysis_artifact() {
        [ -z "$captured_context_fingerprint" ] || \
        [ "$live_context_fingerprint" != "$captured_context_fingerprint" ] || \
        [ "$live_embedded_fingerprint" != "$captured_context_fingerprint" ]; then
-        cleanup_selection_temps
         echo "Error: Analysis context changed during selection; no selected artifacts were published." >&2
         return 1
     fi
 
-    mv "$report_tmp" "$report_dir/analysis.md"
-    mv "$coverage_tmp" "$report_dir/context-coverage.md"
-    [ ! -f "$combined_tmp" ] || mv "$combined_tmp" "$report_dir/combined-data.json"
-    [ ! -f "$comprehensive_tmp" ] || mv "$comprehensive_tmp" "$report_dir/comprehensive-report.md"
     rm -f "$comprehensive_base"
-    [ "$source_is_selected" = true ] || mv "$selected_tmp" "$selected_file"
+    if [ -n "$selected_writer_signal" ]; then
+        echo "Error: Selected-analysis publication was cancelled before commit." >&2
+        case "$selected_writer_signal" in
+            INT) return 130 ;;
+            TERM) return 143 ;;
+        esac
+    fi
+    publish_selected_analysis_transaction \
+        "$report_dir" "$selection_backup_dir" "$replacement_dir" || \
+        publication_rc=$?
+    if [ "$publication_rc" -ne 0 ]; then
+        echo "Error: Selected analysis could not be published safely." >&2
+        return "$publication_rc"
+    fi
+    if [ "$selected_lock_owned" = true ]; then
+        if ! release_selected_analysis_lock \
+                "$selected_lock_dir" "$selected_lock_token"; then
+            echo "Error: Selected analysis was published, but its writer lock could not be released." >&2
+            return 1
+        fi
+        selected_lock_owned=false
+        selected_lock_dir=""
+        selected_lock_token=""
+    fi
+
+    case "$selected_writer_signal" in
+        INT) return 130 ;;
+        TERM) return 143 ;;
+    esac
 
     echo "✅ Selected $(jq -r '._metadata.provider' "$selected_file") analysis at $selected_file"
-}
+)
 
 # Render what the analyzer was and was not shown. A bounded input that reads as a
 # complete one is how a review misses things without anyone noticing.
@@ -5545,7 +6575,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint select_analysis_file select_analysis_artifact fetch_review_threads fetch_linked_issues verify_pr_head_unchanged validate_output_directory_for_writes"
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues verify_pr_head_unchanged validate_output_directory_for_writes"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in
@@ -5782,7 +6812,44 @@ CHECKS_STATS=$(jq -r '{
     )
 }' "$OUTPUT_DIR/checks.json" 2>/dev/null || echo '{"overall_state": "unknown", "total": 0, "passing": 0, "failing": 0, "pending": 0, "skipped": 0, "cancelled": 0}')
 
-# 6. Create combined JSON
+# 6-7. Replace the base selected-analysis views as one coherent transaction.
+# A refresh invalidates any prior selected result while readers are excluded;
+# they can never observe a new combined view beside an old comprehensive view.
+(
+BASE_BACKUP_DIR=""
+BASE_REPLACEMENT_DIR=""
+BASE_LOCK_DIR=""
+BASE_LOCK_TOKEN=""
+BASE_LOCK_OWNED=false
+BASE_WRITER_SIGNAL=""
+BASE_PUBLICATION_RC=0
+cleanup_base_report_writer() {
+    [ -z "$BASE_BACKUP_DIR" ] || rm -rf "$BASE_BACKUP_DIR" 2>/dev/null || true
+    [ -z "$BASE_REPLACEMENT_DIR" ] || \
+        rm -rf "$BASE_REPLACEMENT_DIR" 2>/dev/null || true
+    if [ "$BASE_LOCK_OWNED" = true ]; then
+        if ! release_selected_analysis_lock "$BASE_LOCK_DIR" "$BASE_LOCK_TOKEN"; then
+            echo "Error: Selected-analysis writer lock remains after base-report cleanup." >&2
+        fi
+    fi
+}
+trap cleanup_base_report_writer EXIT
+trap 'BASE_WRITER_SIGNAL=INT' INT
+trap 'BASE_WRITER_SIGNAL=TERM' TERM
+acquire_selected_analysis_lock "$OUTPUT_DIR"
+BASE_LOCK_DIR="$SELECTED_ANALYSIS_LOCK_DIR"
+BASE_LOCK_TOKEN="$SELECTED_ANALYSIS_LOCK_TOKEN"
+BASE_LOCK_OWNED="$SELECTED_ANALYSIS_LOCK_OWNED"
+BASE_BACKUP_DIR="$(mktemp -d "/tmp/gh-pr-enrich-base-report.XXXXXX")"
+BASE_REPLACEMENT_DIR="$(mktemp -d \
+    "$OUTPUT_DIR/.selected-analysis-replacements.XXXXXX")"
+chmod 700 "$BASE_REPLACEMENT_DIR"
+for BASE_VIEW in analysis.json analysis.md context-coverage.md \
+        combined-data.json comprehensive-report.md; do
+    [ ! -f "$OUTPUT_DIR/$BASE_VIEW" ] || \
+        cp -p "$OUTPUT_DIR/$BASE_VIEW" "$BASE_BACKUP_DIR/$BASE_VIEW"
+done
+
 echo "Creating combined JSON..."
 jq -n \
     --argjson summary "$(<"$OUTPUT_DIR/pr-summary.json")" \
@@ -5807,11 +6874,10 @@ jq -n \
             comments: $comment_stats,
             checks: $checks_stats
         }
-    }' > "$OUTPUT_DIR/combined-data.json"
+    }' > "$BASE_REPLACEMENT_DIR/combined-data.json"
 
-# 7. Create Markdown report
 echo "Creating Markdown report..."
-cat > "$OUTPUT_DIR/comprehensive-report.md" << EOF
+cat > "$BASE_REPLACEMENT_DIR/comprehensive-report.md" << EOF
 # Comprehensive PR Review Report: #$PR_NUMBER
 
 **Repository:** $REPO
@@ -5867,6 +6933,36 @@ gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "<THRE
 
 *Report generated by gh-pr-enrich v$VERSION at $TIMESTAMP*
 EOF
+for BASE_VIEW in combined-data.json comprehensive-report.md; do
+    if [ -f "$BASE_BACKUP_DIR/$BASE_VIEW" ]; then
+        BASE_MODE="$(workspace_file_mode "$BASE_BACKUP_DIR/$BASE_VIEW")"
+        chmod "$BASE_MODE" "$BASE_REPLACEMENT_DIR/$BASE_VIEW"
+    fi
+done
+if [ -n "$BASE_WRITER_SIGNAL" ]; then
+    echo "Error: Base report publication was cancelled before commit." >&2
+    case "$BASE_WRITER_SIGNAL" in
+        INT) exit 130 ;;
+        TERM) exit 143 ;;
+    esac
+fi
+publish_selected_analysis_transaction \
+    "$OUTPUT_DIR" "$BASE_BACKUP_DIR" "$BASE_REPLACEMENT_DIR" || \
+    BASE_PUBLICATION_RC=$?
+if [ "$BASE_PUBLICATION_RC" -ne 0 ]; then
+    echo "Error: Base report views could not be published safely." >&2
+    exit "$BASE_PUBLICATION_RC"
+fi
+if ! release_selected_analysis_lock "$BASE_LOCK_DIR" "$BASE_LOCK_TOKEN"; then
+    echo "Error: Base report was published, but its writer lock could not be released." >&2
+    exit 1
+fi
+BASE_LOCK_OWNED=false
+case "$BASE_WRITER_SIGNAL" in
+    INT) exit 130 ;;
+    TERM) exit 143 ;;
+esac
+)
 
 # 8. Inspect analysis inputs, then prepare the provider-neutral snapshot only
 # when explicitly requested or when external Claude has something to analyze.
@@ -5942,10 +7038,80 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
             if [ "$ANALYSIS_USABLE" = true ]; then
                 generate_analysis_report "$OUTPUT_DIR/claude-analysis.json" "$OUTPUT_DIR/claude-analysis.md"
 
+                (
+                PROVIDER_BACKUP_DIR=""
+                PROVIDER_REPLACEMENT_DIR=""
+                PROVIDER_LOCK_DIR=""
+                PROVIDER_LOCK_TOKEN=""
+                PROVIDER_LOCK_OWNED=false
+                PROVIDER_WRITER_SIGNAL=""
+                PROVIDER_PUBLICATION_RC=0
+                cleanup_provider_combined_writer() {
+                    [ -z "$PROVIDER_BACKUP_DIR" ] || \
+                        rm -rf "$PROVIDER_BACKUP_DIR" 2>/dev/null || true
+                    [ -z "$PROVIDER_REPLACEMENT_DIR" ] || \
+                        rm -rf "$PROVIDER_REPLACEMENT_DIR" 2>/dev/null || true
+                    if [ "$PROVIDER_LOCK_OWNED" = true ]; then
+                        if ! release_selected_analysis_lock \
+                                "$PROVIDER_LOCK_DIR" "$PROVIDER_LOCK_TOKEN"; then
+                            echo "Error: Selected-analysis writer lock remains after provider update cleanup." >&2
+                        fi
+                    fi
+                }
+                trap cleanup_provider_combined_writer EXIT
+                trap 'PROVIDER_WRITER_SIGNAL=INT' INT
+                trap 'PROVIDER_WRITER_SIGNAL=TERM' TERM
+                acquire_selected_analysis_lock "$OUTPUT_DIR"
+                PROVIDER_LOCK_DIR="$SELECTED_ANALYSIS_LOCK_DIR"
+                PROVIDER_LOCK_TOKEN="$SELECTED_ANALYSIS_LOCK_TOKEN"
+                PROVIDER_LOCK_OWNED="$SELECTED_ANALYSIS_LOCK_OWNED"
+                PROVIDER_BACKUP_DIR="$(mktemp -d \
+                    "/tmp/gh-pr-enrich-provider-update.XXXXXX")"
+                PROVIDER_REPLACEMENT_DIR="$(mktemp -d \
+                    "$OUTPUT_DIR/.selected-analysis-replacements.XXXXXX")"
+                chmod 700 "$PROVIDER_REPLACEMENT_DIR"
+                for PROVIDER_VIEW in analysis.json analysis.md context-coverage.md \
+                        combined-data.json comprehensive-report.md; do
+                    [ ! -f "$OUTPUT_DIR/$PROVIDER_VIEW" ] || \
+                        cp -p "$OUTPUT_DIR/$PROVIDER_VIEW" \
+                            "$PROVIDER_BACKUP_DIR/$PROVIDER_VIEW"
+                    [ ! -f "$PROVIDER_BACKUP_DIR/$PROVIDER_VIEW" ] || \
+                        cp -p "$PROVIDER_BACKUP_DIR/$PROVIDER_VIEW" \
+                            "$PROVIDER_REPLACEMENT_DIR/$PROVIDER_VIEW"
+                done
                 jq --slurpfile provider_analysis "$OUTPUT_DIR/claude-analysis.json" \
                    '.claude_analysis = $provider_analysis[0]' \
-                   "$OUTPUT_DIR/combined-data.json" > "$OUTPUT_DIR/combined-data.tmp.json" && \
-                   mv "$OUTPUT_DIR/combined-data.tmp.json" "$OUTPUT_DIR/combined-data.json"
+                   "$PROVIDER_BACKUP_DIR/combined-data.json" \
+                   > "$PROVIDER_REPLACEMENT_DIR/combined-data.json"
+                PROVIDER_MODE="$(workspace_file_mode \
+                    "$PROVIDER_BACKUP_DIR/combined-data.json")"
+                chmod "$PROVIDER_MODE" \
+                    "$PROVIDER_REPLACEMENT_DIR/combined-data.json"
+                if [ -n "$PROVIDER_WRITER_SIGNAL" ]; then
+                    echo "Error: Cancellation arrived during provider update." >&2
+                    case "$PROVIDER_WRITER_SIGNAL" in
+                        INT) exit 130 ;;
+                        TERM) exit 143 ;;
+                    esac
+                fi
+                publish_selected_analysis_transaction \
+                    "$OUTPUT_DIR" "$PROVIDER_BACKUP_DIR" \
+                    "$PROVIDER_REPLACEMENT_DIR" || PROVIDER_PUBLICATION_RC=$?
+                if [ "$PROVIDER_PUBLICATION_RC" -ne 0 ]; then
+                    echo "Error: Provider combined update could not be published safely." >&2
+                    exit "$PROVIDER_PUBLICATION_RC"
+                fi
+                if ! release_selected_analysis_lock \
+                        "$PROVIDER_LOCK_DIR" "$PROVIDER_LOCK_TOKEN"; then
+                    echo "Error: Provider combined update was published, but its writer lock could not be released." >&2
+                    exit 1
+                fi
+                PROVIDER_LOCK_OWNED=false
+                case "$PROVIDER_WRITER_SIGNAL" in
+                    INT) exit 130 ;;
+                    TERM) exit 143 ;;
+                esac
+                )
 
                 # The prompt requires a verdict for every category. The schema cannot
                 # express "all 16 present", so it is checked here — an incomplete
@@ -5997,6 +7163,7 @@ case $OUTPUT_FORMAT in
             echo "🧠 Analysis: $OUTPUT_DIR/analysis.md"
             [ ! -f "$OUTPUT_DIR/claude-analysis.json" ] || \
                 echo "   Claude source: $OUTPUT_DIR/claude-analysis.json"
+            cleanup_read_only_analysis_snapshot "$CURRENT_ANALYSIS_FILE"
         elif [ -f "$OUTPUT_DIR/analysis-context.json" ]; then
             echo "🧩 Analysis context: $OUTPUT_DIR/analysis-context.json"
         fi

@@ -66,6 +66,22 @@ exec "$@"
 STUB
 chmod +x "$STUB_DIR/timeout"
 
+cat > "$STUB_DIR/cp" << 'STUB'
+#!/bin/bash
+previous=""
+for argument in "$@"; do
+    previous="$argument"
+done
+case "$previous" in
+    /tmp/gh-pr-enrich-claude-context.*|/private/tmp/gh-pr-enrich-claude-context.*)
+        [ -z "${ANALYZER_CONTEXT_COPY_LOG:-}" ] || \
+            printf '%s\n' "$previous" >> "$ANALYZER_CONTEXT_COPY_LOG"
+        ;;
+esac
+exec /bin/cp "$@"
+STUB
+chmod +x "$STUB_DIR/cp"
+
 PS_CALLED_LOG="$TEST_OUTPUT_DIR/ps-called.log"
 : > "$PS_CALLED_LOG"
 cat > "$STUB_DIR/ps" << 'STUB'
@@ -86,6 +102,7 @@ chmod +x "$STUB_DIR/sleep"
 
 cat > "$STUB_DIR/semgrep" << 'STUB'
 #!/bin/bash
+[ -z "${SEMGREP_CWD_LOG:-}" ] || pwd > "$SEMGREP_CWD_LOG"
 cat << 'JSON'
 {"results": [
   {"check_id": "javascript.lang.security.audit.unsafe-exec",
@@ -287,6 +304,17 @@ for _attempt in $(seq 1 100); do
 done
 assert_true "$([ ! -e "$EXPIRING_JANITOR_SIDECAR" ] && ! kill -0 "$EXPIRING_JANITOR_PID" 2>/dev/null && echo 0 || echo 1)" \
     "TTL expiry removes the lease sidecar and leaves no janitor process"
+for INVALID_SNAPSHOT_TTL in nope 999999999999999999999999999999; do
+    BOUNDED_SNAPSHOT_JSON=$(cd "$CODE_ACCESS_REPO" && \
+        env GH_PR_ENRICH_SNAPSHOT_TTL_SECONDS="$INVALID_SNAPSHOT_TTL" \
+        PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" materialize-analysis-snapshot "$NATIVE_REPORT")
+    BOUNDED_SNAPSHOT_PATH=$(printf '%s' "$BOUNDED_SNAPSHOT_JSON" | jq -r '.path')
+    assert_eq "3600" \
+        "$(printf '%s' "$BOUNDED_SNAPSHOT_JSON" | jq -r '.expires_in_seconds')" \
+        "invalid native snapshot TTL '$INVALID_SNAPSHOT_TTL' uses the bounded default"
+    "$GH_PR_ENRICH" cleanup-analysis-snapshot "$BOUNDED_SNAPSHOT_PATH"
+done
 rm -f "$NATIVE_REPORT/analysis-context.json"
 rmdir "$NATIVE_REPORT"
 
@@ -294,6 +322,7 @@ run_analysis_context() {
     local context_file="$1"
     shift
     (cd "$CODE_ACCESS_REPO" && env CLAUDE_ARG_LOG="$ARG_LOG" \
+        ANALYZER_CONTEXT_COPY_LOG="$TEST_OUTPUT_DIR/context-copy-paths.txt" \
         CLAUDE_SETTINGS_LOG="$TEST_OUTPUT_DIR/claude-settings.json" \
         CLAUDE_SETTINGS_PATH_LOG="$TEST_OUTPUT_DIR/claude-settings-path.txt" \
         CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
@@ -338,6 +367,10 @@ assert_true "$rc" "Claude settings deny the original repository by absolute path
 CLAUDE_SETTINGS_PATH=$(cat "$TEST_OUTPUT_DIR/claude-settings-path.txt")
 assert_true "$([ ! -e "$CLAUDE_SETTINGS_PATH" ] && echo 0 || echo 1)" \
     "the isolated Claude settings file is removed after analysis"
+SUCCESS_CONTEXT_COPY=$(tail -1 "$TEST_OUTPUT_DIR/context-copy-paths.txt" 2>/dev/null || echo "")
+assert_true "$([ -n "$SUCCESS_CONTEXT_COPY" ] && \
+    [ ! -e "$SUCCESS_CONTEXT_COPY" ] && echo 0 || echo 1)" \
+    "successful analysis removes its immutable context copy"
 
 # A context that deliberately withheld code access still runs without tools.
 NO_CODE_CONTEXT="$TEST_OUTPUT_DIR/no-code-context.json"
@@ -372,6 +405,106 @@ assert_contains "$PRE_RUN_MISMATCH" "no longer matches the fingerprinted context
 assert_true "$([ ! -s "$ARG_LOG" ] && echo 0 || echo 1)" \
     "a pre-run workspace mismatch is rejected before invoking Claude"
 git -C "$CODE_ACCESS_REPO" checkout -- tracked.txt
+
+# Prompt construction freezes and binds the context bytes. Swapping A to B
+# only for the copy, then restoring A before the immediate live check, must not
+# let Claude analyze B under A's fingerprinted provenance.
+PROMPT_ABA_CONTEXT="$TEST_OUTPUT_DIR/prompt-aba-context.json"
+PROMPT_ABA_CONTEXT_A="$TEST_OUTPUT_DIR/prompt-aba-context-a.json"
+PROMPT_ABA_CONTEXT_B="$TEST_OUTPUT_DIR/prompt-aba-context-b.json"
+PROMPT_ABA_STUB_DIR="$TEST_OUTPUT_DIR/prompt-aba-stubs"
+PROMPT_ABA_FROZEN_LOG="$TEST_OUTPUT_DIR/prompt-aba-frozen-path.txt"
+mkdir -p "$PROMPT_ABA_STUB_DIR"
+cp "$CONTEXT" "$PROMPT_ABA_CONTEXT"
+cp "$PROMPT_ABA_CONTEXT" "$PROMPT_ABA_CONTEXT_A"
+jq 'del(.coverage.context_fingerprint) | .pr.title = "state-b-only"' \
+    "$PROMPT_ABA_CONTEXT" > "$PROMPT_ABA_CONTEXT_B.tmp"
+PROMPT_ABA_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+    "$PROMPT_ABA_CONTEXT_B.tmp")
+jq --arg fingerprint "$PROMPT_ABA_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$PROMPT_ABA_CONTEXT_B.tmp" > "$PROMPT_ABA_CONTEXT_B"
+rm "$PROMPT_ABA_CONTEXT_B.tmp"
+cat > "$PROMPT_ABA_STUB_DIR/cp" << 'STUB'
+#!/bin/bash
+copy_source=""
+previous=""
+for argument in "$@"; do
+    copy_source="$previous"
+    previous="$argument"
+done
+if [ "$copy_source" = "$PROMPT_ABA_CONTEXT" ]; then
+    printf '%s\n' "$previous" > "$PROMPT_ABA_FROZEN_LOG"
+    "$REAL_CP" "$PROMPT_ABA_CONTEXT_B" "$PROMPT_ABA_CONTEXT"
+    "$REAL_CP" "$@" || exit $?
+    "$REAL_CP" "$PROMPT_ABA_CONTEXT_A" "$PROMPT_ABA_CONTEXT"
+    exit 0
+fi
+exec "$REAL_CP" "$@"
+STUB
+chmod +x "$PROMPT_ABA_STUB_DIR/cp"
+rm -f "$ARG_LOG" "$RESPONSE" "$PROMPT_ABA_FROZEN_LOG"
+rc=0
+PROMPT_ABA_OUT=$(cd "$CODE_ACCESS_REPO" && env \
+    REAL_CP="$(command -v cp)" PROMPT_ABA_CONTEXT="$PROMPT_ABA_CONTEXT" \
+    PROMPT_ABA_CONTEXT_A="$PROMPT_ABA_CONTEXT_A" \
+    PROMPT_ABA_CONTEXT_B="$PROMPT_ABA_CONTEXT_B" \
+    PROMPT_ABA_FROZEN_LOG="$PROMPT_ABA_FROZEN_LOG" \
+    CLAUDE_ARG_LOG="$ARG_LOG" CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+    PATH="$PROMPT_ABA_STUB_DIR:$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call run_claude_analysis \
+    "$PROMPT_ABA_CONTEXT" "$RESPONSE" 2>&1) || rc=$?
+PROMPT_ABA_FROZEN=$(cat "$PROMPT_ABA_FROZEN_LOG" 2>/dev/null || echo "")
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "prompt construction rejects a context ABA during immutable capture"
+assert_contains "$PROMPT_ABA_OUT" "context changed while its immutable copy" \
+    "the prompt-capture ABA is reported at the copy boundary"
+assert_true "$([ ! -s "$ARG_LOG" ] && echo 0 || echo 1)" \
+    "a prompt-capture ABA is rejected before invoking Claude"
+assert_true "$(cmp -s "$PROMPT_ABA_CONTEXT" "$PROMPT_ABA_CONTEXT_A"; echo $?)" \
+    "the prompt-capture ABA fixture restores live context state A"
+assert_true "$([ -n "$PROMPT_ABA_FROZEN" ] && \
+    [ ! -e "$PROMPT_ABA_FROZEN" ] && echo 0 || echo 1)" \
+    "the rejected immutable context copy is removed"
+
+# The shipped enrichment flow invokes run_claude_analysis as an if condition,
+# which disables implicit errexit behavior inside the function. A failed read
+# of the frozen context must still fail explicitly instead of invoking Claude
+# with an empty prompt and stamping the response with captured provenance.
+FROZEN_CAT_STUB_DIR="$TEST_OUTPUT_DIR/frozen-cat-stubs"
+FROZEN_CAT_REPORT="$TEST_OUTPUT_DIR/frozen-cat-report"
+FROZEN_CAT_ARG_LOG="$TEST_OUTPUT_DIR/frozen-cat-claude-args.txt"
+FROZEN_CAT_COPY_LOG="$TEST_OUTPUT_DIR/frozen-cat-copy-path.txt"
+mkdir -p "$FROZEN_CAT_STUB_DIR"
+cat > "$FROZEN_CAT_STUB_DIR/cat" << 'STUB'
+#!/bin/bash
+case "${1:-}" in
+    /tmp/gh-pr-enrich-claude-context.*|/private/tmp/gh-pr-enrich-claude-context.*)
+        exit 88
+        ;;
+esac
+exec /bin/cat "$@"
+STUB
+chmod +x "$FROZEN_CAT_STUB_DIR/cat"
+rm -f "$FROZEN_CAT_ARG_LOG" "$FROZEN_CAT_COPY_LOG"
+FROZEN_CAT_OUT=$(cd "$CODE_ACCESS_REPO" && env \
+    CLAUDE_ARG_LOG="$FROZEN_CAT_ARG_LOG" \
+    ANALYZER_CONTEXT_COPY_LOG="$FROZEN_CAT_COPY_LOG" \
+    CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+    PATH="$FROZEN_CAT_STUB_DIR:$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" 1 --enrich --allow-external \
+    --output-dir "$FROZEN_CAT_REPORT" 2>&1)
+FROZEN_CAT_COPY=$(tail -1 "$FROZEN_CAT_COPY_LOG" 2>/dev/null || echo "")
+assert_contains "$FROZEN_CAT_OUT" \
+    "Immutable analysis context could not be read before Claude analysis" \
+    "the main if-call flow fails explicitly when the frozen context cannot be read"
+assert_true "$([ ! -s "$FROZEN_CAT_ARG_LOG" ] && echo 0 || echo 1)" \
+    "a frozen-context read failure never invokes Claude"
+assert_true "$([ ! -e "$FROZEN_CAT_REPORT/claude-raw-response.json" ] && echo 0 || echo 1)" \
+    "a frozen-context read failure publishes no analyzer response"
+assert_true "$([ -n "$FROZEN_CAT_COPY" ] && \
+    [ ! -e "$FROZEN_CAT_COPY" ] && echo 0 || echo 1)" \
+    "a frozen-context read failure removes its immutable copy"
 
 # Mutating the workspace from inside the analyzer stub deterministically models
 # another process changing local code during a long Claude run.
@@ -433,6 +566,7 @@ SIGNAL_STUB_DIR="$TEST_OUTPUT_DIR/signal-stubs"
 mkdir -p "$SIGNAL_STUB_DIR"
 cp "$STUB_DIR/timeout" "$SIGNAL_STUB_DIR/timeout"
 cp "$STUB_DIR/ps" "$SIGNAL_STUB_DIR/ps"
+cp "$STUB_DIR/cp" "$SIGNAL_STUB_DIR/cp"
 cat > "$SIGNAL_STUB_DIR/claude" << 'STUB'
 #!/bin/bash
 previous=""
@@ -453,14 +587,16 @@ chmod +x "$SIGNAL_STUB_DIR/claude"
 SIGNAL_SNAPSHOT_PATH_LOG="$TEST_OUTPUT_DIR/signal-snapshot-path.txt"
 SIGNAL_SETTINGS_PATH_LOG="$TEST_OUTPUT_DIR/signal-settings-path.txt"
 SIGNAL_CHILD_PID_LOG="$TEST_OUTPUT_DIR/signal-child-pid.txt"
+SIGNAL_CONTEXT_COPY_LOG="$TEST_OUTPUT_DIR/signal-context-copy-path.txt"
 rm -f "$SIGNAL_SNAPSHOT_PATH_LOG" "$SIGNAL_SETTINGS_PATH_LOG" \
-    "$SIGNAL_CHILD_PID_LOG" "$RESPONSE"
+    "$SIGNAL_CHILD_PID_LOG" "$SIGNAL_CONTEXT_COPY_LOG" "$RESPONSE"
 rc=0
 SIGNAL_STARTED_AT=$(date +%s)
 (cd "$CODE_ACCESS_REPO" && env \
     SIGNAL_SNAPSHOT_PATH_LOG="$SIGNAL_SNAPSHOT_PATH_LOG" \
     SIGNAL_SETTINGS_PATH_LOG="$SIGNAL_SETTINGS_PATH_LOG" \
     SIGNAL_CHILD_PID_LOG="$SIGNAL_CHILD_PID_LOG" \
+    ANALYZER_CONTEXT_COPY_LOG="$SIGNAL_CONTEXT_COPY_LOG" \
     PS_CALLED_LOG="$PS_CALLED_LOG" \
     CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
     PATH="$SIGNAL_STUB_DIR:$PATH" \
@@ -470,12 +606,16 @@ SIGNAL_ELAPSED=$(( $(date +%s) - SIGNAL_STARTED_AT ))
 TERMINATED_SNAPSHOT=$(cat "$SIGNAL_SNAPSHOT_PATH_LOG" 2>/dev/null || echo "")
 TERMINATED_SETTINGS=$(cat "$SIGNAL_SETTINGS_PATH_LOG" 2>/dev/null || echo "")
 TERMINATED_CHILD=$(cat "$SIGNAL_CHILD_PID_LOG" 2>/dev/null || echo "")
+TERMINATED_CONTEXT_COPY=$(tail -1 "$SIGNAL_CONTEXT_COPY_LOG" 2>/dev/null || echo "")
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "terminating a code-enabled analyzer interrupts the run"
 assert_true "$([ -n "$TERMINATED_SNAPSHOT" ] && [ ! -e "$TERMINATED_SNAPSHOT" ] && echo 0 || echo 1)" \
     "TERM removes the private analyzer snapshot"
 assert_true "$([ -n "$TERMINATED_SETTINGS" ] && [ ! -e "$TERMINATED_SETTINGS" ] && echo 0 || echo 1)" \
     "TERM removes the isolated Claude settings file"
+assert_true "$([ -n "$TERMINATED_CONTEXT_COPY" ] && \
+    [ ! -e "$TERMINATED_CONTEXT_COPY" ] && echo 0 || echo 1)" \
+    "TERM removes the immutable analyzer context copy"
 assert_true "$([ "$SIGNAL_ELAPSED" -lt 5 ] && echo 0 || echo 1)" \
     "TERM promptly interrupts a hung analyzer that ignores TERM"
 for _attempt in $(seq 1 100); do
@@ -880,7 +1020,11 @@ jq -n --arg sha "$WORKSPACE_HEAD" '{
     headRefOid: $sha
 }' > "$SAST_DIR/pr-summary.json"
 
-(cd "$WORKSPACE" && PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call collect_sast_findings "reports" >/dev/null 2>&1) || true
+SAST_SNAPSHOT_CWD_LOG="$TEST_OUTPUT_DIR/semgrep-snapshot-cwd.log"
+(cd "$WORKSPACE" && env PATH="$STUB_DIR:$PATH" \
+    SEMGREP_CWD_LOG="$SAST_SNAPSHOT_CWD_LOG" \
+    "$GH_PR_ENRICH" --test-call collect_sast_findings \
+    "reports" >/dev/null 2>&1) || true
 SAST_FILE="$SAST_DIR/sast-findings.json"
 
 assert_jq_eq "$SAST_FILE" 'length' "1" "semgrep findings are collected"
@@ -889,6 +1033,125 @@ assert_jq "$SAST_FILE" '.[0].line == 12' "finding carries its line"
 assert_jq "$SAST_FILE" '.[0].severity == "ERROR"' "finding carries its severity"
 assert_jq "$SAST_FILE" '.[0].check_id | contains("unsafe-exec")' "finding carries its rule id"
 assert_jq "$SAST_FILE" '.[0].message | contains("unsafe exec")' "finding carries its message"
+SAST_SNAPSHOT_CWD=$(cat "$SAST_SNAPSHOT_CWD_LOG" 2>/dev/null || echo "")
+assert_true "$([ -n "$SAST_SNAPSHOT_CWD" ] && \
+    [ "$SAST_SNAPSHOT_CWD" != "$WORKSPACE" ] && echo 0 || echo 1)" \
+    "semgrep runs from a private immutable workspace snapshot"
+assert_true "$([ ! -d "$SAST_SNAPSHOT_CWD" ] && echo 0 || echo 1)" \
+    "a successful semgrep scan removes its immutable workspace snapshot"
+assert_jq "$SAST_DIR/sast-status.json" \
+    '.status == "completed" and .workspace_source == "immutable_snapshot" and
+     (.workspace_fingerprint | startswith("sha256:"))' \
+    "completed SAST provenance binds the immutable workspace fingerprint"
+
+# A zero-exit scanner envelope is not automatically a clean result. Semgrep's
+# root must explicitly contain a results array before projection can complete.
+SAST_ENVELOPE_STUBS="$TEST_OUTPUT_DIR/semgrep-envelope-stubs"
+mkdir -p "$SAST_ENVELOPE_STUBS"
+cat > "$SAST_ENVELOPE_STUBS/semgrep" << 'STUB'
+#!/bin/bash
+case "$SEMGREP_ENVELOPE" in
+    missing) printf '%s\n' '{}' ;;
+    wrong-type) printf '%s\n' '{"results":{}}' ;;
+    *) exit 2 ;;
+esac
+STUB
+chmod +x "$SAST_ENVELOPE_STUBS/semgrep"
+for SAST_ENVELOPE in missing wrong-type; do
+    SAST_ENVELOPE_DIR="$WORKSPACE/envelope-$SAST_ENVELOPE"
+    mkdir -p "$SAST_ENVELOPE_DIR"
+    cp "$SAST_DIR/pr-summary.json" "$SAST_ENVELOPE_DIR/pr-summary.json"
+    (cd "$WORKSPACE" && env PATH="$SAST_ENVELOPE_STUBS:$PATH" \
+        GH_PR_ENRICH_CODE_ACCESS=true \
+        SEMGREP_ENVELOPE="$SAST_ENVELOPE" \
+        "$GH_PR_ENRICH" --test-call collect_sast_findings \
+        "envelope-$SAST_ENVELOPE" >/dev/null 2>&1)
+    assert_jq_eq "$SAST_ENVELOPE_DIR/sast-findings.json" 'length' "0" \
+        "Semgrep $SAST_ENVELOPE envelope cannot become a false-clean finding set"
+    assert_jq "$SAST_ENVELOPE_DIR/sast-status.json" \
+        '.status == "failed" and
+         (.reason | contains("object with a results array"))' \
+        "Semgrep $SAST_ENVELOPE envelope records failed scan coverage"
+done
+
+# Freeze before scanning so an original-tree mutate/revert ABA cannot change
+# what Semgrep reads. The scanner blocks between two reads while the test
+# changes and restores the live checkout.
+SAST_ABA_REPORTS="$WORKSPACE/aba-reports"
+SAST_ABA_STUBS="$TEST_OUTPUT_DIR/semgrep-aba-stubs"
+SAST_ABA_READY="$TEST_OUTPUT_DIR/semgrep-aba.ready"
+SAST_ABA_RELEASE="$TEST_OUTPUT_DIR/semgrep-aba.release"
+SAST_ABA_READ_LOG="$TEST_OUTPUT_DIR/semgrep-aba-reads.log"
+SAST_ABA_CWD_LOG="$TEST_OUTPUT_DIR/semgrep-aba-cwd.log"
+mkdir -p "$SAST_ABA_REPORTS" "$SAST_ABA_STUBS"
+cp "$SAST_DIR/pr-summary.json" "$SAST_ABA_REPORTS/pr-summary.json"
+rm -f "$SAST_ABA_READY" "$SAST_ABA_RELEASE"
+: > "$SAST_ABA_READ_LOG"
+cat > "$SAST_ABA_STUBS/semgrep" << 'STUB'
+#!/bin/bash
+pwd > "$SEMGREP_CWD_LOG"
+cat ./src/retry.js >> "$SEMGREP_READ_LOG"
+: > "$SEMGREP_READY_FILE"
+while [ ! -f "$SEMGREP_RELEASE_FILE" ]; do /bin/sleep 0.01; done
+cat ./src/retry.js >> "$SEMGREP_READ_LOG"
+echo '{"results":[{"check_id":"snapshot.aba","path":"./src/retry.js","start":{"line":1},"extra":{"severity":"INFO","message":"stable snapshot","metadata":{}}}],"errors":[]}'
+STUB
+chmod +x "$SAST_ABA_STUBS/semgrep"
+(
+    cd "$WORKSPACE"
+    env PATH="$SAST_ABA_STUBS:$STUB_DIR:$PATH" \
+        GH_PR_ENRICH_CODE_ACCESS=true \
+        SEMGREP_CWD_LOG="$SAST_ABA_CWD_LOG" \
+        SEMGREP_READ_LOG="$SAST_ABA_READ_LOG" \
+        SEMGREP_READY_FILE="$SAST_ABA_READY" \
+        SEMGREP_RELEASE_FILE="$SAST_ABA_RELEASE" \
+        "$GH_PR_ENRICH" --test-call collect_sast_findings "aba-reports"
+) >/dev/null 2>&1 &
+SAST_ABA_CLI_PID=$!
+for _ in {1..200}; do
+    [ ! -f "$SAST_ABA_READY" ] || break
+    /bin/sleep 0.05
+done
+assert_true "$([ -f "$SAST_ABA_READY" ] && echo 0 || echo 1)" \
+    "the immutable Semgrep fixture reaches its between-read barrier"
+printf 'mutated live bytes\n' > "$WORKSPACE/src/retry.js"
+printf 'const x = 1;\n' > "$WORKSPACE/src/retry.js"
+: > "$SAST_ABA_RELEASE"
+wait "$SAST_ABA_CLI_PID"
+assert_eq $'const x = 1;\nconst x = 1;' \
+    "$(cat "$SAST_ABA_READ_LOG")" \
+    "semgrep reads stable snapshot bytes across a live-checkout ABA mutation"
+SAST_ABA_SNAPSHOT=$(cat "$SAST_ABA_CWD_LOG" 2>/dev/null || echo "")
+assert_true "$([ -n "$SAST_ABA_SNAPSHOT" ] && \
+    [ "$SAST_ABA_SNAPSHOT" != "$WORKSPACE" ] && echo 0 || echo 1)" \
+    "the ABA scanner never runs from the mutable original checkout"
+assert_true "$([ ! -d "$SAST_ABA_SNAPSHOT" ] && echo 0 || echo 1)" \
+    "the ABA scan removes its immutable snapshot after completion"
+assert_jq "$SAST_ABA_REPORTS/sast-findings.json" \
+    '.[0].path == "src/retry.js" and .[0].message == "stable snapshot"' \
+    "snapshot-relative Semgrep paths normalize back to repository paths"
+
+# The context builder is a separate trust boundary. A scan that completed for
+# one immutable workspace must not enter a context built after the live
+# workspace changes, even when explicit code access permits inspecting a dirty
+# tree.
+printf '[]\n' > "$SAST_ABA_REPORTS/issue-comments.json"
+printf '[]\n' > "$SAST_ABA_REPORTS/unresolved-threads.json"
+printf 'changed after scan\n' > "$WORKSPACE/src/retry.js"
+(
+    cd "$WORKSPACE"
+    GH_PR_ENRICH_CODE_ACCESS=true "$GH_PR_ENRICH" --test-call \
+        build_claude_context "aba-reports" false true >/dev/null
+)
+assert_jq_eq "$SAST_ABA_REPORTS/claude-context.json" \
+    '.sast_findings | length' "0" \
+    "context construction discards SAST findings from a different workspace fingerprint"
+assert_jq "$SAST_ABA_REPORTS/claude-context.json" \
+    '.coverage.sast.status == "failed" and
+     (.coverage.sast.reason | contains("does not match the analysis context workspace fingerprint")) and
+     .coverage.sast.findings == 0' \
+    "context coverage names a post-scan workspace provenance mismatch"
+printf 'const x = 1;\n' > "$WORKSPACE/src/retry.js"
 
 # Stock macOS has no GNU timeout. The portable owned watchdog must terminate and
 # reap a stalled scanner without invoking any timeout binary on PATH.
@@ -896,6 +1159,7 @@ WATCHDOG_REPORTS="$WORKSPACE/watchdog-reports"
 WATCHDOG_STUBS="$TEST_OUTPUT_DIR/semgrep-watchdog-stubs"
 WATCHDOG_PID_LOG="$TEST_OUTPUT_DIR/semgrep-watchdog.pid"
 WATCHDOG_CHILD_PID_LOG="$TEST_OUTPUT_DIR/semgrep-watchdog-child.pid"
+WATCHDOG_CWD_LOG="$TEST_OUTPUT_DIR/semgrep-watchdog-cwd.log"
 WATCHDOG_TIMEOUT_LOG="$TEST_OUTPUT_DIR/semgrep-timeout-command.log"
 mkdir -p "$WATCHDOG_REPORTS" "$WATCHDOG_STUBS"
 cp "$SAST_DIR/pr-summary.json" "$WATCHDOG_REPORTS/pr-summary.json"
@@ -903,6 +1167,7 @@ cp "$SAST_DIR/pr-summary.json" "$WATCHDOG_REPORTS/pr-summary.json"
 cat > "$WATCHDOG_STUBS/semgrep" << 'STUB'
 #!/bin/bash
 printf '%s\n' "$$" > "$SEMGREP_PID_LOG"
+[ -z "${SEMGREP_CWD_LOG:-}" ] || pwd > "$SEMGREP_CWD_LOG"
 trap '' TERM INT
 "$SEMGREP_CHILD_STUB" &
 child_pid=$!
@@ -930,6 +1195,7 @@ WATCHDOG_OUT=$( (cd "$WORKSPACE" && env \
     SEMGREP_PID_LOG="$WATCHDOG_PID_LOG" \
     SEMGREP_CHILD_PID_LOG="$WATCHDOG_CHILD_PID_LOG" \
     SEMGREP_CHILD_STUB="$WATCHDOG_STUBS/semgrep-child" \
+    SEMGREP_CWD_LOG="$WATCHDOG_CWD_LOG" \
     SEMGREP_GNU_TIMEOUT_LOG="$WATCHDOG_TIMEOUT_LOG" \
     "$GH_PR_ENRICH" --test-call collect_sast_findings \
     "watchdog-reports" 2>&1) || true)
@@ -954,6 +1220,9 @@ assert_true "$([ -n "$WATCHDOG_SEMGREP_PID" ] && [ "$scanner_alive" = false ] &&
     "the portable Semgrep watchdog reaps the stalled scanner"
 assert_true "$([ -n "$WATCHDOG_CHILD_PID" ] && [ "$child_alive" = false ] && echo 0 || echo 1)" \
     "the portable Semgrep watchdog terminates scanner descendants"
+WATCHDOG_SNAPSHOT=$(cat "$WATCHDOG_CWD_LOG" 2>/dev/null || echo "")
+assert_true "$([ -n "$WATCHDOG_SNAPSHOT" ] && [ ! -d "$WATCHDOG_SNAPSHOT" ] && echo 0 || echo 1)" \
+    "a timed-out Semgrep scan removes its immutable snapshot"
 assert_contains "$WATCHDOG_OUT" "semgrep failed" \
     "a watchdog timeout is reported as a failed Semgrep pre-pass"
 
@@ -962,6 +1231,7 @@ assert_contains "$WATCHDOG_OUT" "semgrep failed" \
 CANCEL_REPORTS="$WORKSPACE/cancel-reports"
 CANCEL_SCANNER_PID_LOG="$TEST_OUTPUT_DIR/semgrep-cancel.pid"
 CANCEL_CHILD_PID_LOG="$TEST_OUTPUT_DIR/semgrep-cancel-child.pid"
+CANCEL_CWD_LOG="$TEST_OUTPUT_DIR/semgrep-cancel-cwd.log"
 mkdir -p "$CANCEL_REPORTS"
 cp "$SAST_DIR/pr-summary.json" "$CANCEL_REPORTS/pr-summary.json"
 (
@@ -971,11 +1241,12 @@ cp "$SAST_DIR/pr-summary.json" "$CANCEL_REPORTS/pr-summary.json"
         SEMGREP_PID_LOG="$CANCEL_SCANNER_PID_LOG" \
         SEMGREP_CHILD_PID_LOG="$CANCEL_CHILD_PID_LOG" \
         SEMGREP_CHILD_STUB="$WATCHDOG_STUBS/semgrep-child" \
+        SEMGREP_CWD_LOG="$CANCEL_CWD_LOG" \
         SEMGREP_GNU_TIMEOUT_LOG="$WATCHDOG_TIMEOUT_LOG" \
         "$GH_PR_ENRICH" --test-call collect_sast_findings "cancel-reports"
 ) > "$TEST_OUTPUT_DIR/semgrep-cancel.out" 2>&1 &
 CANCEL_CLI_PID=$!
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+for _ in {1..200}; do
     [ ! -s "$CANCEL_SCANNER_PID_LOG" ] || [ ! -s "$CANCEL_CHILD_PID_LOG" ] || break
     /bin/sleep 0.05
 done
@@ -1002,6 +1273,9 @@ assert_true "$([ -n "$CANCEL_SCANNER_PID" ] && [ "$cancel_scanner_alive" = false
     "CLI cancellation reaps the owned Semgrep scanner"
 assert_true "$([ -n "$CANCEL_CHILD_PID" ] && [ "$cancel_child_alive" = false ] && echo 0 || echo 1)" \
     "CLI cancellation terminates Semgrep descendants"
+CANCEL_SNAPSHOT=$(cat "$CANCEL_CWD_LOG" 2>/dev/null || echo "")
+assert_true "$([ -n "$CANCEL_SNAPSHOT" ] && [ ! -d "$CANCEL_SNAPSHOT" ] && echo 0 || echo 1)" \
+    "CLI cancellation removes the immutable Semgrep snapshot"
 
 # Timeout input is bounded before it reaches sleep. Invalid explicit values use
 # the documented safe default, while the upper boundary remains accepted.

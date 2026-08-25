@@ -302,6 +302,38 @@ assert_jq "$CTX" '.pr.linked_issues[0].body | contains("upstream is slow")' "lin
 assert_jq_eq "$CTX" '.failing_checks | length' "1" "only failing checks are included"
 assert_jq "$CTX" '.failing_checks[0].name == "unit-tests"' "failing check is named"
 assert_jq_eq "$CTX" '.sast_findings | length' "1" "sast findings reach the context when present"
+assert_jq "$CTX" \
+    '.coverage.sast.status == "completed" and
+     .coverage.sast.reason == "status inferred from prebuilt SAST findings" and
+     .coverage.sast.findings == 1' \
+    "legacy two-argument context callers retain prebuilt SAST findings"
+
+for malformed_mode in legacy current; do
+    MALFORMED_SAST_DIR="$TEST_OUTPUT_DIR/malformed-sast-$malformed_mode"
+    mkdir -p "$MALFORMED_SAST_DIR"
+    cp "$CTX_DIR/pr-summary.json" "$MALFORMED_SAST_DIR/pr-summary.json"
+    echo '[]' > "$MALFORMED_SAST_DIR/unresolved-threads.json"
+    echo '[]' > "$MALFORMED_SAST_DIR/issue-comments.json"
+    echo '{not valid JSON' > "$MALFORMED_SAST_DIR/sast-findings.json"
+    if [ "$malformed_mode" = current ]; then
+        jq -n '{requested:true,status:"completed",reason:"",
+            workspace_source:"immutable_snapshot",
+            workspace_fingerprint:"sha256:fixture"}' \
+            > "$MALFORMED_SAST_DIR/sast-status.json"
+        "$GH_PR_ENRICH" --test-call build_claude_context \
+            "$MALFORMED_SAST_DIR" false true >/dev/null 2>&1
+    else
+        "$GH_PR_ENRICH" --test-call build_claude_context \
+            "$MALFORMED_SAST_DIR" false >/dev/null 2>&1
+    fi
+    assert_jq "$MALFORMED_SAST_DIR/claude-context.json" \
+        '.sast_findings == [] and .coverage.sast.status == "failed" and
+         (.coverage.sast.reason | contains("not a valid JSON array")) and
+         .coverage.sast.findings == 0' \
+        "$malformed_mode malformed SAST is failed coverage, never inferred clean"
+    assert_jq "$MALFORMED_SAST_DIR/sast-findings.json" '. == []' \
+        "$malformed_mode malformed SAST uses an empty safe jq payload after failure"
+done
 assert_jq "$CTX" '.review_comments[0].body == "Review summary body"' \
     "top-level review summaries reach the analysis context"
 assert_jq "$CTX" '.inline_comments[0].body == "Inline feedback body"' \
@@ -508,6 +540,75 @@ assert_contains "$(warning_for disabled false)" "could not read the repository" 
     "a warning when access was actually denied"
 assert_not_contains "$(warning_for enabled true)" "could not read the repository" \
     "no warning when the tree is exactly at the PR head"
+
+# Concurrent builders stage fingerprinted contexts privately before taking the
+# report lock. The second builder may publish while the first is paused, but it
+# cannot overwrite or move the first builder's staging file.
+CONCURRENT_CONTEXT_DIR="$TEST_OUTPUT_DIR/concurrent-context"
+CONCURRENT_CONTEXT_STUBS="$TEST_OUTPUT_DIR/concurrent-context-stubs"
+CONCURRENT_CONTEXT_READY="$TEST_OUTPUT_DIR/concurrent-context.ready"
+CONCURRENT_CONTEXT_RELEASE="$TEST_OUTPUT_DIR/concurrent-context.release"
+mkdir -p "$CONCURRENT_CONTEXT_DIR" "$CONCURRENT_CONTEXT_STUBS"
+jq -n '{number:77,title:"concurrent",body:"abcdefghijk",
+    author:{login:"dev"},files:[],commits:[],headRefOid:""}' \
+    > "$CONCURRENT_CONTEXT_DIR/pr-summary.json"
+echo '[]' > "$CONCURRENT_CONTEXT_DIR/issue-comments.json"
+echo '[]' > "$CONCURRENT_CONTEXT_DIR/unresolved-threads.json"
+cat > "$CONCURRENT_CONTEXT_STUBS/jq" << 'STUB'
+#!/bin/bash
+is_fingerprint=false
+previous=""
+for argument in "$@"; do
+    if [ "$previous" = "--arg" ] && [ "$argument" = "fingerprint" ]; then
+        is_fingerprint=true
+    fi
+    previous="$argument"
+done
+"$REAL_JQ" "$@" || exit $?
+if [ "$is_fingerprint" = true ] && [ ! -f "$CONCURRENT_CONTEXT_READY" ]; then
+    : > "$CONCURRENT_CONTEXT_READY"
+    while [ ! -f "$CONCURRENT_CONTEXT_RELEASE" ]; do /bin/sleep 0.01; done
+fi
+STUB
+chmod +x "$CONCURRENT_CONTEXT_STUBS/jq"
+env PATH="$CONCURRENT_CONTEXT_STUBS:$PATH" REAL_JQ="$(command -v jq)" \
+    CONCURRENT_CONTEXT_READY="$CONCURRENT_CONTEXT_READY" \
+    CONCURRENT_CONTEXT_RELEASE="$CONCURRENT_CONTEXT_RELEASE" \
+    GH_PR_ENRICH_TRUNCATE_CHARS=5 \
+    "$GH_PR_ENRICH" --test-call build_claude_context \
+    "$CONCURRENT_CONTEXT_DIR" false >/dev/null 2>&1 &
+CONCURRENT_FIRST_PID=$!
+for _attempt in $(seq 1 200); do
+    [ -f "$CONCURRENT_CONTEXT_READY" ] && break
+    /bin/sleep 0.01
+done
+assert_true "$([ -f "$CONCURRENT_CONTEXT_READY" ] && echo 0 || echo 1)" \
+    "the first context builder pauses after private fingerprint staging"
+GH_PR_ENRICH_TRUNCATE_CHARS=9 "$GH_PR_ENRICH" --test-call \
+    build_claude_context "$CONCURRENT_CONTEXT_DIR" false >/dev/null
+: > "$CONCURRENT_CONTEXT_RELEASE"
+rc=0
+wait "$CONCURRENT_FIRST_PID" || rc=$?
+assert_true "$rc" \
+    "a concurrent context publication cannot steal another builder's staging file"
+assert_jq "$CONCURRENT_CONTEXT_DIR/analysis-context.json" \
+    '.coverage.truncation_limit_chars == 5 and
+     (.coverage.context_fingerprint | type == "string" and length > 0)' \
+    "the resumed builder publishes its own complete fingerprinted context"
+CONCURRENT_CONTEXT_FINGERPRINT=$("$GH_PR_ENRICH" --test-call \
+    analysis_context_fingerprint "$CONCURRENT_CONTEXT_DIR/analysis-context.json")
+rc=0
+jq -e --arg fingerprint "$CONCURRENT_CONTEXT_FINGERPRINT" \
+    '.coverage.context_fingerprint == $fingerprint' \
+    "$CONCURRENT_CONTEXT_DIR/analysis-context.json" >/dev/null 2>&1 || rc=$?
+assert_true "$rc" \
+    "the final concurrent context fingerprint matches its exact bytes"
+assert_true "$([ ! -e "$CONCURRENT_CONTEXT_DIR/analysis-context.tmp.json" ] && \
+    [ ! -e "$CONCURRENT_CONTEXT_DIR/analysis-context.fingerprinted.tmp.json" ] && \
+    ! find "$CONCURRENT_CONTEXT_DIR" -maxdepth 1 \
+        -name '.analysis-context-publish.*' -print -quit | grep -q . && \
+    echo 0 || echo 1)" \
+    "concurrent context builders leave no shared or unique staging residue"
 
 # ---------------------------------------------------------------------------
 # Large inputs: a big PR must not blow the argument list

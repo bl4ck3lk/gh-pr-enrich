@@ -167,6 +167,47 @@ test_author_filter() {
     fi
 }
 
+test_author_filter_uses_frozen_summary() {
+    local reports_root="$TEST_OUTPUT_DIR/frozen-summary-reports"
+    local report_dir="$reports_root/pr-1"
+    local output_dir="$TEST_OUTPUT_DIR/frozen-summary-out"
+    local stub_dir="$TEST_OUTPUT_DIR/frozen-summary-stubs"
+    local output
+    mkdir -p "$reports_root" "$stub_dir"
+    cp -R "$FIXTURES_DIR/pr-1" "$report_dir"
+    jq '.author.login = "mallory"' "$report_dir/pr-summary.json" \
+        > "$TEST_OUTPUT_DIR/frozen-summary-mutated.json"
+
+    cat > "$stub_dir/jq" << 'STUB'
+#!/bin/bash
+if [ "$*" = "-r .author.login // \"\" $FROZEN_SUMMARY_LIVE" ] || \
+   printf '%s\n' "$*" | grep -Fq '.author.login // ""'; then
+    if [ ! -e "$FROZEN_SUMMARY_MUTATED_MARKER" ]; then
+        "$REAL_CP" "$FROZEN_SUMMARY_MUTATED" "$FROZEN_SUMMARY_LIVE"
+        : > "$FROZEN_SUMMARY_MUTATED_MARKER"
+    fi
+fi
+exec "$REAL_JQ" "$@"
+STUB
+    chmod +x "$stub_dir/jq"
+
+    output=$(env PATH="$stub_dir:$PATH" REAL_JQ="$(command -v jq)" \
+        REAL_CP="$(command -v cp)" \
+        FROZEN_SUMMARY_LIVE="$report_dir/pr-summary.json" \
+        FROZEN_SUMMARY_MUTATED="$TEST_OUTPUT_DIR/frozen-summary-mutated.json" \
+        FROZEN_SUMMARY_MUTATED_MARKER="$TEST_OUTPUT_DIR/frozen-summary-mutated" \
+        "$GH_PR_ENRICH" retrospective --reports-dir "$reports_root" \
+        --output-dir "$output_dir" --author alice --min-prs 1 2>&1)
+
+    if [ -e "$TEST_OUTPUT_DIR/frozen-summary-mutated" ] && \
+       echo "$output" | grep -q "Found 1 PR reports with structured analysis"; then
+        pass "retrospective author filtering uses the summary frozen with its analysis"
+    else
+        fail "retrospective author filtering uses the summary frozen with its analysis" \
+            "Got: $output"
+    fi
+}
+
 test_json_output() {
     local output
     output=$("$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" --output-dir "$TEST_OUTPUT_DIR/retro" --min-prs 1 --json 2>/dev/null)
@@ -289,6 +330,55 @@ test_hotspots_group_by_taxonomy() {
     fi
 }
 
+test_refuted_findings_are_not_aggregated() {
+    local reports_root="$TEST_OUTPUT_DIR/refuted-reports"
+    local report_dir="$reports_root/pr-88"
+    local output_dir="$TEST_OUTPUT_DIR/refuted-out"
+    mkdir -p "$report_dir"
+    cat > "$report_dir/pr-summary.json" << 'EOF'
+{"number":88,"title":"Verdict fixture","author":{"login":"alice"},"createdAt":"2026-01-01T00:00:00Z"}
+EOF
+    cat > "$report_dir/claude-analysis.json" << 'EOF'
+{
+  "issue_categories": [
+    {"name":"Confirmed issue","category":"error_handling","severity":"high","verdict":"confirmed"},
+    {"name":"Plausible issue","category":"test_gap","severity":"medium","verdict":"plausible"},
+    {"name":"Refuted issue","category":"error_handling","severity":"critical","verdict":"refuted"},
+    {"name":"Refuted-only issue","category":"security","severity":"critical","verdict":"refuted"}
+  ],
+  "systemic_issues": [],
+  "adjacent_problems": [],
+  "task_list": [{"priority":"low","task":"Task remains aggregated"}],
+  "process_improvements": [],
+  "pr_template_suggestions": []
+}
+EOF
+
+    "$GH_PR_ENRICH" retrospective --reports-dir "$reports_root" \
+        --output-dir "$output_dir" --min-prs 1 >/dev/null 2>&1
+    assert_jq_eq "$output_dir/retrospective-data.json" \
+        '.summary.overview.total_issues' "2" \
+        "retrospective totals exclude refuted findings"
+    assert_jq "$output_dir/retrospective-data.json" \
+        '[.summary.top_issue_categories[].name] | index("Refuted issue") == null' \
+        "retrospective top categories exclude refuted findings"
+    assert_jq_eq "$output_dir/retrospective-data.json" \
+        '[.hotspots[] | select(.category == "error_handling") | .issue_count] | first' "1" \
+        "retrospective hotspots count confirmed findings but not refuted claims"
+    assert_jq_eq "$output_dir/retrospective-data.json" \
+        '[.hotspots[] | select(.category == "test_gap") | .issue_count] | first' "1" \
+        "retrospective hotspots preserve plausible findings"
+    assert_jq "$output_dir/retrospective-data.json" \
+        '[.hotspots[] | select(.category == "security")] | length == 0' \
+        "retrospective hotspots exclude refuted-only categories"
+    assert_jq "$output_dir/retrospective-data.json" \
+        '[.guiding_questions.before_implementation[] | select(contains("security"))] | length == 0' \
+        "retrospective guiding questions exclude refuted-only categories"
+    assert_jq_eq "$output_dir/retrospective-data.json" \
+        '.summary.overview.total_tasks' "1" \
+        "retrospective verdict filtering leaves task aggregation unchanged"
+}
+
 test_legacy_reports_are_reported_not_mixed_in() {
     # Reports written before the taxonomy existed have no .category. Folding them
     # into an "uncategorized" hotspot produces a confident, useless answer:
@@ -379,10 +469,12 @@ test_provider_neutral_analysis_is_discovered() {
         generated_at:"2026-01-01T00:00:00Z",
         analyzers:[{provider:"codex",role:"orchestrator"}]
     }}' "$FIXTURES_DIR/pr-1/claude-analysis.json" > "$report_root/analysis.json"
+    chmod 555 "$report_root"
 
     local output
     output=$("$GH_PR_ENRICH" retrospective --reports-dir "$TEST_OUTPUT_DIR/provider-neutral" \
         --output-dir "$output_root" --min-prs 1 2>&1)
+    chmod 755 "$report_root"
 
     if echo "$output" | grep -q "Found 1 PR reports with structured analysis"; then
         pass "retrospective discovers provider-neutral analysis.json"
@@ -439,6 +531,7 @@ test_basic_run
 test_aggregation
 test_pattern_detection
 test_author_filter
+test_author_filter_uses_frozen_summary
 test_json_output
 test_markdown_output
 test_format_claude_md
@@ -447,6 +540,7 @@ test_format_pr_template
 test_invalid_format
 test_guiding_questions
 test_hotspots_group_by_taxonomy
+test_refuted_findings_are_not_aggregated
 test_legacy_reports_are_reported_not_mixed_in
 test_improvement_tracking
 test_provider_neutral_analysis_is_discovered

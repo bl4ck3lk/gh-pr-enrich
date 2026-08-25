@@ -36,7 +36,7 @@ assert_true "$rc" "script parses cleanly (bash -n)"
 # ---------------------------------------------------------------------------
 # No duplicated function bodies
 # ---------------------------------------------------------------------------
-def_count=$(grep -c '^build_analysis_context() {' "$GH_PR_ENRICH" || true)
+def_count=$(grep -c '^build_analysis_context() ($' "$GH_PR_ENRICH" || true)
 assert_eq "1" "$def_count" "build_analysis_context is defined exactly once"
 
 legacy_wrapper_count=$(grep -c '^build_claude_context() {' "$GH_PR_ENRICH" || true)
@@ -48,7 +48,7 @@ assert_eq "0" "$inline_marker" "no inlined copy of build_claude_context remains"
 
 # The context document must be assembled in exactly one place. Two writers means
 # one of them is a copy that will drift.
-writer_count=$(grep -c '> "$output_dir/analysis-context.tmp.json"' "$GH_PR_ENRICH" || true)
+writer_count=$(grep -c '> "$context_tmp"' "$GH_PR_ENRICH" || true)
 assert_eq "1" "$writer_count" "analysis-context.json is written by exactly one code path"
 
 compat_copy_count=$(grep -c 'copy_compatibility_file "$output_dir/analysis-context.json" "$output_dir/claude-context.json"' "$GH_PR_ENRICH" || true)

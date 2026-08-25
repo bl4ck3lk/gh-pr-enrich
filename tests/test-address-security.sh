@@ -448,6 +448,17 @@ jq -n --arg fingerprint "$LOCAL_CONTEXT_FINGERPRINT" \
         pr_head_sha:"captured-head",context_fingerprint:$fingerprint,
         workspace_fingerprint:$workspace_fingerprint}
 }' > "$LOCAL_MUTATION_REPORT/analysis.json"
+cat > "$LOCAL_MUTATION_REPORT/comprehensive-report.md" << 'EOF'
+# Base PR report
+
+Base report content must survive selected-analysis invalidation.
+
+<!-- BEGIN SELECTED ANALYSIS -->
+
+STALE SELECTED FINDING
+
+<!-- END SELECTED ANALYSIS -->
+EOF
 LOCAL_CONTEXT_TEMPLATE="$TEST_OUTPUT_DIR/local-context-template.json"
 LOCAL_ANALYSIS_TEMPLATE="$TEST_OUTPUT_DIR/local-analysis-template.json"
 cp "$LOCAL_MUTATION_REPORT/analysis-context.json" "$LOCAL_CONTEXT_TEMPLATE"
@@ -465,6 +476,869 @@ assert_contains "$(cat "$LOCAL_MUTATION_LOG")" "unresolve:PRRT_local" \
     "a last-moment workspace mutation is compensated by reopening the thread"
 assert_true "$([ ! -e "$LOCAL_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
     "a last-moment workspace mutation invalidates the selected artifact"
+assert_contains "$(cat "$LOCAL_MUTATION_REPORT/comprehensive-report.md")" \
+    "Base report content must survive" \
+    "address invalidation preserves the comprehensive base report"
+assert_not_contains "$(cat "$LOCAL_MUTATION_REPORT/comprehensive-report.md")" \
+    "STALE SELECTED FINDING" \
+    "address invalidation removes stale selected findings from the comprehensive report"
+assert_not_contains "$(cat "$LOCAL_MUTATION_REPORT/comprehensive-report.md")" \
+    "<!-- BEGIN SELECTED ANALYSIS -->" \
+    "address invalidation removes the generated selected-analysis marker block"
+
+# Invalidation preflights every derived artifact before deleting the selected
+# JSON. A planted report symlink or branch-tracked report must fail closed and
+# preserve the current selection.
+UNSAFE_INVALIDATION_DIR="$TEST_OUTPUT_DIR/unsafe-invalidation"
+mkdir -p "$UNSAFE_INVALIDATION_DIR"
+echo '{"selected":true}' > "$UNSAFE_INVALIDATION_DIR/analysis.json"
+echo "operator target" > "$TEST_OUTPUT_DIR/invalidation-target.md"
+ln -s "$TEST_OUTPUT_DIR/invalidation-target.md" \
+    "$UNSAFE_INVALIDATION_DIR/comprehensive-report.md"
+rc=0
+"$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$UNSAFE_INVALIDATION_DIR" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selected-analysis invalidation rejects a comprehensive-report symlink"
+assert_true "$([ -f "$UNSAFE_INVALIDATION_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "unsafe invalidation preserves the selected JSON"
+assert_eq "operator target" "$(cat "$TEST_OUTPUT_DIR/invalidation-target.md")" \
+    "unsafe invalidation leaves the symlink target untouched"
+
+TRACKED_INVALIDATION_WS="$TEST_OUTPUT_DIR/tracked-invalidation"
+TRACKED_INVALIDATION_DIR="$TRACKED_INVALIDATION_WS/reports"
+mkdir -p "$TRACKED_INVALIDATION_DIR"
+(cd "$TRACKED_INVALIDATION_WS" && git init -q . && git config user.email t@t && \
+    git config user.name t)
+cat > "$TRACKED_INVALIDATION_DIR/comprehensive-report.md" << 'EOF'
+# Tracked base
+<!-- BEGIN SELECTED ANALYSIS -->
+TRACKED STALE FINDING
+<!-- END SELECTED ANALYSIS -->
+EOF
+(cd "$TRACKED_INVALIDATION_WS" && git add reports/comprehensive-report.md && \
+    git commit -qm init)
+echo '{"selected":true}' > "$TRACKED_INVALIDATION_DIR/analysis.json"
+rc=0
+(cd "$TRACKED_INVALIDATION_WS" && "$GH_PR_ENRICH" --test-call \
+    invalidate_selected_analysis reports >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selected-analysis invalidation rejects a branch-tracked comprehensive report"
+assert_true "$([ -f "$TRACKED_INVALIDATION_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "tracked-report invalidation preserves the selected JSON"
+assert_contains "$(cat "$TRACKED_INVALIDATION_DIR/comprehensive-report.md")" \
+    "TRACKED STALE FINDING" \
+    "tracked-report invalidation leaves branch content untouched"
+
+# Successful report replacement preserves the modes of the captured sources,
+# including a combined view that already has no selected-analysis keys.
+MODE_INVALIDATION_DIR="$TEST_OUTPUT_DIR/mode-invalidation"
+mkdir -p "$MODE_INVALIDATION_DIR"
+cat > "$MODE_INVALIDATION_DIR/comprehensive-report.md" << 'EOF'
+# Mode base
+<!-- BEGIN SELECTED ANALYSIS -->
+MODE STALE FINDING
+<!-- END SELECTED ANALYSIS -->
+EOF
+echo '{"base":"already clean"}' > "$MODE_INVALIDATION_DIR/combined-data.json"
+echo '{"selected":true}' > "$MODE_INVALIDATION_DIR/analysis.json"
+chmod 640 "$MODE_INVALIDATION_DIR/comprehensive-report.md"
+chmod 644 "$MODE_INVALIDATION_DIR/combined-data.json"
+"$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$MODE_INVALIDATION_DIR" >/dev/null 2>&1
+assert_eq "640" \
+    "$("$GH_PR_ENRICH" --test-call workspace_file_mode \
+        "$MODE_INVALIDATION_DIR/comprehensive-report.md")" \
+    "successful invalidation preserves the comprehensive report mode"
+assert_eq "644" \
+    "$("$GH_PR_ENRICH" --test-call workspace_file_mode \
+        "$MODE_INVALIDATION_DIR/combined-data.json")" \
+    "successful invalidation preserves an already-clean combined-data mode"
+assert_jq "$MODE_INVALIDATION_DIR/combined-data.json" \
+    '.base == "already clean" and (has("analysis") | not)' \
+    "already-clean combined data remains valid after invalidation"
+
+MARKER_FREE_DIR="$TEST_OUTPUT_DIR/marker-free-invalidation"
+mkdir -p "$MARKER_FREE_DIR"
+printf '%s\n' '# Marker-free base report' 'Base content must survive.' \
+    > "$MARKER_FREE_DIR/comprehensive-report.md"
+echo '{"selected":true}' > "$MARKER_FREE_DIR/analysis.json"
+chmod 640 "$MARKER_FREE_DIR/comprehensive-report.md"
+MARKER_FREE_BEFORE=$(cat "$MARKER_FREE_DIR/comprehensive-report.md")
+"$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$MARKER_FREE_DIR" >/dev/null 2>&1
+assert_eq "$MARKER_FREE_BEFORE" \
+    "$(cat "$MARKER_FREE_DIR/comprehensive-report.md")" \
+    "marker-free comprehensive base report survives invalidation unchanged"
+assert_eq "640" \
+    "$("$GH_PR_ENRICH" --test-call workspace_file_mode \
+        "$MARKER_FREE_DIR/comprehensive-report.md")" \
+    "marker-free comprehensive report keeps its original mode"
+assert_true "$([ ! -e "$MARKER_FREE_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "marker-free invalidation still removes the selected artifact"
+
+# A live lock is never stolen. A lock whose well-formed owner PID has exited is
+# atomically claimed, token-checked, and replaced so SIGKILL does not create a
+# permanent report-directory blocker.
+LOCK_RECOVERY_DIR="$TEST_OUTPUT_DIR/lock-recovery"
+LOCK_RECOVERY_PATH="$LOCK_RECOVERY_DIR/.selected-analysis.lock"
+mkdir -p "$LOCK_RECOVERY_PATH"
+echo '{"selected":"live"}' > "$LOCK_RECOVERY_DIR/analysis.json"
+printf '%s\n' "$$.1.1" > "$LOCK_RECOVERY_PATH/owner"
+rc=0
+"$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$LOCK_RECOVERY_DIR" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a live selected-analysis lock owner is never displaced"
+assert_eq "$$.1.1" "$(cat "$LOCK_RECOVERY_PATH/owner")" \
+    "live lock refusal preserves the recorded owner"
+rm "$LOCK_RECOVERY_PATH/owner"
+rmdir "$LOCK_RECOVERY_PATH"
+STALE_LOCK_PID=999999
+while kill -0 "$STALE_LOCK_PID" 2>/dev/null; do
+    STALE_LOCK_PID=$((STALE_LOCK_PID - 1))
+done
+mkdir "$LOCK_RECOVERY_PATH"
+printf '%s\n' "$STALE_LOCK_PID.1.1" > "$LOCK_RECOVERY_PATH/owner"
+"$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$LOCK_RECOVERY_DIR" >/dev/null 2>&1
+assert_true "$([ ! -e "$LOCK_RECOVERY_PATH" ] && echo 0 || echo 1)" \
+    "a dead owner's selected-analysis lock is recovered and released"
+assert_true "$([ ! -e "$LOCK_RECOVERY_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "stale-lock recovery allows the selected-analysis transaction to complete"
+
+# A one-shot rmdir failure after stale-owner unlink leaves an authenticated,
+# empty recovery directory. The next preflight may safely rmdir only that exact
+# empty shape, then proceed normally.
+STALE_RMDIR_DIR="$TEST_OUTPUT_DIR/stale-rmdir"
+STALE_RMDIR_STUBS="$TEST_OUTPUT_DIR/stale-rmdir-stubs"
+STALE_RMDIR_MARKER="$TEST_OUTPUT_DIR/stale-rmdir-fired"
+mkdir -p "$STALE_RMDIR_DIR/.selected-analysis.lock" "$STALE_RMDIR_STUBS"
+echo '{"selected":"stale-rmdir"}' > "$STALE_RMDIR_DIR/analysis.json"
+printf '%s\n' "$STALE_LOCK_PID.2.2" \
+    > "$STALE_RMDIR_DIR/.selected-analysis.lock/owner"
+cat > "$STALE_RMDIR_STUBS/rmdir" << 'STUB'
+#!/bin/bash
+case "$1" in
+    "$STALE_RMDIR_REPORT"/.selected-analysis-stale.*)
+        if [ ! -f "$STALE_RMDIR_MARKER" ]; then
+            : > "$STALE_RMDIR_MARKER"
+            exit 77
+        fi
+        ;;
+esac
+exec "$REAL_RMDIR" "$@"
+STUB
+chmod +x "$STALE_RMDIR_STUBS/rmdir"
+rc=0
+env PATH="$STALE_RMDIR_STUBS:$PATH" REAL_RMDIR="$(command -v rmdir)" \
+    STALE_RMDIR_REPORT="$STALE_RMDIR_DIR" \
+    STALE_RMDIR_MARKER="$STALE_RMDIR_MARKER" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$STALE_RMDIR_DIR" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -f "$STALE_RMDIR_MARKER" ] && \
+    echo 0 || echo 1)" \
+    "stale-lock recovery reports a transient claimed-directory rmdir failure"
+STALE_RMDIR_RESIDUE=$(find "$STALE_RMDIR_DIR" -maxdepth 1 \
+    -name '.selected-analysis-stale.*' -print -quit)
+assert_true "$([ -d "$STALE_RMDIR_RESIDUE" ] && \
+    ! find "$STALE_RMDIR_RESIDUE" -mindepth 1 -print -quit | grep -q . && \
+    echo 0 || echo 1)" \
+    "failed stale cleanup preserves only an empty authenticated residue"
+"$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$STALE_RMDIR_DIR" >/dev/null 2>&1
+assert_true "$([ ! -e "$STALE_RMDIR_DIR/analysis.json" ] && \
+    ! find "$STALE_RMDIR_DIR" -maxdepth 1 \
+        -name '.selected-analysis-stale.*' -print -quit | grep -q . && \
+    echo 0 || echo 1)" \
+    "the next writer safely recovers an empty stale-rmdir residue"
+
+echo '{"selected":"ownerless"}' > "$LOCK_RECOVERY_DIR/analysis.json"
+mkdir "$LOCK_RECOVERY_PATH"
+rc=0
+"$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$LOCK_RECOVERY_DIR" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a fresh ownerless lock keeps the acquisition grace period"
+assert_true "$([ -d "$LOCK_RECOVERY_PATH" ] && \
+    [ -f "$LOCK_RECOVERY_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "fresh ownerless lock refusal preserves the lock and selected artifact"
+touch -t 200001010000 "$LOCK_RECOVERY_PATH"
+"$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$LOCK_RECOVERY_DIR" >/dev/null 2>&1
+assert_true "$([ ! -e "$LOCK_RECOVERY_PATH" ] && \
+    [ ! -e "$LOCK_RECOVERY_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "an old empty ownerless lock is recovered after the bounded grace period"
+
+# A pathname planted between mkdir and the owner write cannot redirect the
+# lock token through a symlink. Noclobber must fail and preserve the target.
+OWNER_RACE_DIR="$TEST_OUTPUT_DIR/owner-record-race"
+OWNER_RACE_STUBS="$TEST_OUTPUT_DIR/owner-record-race-stubs"
+OWNER_RACE_TARGET="$TEST_OUTPUT_DIR/owner-record-race-target"
+mkdir -p "$OWNER_RACE_DIR" "$OWNER_RACE_STUBS"
+echo '{"selected":"owner-race"}' > "$OWNER_RACE_DIR/analysis.json"
+printf '%s\n' external-sentinel > "$OWNER_RACE_TARGET"
+cat > "$OWNER_RACE_STUBS/mkdir" << 'STUB'
+#!/bin/bash
+"$REAL_MKDIR" "$@" || exit $?
+for candidate in "$@"; do
+    if [ "$candidate" = "$OWNER_RACE_LOCK" ]; then
+        ln -s "$OWNER_RACE_TARGET" "$candidate/owner"
+    fi
+done
+STUB
+chmod +x "$OWNER_RACE_STUBS/mkdir"
+rc=0
+OWNER_RACE_OUT=$(env PATH="$OWNER_RACE_STUBS:$PATH" \
+    REAL_MKDIR="$(command -v mkdir)" \
+    OWNER_RACE_LOCK="$OWNER_RACE_DIR/.selected-analysis.lock" \
+    OWNER_RACE_TARGET="$OWNER_RACE_TARGET" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$OWNER_RACE_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "lock owner creation fails closed on a planted symlink"
+assert_eq "external-sentinel" "$(cat "$OWNER_RACE_TARGET")" \
+    "noclobber owner creation never follows the planted symlink"
+assert_contains "$OWNER_RACE_OUT" "changed while its owner was recorded" \
+    "the owner-record race reports a lock integrity failure"
+rm "$OWNER_RACE_DIR/.selected-analysis.lock/owner"
+rmdir "$OWNER_RACE_DIR/.selected-analysis.lock"
+
+echo '{"selected":"malformed-lock"}' > "$LOCK_RECOVERY_DIR/analysis.json"
+mkdir "$LOCK_RECOVERY_PATH"
+echo unexpected > "$LOCK_RECOVERY_PATH/extra"
+touch -t 200001010000 "$LOCK_RECOVERY_PATH"
+rc=0
+"$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$LOCK_RECOVERY_DIR" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "an old ownerless lock with extra content remains malformed"
+assert_true "$([ -f "$LOCK_RECOVERY_PATH/extra" ] && \
+    [ -f "$LOCK_RECOVERY_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "malformed ownerless lock recovery preserves every existing path"
+rm "$LOCK_RECOVERY_PATH/extra"
+rmdir "$LOCK_RECOVERY_PATH"
+rm "$LOCK_RECOVERY_DIR/analysis.json"
+
+RECOVERY_RESIDUE_DIR="$TEST_OUTPUT_DIR/recovery-residue"
+RECOVERY_RESIDUE_PATH="$RECOVERY_RESIDUE_DIR/.selected-analysis-quarantine.manual"
+mkdir -p "$RECOVERY_RESIDUE_PATH"
+echo '{"selected":"residue"}' > "$RECOVERY_RESIDUE_DIR/analysis.json"
+rc=0
+RECOVERY_RESIDUE_OUT=$("$GH_PR_ENRICH" --test-call \
+    invalidate_selected_analysis "$RECOVERY_RESIDUE_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a prior selected-analysis quarantine blocks every new writer"
+assert_contains "$RECOVERY_RESIDUE_OUT" "$RECOVERY_RESIDUE_PATH" \
+    "recovery-residue refusal names the manual reconciliation path"
+assert_true "$([ -f "$RECOVERY_RESIDUE_DIR/analysis.json" ] && \
+    [ -d "$RECOVERY_RESIDUE_PATH" ] && echo 0 || echo 1)" \
+    "recovery-residue refusal preserves the selected view and quarantine"
+
+# Publication is not reported as successful until the cooperative lock is
+# released. A one-time owner-removal failure is surfaced, returns nonzero, and
+# the EXIT retry reaps the lock instead of silently blocking future writers.
+LOCK_RELEASE_DIR="$TEST_OUTPUT_DIR/invalidation-lock-release"
+LOCK_RELEASE_STUBS="$TEST_OUTPUT_DIR/invalidation-lock-release-stubs"
+LOCK_RELEASE_MARKER="$TEST_OUTPUT_DIR/invalidation-lock-release-fired"
+mkdir -p "$LOCK_RELEASE_DIR" "$LOCK_RELEASE_STUBS"
+echo '{"selected":"release"}' > "$LOCK_RELEASE_DIR/analysis.json"
+cat > "$LOCK_RELEASE_STUBS/rm" << 'STUB'
+#!/bin/bash
+for candidate in "$@"; do
+    case "$candidate" in
+        "$LOCK_RELEASE_REPORT"/.selected-analysis-release.*/owner)
+            if [ ! -f "$LOCK_RELEASE_MARKER" ]; then
+                : > "$LOCK_RELEASE_MARKER"
+                exit 79
+            fi
+            ;;
+    esac
+done
+exec "$REAL_RM" "$@"
+STUB
+chmod +x "$LOCK_RELEASE_STUBS/rm"
+rc=0
+LOCK_RELEASE_OUT=$(env PATH="$LOCK_RELEASE_STUBS:$PATH" \
+    REAL_RM="$(command -v rm)" \
+    LOCK_RELEASE_REPORT="$LOCK_RELEASE_DIR" \
+    LOCK_RELEASE_MARKER="$LOCK_RELEASE_MARKER" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$LOCK_RELEASE_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "invalidation propagates a writer-lock release failure"
+assert_contains "$LOCK_RELEASE_OUT" \
+    "invalidation was published, but its writer lock could not be released" \
+    "invalidation reports the post-publication lock-release failure"
+assert_true "$([ -f "$LOCK_RELEASE_MARKER" ] && \
+    [ ! -e "$LOCK_RELEASE_DIR/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "invalidation EXIT cleanup retries and removes a transient failed lock"
+assert_true "$([ ! -e "$LOCK_RELEASE_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "lock-release failure does not misrepresent the already-published invalidation"
+
+# If owner removal succeeds but the claimed directory rmdir fails once, EXIT
+# cleanup resumes the deterministic authenticated release path and leaves no
+# permanent writer blocker.
+RELEASE_RMDIR_DIR="$TEST_OUTPUT_DIR/release-rmdir"
+RELEASE_RMDIR_STUBS="$TEST_OUTPUT_DIR/release-rmdir-stubs"
+RELEASE_RMDIR_MARKER="$TEST_OUTPUT_DIR/release-rmdir-fired"
+mkdir -p "$RELEASE_RMDIR_DIR" "$RELEASE_RMDIR_STUBS"
+echo '{"selected":"release-rmdir"}' > "$RELEASE_RMDIR_DIR/analysis.json"
+cat > "$RELEASE_RMDIR_STUBS/rmdir" << 'STUB'
+#!/bin/bash
+case "$1" in
+    "$RELEASE_RMDIR_REPORT"/.selected-analysis-release.*)
+        if [ ! -f "$RELEASE_RMDIR_MARKER" ]; then
+            : > "$RELEASE_RMDIR_MARKER"
+            exit 78
+        fi
+        ;;
+esac
+exec "$REAL_RMDIR" "$@"
+STUB
+chmod +x "$RELEASE_RMDIR_STUBS/rmdir"
+rc=0
+RELEASE_RMDIR_OUT=$(env PATH="$RELEASE_RMDIR_STUBS:$PATH" \
+    REAL_RMDIR="$(command -v rmdir)" \
+    RELEASE_RMDIR_REPORT="$RELEASE_RMDIR_DIR" \
+    RELEASE_RMDIR_MARKER="$RELEASE_RMDIR_MARKER" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$RELEASE_RMDIR_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "invalidation reports a transient claimed-lock rmdir failure"
+assert_contains "$RELEASE_RMDIR_OUT" "claimed lock directory" \
+    "claimed-lock rmdir failure is diagnostic"
+assert_true "$([ -f "$RELEASE_RMDIR_MARKER" ] && \
+    [ ! -e "$RELEASE_RMDIR_DIR/.selected-analysis.lock" ] && \
+    ! find "$RELEASE_RMDIR_DIR" -maxdepth 1 \
+        -name '.selected-analysis-release.*' -print -quit | grep -q . && \
+    echo 0 || echo 1)" \
+    "EXIT cleanup removes an authenticated ownerless release residue"
+echo '{"selected":"next-writer"}' > "$RELEASE_RMDIR_DIR/analysis.json"
+"$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$RELEASE_RMDIR_DIR" >/dev/null 2>&1
+assert_true "$([ ! -e "$RELEASE_RMDIR_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "a later writer proceeds after release-rmdir retry cleanup"
+
+# A release residue is untrusted report-directory state. Even when its owner
+# token matches the live lock, a symlink must never redirect release cleanup
+# outside the report directory.
+RELEASE_SYMLINK_DIR="$TEST_OUTPUT_DIR/release-symlink"
+RELEASE_SYMLINK_STUBS="$TEST_OUTPUT_DIR/release-symlink-stubs"
+RELEASE_SYMLINK_TARGET="$TEST_OUTPUT_DIR/release-symlink-target"
+RELEASE_SYMLINK_MARKER="$TEST_OUTPUT_DIR/release-symlink-fired"
+mkdir -p "$RELEASE_SYMLINK_DIR" "$RELEASE_SYMLINK_STUBS" \
+    "$RELEASE_SYMLINK_TARGET"
+echo '{"selected":"release-symlink"}' > "$RELEASE_SYMLINK_DIR/analysis.json"
+cat > "$RELEASE_SYMLINK_STUBS/cp" << 'STUB'
+#!/bin/bash
+"$REAL_CP" "$@" || exit $?
+if [ ! -f "$RELEASE_SYMLINK_MARKER" ]; then
+    : > "$RELEASE_SYMLINK_MARKER"
+    release_token=$(cat "$RELEASE_SYMLINK_REPORT/.selected-analysis.lock/owner")
+    cat "$RELEASE_SYMLINK_REPORT/.selected-analysis.lock/owner" \
+        > "$RELEASE_SYMLINK_TARGET/owner"
+    ln -s "$RELEASE_SYMLINK_TARGET" \
+        "$RELEASE_SYMLINK_REPORT/.selected-analysis-release.$release_token"
+fi
+STUB
+chmod +x "$RELEASE_SYMLINK_STUBS/cp"
+rc=0
+RELEASE_SYMLINK_OUT=$(env PATH="$RELEASE_SYMLINK_STUBS:$PATH" \
+    REAL_CP="$(command -v cp)" \
+    RELEASE_SYMLINK_REPORT="$RELEASE_SYMLINK_DIR" \
+    RELEASE_SYMLINK_TARGET="$RELEASE_SYMLINK_TARGET" \
+    RELEASE_SYMLINK_MARKER="$RELEASE_SYMLINK_MARKER" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$RELEASE_SYMLINK_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "release rejects a matching-token symlink residue"
+assert_contains "$RELEASE_SYMLINK_OUT" \
+    "Unsafe selected-analysis release residue" \
+    "unsafe release residue reports manual reconciliation"
+RELEASE_SYMLINK_RESIDUE=$(find "$RELEASE_SYMLINK_DIR" -maxdepth 1 \
+    -name '.selected-analysis-release.*' -print -quit)
+assert_true "$([ -f "$RELEASE_SYMLINK_TARGET/owner" ] && \
+    [ -L "$RELEASE_SYMLINK_RESIDUE" ] && \
+    echo 0 || echo 1)" \
+    "release residue validation leaves the external symlink target untouched"
+rm "$RELEASE_SYMLINK_RESIDUE"
+rm "$RELEASE_SYMLINK_TARGET/owner"
+rm "$RELEASE_SYMLINK_DIR/.selected-analysis.lock/owner"
+rmdir "$RELEASE_SYMLINK_DIR/.selected-analysis.lock"
+
+# A real matching-token residue is not a resumable release while the original
+# lock still exists. Both paths are preserved for manual reconciliation.
+RELEASE_DUPLICATE_DIR="$TEST_OUTPUT_DIR/release-duplicate"
+RELEASE_DUPLICATE_STUBS="$TEST_OUTPUT_DIR/release-duplicate-stubs"
+RELEASE_DUPLICATE_MARKER="$TEST_OUTPUT_DIR/release-duplicate-fired"
+mkdir -p "$RELEASE_DUPLICATE_DIR" "$RELEASE_DUPLICATE_STUBS"
+echo '{"selected":"release-duplicate"}' > "$RELEASE_DUPLICATE_DIR/analysis.json"
+cat > "$RELEASE_DUPLICATE_STUBS/cp" << 'STUB'
+#!/bin/bash
+"$REAL_CP" "$@" || exit $?
+if [ ! -f "$RELEASE_DUPLICATE_MARKER" ]; then
+    : > "$RELEASE_DUPLICATE_MARKER"
+    release_token=$(cat "$RELEASE_DUPLICATE_REPORT/.selected-analysis.lock/owner")
+    release_dir="$RELEASE_DUPLICATE_REPORT/.selected-analysis-release.$release_token"
+    mkdir "$release_dir"
+    cp "$RELEASE_DUPLICATE_REPORT/.selected-analysis.lock/owner" \
+        "$release_dir/owner"
+fi
+STUB
+chmod +x "$RELEASE_DUPLICATE_STUBS/cp"
+rc=0
+RELEASE_DUPLICATE_OUT=$(env PATH="$RELEASE_DUPLICATE_STUBS:$PATH" \
+    REAL_CP="$(command -v cp)" \
+    RELEASE_DUPLICATE_REPORT="$RELEASE_DUPLICATE_DIR" \
+    RELEASE_DUPLICATE_MARKER="$RELEASE_DUPLICATE_MARKER" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$RELEASE_DUPLICATE_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "release refuses a matching-token residue beside the active lock"
+assert_contains "$RELEASE_DUPLICATE_OUT" "beside the active writer lock" \
+    "duplicate release state is reported for manual reconciliation"
+RELEASE_DUPLICATE_RESIDUE=$(find "$RELEASE_DUPLICATE_DIR" -maxdepth 1 \
+    -name '.selected-analysis-release.*' -print -quit)
+assert_true "$([ -f "$RELEASE_DUPLICATE_DIR/.selected-analysis.lock/owner" ] && \
+    [ -f "$RELEASE_DUPLICATE_RESIDUE/owner" ] && \
+    echo 0 || echo 1)" \
+    "duplicate release refusal preserves both ownership records"
+rm "$RELEASE_DUPLICATE_RESIDUE/owner"
+rmdir "$RELEASE_DUPLICATE_RESIDUE"
+rm "$RELEASE_DUPLICATE_DIR/.selected-analysis.lock/owner"
+rmdir "$RELEASE_DUPLICATE_DIR/.selected-analysis.lock"
+
+# Release no longer discovers residues through an unobservable process
+# substitution. A later directory-enumeration failure after atomic claim is
+# visible and preserves the claimed lock for recovery.
+RELEASE_FIND_DIR="$TEST_OUTPUT_DIR/release-find-failure"
+RELEASE_FIND_STUBS="$TEST_OUTPUT_DIR/release-find-failure-stubs"
+RELEASE_FIND_MARKER="$TEST_OUTPUT_DIR/release-find-claimed"
+mkdir -p "$RELEASE_FIND_DIR" "$RELEASE_FIND_STUBS"
+echo '{"selected":"release-find"}' > "$RELEASE_FIND_DIR/analysis.json"
+cat > "$RELEASE_FIND_STUBS/mv" << 'STUB'
+#!/bin/bash
+"$REAL_MV" "$@" || exit $?
+case "$2" in
+    "$RELEASE_FIND_REPORT"/.selected-analysis-release.*)
+        : > "$RELEASE_FIND_MARKER"
+        ;;
+esac
+STUB
+cat > "$RELEASE_FIND_STUBS/find" << 'STUB'
+#!/bin/bash
+if [ -f "$RELEASE_FIND_MARKER" ]; then
+    exit 74
+fi
+exec "$REAL_FIND" "$@"
+STUB
+chmod +x "$RELEASE_FIND_STUBS/mv" "$RELEASE_FIND_STUBS/find"
+rc=0
+RELEASE_FIND_OUT=$(env PATH="$RELEASE_FIND_STUBS:$PATH" \
+    REAL_MV="$(command -v mv)" REAL_FIND="$(command -v find)" \
+    RELEASE_FIND_REPORT="$RELEASE_FIND_DIR" \
+    RELEASE_FIND_MARKER="$RELEASE_FIND_MARKER" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$RELEASE_FIND_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "release fails closed when claimed-directory enumeration fails"
+assert_contains "$RELEASE_FIND_OUT" "unexpected content" \
+    "release enumeration failure is reported instead of silently succeeding"
+RELEASE_FIND_RESIDUE=$(find "$RELEASE_FIND_DIR" -maxdepth 1 \
+    -name '.selected-analysis-release.*' -print -quit)
+assert_true "$([ -n "$RELEASE_FIND_RESIDUE" ] && \
+    [ -f "$RELEASE_FIND_RESIDUE/owner" ] && echo 0 || echo 1)" \
+    "release enumeration failure preserves the atomically claimed lock"
+rm "$RELEASE_FIND_RESIDUE/owner"
+rmdir "$RELEASE_FIND_RESIDUE"
+
+# The lock token belongs to the actual Bash 3.2 transaction subshell, not the
+# top-level script PID. Killing only the top-level caller cannot make another
+# writer steal the lease while the transaction worker remains active.
+WORKER_OWNER_DIR="$TEST_OUTPUT_DIR/actual-worker-owner"
+WORKER_OWNER_STUBS="$TEST_OUTPUT_DIR/actual-worker-owner-stubs"
+WORKER_OWNER_READY="$TEST_OUTPUT_DIR/actual-worker-owner.ready"
+WORKER_OWNER_RELEASE="$TEST_OUTPUT_DIR/actual-worker-owner.release"
+mkdir -p "$WORKER_OWNER_DIR" "$WORKER_OWNER_STUBS"
+echo '{"selected":"worker"}' > "$WORKER_OWNER_DIR/analysis.json"
+cat > "$WORKER_OWNER_STUBS/cp" << 'STUB'
+#!/bin/bash
+"$REAL_CP" "$@" || exit $?
+copy_source=""
+previous=""
+for argument in "$@"; do
+    copy_source="$previous"
+    previous="$argument"
+done
+if [ "$copy_source" = "$WORKER_OWNER_SOURCE" ]; then
+    : > "$WORKER_OWNER_READY"
+    while [ ! -f "$WORKER_OWNER_RELEASE" ]; do /bin/sleep 0.02; done
+fi
+STUB
+chmod +x "$WORKER_OWNER_STUBS/cp"
+env PATH="$WORKER_OWNER_STUBS:$PATH" REAL_CP="$(command -v cp)" \
+    WORKER_OWNER_SOURCE="$WORKER_OWNER_DIR/analysis.json" \
+    WORKER_OWNER_READY="$WORKER_OWNER_READY" \
+    WORKER_OWNER_RELEASE="$WORKER_OWNER_RELEASE" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$WORKER_OWNER_DIR" > "$TEST_OUTPUT_DIR/actual-worker-owner.out" 2>&1 &
+WORKER_TOP_PID=$!
+for _ in $(seq 1 200); do
+    [ -f "$WORKER_OWNER_READY" ] && break
+    /bin/sleep 0.01
+done
+WORKER_OWNER_TOKEN=$(cat "$WORKER_OWNER_DIR/.selected-analysis.lock/owner")
+WORKER_OWNER_PID=${WORKER_OWNER_TOKEN%%.*}
+assert_true "$([ "$WORKER_OWNER_PID" != "$WORKER_TOP_PID" ] && \
+    kill -0 "$WORKER_OWNER_PID" 2>/dev/null && echo 0 || echo 1)" \
+    "selected-analysis lock ownership follows the live transaction worker"
+kill -TERM "$WORKER_TOP_PID" 2>/dev/null || true
+/bin/sleep 0.05
+rc=0
+WORKER_CONTENDER_OUT=$("$GH_PR_ENRICH" --test-call \
+    invalidate_selected_analysis "$WORKER_OWNER_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a contender cannot stale-recover after only the top-level caller dies"
+assert_contains "$WORKER_CONTENDER_OUT" "Another selected-analysis writer is active" \
+    "the live worker lease is recognized as active after top-level termination"
+: > "$WORKER_OWNER_RELEASE"
+wait "$WORKER_TOP_PID" 2>/dev/null || true
+for _ in $(seq 1 200); do
+    [ ! -e "$WORKER_OWNER_DIR/.selected-analysis.lock" ] && break
+    /bin/sleep 0.01
+done
+assert_true "$([ ! -e "$WORKER_OWNER_DIR/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "the surviving transaction worker releases its lease on completion"
+
+# A signal delivered to the transaction worker is deferred until the current
+# copy returns, then surfaced as 143 before any selected views are published.
+WORKER_CANCEL_DIR="$TEST_OUTPUT_DIR/worker-cancellation"
+WORKER_CANCEL_STUBS="$TEST_OUTPUT_DIR/worker-cancellation-stubs"
+WORKER_CANCEL_MARKER="$TEST_OUTPUT_DIR/worker-cancellation-fired"
+mkdir -p "$WORKER_CANCEL_DIR" "$WORKER_CANCEL_STUBS"
+echo '{"selected":"cancel"}' > "$WORKER_CANCEL_DIR/analysis.json"
+cat > "$WORKER_CANCEL_STUBS/cp" << 'STUB'
+#!/bin/bash
+"$REAL_CP" "$@" || exit $?
+copy_source=""
+previous=""
+for argument in "$@"; do
+    copy_source="$previous"
+    previous="$argument"
+done
+if [ "$copy_source" = "$WORKER_CANCEL_SOURCE" ] && \
+   [ ! -f "$WORKER_CANCEL_MARKER" ]; then
+    : > "$WORKER_CANCEL_MARKER"
+    kill -TERM "$PPID"
+fi
+STUB
+chmod +x "$WORKER_CANCEL_STUBS/cp"
+rc=0
+env PATH="$WORKER_CANCEL_STUBS:$PATH" REAL_CP="$(command -v cp)" \
+    WORKER_CANCEL_SOURCE="$WORKER_CANCEL_DIR/analysis.json" \
+    WORKER_CANCEL_MARKER="$WORKER_CANCEL_MARKER" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$WORKER_CANCEL_DIR" >/dev/null 2>&1 || rc=$?
+assert_eq "143" "$rc" \
+    "transaction-worker TERM is propagated after reaching a safe boundary"
+assert_true "$([ -f "$WORKER_CANCEL_DIR/analysis.json" ] && \
+    [ ! -e "$WORKER_CANCEL_DIR/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "cancelled invalidation preserves selected bytes and releases its lease"
+
+# Publisher signals retain their conventional status. INT during quarantine
+# rolls back the original bytes; TERM after the final quarantine cleanup
+# reports cancellation without misrepresenting the coherent committed state.
+PUBLISH_INT_DIR="$TEST_OUTPUT_DIR/publisher-int"
+PUBLISH_INT_STUBS="$TEST_OUTPUT_DIR/publisher-int-stubs"
+PUBLISH_INT_MARKER="$TEST_OUTPUT_DIR/publisher-int-fired"
+mkdir -p "$PUBLISH_INT_DIR" "$PUBLISH_INT_STUBS"
+echo '{"selected":"publisher-int"}' > "$PUBLISH_INT_DIR/analysis.json"
+cat > "$PUBLISH_INT_STUBS/mv" << 'STUB'
+#!/bin/bash
+"$REAL_MV" "$@" || exit $?
+if [ "$1" = "$PUBLISH_INT_SOURCE" ] && [ ! -f "$PUBLISH_INT_MARKER" ]; then
+    : > "$PUBLISH_INT_MARKER"
+    kill -INT "$PPID"
+fi
+STUB
+chmod +x "$PUBLISH_INT_STUBS/mv"
+rc=0
+env PATH="$PUBLISH_INT_STUBS:$PATH" REAL_MV="$(command -v mv)" \
+    PUBLISH_INT_SOURCE="$PUBLISH_INT_DIR/analysis.json" \
+    PUBLISH_INT_MARKER="$PUBLISH_INT_MARKER" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$PUBLISH_INT_DIR" >/dev/null 2>&1 || rc=$?
+assert_eq "130" "$rc" \
+    "publisher INT rollback preserves the direct cancellation status"
+assert_true "$([ -f "$PUBLISH_INT_DIR/analysis.json" ] && \
+    [ ! -e "$PUBLISH_INT_DIR/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "publisher INT restores selected bytes and releases its lease"
+
+PUBLISH_TERM_DIR="$TEST_OUTPUT_DIR/publisher-term"
+PUBLISH_TERM_STUBS="$TEST_OUTPUT_DIR/publisher-term-stubs"
+PUBLISH_TERM_MARKER="$TEST_OUTPUT_DIR/publisher-term-fired"
+mkdir -p "$PUBLISH_TERM_DIR" "$PUBLISH_TERM_STUBS"
+echo '{"selected":"publisher-term"}' > "$PUBLISH_TERM_DIR/analysis.json"
+cat > "$PUBLISH_TERM_STUBS/rm" << 'STUB'
+#!/bin/bash
+matched=false
+for candidate in "$@"; do
+    case "$candidate" in
+        "$PUBLISH_TERM_REPORT"/.selected-analysis-quarantine.*) matched=true ;;
+    esac
+done
+"$REAL_RM" "$@" || exit $?
+if [ "$matched" = true ] && [ ! -f "$PUBLISH_TERM_MARKER" ]; then
+    : > "$PUBLISH_TERM_MARKER"
+    kill -TERM "$PPID"
+fi
+STUB
+chmod +x "$PUBLISH_TERM_STUBS/rm"
+rc=0
+env PATH="$PUBLISH_TERM_STUBS:$PATH" REAL_RM="$(command -v rm)" \
+    PUBLISH_TERM_REPORT="$PUBLISH_TERM_DIR" \
+    PUBLISH_TERM_MARKER="$PUBLISH_TERM_MARKER" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$PUBLISH_TERM_DIR" >/dev/null 2>&1 || rc=$?
+assert_eq "143" "$rc" \
+    "publisher TERM after coherent commit preserves the direct cancellation status"
+assert_true "$([ ! -e "$PUBLISH_TERM_DIR/analysis.json" ] && \
+    [ ! -e "$PUBLISH_TERM_DIR/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "publisher TERM reports the coherent committed state and releases its lease"
+
+# mktemp -d already creates a private quarantine. A hostile chmod failpoint for
+# that path must be unreachable, so successful invalidation cannot strand a
+# recovery residue before traps are installed.
+QUARANTINE_MODE_DIR="$TEST_OUTPUT_DIR/quarantine-mode"
+QUARANTINE_MODE_STUBS="$TEST_OUTPUT_DIR/quarantine-mode-stubs"
+QUARANTINE_MODE_MARKER="$TEST_OUTPUT_DIR/quarantine-mode-fired"
+mkdir -p "$QUARANTINE_MODE_DIR" "$QUARANTINE_MODE_STUBS"
+echo '{"selected":"quarantine-mode"}' > "$QUARANTINE_MODE_DIR/analysis.json"
+cat > "$QUARANTINE_MODE_STUBS/chmod" << 'STUB'
+#!/bin/bash
+for candidate in "$@"; do
+    case "$candidate" in
+        "$QUARANTINE_MODE_REPORT"/.selected-analysis-quarantine.*)
+            : > "$QUARANTINE_MODE_MARKER"
+            exit 77
+            ;;
+    esac
+done
+exec "$REAL_CHMOD" "$@"
+STUB
+chmod +x "$QUARANTINE_MODE_STUBS/chmod"
+env PATH="$QUARANTINE_MODE_STUBS:$PATH" \
+    REAL_CHMOD="$(command -v chmod)" \
+    QUARANTINE_MODE_REPORT="$QUARANTINE_MODE_DIR" \
+    QUARANTINE_MODE_MARKER="$QUARANTINE_MODE_MARKER" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$QUARANTINE_MODE_DIR" >/dev/null 2>&1
+assert_true "$([ ! -e "$QUARANTINE_MODE_MARKER" ] && \
+    [ ! -e "$QUARANTINE_MODE_DIR/analysis.json" ] && \
+    ! find "$QUARANTINE_MODE_DIR" -name '.selected-analysis-quarantine.*' \
+        -print -quit | grep -q . && echo 0 || echo 1)" \
+    "private quarantine setup has no chmod failure residue path"
+
+# If quarantining a later selected view fails, restore every earlier claimed
+# original without changing its bytes or mode.
+ROLLBACK_INVALIDATION_DIR="$TEST_OUTPUT_DIR/rollback-invalidation"
+ROLLBACK_MV_STUBS="$TEST_OUTPUT_DIR/rollback-mv-stubs"
+ROLLBACK_MV_COUNT="$TEST_OUTPUT_DIR/rollback-mv-count"
+mkdir -p "$ROLLBACK_INVALIDATION_DIR" "$ROLLBACK_MV_STUBS"
+cat > "$ROLLBACK_INVALIDATION_DIR/comprehensive-report.md" << 'EOF'
+# Rollback base
+<!-- BEGIN SELECTED ANALYSIS -->
+ROLLBACK STALE FINDING
+<!-- END SELECTED ANALYSIS -->
+EOF
+chmod 640 "$ROLLBACK_INVALIDATION_DIR/comprehensive-report.md"
+cat > "$ROLLBACK_INVALIDATION_DIR/combined-data.json" << 'EOF'
+{"base":"keep","analysis":{"selected":true},"analysis_context_coverage":{"included":true}}
+EOF
+echo '{"selected":true}' > "$ROLLBACK_INVALIDATION_DIR/analysis.json"
+cat > "$ROLLBACK_MV_STUBS/mv" << 'STUB'
+#!/bin/bash
+count=0
+[ ! -f "$MV_COUNT_FILE" ] || read -r count < "$MV_COUNT_FILE"
+count=$((count + 1))
+printf '%s\n' "$count" > "$MV_COUNT_FILE"
+[ "$count" -ne "$MV_FAIL_ON" ] || exit 73
+exec "$REAL_MV" "$@"
+STUB
+chmod +x "$ROLLBACK_MV_STUBS/mv"
+rc=0
+env PATH="$ROLLBACK_MV_STUBS:$PATH" REAL_MV="$(command -v mv)" \
+    MV_COUNT_FILE="$ROLLBACK_MV_COUNT" MV_FAIL_ON=2 \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$ROLLBACK_INVALIDATION_DIR" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a later report rename failure makes invalidation fail"
+assert_contains "$(cat "$ROLLBACK_INVALIDATION_DIR/comprehensive-report.md")" \
+    "ROLLBACK STALE FINDING" \
+    "failed combined-data publication restores the original comprehensive report"
+assert_eq "640" \
+    "$("$GH_PR_ENRICH" --test-call workspace_file_mode \
+        "$ROLLBACK_INVALIDATION_DIR/comprehensive-report.md")" \
+    "cross-artifact rollback preserves the comprehensive report mode"
+assert_jq "$ROLLBACK_INVALIDATION_DIR/combined-data.json" \
+    '.analysis.selected == true and .analysis_context_coverage.included == true' \
+    "failed invalidation preserves the selected combined-data view"
+assert_true "$([ -f "$ROLLBACK_INVALIDATION_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "failed cross-artifact invalidation preserves selected JSON"
+
+# Copying several originals into the private transaction takes time. A source
+# backed up earlier must still match that backup when the last copy finishes.
+BACKUP_RACE_DIR="$TEST_OUTPUT_DIR/backup-race-invalidation"
+BACKUP_RACE_STUBS="$TEST_OUTPUT_DIR/backup-race-stubs"
+BACKUP_RACE_MARKER="$TEST_OUTPUT_DIR/backup-race-mutated"
+mkdir -p "$BACKUP_RACE_DIR" "$BACKUP_RACE_STUBS"
+cp "$ROLLBACK_INVALIDATION_DIR/comprehensive-report.md" \
+    "$BACKUP_RACE_DIR/comprehensive-report.md"
+cp "$ROLLBACK_INVALIDATION_DIR/combined-data.json" \
+    "$BACKUP_RACE_DIR/combined-data.json"
+echo '{"selected":true}' > "$BACKUP_RACE_DIR/analysis.json"
+cat > "$BACKUP_RACE_STUBS/cp" << 'STUB'
+#!/bin/bash
+"$REAL_CP" "$@" || exit $?
+copy_source=""
+previous=""
+for argument in "$@"; do
+    copy_source="$previous"
+    previous="$argument"
+done
+if [ "$copy_source" = "$CP_MUTATE_AFTER_SOURCE" ] && \
+   [ ! -f "$CP_MUTATION_MARKER" ]; then
+    printf '%s\n' \
+        '{"concurrent":"preserved","analysis":{"selected":"concurrent"},"analysis_context_coverage":{"included":true}}' \
+        > "$CP_MUTATION_TARGET"
+    : > "$CP_MUTATION_MARKER"
+fi
+STUB
+chmod +x "$BACKUP_RACE_STUBS/cp"
+rc=0
+env PATH="$BACKUP_RACE_STUBS:$PATH" REAL_CP="$(command -v cp)" \
+    CP_MUTATE_AFTER_SOURCE="$BACKUP_RACE_DIR/analysis.json" \
+    CP_MUTATION_TARGET="$BACKUP_RACE_DIR/combined-data.json" \
+    CP_MUTATION_MARKER="$BACKUP_RACE_MARKER" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$BACKUP_RACE_DIR" >/dev/null 2>&1 || rc=$?
+assert_eq "0" "$rc" \
+    "invalidation can capture a not-yet-backed report that changes during backup"
+assert_jq "$BACKUP_RACE_DIR/combined-data.json" \
+    '.concurrent == "preserved" and
+     (has("analysis") | not) and (has("analysis_context_coverage") | not)' \
+    "replacement rendering preserves concurrent base data captured by its backup"
+assert_not_contains "$(cat "$BACKUP_RACE_DIR/comprehensive-report.md")" \
+    "ROLLBACK STALE FINDING" \
+    "backup-first rendering completes the comprehensive invalidation coherently"
+assert_true "$([ ! -e "$BACKUP_RACE_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "backup-first invalidation removes the selected artifact"
+
+# After originals are quarantined, a destination can reappear before publish.
+# The no-clobber link must abort, leave concurrent paths untouched, and retain
+# quarantined originals when restore also finds the collision.
+BOUNDARY_DIR="$TEST_OUTPUT_DIR/publication-boundary-invalidation"
+BOUNDARY_STUBS="$TEST_OUTPUT_DIR/publication-boundary-stubs"
+BOUNDARY_MARKER="$TEST_OUTPUT_DIR/publication-boundary-fired"
+mkdir -p "$BOUNDARY_DIR" "$BOUNDARY_STUBS"
+cp "$ROLLBACK_INVALIDATION_DIR/comprehensive-report.md" \
+    "$BOUNDARY_DIR/comprehensive-report.md"
+cp "$ROLLBACK_INVALIDATION_DIR/combined-data.json" \
+    "$BOUNDARY_DIR/combined-data.json"
+echo '{"selected":"original"}' > "$BOUNDARY_DIR/analysis.json"
+cat > "$BOUNDARY_STUBS/ln" << 'STUB'
+#!/bin/bash
+if [ ! -f "$BOUNDARY_MARKER" ]; then
+    printf '%s\n' '{"selected":"concurrent"}' > "$BOUNDARY_ANALYSIS_TARGET"
+    printf '%s\n' '{"concurrent":"combined"}' > "$BOUNDARY_COMBINED_TARGET"
+    : > "$BOUNDARY_MARKER"
+fi
+exec "$REAL_LN" "$@"
+STUB
+chmod +x "$BOUNDARY_STUBS/ln"
+rc=0
+env PATH="$BOUNDARY_STUBS:$PATH" REAL_LN="$(command -v ln)" \
+    BOUNDARY_MARKER="$BOUNDARY_MARKER" \
+    BOUNDARY_ANALYSIS_TARGET="$BOUNDARY_DIR/analysis.json" \
+    BOUNDARY_COMBINED_TARGET="$BOUNDARY_DIR/combined-data.json" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$BOUNDARY_DIR" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a destination reappearing at publication aborts invalidation"
+assert_jq "$BOUNDARY_DIR/analysis.json" '.selected == "concurrent"' \
+    "delete-boundary collision leaves concurrent selected JSON untouched"
+assert_jq "$BOUNDARY_DIR/combined-data.json" '.concurrent == "combined"' \
+    "publish-boundary collision never clobbers concurrent combined data"
+BOUNDARY_QUARANTINE=$(find "$BOUNDARY_DIR" -maxdepth 1 -type d \
+    -name '.selected-analysis-quarantine.*' -print -quit)
+assert_true "$([ -n "$BOUNDARY_QUARANTINE" ] && \
+    [ -f "$BOUNDARY_QUARANTINE/analysis.json" ] && \
+    [ -f "$BOUNDARY_QUARANTINE/combined-data.json" ] && echo 0 || echo 1)" \
+    "restore-boundary collisions preserve original artifacts in quarantine"
+assert_true "$([ ! -e "$BOUNDARY_DIR/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "failed publication releases the cooperative writer lock"
+
+# A publication can fail after an earlier replacement was linked successfully.
+# Rollback first claims that replacement by moving it to quarantine. If another
+# writer recreates the pathname at that exact boundary, the concurrent bytes
+# must remain live and the original must remain recoverable in quarantine.
+ROLLBACK_BOUNDARY_DIR="$TEST_OUTPUT_DIR/rollback-boundary-invalidation"
+ROLLBACK_BOUNDARY_STUBS="$TEST_OUTPUT_DIR/rollback-boundary-stubs"
+ROLLBACK_BOUNDARY_LN_COUNT="$TEST_OUTPUT_DIR/rollback-boundary-ln-count"
+ROLLBACK_BOUNDARY_MARKER="$TEST_OUTPUT_DIR/rollback-boundary-fired"
+mkdir -p "$ROLLBACK_BOUNDARY_DIR" "$ROLLBACK_BOUNDARY_STUBS"
+cp "$ROLLBACK_INVALIDATION_DIR/comprehensive-report.md" \
+    "$ROLLBACK_BOUNDARY_DIR/comprehensive-report.md"
+cp "$ROLLBACK_INVALIDATION_DIR/combined-data.json" \
+    "$ROLLBACK_BOUNDARY_DIR/combined-data.json"
+echo '{"selected":"original"}' > "$ROLLBACK_BOUNDARY_DIR/analysis.json"
+cat > "$ROLLBACK_BOUNDARY_STUBS/ln" << 'STUB'
+#!/bin/bash
+count=0
+[ ! -f "$ROLLBACK_LN_COUNT" ] || read -r count < "$ROLLBACK_LN_COUNT"
+count=$((count + 1))
+printf '%s\n' "$count" > "$ROLLBACK_LN_COUNT"
+[ "$count" -ne 2 ] || exit 76
+exec "$REAL_LN" "$@"
+STUB
+cat > "$ROLLBACK_BOUNDARY_STUBS/mv" << 'STUB'
+#!/bin/bash
+"$REAL_MV" "$@" || exit $?
+case "$2" in
+    */.published-combined-data.json)
+        if [ ! -f "$ROLLBACK_BOUNDARY_MARKER" ]; then
+            printf '%s\n' '{"concurrent":"rollback-boundary"}' \
+                > "$ROLLBACK_BOUNDARY_TARGET"
+            : > "$ROLLBACK_BOUNDARY_MARKER"
+        fi
+        ;;
+esac
+STUB
+chmod +x "$ROLLBACK_BOUNDARY_STUBS/ln" "$ROLLBACK_BOUNDARY_STUBS/mv"
+rc=0
+env PATH="$ROLLBACK_BOUNDARY_STUBS:$PATH" \
+    REAL_LN="$(command -v ln)" REAL_MV="$(command -v mv)" \
+    ROLLBACK_LN_COUNT="$ROLLBACK_BOUNDARY_LN_COUNT" \
+    ROLLBACK_BOUNDARY_MARKER="$ROLLBACK_BOUNDARY_MARKER" \
+    ROLLBACK_BOUNDARY_TARGET="$ROLLBACK_BOUNDARY_DIR/combined-data.json" \
+    "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
+    "$ROLLBACK_BOUNDARY_DIR" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a concurrent destination appearing during rollback fails reconciliation"
+assert_jq "$ROLLBACK_BOUNDARY_DIR/combined-data.json" \
+    '.concurrent == "rollback-boundary"' \
+    "rollback never removes a concurrently recreated destination"
+ROLLBACK_BOUNDARY_QUARANTINE=$(find "$ROLLBACK_BOUNDARY_DIR" -maxdepth 1 -type d \
+    -name '.selected-analysis-quarantine.*' -print -quit)
+assert_true "$([ -n "$ROLLBACK_BOUNDARY_QUARANTINE" ] && \
+    [ -f "$ROLLBACK_BOUNDARY_QUARANTINE/combined-data.json" ] && \
+    jq -e '.analysis.selected == true' \
+        "$ROLLBACK_BOUNDARY_QUARANTINE/combined-data.json" >/dev/null 2>&1 && \
+    echo 0 || echo 1)" \
+    "rollback preserves the original collided view in quarantine"
+assert_true "$([ ! -e "$ROLLBACK_BOUNDARY_DIR/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "rollback-boundary failure releases the cooperative writer lock"
 
 # A same-head reply posted while resolveReviewThread is in flight is concurrent
 # reviewer-owned state. Invalidate locally, but never overwrite it by reopening.
