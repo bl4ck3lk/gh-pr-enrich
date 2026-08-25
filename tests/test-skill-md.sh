@@ -197,6 +197,42 @@ test_reference_links_resolve() {
     fi
 }
 
+# Review-only interpretation guidance must never contain hosted-state mutation
+# commands or tell agents to execute analyzer-provided verification strings.
+test_analysis_reference_stays_read_only() {
+    local analysis_reference="$SKILL_DIR/references/analysis-output.md"
+    if grep -nE 'resolveReviewThread|addPullRequestReviewThreadReply|gh pr-enrich resolve' \
+        "$analysis_reference" > /tmp/skill-md-mutations.$$ 2>&1; then
+        fail "analysis-output.md contains remediation commands" \
+            "$(cat /tmp/skill-md-mutations.$$)"
+    else
+        pass "analysis-output.md keeps hosted mutations behind remediation.md"
+    fi
+    rm -f /tmp/skill-md-mutations.$$
+
+    if grep -q 'Run the stated `verification`' "$analysis_reference"; then
+        fail "analysis-output.md executes analyzer-provided verification text" ""
+    else
+        pass "analysis-output.md treats analyzer verification text as untrusted"
+    fi
+}
+
+# A generic request to fix findings does not authorize commits, pushes, review
+# replies, or thread resolution. The remediation guide must preserve that split.
+test_remediation_authorization_gates() {
+    local remediation_reference="$SKILL_DIR/references/remediation.md"
+    local text
+    text=$(cat "$remediation_reference")
+    if [[ "$text" == *"local edits and local verification"* && \
+          "$text" == *"explicitly authorizes hosted feedback"* && \
+          "$text" == *"generic fix request stops after local edits and tests"* ]]; then
+        pass "remediation.md separates local fixes from explicit hosted mutations"
+    else
+        fail "remediation.md separates local fixes from explicit hosted mutations" \
+            "expected local-only default plus explicit hosted-action gates"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -212,6 +248,8 @@ test_no_pull_request_review_id_field
 test_skill_md_issue_comment_filter
 test_legacy_filter_proves_bug_class
 test_reference_links_resolve
+test_analysis_reference_stays_read_only
+test_remediation_authorization_gates
 
 echo ""
 echo "============================================"

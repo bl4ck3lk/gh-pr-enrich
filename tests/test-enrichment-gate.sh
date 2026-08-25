@@ -30,7 +30,14 @@ suite_start "gh pr-enrich enrichment gate suite"
 cat > "$STUB_DIR/gh" << 'STUB'
 #!/bin/bash
 case "$1 $2" in
-    "repo view")   echo "o/r"; exit 0 ;;
+    "repo view")
+        case "$*" in
+            *nameWithOwner,visibility*) printf '{"nameWithOwner":"o/r","visibility":"%s"}\n' "${REPO_VISIBILITY:-PUBLIC}" ;;
+            *visibility*) echo "${REPO_VISIBILITY:-PUBLIC}" ;;
+            *) echo "o/r" ;;
+        esac
+        exit 0
+        ;;
     "pr view")     cat "$FIXTURE_DIR/pr-summary.json"; exit 0 ;;
     "pr checks")   echo '[]'; exit 0 ;;
     "pr diff")     echo ""; exit 0 ;;
@@ -58,7 +65,12 @@ cat > "$STUB_DIR/claude" << 'STUB'
 # Records that it ran, drains stdin, returns a minimal valid analysis.
 echo "invoked" >> "$CLAUDE_INVOKED_LOG"
 cat > /dev/null
-echo '{"structured_output": {"issue_categories": [], "category_coverage": [], "disputed_comments": [], "systemic_issues": [], "adjacent_problems": [], "task_list": [], "process_improvements": [], "pr_template_suggestions": []}}'
+jq -nc '
+  ["logic_error","boundary_condition","concurrency","error_handling","resource_lifecycle","security","secrets_exposure","data_integrity","api_contract","performance","test_gap","observability","maintainability","documentation","build_ci","dependency_risk"] as $categories
+  | {structured_output:{issue_categories:[],
+      category_coverage:[$categories[] | {category:., verdict:"reviewed_none_found", note:"fixture"}],
+      disputed_comments:[],systemic_issues:[],adjacent_problems:[],task_list:[],
+      process_improvements:[],pr_template_suggestions:[]}}'
 STUB
 chmod +x "$STUB_DIR/claude"
 
@@ -93,6 +105,7 @@ run_scenario() {
 {"number": 1, "title": "t", "body": "b", "author": {"login": "u"}, "state": "OPEN",
  "url": "https://github.com/o/r/pull/1", "createdAt": "2026-01-01T00:00:00Z",
  "updatedAt": "2026-01-01T00:00:00Z", "mergeable": "MERGEABLE", "isDraft": false,
+ "headRefOid": "abc123",
  "additions": 1, "deletions": 0, "changedFiles": 1, "files": [{"path": "a.js", "additions": 1, "deletions": 0}],
  "commits": [], "labels": [], "assignees": [], "reviews": []}
 EOF
@@ -114,6 +127,13 @@ assert_eq "yes" "$(claude_ran threads-only)" "an unresolved thread triggers the 
 assert_contains "$OUT" "Found 1 unresolved thread" "the script reports what it found"
 assert_jq "$TEST_OUTPUT_DIR/threads-only/report/claude-analysis.json" '.issue_categories != null' \
     "the analysis result is written"
+assert_jq "$TEST_OUTPUT_DIR/threads-only/report/analysis.json" '._metadata.provider == "claude"' \
+    "the provider-neutral analysis records Claude attribution"
+assert_jq "$TEST_OUTPUT_DIR/threads-only/report/analysis.json" \
+    '._metadata.pr_head_sha != null and ._metadata.generated_at != null' \
+    "the provider-neutral analysis records snapshot provenance"
+assert_jq "$TEST_OUTPUT_DIR/threads-only/report/analysis-context.json" '.coverage != null' \
+    "the provider-neutral analysis context is written"
 
 # ---------------------------------------------------------------------------
 # Issue comment only, no threads -> analysis still runs (bot/CI reports matter)
@@ -149,6 +169,8 @@ OUT=$(run_scenario "partial-coverage" "$THREAD_JSON" '[]')
 assert_contains "$OUT" "Category coverage is incomplete" "an incomplete sweep is reported"
 assert_contains "$OUT" "1 of 16" "the report says how many categories were swept"
 assert_contains "$OUT" "logic_error" "the unswept categories are named"
+assert_true "$([ ! -e "$TEST_OUTPUT_DIR/partial-coverage/report/analysis.json" ] && echo 0 || echo 1)" \
+    "an incomplete category sweep is not promoted as selected analysis"
 
 # ---------------------------------------------------------------------------
 # Structured output missing entirely (clean exit, unusable result)
@@ -164,5 +186,9 @@ chmod +x "$STUB_DIR/claude"
 OUT=$(run_scenario "no-structured-output" "$THREAD_JSON" '[]')
 assert_contains "$OUT" "no structured output" "a missing analysis is called out, not passed off as empty"
 assert_contains "$OUT" "claude-stderr.log" "the user is pointed at the analyzer log"
+assert_true "$([ ! -e "$TEST_OUTPUT_DIR/no-structured-output/report/claude-analysis.json" ] && echo 0 || echo 1)" \
+    "an analyzer envelope is not published as Claude analysis"
+assert_true "$([ ! -e "$TEST_OUTPUT_DIR/no-structured-output/report/analysis.json" ] && echo 0 || echo 1)" \
+    "an unusable analyzer response is not published as selected analysis"
 
 suite_end

@@ -36,8 +36,11 @@ assert_true "$rc" "script parses cleanly (bash -n)"
 # ---------------------------------------------------------------------------
 # No duplicated function bodies
 # ---------------------------------------------------------------------------
-def_count=$(grep -c '^build_claude_context() {' "$GH_PR_ENRICH" || true)
-assert_eq "1" "$def_count" "build_claude_context is defined exactly once"
+def_count=$(grep -c '^build_analysis_context() {' "$GH_PR_ENRICH" || true)
+assert_eq "1" "$def_count" "build_analysis_context is defined exactly once"
+
+legacy_wrapper_count=$(grep -c '^build_claude_context() {' "$GH_PR_ENRICH" || true)
+assert_eq "1" "$legacy_wrapper_count" "the legacy Claude builder name has one thin wrapper"
 
 # The inlined copy was identified by this comment; it must not come back.
 inline_marker=$(grep -c 'Inlined version of build_claude_context' "$GH_PR_ENRICH" || true)
@@ -45,8 +48,11 @@ assert_eq "0" "$inline_marker" "no inlined copy of build_claude_context remains"
 
 # The context document must be assembled in exactly one place. Two writers means
 # one of them is a copy that will drift.
-writer_count=$(grep -c '> "$output_dir/claude-context.json"' "$GH_PR_ENRICH" || true)
-assert_eq "1" "$writer_count" "claude-context.json is written by exactly one code path"
+writer_count=$(grep -c '> "$output_dir/analysis-context.tmp.json"' "$GH_PR_ENRICH" || true)
+assert_eq "1" "$writer_count" "analysis-context.json is written by exactly one code path"
+
+compat_copy_count=$(grep -c 'copy_compatibility_file "$output_dir/analysis-context.json" "$output_dir/claude-context.json"' "$GH_PR_ENRICH" || true)
+assert_eq "1" "$compat_copy_count" "the legacy Claude context is only a compatibility alias"
 
 # ---------------------------------------------------------------------------
 # Generic test dispatcher replaces the special-cased --test-build-context hook
@@ -67,6 +73,8 @@ rc=0
 assert_true "$rc" "--test-call dispatches build_claude_context"
 assert_jq "$TEST_OUTPUT_DIR/ctx/claude-context.json" '.pr.title == "t"' \
     "dispatched function produced a valid context file"
+assert_jq "$TEST_OUTPUT_DIR/ctx/analysis-context.json" '.pr.title == "t"' \
+    "dispatched function produced the provider-neutral context file"
 
 # ---------------------------------------------------------------------------
 # Dispatcher is allowlisted (must not invoke arbitrary shell functions)

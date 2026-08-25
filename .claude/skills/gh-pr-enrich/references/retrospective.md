@@ -19,8 +19,9 @@ The `retrospective` subcommand analyzes patterns across all PR reports to identi
 # Basic retrospective
 gh pr-enrich retrospective
 
-# Last 30 days with Claude meta-analysis
-gh pr-enrich retrospective --since 30d --enrich
+# Last 30 days with external Claude meta-analysis. Aggregated reports may
+# contain private data, so disclosure authorization is always explicit.
+gh pr-enrich retrospective --since 30d --enrich --allow-external
 
 # Filter by author
 gh pr-enrich retrospective --author alice,bob
@@ -40,6 +41,7 @@ gh pr-enrich retrospective --format pr-template  # PR template additions
 | `--reports-dir DIR` | Path to reports directory |
 | `--output-dir DIR` | Where to save output |
 | `--enrich` | Use Claude for meta-analysis |
+| `--allow-external` | Authorize sending aggregated report data to external Claude |
 | `--min-prs N` | Warn if fewer PRs found |
 | `--format TYPE` | Output: `claude-md`, `pr-template`, `checklist` |
 | `--json` | Output JSON only |
@@ -78,7 +80,7 @@ jq '.cross_pr_patterns[] | select(.occurrences >= 3)' \
 
 ```bash
 # 1. Generate retrospective for the sprint
-gh pr-enrich retrospective --since 2w --enrich
+gh pr-enrich retrospective --since 2w --enrich --allow-external
 
 # 2. Review the report
 cat .reports/retrospectives/retrospective-report.md

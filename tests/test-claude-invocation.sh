@@ -71,7 +71,11 @@ chmod +x "$STUB_DIR/semgrep"
 CONTEXT="$TEST_OUTPUT_DIR/claude-context.json"
 # The context records the PR head; the analyzer re-checks it against the working
 # tree before granting tools, so the fixture claims the revision under test.
-HEAD_SHA=$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo "")
+CODE_ACCESS_REPO="$TEST_OUTPUT_DIR/code-access-repo"
+mkdir -p "$CODE_ACCESS_REPO"
+(cd "$CODE_ACCESS_REPO" && git init -q . && git config user.email t@t && git config user.name t \
+    && printf '.env\n' > .gitignore && echo clean > tracked.txt && git add -A && git commit -qm init)
+HEAD_SHA=$(git -C "$CODE_ACCESS_REPO" rev-parse HEAD)
 jq -n --arg sha "$HEAD_SHA" '{
     pr: {title: "t"}, unresolved_threads: [], issue_comments: [],
     coverage: {code_access: {pr_head_sha: $sha}}
@@ -79,9 +83,9 @@ jq -n --arg sha "$HEAD_SHA" '{
 RESPONSE="$TEST_OUTPUT_DIR/response.json"
 
 run_analysis() {
-    env CLAUDE_ARG_LOG="$ARG_LOG" CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+    (cd "$CODE_ACCESS_REPO" && env CLAUDE_ARG_LOG="$ARG_LOG" CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
         PATH="$STUB_DIR:$PATH" "$@" \
-        "$GH_PR_ENRICH" --test-call run_claude_analysis "$CONTEXT" "$RESPONSE" >/dev/null 2>&1 || true
+        "$GH_PR_ENRICH" --test-call run_claude_analysis "$CONTEXT" "$RESPONSE" >/dev/null 2>&1) || true
 }
 
 # ---------------------------------------------------------------------------
@@ -98,11 +102,17 @@ assert_not_contains "$ARGS" "Bash" "analyzer is not granted Bash"
 assert_not_contains "$ARGS" "Write" "analyzer is not granted Write"
 assert_not_contains "$ARGS" "Edit" "analyzer is not granted Edit"
 assert_contains "$ARGS" "--json-schema" "analyzer is given the structured-output schema"
+assert_contains "$ARGS" "--tools" "the available Claude tools are explicitly restricted"
+assert_contains "$ARGS" "--permission-mode" "Claude cannot pause for permission prompts"
+assert_contains "$ARGS" "dontAsk" "Claude uses the non-interactive permission mode"
+assert_contains "$ARGS" "--no-session-persistence" "Claude analysis does not persist a session"
 
 # Opt-out for sandboxed environments
 run_analysis GH_PR_ENRICH_CODE_ACCESS=false
 ARGS_NO_CODE=$(cat "$ARG_LOG" 2>/dev/null || echo "")
 assert_not_contains "$ARGS_NO_CODE" "--allowedTools" "code access can be disabled"
+assert_contains "$ARGS_NO_CODE" "--tools" "the no-code run explicitly disables Claude tools"
+assert_not_contains "$ARGS_NO_CODE" "Read" "the no-code run cannot read repository files"
 
 # ---------------------------------------------------------------------------
 # Model selection
@@ -168,13 +178,58 @@ assert_contains "$(sed -n '/run_retrospective_claude_analysis() {/,/^    }/p' "$
 # ---------------------------------------------------------------------------
 revision_state() {
     # resolve_code_access PR_HEAD_SHA -> prints "enabled"/"disabled" plus reason
-    env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call resolve_code_access "$1" 2>&1 || true
+    (cd "$CODE_ACCESS_REPO" && env PATH="$STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" --test-call resolve_code_access "$1" 2>&1) || true
 }
 
-LOCAL_HEAD=$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo "nogit")
+LOCAL_HEAD=$(git -C "$CODE_ACCESS_REPO" rev-parse HEAD)
 
 MATCHED=$(revision_state "$LOCAL_HEAD")
 assert_contains "$MATCHED" "enabled" "code access is enabled when the tree is at the PR head"
+
+echo dirty >> "$CODE_ACCESS_REPO/tracked.txt"
+DIRTY=$(revision_state "$LOCAL_HEAD")
+assert_contains "$DIRTY" "disabled" "automatic code access is disabled for a dirty working tree"
+DIRTY_FORCED=$( (cd "$CODE_ACCESS_REPO" && env GH_PR_ENRICH_CODE_ACCESS=true \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "$LOCAL_HEAD" 2>&1) || true)
+assert_contains "$DIRTY_FORCED" "enabled" "an explicit code-access override can expose a dirty working tree"
+git -C "$CODE_ACCESS_REPO" checkout -- tracked.txt
+
+echo 'IGNORED_SECRET=fixture' > "$CODE_ACCESS_REPO/.env"
+IGNORED_DIRTY=$(revision_state "$LOCAL_HEAD")
+assert_contains "$IGNORED_DIRTY" "disabled" \
+    "automatic code access is disabled when ignored files exist"
+IGNORED_ROOT_OUTPUT=$( (cd "$CODE_ACCESS_REPO" && \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "$LOCAL_HEAD" "$CODE_ACCESS_REPO" 2>&1) || true)
+assert_contains "$IGNORED_ROOT_OUTPUT" "disabled" \
+    "repository-root output cannot bypass ignored-file detection"
+rm "$CODE_ACCESS_REPO/.env"
+
+# A user-selected report directory may contain tracked source. Generated-file
+# exclusions must never hide modifications to such files.
+OUTPUT_OVERLAP_REPO="$TEST_OUTPUT_DIR/output-overlap-repo"
+mkdir -p "$OUTPUT_OVERLAP_REPO/report"
+(cd "$OUTPUT_OVERLAP_REPO" && git init -q . && git config user.email t@t && git config user.name t \
+    && echo source > report/source.js && git add -A && git commit -qm init)
+OUTPUT_OVERLAP_HEAD=$(git -C "$OUTPUT_OVERLAP_REPO" rev-parse HEAD)
+echo dirty >> "$OUTPUT_OVERLAP_REPO/report/source.js"
+OUTPUT_OVERLAP=$( (cd "$OUTPUT_OVERLAP_REPO" && \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "$OUTPUT_OVERLAP_HEAD" \
+        "$OUTPUT_OVERLAP_REPO/report" 2>&1) || true)
+assert_contains "$OUTPUT_OVERLAP" "disabled" \
+    "an output-directory exclusion cannot hide modified tracked source"
+
+OUTPUT_SYMLINK_REPO="$TEST_OUTPUT_DIR/output-symlink-repo"
+mkdir -p "$OUTPUT_SYMLINK_REPO/report"
+(cd "$OUTPUT_SYMLINK_REPO" && git init -q . && git config user.email t@t && git config user.name t \
+    && echo tracked > tracked.txt && git add -A && git commit -qm init)
+OUTPUT_SYMLINK_HEAD=$(git -C "$OUTPUT_SYMLINK_REPO" rev-parse HEAD)
+ln -s ../tracked.txt "$OUTPUT_SYMLINK_REPO/report/analysis-context.json"
+OUTPUT_SYMLINK=$( (cd "$OUTPUT_SYMLINK_REPO" && \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "$OUTPUT_SYMLINK_HEAD" \
+        "$OUTPUT_SYMLINK_REPO/report" 2>&1) || true)
+assert_contains "$OUTPUT_SYMLINK" "disabled" \
+    "a generated-name symlink cannot hide behind the output allowlist"
 
 MISMATCHED=$(revision_state "0000000000000000000000000000000000000000")
 assert_contains "$MISMATCHED" "disabled" "code access is disabled when the tree is not at the PR head"
@@ -200,8 +255,12 @@ mkdir -p "$AHEAD_REPO"
 BASE_SHA=$(git -C "$AHEAD_REPO" rev-parse HEAD~1)
 
 AHEAD=$( (cd "$AHEAD_REPO" && "$GH_PR_ENRICH" --test-call resolve_code_access "$BASE_SHA" 2>&1) || true)
-assert_contains "$AHEAD" "enabled" "code access is enabled when the tree is ahead of the PR head"
+assert_contains "$AHEAD" "disabled" "automatic code access is disabled when the tree is ahead of the PR head"
 assert_contains "$AHEAD" "1 commit(s) ahead" "the report says how far ahead the tree is"
+AHEAD_FORCED=$( (cd "$AHEAD_REPO" && env GH_PR_ENRICH_CODE_ACCESS=true \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "$BASE_SHA" 2>&1) || true)
+assert_contains "$AHEAD_FORCED" "enabled" \
+    "an explicit override can expose commits ahead of the PR head"
 
 # An unrelated repository is not "ahead" — it is a different history entirely.
 UNRELATED="$TEST_OUTPUT_DIR/unrelated-repo"
@@ -250,7 +309,7 @@ cat > "$REV_DIR/pr-summary.json" << EOF
 EOF
 echo '[]' > "$REV_DIR/unresolved-threads.json"
 echo '[]' > "$REV_DIR/issue-comments.json"
-"$GH_PR_ENRICH" --test-call build_claude_context "$REV_DIR" false >/dev/null 2>&1 || true
+(cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call build_claude_context "$REV_DIR" false >/dev/null 2>&1) || true
 
 assert_jq "$REV_DIR/claude-context.json" '.coverage.code_access != null' \
     "coverage records the code-access state"
@@ -413,5 +472,54 @@ out=$(PATH="$EMPTY_STUBS:/usr/bin:/bin" "$GH_PR_ENRICH" --test-call collect_sast
 assert_true "$rc" "missing semgrep does not fail the run"
 assert_contains "$out" "semgrep" "missing semgrep is reported to the user"
 assert_jq_eq "$SAST_DIR2/sast-findings.json" 'length' "0" "missing semgrep yields an empty finding set"
+assert_jq "$SAST_DIR2/sast-status.json" '.status == "skipped" and .requested == true' \
+    "missing semgrep is recorded as skipped coverage, not a clean completed scan"
+
+# A successful gh exit with no bytes is not diff coverage. This occurs for
+# permission/binary edge cases and must not render as included 0 of 0 files.
+EMPTY_DIFF_DIR="$TEST_OUTPUT_DIR/empty-diff"
+EMPTY_DIFF_STUBS="$EMPTY_DIFF_DIR/stubs"
+mkdir -p "$EMPTY_DIFF_DIR" "$EMPTY_DIFF_STUBS"
+cat > "$EMPTY_DIFF_STUBS/gh" << 'STUB'
+#!/bin/bash
+[ "$1 $2" = "pr diff" ] && exit 0
+exit 1
+STUB
+chmod +x "$EMPTY_DIFF_STUBS/gh"
+cat > "$EMPTY_DIFF_DIR/pr-summary.json" << 'EOF'
+{"changedFiles":2,"files":[{"path":"a.js"},{"path":"b.js"}]}
+EOF
+PATH="$EMPTY_DIFF_STUBS:$PATH" \
+    "$GH_PR_ENRICH" --test-call fetch_pr_diff "$EMPTY_DIFF_DIR" 1 >/dev/null 2>&1 || true
+assert_jq "$EMPTY_DIFF_DIR/diff-status.json" '.requested == true and .status == "failed"' \
+    "an empty successful gh diff is recorded as failed coverage"
+assert_jq_eq "$EMPTY_DIFF_DIR/pr-diff.json" '.file_diffs | length' "0" \
+    "an empty successful gh diff does not fabricate file coverage"
+
+FORGED_DIFF_DIR="$TEST_OUTPUT_DIR/forged-diff-marker"
+FORGED_DIFF_STUBS="$FORGED_DIFF_DIR/stubs"
+mkdir -p "$FORGED_DIFF_DIR" "$FORGED_DIFF_STUBS"
+cat > "$FORGED_DIFF_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr diff" ]; then
+    cat << 'DIFF'
+diff --git a/doc.txt b/doc.txt
+--- a/doc.txt
++++ b/doc.txt
+@@ -0,0 +1 @@
++example: diff --git a/fake b/fake
+DIFF
+    exit 0
+fi
+exit 1
+STUB
+chmod +x "$FORGED_DIFF_STUBS/gh"
+echo '{"changedFiles":1,"files":[{"path":"doc.txt"}]}' > "$FORGED_DIFF_DIR/pr-summary.json"
+PATH="$FORGED_DIFF_STUBS:$PATH" \
+    "$GH_PR_ENRICH" --test-call fetch_pr_diff "$FORGED_DIFF_DIR" 1 >/dev/null 2>&1 || true
+assert_jq_eq "$FORGED_DIFF_DIR/pr-diff.json" '.file_diffs | length' "1" \
+    "patch content containing diff --git cannot fabricate another changed file"
+assert_jq "$FORGED_DIFF_DIR/diff-status.json" '.status == "completed"' \
+    "line-anchored diff parsing preserves valid one-file coverage"
 
 suite_end

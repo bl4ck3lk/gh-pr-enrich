@@ -116,6 +116,44 @@ rc=0
 PATH="$FAIL_STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call fetch_review_threads owner repo 1 "$THREADS_OUT" >/dev/null 2>&1 || rc=$?
 assert_eq "1" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)" "a failed thread fetch reports failure to its caller"
 
+# GraphQL can return HTTP 200 with an errors envelope or no response pages. Both
+# must remain failed coverage rather than completed empty input.
+ERROR_STUB_DIR="$TEST_OUTPUT_DIR/graphql-error-gh"
+mkdir -p "$ERROR_STUB_DIR"
+cat > "$ERROR_STUB_DIR/gh" << 'STUB'
+#!/bin/bash
+echo '{"errors":[{"message":"scope denied"}],"data":{"repository":null}}'
+exit 0
+STUB
+chmod +x "$ERROR_STUB_DIR/gh"
+
+GRAPHQL_ERROR_THREADS="$TEST_OUTPUT_DIR/threads-from-graphql-error.json"
+rc=0
+PATH="$ERROR_STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call fetch_review_threads \
+    owner repo 1 "$GRAPHQL_ERROR_THREADS" >/dev/null 2>&1 || rc=$?
+assert_eq "1" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)" \
+    "an HTTP-200 GraphQL error fails the review-thread fetch"
+
+GRAPHQL_ERROR_LINKED="$TEST_OUTPUT_DIR/linked-from-graphql-error.json"
+rc=0
+PATH="$ERROR_STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call fetch_linked_issues \
+    owner repo 1 "$GRAPHQL_ERROR_LINKED" >/dev/null 2>&1 || rc=$?
+assert_eq "1" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)" \
+    "an HTTP-200 GraphQL error fails the linked-issue fetch"
+
+EMPTY_SUCCESS_STUB_DIR="$TEST_OUTPUT_DIR/graphql-empty-gh"
+mkdir -p "$EMPTY_SUCCESS_STUB_DIR"
+cat > "$EMPTY_SUCCESS_STUB_DIR/gh" << 'STUB'
+#!/bin/bash
+exit 0
+STUB
+chmod +x "$EMPTY_SUCCESS_STUB_DIR/gh"
+rc=0
+PATH="$EMPTY_SUCCESS_STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call fetch_review_threads \
+    owner repo 1 "$TEST_OUTPUT_DIR/threads-from-empty-success.json" >/dev/null 2>&1 || rc=$?
+assert_eq "1" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)" \
+    "a zero-page successful GraphQL call fails the review-thread fetch"
+
 # ---------------------------------------------------------------------------
 # Outdated threads are labelled and kept
 # ---------------------------------------------------------------------------
@@ -230,6 +268,16 @@ cat > "$CTX_DIR/linked-issues.json" << 'EOF'
 [{"number": 42, "title": "Requests fail on flaky network", "body": "Users see 500s when upstream is slow.", "url": "https://gh/42"}]
 EOF
 
+cat > "$CTX_DIR/review-comments.json" << 'EOF'
+[{"id":11,"body":"Review summary body","user":"reviewer","state":"CHANGES_REQUESTED","submitted_at":"2026-01-03T00:00:00Z","html_url":"https://gh/review/11"}]
+EOF
+cat > "$CTX_DIR/inline-comments.json" << 'EOF'
+[{"id":12,"body":"Inline feedback body","user":"reviewer","path":"src/retry.js","line":12,"created_at":"2026-01-03T00:00:00Z","html_url":"https://gh/comment/12"}]
+EOF
+for source in issue-comments review-comments inline-comments review-threads checks linked-issues; do
+    jq -n '{requested:true,status:"completed",reason:""}' > "$CTX_DIR/$source-status.json"
+done
+
 cat > "$CTX_DIR/sast-findings.json" << 'EOF'
 [{"check_id": "javascript.lang.security.audit.unsafe-exec", "path": "src/retry.js", "line": 12, "severity": "ERROR", "message": "Unsafe exec"}]
 EOF
@@ -254,6 +302,10 @@ assert_jq "$CTX" '.pr.linked_issues[0].body | contains("upstream is slow")' "lin
 assert_jq_eq "$CTX" '.failing_checks | length' "1" "only failing checks are included"
 assert_jq "$CTX" '.failing_checks[0].name == "unit-tests"' "failing check is named"
 assert_jq_eq "$CTX" '.sast_findings | length' "1" "sast findings reach the context when present"
+assert_jq "$CTX" '.review_comments[0].body == "Review summary body"' \
+    "top-level review summaries reach the analysis context"
+assert_jq "$CTX" '.inline_comments[0].body == "Inline feedback body"' \
+    "inline REST comments reach the analysis context"
 
 # Thread context carries the outdated flag through to the analyzer
 assert_jq "$CTX" '[.unresolved_threads[] | select(.thread_id == "PRRT_page2")][0].is_outdated == true' \
@@ -273,6 +325,8 @@ assert_jq_eq "$CTX" '.coverage.diff.files_truncated | length' "1" "coverage name
 assert_jq "$CTX" '.coverage.diff.files_truncated | index("src/retry.js") != null' \
     "coverage names which file was truncated"
 assert_jq_eq "$CTX" '.coverage.truncation_limit_chars' "5000" "coverage states the truncation limit"
+assert_jq "$CTX" '.coverage.sources | to_entries | all(.value.status == "completed")' \
+    "coverage records successful GitHub source fetches explicitly"
 
 # A thread's replies are fetched with a per-thread cap. A thread that hits the
 # cap has lost replies, and the coverage block is the only place that can say so.
@@ -358,10 +412,9 @@ assert_contains "$COV_TEXT" "src/retry.js" "coverage section names the truncated
 assert_contains "$COV_TEXT" "superseded bot reposts dropped" "coverage section reports dropped bot reposts"
 assert_contains "$COV_TEXT" "outdated" "coverage section reports outdated threads"
 
-# The "not verified against code" warning must key on whether access was denied,
-# not on strict revision equality. A tree ahead of the PR head — the normal state
-# while addressing feedback — does get access, and warning there trains users to
-# ignore the warning that matters.
+# The "not verified against code" warning keys on the recorded access decision,
+# not a second inference from revision fields. An explicit override may grant
+# access to a non-matching revision, and that state must render consistently.
 warning_for() {
     local state="$1" matches="$2" ctx="$TEST_OUTPUT_DIR/warn-ctx.json" out="$TEST_OUTPUT_DIR/warn.md"
     jq -n --arg state "$state" --argjson matches "$matches" '{
@@ -372,7 +425,7 @@ warning_for() {
 }
 
 assert_not_contains "$(warning_for enabled false)" "could not read the repository" \
-    "no warning when access was granted on a tree ahead of the PR head"
+    "no warning when access was granted explicitly on a non-matching revision"
 assert_contains "$(warning_for disabled false)" "could not read the repository" \
     "a warning when access was actually denied"
 assert_not_contains "$(warning_for enabled true)" "could not read the repository" \

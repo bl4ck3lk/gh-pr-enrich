@@ -5,8 +5,9 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-FIXTURES_DIR="$SCRIPT_DIR/fixtures"
 TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output/retrospective"
+SOURCE_FIXTURES_DIR="$SCRIPT_DIR/fixtures"
+FIXTURES_DIR="$TEST_OUTPUT_DIR/fixtures"
 GH_PR_ENRICH="$PROJECT_DIR/gh-pr-enrich"
 
 # shellcheck source=lib/assert.sh
@@ -19,6 +20,7 @@ cleanup() {
 setup() {
     cleanup
     mkdir -p "$TEST_OUTPUT_DIR"
+    cp -R "$SOURCE_FIXTURES_DIR" "$FIXTURES_DIR"
 }
 
 # ============================================================================
@@ -79,10 +81,10 @@ test_no_analysis_files() {
     local output
     output=$("$GH_PR_ENRICH" retrospective --reports-dir "$TEST_OUTPUT_DIR/empty-reports" 2>&1) || true
 
-    if echo "$output" | grep -q "No PR reports found with Claude analysis"; then
-        pass "Error when no claude-analysis.json files"
+    if echo "$output" | grep -q "No PR reports found with structured analysis"; then
+        pass "Error when no structured analysis files"
     else
-        fail "Error when no claude-analysis.json files" "Got: $output"
+        fail "Error when no structured analysis files" "Got: $output"
     fi
 }
 
@@ -350,6 +352,68 @@ test_improvement_tracking() {
     fi
 }
 
+test_provider_neutral_analysis_is_discovered() {
+    local report_root="$TEST_OUTPUT_DIR/provider-neutral/pr-1"
+    local output_root="$TEST_OUTPUT_DIR/provider-neutral-out"
+    local fingerprint
+    mkdir -p "$report_root"
+    cp "$FIXTURES_DIR/pr-1/pr-summary.json" "$report_root/pr-summary.json"
+    jq '.headRefOid = "fixture-head"' "$report_root/pr-summary.json" \
+        > "$report_root/pr-summary.tmp.json"
+    mv "$report_root/pr-summary.tmp.json" "$report_root/pr-summary.json"
+    jq -n '{pr:{repository:"o/r",number:1},
+        coverage:{code_access:{pr_head_sha:"fixture-head"}}}' \
+        > "$report_root/analysis-context.tmp.json"
+    fingerprint=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+        "$report_root/analysis-context.tmp.json")
+    jq --arg fingerprint "$fingerprint" '.coverage.context_fingerprint = $fingerprint' \
+        "$report_root/analysis-context.tmp.json" > "$report_root/analysis-context.json"
+    jq --arg fingerprint "$fingerprint" '. + {_metadata:{
+        provider:"codex", repository:"o/r", pr_number:1,
+        pr_head_sha:"fixture-head", context_fingerprint:$fingerprint,
+        generated_at:"2026-01-01T00:00:00Z",
+        analyzers:[{provider:"codex",role:"orchestrator"}]
+    }}' "$FIXTURES_DIR/pr-1/claude-analysis.json" > "$report_root/analysis.json"
+
+    local output
+    output=$("$GH_PR_ENRICH" retrospective --reports-dir "$TEST_OUTPUT_DIR/provider-neutral" \
+        --output-dir "$output_root" --min-prs 1 2>&1)
+
+    if echo "$output" | grep -q "Found 1 PR reports with structured analysis"; then
+        pass "retrospective discovers provider-neutral analysis.json"
+    else
+        fail "retrospective discovers provider-neutral analysis.json" "Got: $output"
+    fi
+
+    if [ "$(jq '.summary.overview.total_prs_analyzed' "$output_root/retrospective-data.json")" = "1" ]; then
+        pass "provider-neutral report is included in aggregation"
+    else
+        fail "provider-neutral report is included in aggregation"
+    fi
+}
+
+test_current_rejected_source_is_not_aggregated() {
+    local report_root="$TEST_OUTPUT_DIR/current-rejected/pr-91"
+    local output_root="$TEST_OUTPUT_DIR/current-rejected-out"
+    mkdir -p "$report_root"
+    cat > "$report_root/pr-summary.json" << 'EOF'
+{"number":91,"title":"Current rejected source","author":{"login":"u"},"createdAt":"2026-01-01T00:00:00Z"}
+EOF
+    jq -n '{issue_categories:[],category_coverage:[],disputed_comments:[],
+        systemic_issues:[],adjacent_problems:[],task_list:[],process_improvements:[],
+        pr_template_suggestions:[],_metadata:{provider:"claude",pr_head_sha:"head",
+        context_fingerprint:"sha256:fixture"}}' > "$report_root/claude-analysis.json"
+
+    local output
+    output=$("$GH_PR_ENRICH" retrospective --reports-dir "$TEST_OUTPUT_DIR/current-rejected" \
+        --output-dir "$output_root" --min-prs 1 2>&1 || true)
+    if echo "$output" | grep -q "Found 0 PR reports with structured analysis"; then
+        pass "retrospective excludes a current Claude source that was not selected"
+    else
+        fail "retrospective excludes a current Claude source that was not selected" "Got: $output"
+    fi
+}
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -380,6 +444,8 @@ test_guiding_questions
 test_hotspots_group_by_taxonomy
 test_legacy_reports_are_reported_not_mixed_in
 test_improvement_tracking
+test_provider_neutral_analysis_is_discovered
+test_current_rejected_source_is_not_aggregated
 
 # Summary
 trap cleanup EXIT
