@@ -68,6 +68,45 @@ JSON
 STUB
 chmod +x "$STUB_DIR/semgrep"
 
+# The CLI-flag check below runs the real end-to-end enrichment path. Keep that
+# path independent of the developer's gh authentication and Actions' token
+# environment so it reaches the analyzer on every platform.
+cat > "$STUB_DIR/gh" << 'STUB'
+#!/bin/bash
+case "$1 $2" in
+    "repo view")
+        echo '{"nameWithOwner":"o/r","visibility":"PUBLIC"}'
+        exit 0
+        ;;
+    "pr view")
+        cat << 'JSON'
+{"number":1,"title":"t","body":"b","author":{"login":"u"},"state":"OPEN",
+ "url":"https://github.com/o/r/pull/1","createdAt":"2026-01-01T00:00:00Z",
+ "updatedAt":"2026-01-01T00:00:00Z","mergeable":"MERGEABLE","isDraft":false,
+ "additions":1,"deletions":0,"changedFiles":1,"headRefOid":"abc123",
+ "files":[{"path":"a.js","additions":1,"deletions":0}],"commits":[],
+ "labels":[],"assignees":[],"reviews":[]}
+JSON
+        exit 0
+        ;;
+    "pr checks") echo '[]'; exit 0 ;;
+esac
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+    case "$*" in
+        *closingIssuesReferences*)
+            echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[]}}}}}'
+            ;;
+        *)
+            echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PRRT_open","isResolved":false,"isOutdated":false,"path":"a.js","line":1,"comments":{"nodes":[{"id":"c","databaseId":1,"body":"check this","author":{"login":"rev"},"createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/1#discussion_r1"}]}}]}}}}}'
+            ;;
+    esac
+    exit 0
+fi
+if [ "$1" = "api" ]; then echo '[]'; exit 0; fi
+exit 0
+STUB
+chmod +x "$STUB_DIR/gh"
+
 CONTEXT="$TEST_OUTPUT_DIR/claude-context.json"
 # The context records the PR head; the analyzer re-checks it against the working
 # tree before granting tools, so the fixture claims the revision under test.
