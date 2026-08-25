@@ -15,6 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 GH_PR_ENRICH="$PROJECT_DIR/gh-pr-enrich"
 PROMPT_FILE="$PROJECT_DIR/default-prompt.txt"
+SEVERITY_DOC="$PROJECT_DIR/.claude/skills/gh-pr-enrich/references/analysis-output.md"
 TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output/contract"
 
 # shellcheck source=lib/assert.sh
@@ -121,6 +122,27 @@ assert_contains "$PROMPT_TEXT" "likelihood" "prompt defines severity via likelih
 # The old prompt equated severity with category ("low: Style, documentation").
 assert_not_contains "$PROMPT_TEXT" "low: Style, documentation" \
     "prompt no longer pins severity to a category"
+assert_contains "$(cat "$SEVERITY_DOC")" \
+    "| **severe** | critical | critical | high | medium |" \
+    "documented severe-impact severity matrix is pinned"
+assert_contains "$(cat "$SEVERITY_DOC")" \
+    "| **moderate** | high | high | medium | low |" \
+    "documented moderate-impact severity matrix is pinned"
+assert_contains "$(cat "$SEVERITY_DOC")" \
+    "| **minor** | medium | low | low | low |" \
+    "documented minor-impact severity matrix is pinned"
+for rule in \
+    "severe + certain or likely -> critical" \
+    "severe + possible -> high" \
+    "severe + unlikely -> medium" \
+    "moderate + certain or likely -> high" \
+    "moderate + possible -> medium" \
+    "moderate + unlikely -> low" \
+    "minor + certain -> medium" \
+    "minor + anything else -> low"; do
+    assert_contains "$PROMPT_TEXT" "$rule" \
+        "prompt severity rule '$rule' matches the documented matrix"
+done
 
 # ---------------------------------------------------------------------------
 # 4. Tasks anchored to code

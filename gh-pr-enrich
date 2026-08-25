@@ -95,6 +95,99 @@ sha256_file() {
     fi
 }
 
+positive_integer_or_default() {
+    local value="${1:-}" fallback="$2" maximum="${3:-2147483647}"
+    local value_length=${#value} maximum_length=${#maximum}
+    if [[ "$value" =~ ^[1-9][0-9]*$ ]] && \
+       { [ "$value_length" -lt "$maximum_length" ] || \
+         { [ "$value_length" -eq "$maximum_length" ] && \
+           { [ "$value" = "$maximum" ] || [[ "$value" < "$maximum" ]]; }; }; }; then
+        printf '%s\n' "$value"
+    else
+        printf '%s\n' "$fallback"
+    fi
+}
+
+fetch_watch_state() {
+    local owner="$1" repository="$2" pr_number="$3"
+    local issue_id_lines review_id_lines issue_comment_ids review_ids thread_state
+    issue_id_lines="$(gh api --paginate \
+        "repos/$owner/$repository/issues/$pr_number/comments?per_page=100" \
+        --jq '.[] | if .id == null then error("missing issue-comment id")
+              else (.id | tostring) end' \
+        2>/dev/null)" || return 1
+    issue_comment_ids="$(printf '%s\n' "$issue_id_lines" | jq -Rsc '
+        (split("\n") | map(select(length > 0))) as $ids
+        | if all($ids[]; test("^[1-9][0-9]*$")) then ($ids | unique | sort)
+          else error("issue-comment pagination returned an invalid id") end
+    ')" || return 1
+    review_id_lines="$(gh api --paginate \
+        "repos/$owner/$repository/pulls/$pr_number/reviews?per_page=100" \
+        --jq '.[] | if .id == null then error("missing review id")
+              else (.id | tostring) end' \
+        2>/dev/null)" || return 1
+    review_ids="$(printf '%s\n' "$review_id_lines" | jq -Rsc '
+        (split("\n") | map(select(length > 0))) as $ids
+        | if all($ids[]; test("^[1-9][0-9]*$")) then ($ids | unique | sort)
+          else error("review pagination returned an invalid id") end
+    ')" || return 1
+    thread_state="$(gh api graphql \
+        -F owner="$owner" \
+        -F name="$repository" \
+        -F prNumber="$pr_number" \
+        -f query='query($owner: String!, $name: String!, $prNumber: Int!) {
+            repository(owner: $owner, name: $name) {
+                pullRequest(number: $prNumber) {
+                    reviewThreads(first: 100) {
+                        totalCount
+                        nodes {
+                            isResolved
+                            comments(first: 100) { totalCount nodes { id } }
+                        }
+                    }
+                }
+            }
+        }' 2>/dev/null)" || return 1
+
+    # Feed even the projected ID sets through stdin: a PR can accumulate an
+    # unbounded number of comments, so placing the complete arrays in argv
+    # would only move the ARG_MAX failure from bodies to very large ID sets.
+    printf '%s\n%s\n%s\n' "$issue_comment_ids" "$review_ids" "$thread_state" | \
+    jq -sec '
+        .[0] as $issue_comment_ids
+        | .[1] as $review_ids
+        | .[2] as $threads
+        | ($threads.data.repository.pullRequest.reviewThreads.nodes | arrays) as $thread_nodes
+        | select(($threads.data.repository.pullRequest.reviewThreads.totalCount | type) == "number")
+        | select($threads.data.repository.pullRequest.reviewThreads.totalCount == ($thread_nodes | length))
+        | select(all($thread_nodes[];
+            (.isResolved | type) == "boolean"
+            and (.comments.nodes | type) == "array"
+            and (.comments.totalCount | type) == "number"
+            and .comments.totalCount == (.comments.nodes | length)
+            and all(.comments.nodes[]; .id != null and ((.id | tostring) | length > 0))))
+        | {
+            issue_comment_ids: $issue_comment_ids,
+            review_ids: $review_ids,
+            inline_comment_ids: ([$thread_nodes[].comments.nodes[].id | tostring] | unique | sort),
+            unresolved: ([$thread_nodes[] | select(.isResolved == false)] | length)
+          }
+    '
+}
+
+watch_selected_analysis_identity() {
+    local report_dir="$1" repository="$2" pr_number="$3" selected_file
+    selected_file="$(select_analysis_file "$report_dir" read-only 2>/dev/null)" || \
+        return 1
+    [ "$(basename "$selected_file")" = "analysis.json" ] || return 1
+    jq -e --arg repository "$repository" --argjson pr_number "$pr_number" '
+        ._metadata.repository == $repository
+        and ._metadata.pr_number == $pr_number
+        and (._metadata.context_fingerprint | type == "string" and length > 0)
+    ' "$selected_file" > /dev/null 2>&1 || return 1
+    sha256_file "$selected_file"
+}
+
 # Stable content identity for one analysis snapshot. Recompute this digest at
 # every trust boundary; the value embedded in the context is only a claim until
 # it matches the canonical snapshot bytes.
@@ -1216,7 +1309,9 @@ invoke_claude() {
     # writes nothing until the run completes. The heartbeat is the background job
     # and the analyzer runs in the foreground, because backgrounding the analyzer
     # makes the shell print its own job-death notice on an external kill.
-    local heartbeat_interval="${GH_PR_ENRICH_HEARTBEAT_SECONDS:-60}"
+    local heartbeat_interval
+    heartbeat_interval="$(positive_integer_or_default \
+        "${GH_PR_ENRICH_HEARTBEAT_SECONDS:-}" 60 86400)"
     local start_ts=$SECONDS
     (
         # The sleep runs as a killable child: terminating only the subshell would
@@ -1230,7 +1325,11 @@ invoke_claude() {
         while true; do
             sleep "$heartbeat_interval" &
             sleep_pid=$!
-            wait "$sleep_pid" 2>/dev/null || true
+            if ! wait "$sleep_pid" 2>/dev/null; then
+                sleep_pid=""
+                exit 0
+            fi
+            sleep_pid=""
             waited=$((waited + heartbeat_interval))
             echo "   ⏳ still running ${label} — ${waited}s elapsed of ${timeout_secs}s" >&2
         done
@@ -2716,22 +2815,19 @@ if [ "$1" = "watch" ]; then
     REPO_OWNER="${REPO%/*}"
     REPO_NAME="${REPO#*/}"
 
-    # Get initial comment count
-    LAST_COUNT=$(gh pr view "$WATCH_PR" --json comments,reviews --jq '(.comments | length) + (.reviews | length)' 2>/dev/null || echo "0")
-    # Note: Limited to 100 review threads. PRs with more threads may show incomplete counts.
-    LAST_UNRESOLVED=$(gh api graphql \
-        -F owner="$REPO_OWNER" \
-        -F name="$REPO_NAME" \
-        -F prNumber="$WATCH_PR" \
-        -f query='query($owner: String!, $name: String!, $prNumber: Int!) {
-            repository(owner: $owner, name: $name) {
-                pullRequest(number: $prNumber) {
-                    reviewThreads(first: 100) {
-                        nodes { isResolved }
-                    }
-                }
-            }
-        }' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' 2>/dev/null || echo "0")
+    # One bounded page is enough only when GitHub confirms it contains every
+    # thread and every reply. Incomplete snapshots fail and retry instead of
+    # silently advancing the watch baseline.
+    if ! LAST_WATCH_STATE="$(fetch_watch_state "$REPO_OWNER" "$REPO_NAME" \
+            "$WATCH_PR")"; then
+        echo "Error: Could not fetch the initial PR comment state." >&2
+        exit 1
+    fi
+    LAST_COUNT="$(jq '
+        (.issue_comment_ids | length) + (.review_ids | length)
+        + (.inline_comment_ids | length)
+    ' <<< "$LAST_WATCH_STATE")"
+    LAST_UNRESOLVED="$(jq '.unresolved' <<< "$LAST_WATCH_STATE")"
 
     echo "📊 Initial state: $LAST_COUNT comments/reviews, $LAST_UNRESOLVED unresolved threads"
     echo ""
@@ -2742,27 +2838,12 @@ if [ "$1" = "watch" ]; then
     while true; do
         sleep $((WATCH_INTERVAL * 60))
 
-        # Get current counts (using parameterized queries to prevent injection)
-        CURRENT_COUNT=$(gh pr view "$WATCH_PR" --json comments,reviews --jq '(.comments | length) + (.reviews | length)' 2>/dev/null)
-        CURRENT_UNRESOLVED=$(gh api graphql \
-            -F owner="$REPO_OWNER" \
-            -F name="$REPO_NAME" \
-            -F prNumber="$WATCH_PR" \
-            -f query='query($owner: String!, $name: String!, $prNumber: Int!) {
-                repository(owner: $owner, name: $name) {
-                    pullRequest(number: $prNumber) {
-                        reviewThreads(first: 100) {
-                            nodes { isResolved }
-                        }
-                    }
-                }
-            }' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' 2>/dev/null)
-
         TIMESTAMP=$(date '+%H:%M:%S')
 
         # Check for API failures
-        if [ -z "$CURRENT_COUNT" ] || [ -z "$CURRENT_UNRESOLVED" ]; then
-            ((CONSECUTIVE_FAILURES++))
+        if ! CURRENT_WATCH_STATE="$(fetch_watch_state "$REPO_OWNER" \
+                "$REPO_NAME" "$WATCH_PR")"; then
+            CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
             echo "[$TIMESTAMP] ⚠️  API request failed (attempt $CONSECUTIVE_FAILURES/$MAX_FAILURES)"
             if [ "$CONSECUTIVE_FAILURES" -ge "$MAX_FAILURES" ]; then
                 echo "[$TIMESTAMP] ❌ Too many consecutive failures. Check network/auth and restart watch."
@@ -2771,13 +2852,58 @@ if [ "$1" = "watch" ]; then
             continue
         fi
         CONSECUTIVE_FAILURES=0
+        WATCH_DELTA="$(printf '%s\n%s\n' "$LAST_WATCH_STATE" \
+            "$CURRENT_WATCH_STATE" | jq -sec '
+            .[0] as $previous
+            | .[1] as $current
+            |
+            def unseen($key):
+                (reduce $previous[$key][] as $id ({}; .[$id] = true)) as $seen
+                | [$current[$key][] as $id
+                 | select($seen[$id] != true)
+                 | $id]
+                | length;
+            {
+                changed: ($current != $previous),
+                current_comments: (
+                    ($current.issue_comment_ids | length)
+                    + ($current.review_ids | length)
+                    + ($current.inline_comment_ids | length)
+                ),
+                current_unresolved: $current.unresolved,
+                comment_count_diff: (
+                    (($current.issue_comment_ids | length)
+                     + ($current.review_ids | length)
+                     + ($current.inline_comment_ids | length))
+                    - (($previous.issue_comment_ids | length)
+                       + ($previous.review_ids | length)
+                       + ($previous.inline_comment_ids | length))
+                ),
+                thread_diff: ($current.unresolved - $previous.unresolved),
+                new_issue_comments: unseen("issue_comment_ids"),
+                new_reviews: unseen("review_ids"),
+                new_inline_comments: unseen("inline_comment_ids")
+            }
+        ')"
+        CURRENT_COUNT="$(jq '.current_comments' <<< "$WATCH_DELTA")"
+        CURRENT_UNRESOLVED="$(jq '.current_unresolved' <<< "$WATCH_DELTA")"
 
-        if [ "$CURRENT_COUNT" -ne "$LAST_COUNT" ] || [ "$CURRENT_UNRESOLVED" -ne "$LAST_UNRESOLVED" ]; then
-            NEW_COMMENTS=$((CURRENT_COUNT - LAST_COUNT))
-            THREAD_DIFF=$((CURRENT_UNRESOLVED - LAST_UNRESOLVED))
+        if [ "$(jq -r '.changed' <<< "$WATCH_DELTA")" = true ]; then
+            COMMENT_COUNT_DIFF="$(jq '.comment_count_diff' <<< "$WATCH_DELTA")"
+            THREAD_DIFF="$(jq '.thread_diff' <<< "$WATCH_DELTA")"
+            NEW_ISSUE_COMMENTS="$(jq '.new_issue_comments' <<< "$WATCH_DELTA")"
+            NEW_REVIEWS="$(jq '.new_reviews' <<< "$WATCH_DELTA")"
+            NEW_INLINE_COMMENTS="$(jq '.new_inline_comments' <<< "$WATCH_DELTA")"
+            NEW_COMMENTS=$((NEW_ISSUE_COMMENTS + NEW_REVIEWS + NEW_INLINE_COMMENTS))
 
             echo "[$TIMESTAMP] 🔔 Changes detected!"
-            [ "$NEW_COMMENTS" -ne 0 ] && echo "   New comments/reviews: $NEW_COMMENTS"
+            [ "$NEW_ISSUE_COMMENTS" -gt 0 ] && \
+                echo "   New issue comments: +$NEW_ISSUE_COMMENTS"
+            [ "$NEW_REVIEWS" -gt 0 ] && echo "   New review summaries: +$NEW_REVIEWS"
+            [ "$NEW_INLINE_COMMENTS" -gt 0 ] && \
+                echo "   New inline comments: +$NEW_INLINE_COMMENTS"
+            [ "$COMMENT_COUNT_DIFF" -ne 0 ] && \
+                echo "   Comment/review count change: $COMMENT_COUNT_DIFF"
             [ "$THREAD_DIFF" -gt 0 ] && echo "   New unresolved threads: +$THREAD_DIFF"
             [ "$THREAD_DIFF" -lt 0 ] && echo "   Threads resolved: ${THREAD_DIFF#-}"
 
@@ -2786,24 +2912,37 @@ if [ "$1" = "watch" ]; then
                 osascript -e "display notification \"${NEW_COMMENTS} new comments, ${CURRENT_UNRESOLVED} unresolved\" with title \"PR #${WATCH_PR} Updated\"" 2>/dev/null || true
             fi
 
-            # Run enrichment if requested
-            if [ "$WATCH_ENRICH" = true ] && [ "$CURRENT_UNRESOLVED" -gt 0 ]; then
+            ADVANCE_WATCH_BASELINE=true
+            # Preserve resolution-only behavior: a final thread resolution is
+            # reported but does not run analysis when no unresolved work or new
+            # stable comment/review identity remains.
+            if [ "$WATCH_ENRICH" = true ] && \
+               { [ "$CURRENT_UNRESOLVED" -gt 0 ] || [ "$NEW_COMMENTS" -gt 0 ]; }; then
                 echo "   Running analysis..."
                 WATCH_EXTERNAL_ARGS=()
                 [ "$WATCH_ALLOW_EXTERNAL" = true ] && WATCH_EXTERNAL_ARGS+=(--allow-external)
-                if "$0" "$WATCH_PR" --enrich "${WATCH_EXTERNAL_ARGS[@]}" --output-dir ".reports/pr-reviews/pr-$WATCH_PR" > /dev/null 2>&1; then
-                    if [ -f ".reports/pr-reviews/pr-$WATCH_PR/analysis.md" ]; then
-                        echo "   ✅ Analysis updated: .reports/pr-reviews/pr-$WATCH_PR/analysis.md"
-                    else
-                        echo "   ⚠️  Analysis ran but no analysis.md was created (no unresolved threads or Claude unavailable)"
-                    fi
+                WATCH_REPORT_DIR=".reports/pr-reviews/pr-$WATCH_PR"
+                BEFORE_ANALYSIS_IDENTITY="$(watch_selected_analysis_identity \
+                    "$WATCH_REPORT_DIR" "$REPO" "$WATCH_PR" 2>/dev/null || echo "")"
+                ENRICH_EXIT=0
+                "$0" "$WATCH_PR" --enrich "${WATCH_EXTERNAL_ARGS[@]}" \
+                    --output-dir "$WATCH_REPORT_DIR" > /dev/null 2>&1 || ENRICH_EXIT=$?
+                AFTER_ANALYSIS_IDENTITY="$(watch_selected_analysis_identity \
+                    "$WATCH_REPORT_DIR" "$REPO" "$WATCH_PR" 2>/dev/null || echo "")"
+                if [ "$ENRICH_EXIT" -eq 0 ] && \
+                   [ -n "$AFTER_ANALYSIS_IDENTITY" ] && \
+                   [ "$AFTER_ANALYSIS_IDENTITY" != "$BEFORE_ANALYSIS_IDENTITY" ]; then
+                    echo "   ✅ Analysis updated: $WATCH_REPORT_DIR/analysis.md"
                 else
-                    echo "   ❌ Analysis failed - check manually with: gh pr-enrich $WATCH_PR --enrich"
+                    ADVANCE_WATCH_BASELINE=false
+                    echo "   ❌ Analysis did not publish a fresh selected artifact; retaining the prior watch state for retry."
+                    echo "      Check manually with: gh pr-enrich $WATCH_PR --enrich"
                 fi
             fi
 
-            LAST_COUNT=$CURRENT_COUNT
-            LAST_UNRESOLVED=$CURRENT_UNRESOLVED
+            if [ "$ADVANCE_WATCH_BASELINE" = true ]; then
+                LAST_WATCH_STATE="$CURRENT_WATCH_STATE"
+            fi
             echo ""
         else
             echo "[$TIMESTAMP] No changes (comments: $CURRENT_COUNT, unresolved: $CURRENT_UNRESOLVED)"
@@ -4754,6 +4893,18 @@ _select_analysis_artifact() {
     fi
     if [ ! -f "$source_file" ] || ! jq -e '
         ["logic_error", "boundary_condition", "concurrency", "error_handling", "resource_lifecycle", "security", "secrets_exposure", "data_integrity", "api_contract", "performance", "test_gap", "observability", "maintainability", "documentation", "build_ci", "dependency_risk"] as $required_categories |
+        def derived_severity:
+            if .impact == "severe" then
+                if (.likelihood == "certain" or .likelihood == "likely") then "critical"
+                elif .likelihood == "possible" then "high"
+                else "medium" end
+            elif .impact == "moderate" then
+                if (.likelihood == "certain" or .likelihood == "likely") then "high"
+                elif .likelihood == "possible" then "medium"
+                else "low" end
+            else
+                if .likelihood == "certain" then "medium" else "low" end
+            end;
         . as $analysis |
         ((._metadata.analyzers // []) | map((.provider // "") + ":" + (.role // ""))) as $analyzer_ids |
         (.issue_categories | type == "array") and
@@ -4763,6 +4914,7 @@ _select_analysis_artifact() {
             (.severity | IN("critical", "high", "medium", "low")) and
             (.impact | IN("severe", "moderate", "minor")) and
             (.likelihood | IN("certain", "likely", "possible", "unlikely")) and
+            (.severity == derived_severity) and
             (.severity_rationale | type == "string") and
             (.verdict | IN("confirmed", "plausible", "refuted")) and
             (.confidence | IN("high", "medium", "low")) and
@@ -5136,7 +5288,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint select_analysis_file select_analysis_artifact fetch_review_threads fetch_linked_issues verify_pr_head_unchanged validate_output_directory_for_writes"
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint select_analysis_file select_analysis_artifact fetch_review_threads fetch_linked_issues verify_pr_head_unchanged validate_output_directory_for_writes"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in

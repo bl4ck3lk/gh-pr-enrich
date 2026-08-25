@@ -392,6 +392,49 @@ assert_jq "$AUTHORIZED_DIR/combined-data.json" \
     '.analysis._metadata.provider == "hybrid" and .analysis.task_list[0].task == "Hybrid-selected task"' \
     "select-analysis refreshes the combined-data selected view"
 
+# Selection enforces the documented impact × likelihood matrix rather than
+# accepting independently valid enum values that contradict one another.
+VALID_SEVERITY_SOURCE="$AUTHORIZED_DIR/valid-severity-matrix.json"
+INVALID_SEVERITY_SOURCE="$AUTHORIZED_DIR/invalid-severity-matrix.json"
+jq '
+    .issue_categories = ([
+      {impact:"severe", likelihood:"certain", severity:"critical"},
+      {impact:"severe", likelihood:"likely", severity:"critical"},
+      {impact:"severe", likelihood:"possible", severity:"high"},
+      {impact:"severe", likelihood:"unlikely", severity:"medium"},
+      {impact:"moderate", likelihood:"certain", severity:"high"},
+      {impact:"moderate", likelihood:"likely", severity:"high"},
+      {impact:"moderate", likelihood:"possible", severity:"medium"},
+      {impact:"moderate", likelihood:"unlikely", severity:"low"},
+      {impact:"minor", likelihood:"certain", severity:"medium"},
+      {impact:"minor", likelihood:"likely", severity:"low"},
+      {impact:"minor", likelihood:"possible", severity:"low"},
+      {impact:"minor", likelihood:"unlikely", severity:"low"}
+    ] | to_entries | map(.value + {
+      name:("Matrix tuple " + (.key | tostring)), category:"logic_error",
+      severity_rationale:"matrix fixture", verdict:"plausible", confidence:"medium",
+      description:"matrix fixture", evidence:[{file:"a.js",line:1,detail:"fixture"}],
+      thread_ids:[], sources:["codex:orchestrator"]
+    }))
+    | .category_coverage |= map(if .category == "logic_error"
+        then .verdict = "findings_reported" else . end)
+' "$HYBRID_SOURCE" > "$VALID_SEVERITY_SOURCE"
+"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+    "$VALID_SEVERITY_SOURCE" >/dev/null
+assert_jq "$AUTHORIZED_DIR/analysis.json" \
+    '.issue_categories | length == 12' \
+    "selection accepts every documented severity-matrix tuple"
+jq '.issue_categories[0].severity = "low"' \
+    "$VALID_SEVERITY_SOURCE" > "$INVALID_SEVERITY_SOURCE"
+rc=0
+INVALID_SEVERITY_OUT=$("$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+    "$INVALID_SEVERITY_SOURCE" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects a severity that contradicts impact and likelihood"
+assert_contains "$INVALID_SEVERITY_OUT" "missing required findings or provenance" \
+    "the invalid severity tuple fails selected-analysis contract validation"
+"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$HYBRID_SOURCE" >/dev/null
+
 FROZEN_SOURCE="$AUTHORIZED_DIR/freeze-race-analysis.json"
 jq '.task_list[0].task = "frozen before hosted verification"' \
     "$HYBRID_SOURCE" > "$FROZEN_SOURCE"

@@ -142,6 +142,317 @@ OUT=$(run_scenario "comments-only" "$NO_THREADS" "$ONE_COMMENT")
 assert_eq "yes" "$(claude_ran comments-only)" "an issue comment alone triggers the analysis"
 assert_contains "$OUT" "1 issue comment" "the script reports the issue comment it found"
 
+# Watch integration: the first poll simultaneously replaces an issue-comment
+# ID, adds another issue comment, and deletes an inline comment. Total comments
+# stay at three, so count-only or net-delta logic misses the change. The first
+# analyzer response is unusable even though the nested command exits zero; a
+# planted analysis.md must not make that attempt look successful. The retained
+# baseline drives one retry, whose fresh selected analysis advances the state.
+WATCH_CASE="$TEST_OUTPUT_DIR/watch-transaction"
+WATCH_STUB_DIR="$WATCH_CASE/stubs"
+WATCH_WORK_DIR="$WATCH_CASE/work"
+WATCH_POLL_FILE="$WATCH_CASE/poll.txt"
+WATCH_SLEEP_COUNT_FILE="$WATCH_CASE/sleep-count.txt"
+WATCH_CLAUDE_ATTEMPT_FILE="$WATCH_CASE/claude-attempt.txt"
+WATCH_CLAUDE_LOG="$WATCH_CASE/claude.log"
+mkdir -p "$WATCH_STUB_DIR" "$WATCH_WORK_DIR/.reports/pr-reviews/pr-1"
+printf 'stale report\n' > "$WATCH_WORK_DIR/.reports/pr-reviews/pr-1/analysis.md"
+printf '0\n' > "$WATCH_POLL_FILE"
+printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"
+
+cat > "$WATCH_STUB_DIR/sleep" << 'STUB'
+#!/bin/bash
+if [ -n "${WATCH_POLL_FILE:-}" ] && [ "$1" = "60" ]; then
+    count=$(cat "$WATCH_SLEEP_COUNT_FILE")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$WATCH_SLEEP_COUNT_FILE"
+    if [ "$count" -le "${WATCH_SLEEP_LIMIT:-3}" ]; then
+        printf '%s\n' "$count" > "$WATCH_POLL_FILE"
+        exit 0
+    fi
+    kill -TERM "$PPID"
+    exit 0
+fi
+exec /bin/sleep "$@"
+STUB
+chmod +x "$WATCH_STUB_DIR/sleep"
+
+cat > "$WATCH_STUB_DIR/gh" << 'STUB'
+#!/bin/bash
+poll=$(cat "$WATCH_POLL_FILE" 2>/dev/null || echo 0)
+summary='{"number":1,"title":"t","body":"b","author":{"login":"u"},"state":"OPEN","url":"https://github.com/o/r/pull/1","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","mergeable":"MERGEABLE","isDraft":false,"headRefOid":"abc123","additions":1,"deletions":0,"changedFiles":1,"files":[{"path":"a.js","additions":1,"deletions":0}],"commits":[],"labels":[],"assignees":[],"reviews":[]}'
+case "$1 $2" in
+    "repo view")
+        case "$*" in
+            *nameWithOwner,visibility*) echo '{"nameWithOwner":"o/r","visibility":"PUBLIC"}' ;;
+            *visibility*) echo 'PUBLIC' ;;
+            *) echo 'o/r' ;;
+        esac
+        exit 0
+        ;;
+    "pr view")
+        printf '%s\n' "$summary"
+        exit 0
+        ;;
+    "pr checks") echo '[]'; exit 0 ;;
+    "pr diff") echo ''; exit 0 ;;
+esac
+if [ "$1 $2" = "api graphql" ]; then
+    case "$*" in
+        *closingIssuesReferences*)
+            echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[]}}}}}'
+            ;;
+        *)
+            if [ "${WATCH_INCOMPLETE_THREADS:-false}" = true ]; then
+                echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":101,"pageInfo":{"hasNextPage":true,"endCursor":"x"},"nodes":[]}}}}}'
+            elif [ "$poll" -eq 0 ]; then
+                echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"THREAD_OLD","isResolved":true,"isOutdated":false,"path":"a.js","line":1,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"INLINE_OLD","databaseId":10,"body":"old","author":{"login":"rev"},"createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/1#discussion_r10"}]}}]}}}}}'
+            else
+                echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+            fi
+            ;;
+    esac
+    exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "--paginate" ]; then
+    watch_projection=false
+    case "$*" in *"--jq"*) watch_projection=true ;; esac
+    if [ "$watch_projection" = true ] && [ -n "${WATCH_PROJECTION_LOG:-}" ]; then
+        printf '%s\n' "$*" >> "$WATCH_PROJECTION_LOG"
+        [ -z "${WATCH_LARGE_BODY_FILE:-}" ] || \
+            wc -c < "$WATCH_LARGE_BODY_FILE" >> "$WATCH_PROJECTION_LOG"
+    fi
+    case "$3" in
+        *issues/*/comments*)
+            if [ "$watch_projection" = true ]; then
+                if [ -n "${WATCH_LARGE_ID_COUNT:-}" ]; then
+                    jq -nr --argjson count "$WATCH_LARGE_ID_COUNT" \
+                        'range(1; $count + 1)'
+                else
+                    jq -nr 'range(1; 101)'
+                fi
+            else
+                jq -nc '[range(1; 101) | {
+                    id: ., body:"common", user:{login:"u"},
+                    created_at:"2026-01-01T00:00:00Z",
+                    updated_at:"2026-01-01T00:00:00Z",
+                    html_url:("https://github.com/o/r/pull/1#issuecomment-" + tostring)
+                }]'
+            fi
+            if [ "${WATCH_INCOMPLETE_BASE:-}" = "issue-comments" ] || \
+               { [ "${WATCH_TRANSIENT_BASE_FAILURE:-false}" = true ] && \
+                 [ "$poll" -eq 1 ]; } || \
+               { [ "${WATCH_PERSISTENT_BASE_FAILURE:-false}" = true ] && \
+                 [ "$poll" -gt 0 ]; }; then
+                exit 41
+            fi
+            if [ "$poll" -eq 0 ]; then
+                if [ "$watch_projection" = true ]; then
+                    printf '101\n102\n'
+                else
+                    echo '[{"id":101,"body":"old","user":{"login":"u"}},{"id":102,"body":"keep","user":{"login":"u"}}]'
+                fi
+            else
+                if [ "$watch_projection" = true ]; then
+                    printf '103\n102\n104\n'
+                else
+                    echo '[{"id":103,"body":"new","user":{"login":"u"}},{"id":102,"body":"keep","user":{"login":"u"}},{"id":104,"body":"added","user":{"login":"u"}}]'
+                fi
+            fi
+            ;;
+        *pulls/*/reviews*)
+            if [ "$watch_projection" = true ]; then
+                if [ -n "${WATCH_LARGE_ID_COUNT:-}" ]; then
+                    jq -nr --argjson count "$WATCH_LARGE_ID_COUNT" \
+                        'range(1001; 1001 + $count)'
+                else
+                    jq -nr 'range(1001; 1101)'
+                fi
+            else
+                jq -nc '[range(1001; 1101) | {id: ., body:"common", user:{login:"u"}}]'
+            fi
+            if [ "${WATCH_INCOMPLETE_BASE:-}" = "reviews" ]; then
+                exit 42
+            fi
+            if [ "$poll" -eq 0 ]; then
+                if [ "$watch_projection" = true ]; then
+                    echo '1101'
+                else
+                    echo '[{"id":1101,"body":"old","user":{"login":"u"}}]'
+                fi
+            else
+                if [ "$watch_projection" = true ]; then
+                    echo '1102'
+                else
+                    echo '[{"id":1102,"body":"new","user":{"login":"u"}}]'
+                fi
+            fi
+            ;;
+        *) echo '[]' ;;
+    esac
+    exit 0
+fi
+if [ "$1" = "api" ]; then echo '[]'; exit 0; fi
+exit 0
+STUB
+chmod +x "$WATCH_STUB_DIR/gh"
+
+cat > "$WATCH_STUB_DIR/claude" << 'STUB'
+#!/bin/bash
+attempt=$(cat "$WATCH_CLAUDE_ATTEMPT_FILE" 2>/dev/null || echo 0)
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" > "$WATCH_CLAUDE_ATTEMPT_FILE"
+printf 'invoked\n' >> "$WATCH_CLAUDE_LOG"
+cat > /dev/null
+if [ "$attempt" -eq 1 ]; then
+    echo '{"is_error":false,"result":"no structured output"}'
+    exit 0
+fi
+jq -nc '
+  ["logic_error","boundary_condition","concurrency","error_handling","resource_lifecycle","security","secrets_exposure","data_integrity","api_contract","performance","test_gap","observability","maintainability","documentation","build_ci","dependency_risk"] as $categories
+  | {structured_output:{issue_categories:[],
+      category_coverage:[$categories[] | {category:., verdict:"reviewed_none_found", note:"fixture"}],
+      disputed_comments:[],systemic_issues:[],adjacent_problems:[],task_list:[],
+      process_improvements:[],pr_template_suggestions:[]}}'
+STUB
+chmod +x "$WATCH_STUB_DIR/claude"
+
+WATCH_OUT_FILE="$WATCH_CASE/watch.out"
+set +e
+(
+    cd "$WATCH_WORK_DIR" || exit 1
+    env WATCH_POLL_FILE="$WATCH_POLL_FILE" \
+        WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" \
+        WATCH_SLEEP_LIMIT=4 WATCH_TRANSIENT_BASE_FAILURE=true \
+        WATCH_CLAUDE_ATTEMPT_FILE="$WATCH_CLAUDE_ATTEMPT_FILE" \
+        WATCH_CLAUDE_LOG="$WATCH_CLAUDE_LOG" \
+        GH_PR_ENRICH_HEARTBEAT_SECONDS=97 PATH="$WATCH_STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" watch 1 --interval 1 --enrich
+) > "$WATCH_OUT_FILE" 2>&1
+set -e
+WATCH_OUT=$(cat "$WATCH_OUT_FILE")
+assert_contains "$WATCH_OUT" "New issue comments: +2" \
+    "watch detects unseen IDs during same-component replacement"
+assert_contains "$WATCH_OUT" "New review summaries: +1" \
+    "watch detects a changed review ID from the second paginated page"
+assert_not_contains "$WATCH_OUT" "Comment/review count change:" \
+    "component offset is detected even when the aggregate count is unchanged"
+assert_contains "$WATCH_OUT" "API request failed (attempt 1/3)" \
+    "a transient incomplete base snapshot is retried under set -e"
+assert_contains "$WATCH_OUT" "retaining the prior watch state for retry" \
+    "watch retains its baseline when enrichment publishes no fresh selection"
+assert_contains "$WATCH_OUT" "Analysis updated:" \
+    "watch accepts the retry only after a fresh selected artifact is published"
+assert_eq "2" "$(wc -l < "$WATCH_CLAUDE_LOG" | tr -d ' ')" \
+    "failed enrichment retries once and a successful baseline does not rerun"
+assert_eq "1" "$(grep -c 'Analysis updated:' "$WATCH_OUT_FILE")" \
+    "a pre-existing analysis.md cannot masquerade as fresh output"
+assert_jq "$WATCH_WORK_DIR/.reports/pr-reviews/pr-1/analysis.json" \
+    '._metadata.repository == "o/r" and ._metadata.pr_number == 1' \
+    "watch success is bound to a current selected artifact for the watched PR"
+
+WATCH_LARGE_BODY_FILE="$WATCH_CASE/large-comment-body.txt"
+WATCH_PROJECTION_LOG="$WATCH_CASE/projection.log"
+LC_ALL=C awk 'BEGIN { for (i = 0; i < 1100000; i++) printf "x" }' \
+    > "$WATCH_LARGE_BODY_FILE"
+printf '0\n' > "$WATCH_POLL_FILE"
+printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"
+: > "$WATCH_PROJECTION_LOG"
+set +e
+LARGE_BODY_WATCH_OUT=$(
+    cd "$WATCH_WORK_DIR" && \
+    env WATCH_LARGE_BODY_FILE="$WATCH_LARGE_BODY_FILE" \
+        WATCH_PROJECTION_LOG="$WATCH_PROJECTION_LOG" \
+        WATCH_POLL_FILE="$WATCH_POLL_FILE" \
+        WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" WATCH_SLEEP_LIMIT=0 \
+        PATH="$WATCH_STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" watch 1 --interval 1 2>&1
+)
+set -e
+assert_contains "$LARGE_BODY_WATCH_OUT" \
+    "Initial state: 204 comments/reviews" \
+    "watch initializes after API-side projection of bodies larger than macOS ARG_MAX"
+assert_contains "$(cat "$WATCH_PROJECTION_LOG")" "--jq" \
+    "paginated base comment and review fetches project IDs before shell capture"
+assert_contains "$(cat "$WATCH_PROJECTION_LOG")" "1100000" \
+    "the large-body regression exercises a payload beyond macOS ARG_MAX"
+
+printf '0\n' > "$WATCH_POLL_FILE"
+printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"
+set +e
+LARGE_ID_WATCH_OUT=$(
+    cd "$WATCH_WORK_DIR" && \
+    env WATCH_LARGE_ID_COUNT=70000 WATCH_POLL_FILE="$WATCH_POLL_FILE" \
+        WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" WATCH_SLEEP_LIMIT=1 \
+        PATH="$WATCH_STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" watch 1 --interval 1 2>&1
+)
+set -e
+assert_contains "$LARGE_ID_WATCH_OUT" \
+    "Initial state: 140001 comments/reviews" \
+    "watch initializes with complete ID arrays beyond macOS ARG_MAX"
+assert_contains "$LARGE_ID_WATCH_OUT" "Changes detected!" \
+    "watch computes a large-state delta over stdin instead of argv"
+
+for incomplete_component in issue-comments reviews; do
+    printf '0\n' > "$WATCH_POLL_FILE"
+    printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"
+    set +e
+    INCOMPLETE_BASE_OUT=$(
+        cd "$WATCH_WORK_DIR" && \
+        env WATCH_INCOMPLETE_BASE="$incomplete_component" \
+            WATCH_POLL_FILE="$WATCH_POLL_FILE" \
+            WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" \
+            PATH="$WATCH_STUB_DIR:$PATH" \
+            "$GH_PR_ENRICH" watch 1 --interval 1 2>&1
+    )
+    INCOMPLETE_BASE_RC=$?
+    set -e
+    assert_true "$([ "$INCOMPLETE_BASE_RC" -ne 0 ] && echo 0 || echo 1)" \
+        "watch fails closed on incomplete paginated $incomplete_component"
+    assert_contains "$INCOMPLETE_BASE_OUT" \
+        "Could not fetch the initial PR comment state" \
+        "incomplete paginated $incomplete_component cannot establish a baseline"
+done
+
+printf '0\n' > "$WATCH_POLL_FILE"
+printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"
+set +e
+PERSISTENT_FAILURE_OUT=$(
+    cd "$WATCH_WORK_DIR" && \
+    env WATCH_PERSISTENT_BASE_FAILURE=true WATCH_POLL_FILE="$WATCH_POLL_FILE" \
+        WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" \
+        PATH="$WATCH_STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" watch 1 --interval 1 2>&1
+)
+PERSISTENT_FAILURE_RC=$?
+set -e
+assert_true "$([ "$PERSISTENT_FAILURE_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "persistent watch snapshot failures exit nonzero"
+assert_contains "$PERSISTENT_FAILURE_OUT" "API request failed (attempt 1/3)" \
+    "the first persistent failure is reported instead of exiting via set -e"
+assert_contains "$PERSISTENT_FAILURE_OUT" "API request failed (attempt 3/3)" \
+    "watch retries snapshot failures through the configured maximum"
+assert_contains "$PERSISTENT_FAILURE_OUT" "Too many consecutive failures" \
+    "watch exits only after the configured consecutive-failure limit"
+
+printf '0\n' > "$WATCH_POLL_FILE"
+printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"
+set +e
+INCOMPLETE_WATCH_OUT=$(
+    cd "$WATCH_WORK_DIR" && \
+    env WATCH_INCOMPLETE_THREADS=true WATCH_POLL_FILE="$WATCH_POLL_FILE" \
+        WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" \
+        PATH="$WATCH_STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" watch 1 --interval 1 2>&1
+)
+INCOMPLETE_WATCH_RC=$?
+set -e
+assert_true "$([ "$INCOMPLETE_WATCH_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "watch fails closed when the review-thread ID snapshot is incomplete"
+assert_contains "$INCOMPLETE_WATCH_OUT" "Could not fetch the initial PR comment state" \
+    "watch reports an incomplete stable-ID baseline instead of silently truncating it"
+
 # ---------------------------------------------------------------------------
 # Nothing to analyze -> analysis is skipped, and the run still succeeds
 # ---------------------------------------------------------------------------

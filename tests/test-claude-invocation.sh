@@ -45,6 +45,7 @@ for argument in "$@"; do
     previous="$argument"
 done
 cat > /dev/null
+[ -z "${CLAUDE_STUB_DELAY:-}" ] || /bin/sleep "$CLAUDE_STUB_DELAY"
 echo "stub claude stderr line" >&2
 echo '{"structured_output": {"issue_categories": [], "category_coverage": [], "disputed_comments": [], "systemic_issues": [], "adjacent_problems": [], "task_list": [], "process_improvements": [], "pr_template_suggestions": []}}'
 STUB
@@ -73,6 +74,14 @@ printf 'ps invoked\n' >> "$PS_CALLED_LOG"
 exit 97
 STUB
 chmod +x "$STUB_DIR/ps"
+
+cat > "$STUB_DIR/sleep" << 'STUB'
+#!/bin/bash
+[ -z "${SLEEP_INTERVAL_LOG:-}" ] || printf '%s\n' "$1" >> "$SLEEP_INTERVAL_LOG"
+[ "${SLEEP_FAIL_INTERVAL:-}" != "$1" ] || exit 64
+exec /bin/sleep "$@"
+STUB
+chmod +x "$STUB_DIR/sleep"
 
 cat > "$STUB_DIR/semgrep" << 'STUB'
 #!/bin/bash
@@ -514,6 +523,45 @@ fi
 run_analysis CLAUDE_TIMEOUT=42
 assert_eq "42" "$(cat "$TEST_OUTPUT_DIR/timeout.txt" 2>/dev/null || echo "")" \
     "CLAUDE_TIMEOUT still overrides the default"
+
+for invalid_heartbeat in 0 -1 invalid; do
+    assert_eq "60" \
+        "$("$GH_PR_ENRICH" --test-call positive_integer_or_default \
+            "$invalid_heartbeat" 60)" \
+        "invalid heartbeat '$invalid_heartbeat' falls back to 60 seconds"
+done
+assert_eq "7" \
+    "$("$GH_PR_ENRICH" --test-call positive_integer_or_default 7 60)" \
+    "a positive heartbeat interval is preserved"
+assert_eq "60" \
+    "$("$GH_PR_ENRICH" --test-call positive_integer_or_default 86401 60 86400)" \
+    "a heartbeat above the safe one-day bound falls back to 60 seconds"
+assert_eq "60" \
+    "$("$GH_PR_ENRICH" --test-call positive_integer_or_default \
+        999999999999999999999999 60 86400)" \
+    "an oversized heartbeat cannot overflow the numeric bound"
+SLEEP_INTERVAL_LOG="$TEST_OUTPUT_DIR/heartbeat-sleeps.txt"
+rm -f "$SLEEP_INTERVAL_LOG"
+run_analysis GH_PR_ENRICH_HEARTBEAT_SECONDS=0 \
+    SLEEP_INTERVAL_LOG="$SLEEP_INTERVAL_LOG"
+assert_contains "$(cat "$SLEEP_INTERVAL_LOG")" "60" \
+    "a zero heartbeat starts a normal 60-second wait"
+assert_eq "" "$(grep -x '0' "$SLEEP_INTERVAL_LOG" || true)" \
+    "a zero heartbeat cannot create a progress-loop spin"
+rm -f "$SLEEP_INTERVAL_LOG"
+run_analysis GH_PR_ENRICH_HEARTBEAT_SECONDS=999999999999999999999999 \
+    SLEEP_INTERVAL_LOG="$SLEEP_INTERVAL_LOG"
+assert_contains "$(cat "$SLEEP_INTERVAL_LOG")" "60" \
+    "an oversized heartbeat starts a valid 60-second wait"
+assert_eq "" \
+    "$(grep -x '999999999999999999999999' "$SLEEP_INTERVAL_LOG" || true)" \
+    "an oversized heartbeat never reaches sleep"
+rm -f "$SLEEP_INTERVAL_LOG"
+run_analysis GH_PR_ENRICH_HEARTBEAT_SECONDS=60 \
+    SLEEP_INTERVAL_LOG="$SLEEP_INTERVAL_LOG" SLEEP_FAIL_INTERVAL=60 \
+    CLAUDE_STUB_DELAY=0.1
+assert_eq "1" "$(grep -cx '60' "$SLEEP_INTERVAL_LOG" || true)" \
+    "a rejected heartbeat sleep terminates instead of spinning"
 
 # ---------------------------------------------------------------------------
 # Analyzer stderr is kept
