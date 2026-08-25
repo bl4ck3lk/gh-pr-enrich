@@ -3984,7 +3984,10 @@ RETRO_HELP
                 .pr_meta.number as $pr_num |
                 (
                     # From issue categories
-                    ((.issue_categories // [])[] | select(.verdict != "refuted") | {
+                    # Retrospective hotspots are defect metrics, so only
+                    # independently confirmed findings may affect their counts,
+                    # severities, or generated remediation questions.
+                    ((.issue_categories // [])[] | select(.verdict == "confirmed") | {
                         category: (.category // "uncategorized"),
                         severity: .severity,
                         pr: $pr_num

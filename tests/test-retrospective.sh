@@ -767,15 +767,15 @@ EOF
     assert_jq_eq "$output_dir/retrospective-data.json" \
         '[.hotspots[] | select(.category == "error_handling") | .issue_count] | first' "1" \
         "retrospective hotspots count confirmed findings but not refuted claims"
-    assert_jq_eq "$output_dir/retrospective-data.json" \
-        '[.hotspots[] | select(.category == "test_gap") | .issue_count] | first' "1" \
-        "retrospective hotspots preserve plausible findings"
+    assert_jq "$output_dir/retrospective-data.json" \
+        '[.hotspots[] | select(.category == "test_gap")] | length == 0' \
+        "retrospective hotspots exclude plausible-only categories"
     assert_jq "$output_dir/retrospective-data.json" \
         '[.hotspots[] | select(.category == "security")] | length == 0' \
         "retrospective hotspots exclude refuted-only categories"
     assert_jq "$output_dir/retrospective-data.json" \
-        '[.guiding_questions.before_implementation[] | select(contains("security"))] | length == 0' \
-        "retrospective guiding questions exclude refuted-only categories"
+        '[.guiding_questions.before_implementation[] | select(contains("security") or contains("test_gap"))] | length == 0' \
+        "retrospective guiding questions exclude unconfirmed categories"
     assert_jq_eq "$output_dir/retrospective-data.json" \
         '.summary.overview.total_tasks' "1" \
         "retrospective verdict filtering leaves task aggregation unchanged"
