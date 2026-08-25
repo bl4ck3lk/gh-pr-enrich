@@ -366,7 +366,16 @@ assert_jq "$CTX" '[.code_changes.file_diffs[] | select(.file == "src/small.js" a
 BOUNDARY_DIR="$TEST_OUTPUT_DIR/boundary"
 mkdir -p "$BOUNDARY_DIR"
 cp "$CTX_DIR/pr-summary.json" "$BOUNDARY_DIR/pr-summary.json"
-echo '[]' > "$BOUNDARY_DIR/unresolved-threads.json"
+python3 - "$BOUNDARY_DIR/unresolved-threads.json" << 'PY'
+import json, sys
+json.dump([{
+    "thread_id": "PRRT_boundary", "is_outdated": False, "path": "a.js", "line": 1,
+    "comments": [
+        {"author": "r", "body": "c" * 5000, "url": "thread-at-limit"},
+        {"author": "r", "body": "d" * 5001, "url": "thread-over-limit"},
+    ],
+}], open(sys.argv[1], "w"))
+PY
 python3 - "$BOUNDARY_DIR/issue-comments.json" << 'PY'
 import json, sys
 json.dump([
@@ -386,19 +395,37 @@ assert_jq "$BOUNDARY_CTX" '[.issue_comments[] | select(.url == "over-limit" and 
     "a comment one byte over the limit is truncated"
 assert_jq "$BOUNDARY_CTX" '.coverage.issue_comments.truncated == ["over-limit"]' \
     "coverage names exactly the truncated comment"
+assert_jq "$BOUNDARY_CTX" '[.unresolved_threads[].comments[] | select(.url == "thread-at-limit" and (.body | contains("(truncated)")))] | length == 0' \
+    "a nested thread comment exactly at the limit is not truncated"
+assert_jq "$BOUNDARY_CTX" '[.unresolved_threads[].comments[] | select(.url == "thread-over-limit" and (.body | contains("(truncated)")))] | length == 1' \
+    "a nested thread comment one byte over the limit is truncated"
+assert_jq "$BOUNDARY_CTX" '.coverage.unresolved_threads.truncated == ["thread-over-limit"]' \
+    "thread coverage names exactly the truncated nested comment"
+
+BOUNDARY_COV_MD="$BOUNDARY_DIR/coverage.md"
+"$GH_PR_ENRICH" --test-call generate_coverage_section "$BOUNDARY_CTX" "$BOUNDARY_COV_MD" >/dev/null 2>&1 || true
+assert_contains "$(cat "$BOUNDARY_COV_MD" 2>/dev/null || echo "")" \
+    "nested comments truncated: 1" \
+    "rendered thread coverage counts truncated nested comments"
 
 # The limit is configurable, and the coverage block reports the configured value.
 CUSTOM_DIR="$TEST_OUTPUT_DIR/custom-limit"
 mkdir -p "$CUSTOM_DIR"
 cp "$BOUNDARY_DIR/pr-summary.json" "$CUSTOM_DIR/pr-summary.json"
 cp "$BOUNDARY_DIR/issue-comments.json" "$CUSTOM_DIR/issue-comments.json"
-echo '[]' > "$CUSTOM_DIR/unresolved-threads.json"
+cp "$BOUNDARY_DIR/unresolved-threads.json" "$CUSTOM_DIR/unresolved-threads.json"
 
 GH_PR_ENRICH_TRUNCATE_CHARS=100 "$GH_PR_ENRICH" --test-call build_claude_context "$CUSTOM_DIR" false >/dev/null 2>&1 || true
 assert_jq_eq "$CUSTOM_DIR/claude-context.json" '.coverage.truncation_limit_chars' "100" \
     "GH_PR_ENRICH_TRUNCATE_CHARS changes the reported limit"
 assert_jq "$CUSTOM_DIR/claude-context.json" '[.issue_comments[] | select(.body | contains("(truncated)"))] | length == 2' \
     "a lower limit truncates comments that were previously untouched"
+assert_jq_eq "$CUSTOM_DIR/claude-context.json" \
+    '[.unresolved_threads[].comments[] | select(.body | contains("(truncated)"))] | length' "2" \
+    "a lower limit also truncates nested thread comments"
+assert_jq "$CUSTOM_DIR/claude-context.json" \
+    '.coverage.unresolved_threads.truncated == ["thread-at-limit", "thread-over-limit"]' \
+    "thread coverage follows the configured truncation limit"
 
 # ---------------------------------------------------------------------------
 # Coverage is rendered for humans, not just stored

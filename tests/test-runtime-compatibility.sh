@@ -285,7 +285,8 @@ for VISIBILITY in INTERNAL UNKNOWN; do
 done
 
 AUTHORIZED_DIR="$TEST_OUTPUT_DIR/private-authorized"
-env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PRIVATE CLAUDE_INVOKED_LOG="$CLAUDE_LOG" \
+env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PRIVATE GH_PR_ENRICH_CODE_ACCESS=false \
+    CLAUDE_INVOKED_LOG="$CLAUDE_LOG" \
     "$GH_PR_ENRICH" 1 --enrich --allow-external --output-dir "$AUTHORIZED_DIR" >/dev/null 2>&1
 
 assert_true "$([ -s "$CLAUDE_LOG" ] && echo 0 || echo 1)" \
@@ -316,6 +317,28 @@ assert_contains "$(cat "$AUTHORIZED_DIR/analysis.md")" "Hybrid-selected task" \
 assert_jq "$AUTHORIZED_DIR/combined-data.json" \
     '.analysis._metadata.provider == "hybrid" and .analysis.task_list[0].task == "Hybrid-selected task"' \
     "select-analysis refreshes the combined-data selected view"
+
+assert_jq "$AUTHORIZED_DIR/analysis-context.json" \
+    '.coverage.code_access.state == "disabled"' \
+    "the selection fixture records disabled repository code access"
+NO_CODE_CONFIRMED_SOURCE="$AUTHORIZED_DIR/no-code-confirmed.json"
+jq '.issue_categories = [{
+        name: "Unverified finding", category: "logic_error", severity: "high",
+        impact: "moderate", likelihood: "likely", severity_rationale: "fixture",
+        verdict: "confirmed", confidence: "high", description: "fixture",
+        evidence: [{file:"a.js",line:1,detail:"fixture"}], thread_ids: [],
+        sources: ["codex:orchestrator"]
+    }]
+    | .category_coverage |= map(if .category == "logic_error"
+        then .verdict = "findings_reported" else . end)' \
+    "$HYBRID_SOURCE" > "$NO_CODE_CONFIRMED_SOURCE"
+rc=0
+NO_CODE_CONFIRMED_OUT=$("$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+    "$NO_CODE_CONFIRMED_SOURCE" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "disabled code access prevents publishing confirmed findings"
+assert_contains "$NO_CODE_CONFIRMED_OUT" "without enabled repository code access" \
+    "the no-code confirmation error identifies the verdict contract"
 
 rc=0
 echo "do not overwrite" > "$TEST_OUTPUT_DIR/selection-temp-target.json"

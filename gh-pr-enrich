@@ -2901,7 +2901,8 @@ build_analysis_context() {
                     body: trunc(.body)
                 }]
             },
-            unresolved_threads: $thread_list,
+            unresolved_threads: [$thread_list[]
+                | .comments = [(.comments // [])[] | .body = trunc(.body)]],
             issue_comments: [$kept[] | {
                 user: .user,
                 body: trunc(.body),
@@ -2957,6 +2958,8 @@ build_analysis_context() {
                     total: ($thread_list | length),
                     included: ($thread_list | length),
                     outdated: ([$thread_list[] | select(.is_outdated == true)] | length),
+                    truncated: [$thread_list[] | (.comments // [])[]
+                        | select(was_truncated(.body)) | .url],
                     comments_per_thread_limit: $thread_comment_limit,
                     threads_at_comment_limit: ([$thread_list[]
                         | select((.comments // []) | length >= $thread_comment_limit)] | length)
@@ -3661,6 +3664,12 @@ select_analysis_artifact() {
         echo "Error: Selected analysis context fingerprint does not match the current snapshot." >&2
         return 1
     fi
+    if [ "$(jq -r '.coverage.code_access.state // "unknown"' "$context_file")" != "enabled" ] && \
+       jq -e 'any(.issue_categories[]; .verdict == "confirmed")' \
+           "$source_file" > /dev/null 2>&1; then
+        echo "Error: Selected analysis contains confirmed findings without enabled repository code access in the fingerprinted context." >&2
+        return 1
+    fi
     context_pr_number="$(jq -r '.pr.number // ""' "$context_file")"
     context_repository="$(jq -r '.pr.repository // ""' "$context_file")"
     source_pr_number="$(jq -r '._metadata.pr_number' "$source_file")"
@@ -3761,6 +3770,7 @@ generate_coverage_section() {
       "| Input | Included | Notes |\n|---|---|---|\n" +
       "| Review threads | " + (($c.unresolved_threads.total // 0) | tostring) + " unresolved (all pages) | " +
         (($c.unresolved_threads.outdated // 0) | tostring) + " outdated; " +
+        "nested comments truncated: " + ((($c.unresolved_threads.truncated // []) | length) | tostring) + "; " +
         (($c.unresolved_threads.threads_at_comment_limit // 0) | tostring) + " at the " +
         (($c.unresolved_threads.comments_per_thread_limit // 0) | tostring) + "-reply fetch limit (later replies not analyzed) |\n" +
       "| Issue comments | " + (($c.issue_comments.included // 0) | tostring) + " of " + (($c.issue_comments.total // 0) | tostring) + " | " +
