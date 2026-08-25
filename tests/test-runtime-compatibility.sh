@@ -20,6 +20,8 @@ LINKED_CONCURRENT_RELEASE=""
 CHILD_START_PID_FILE=""
 BLOCKED_HEAD_CHILD_PID_FILE=""
 BLOCKED_HEAD_DESCENDANT_PID_FILE=""
+PROVIDER_SIGNAL_CHILD_PID_FILE=""
+PROVIDER_SIGNAL_DESCENDANT_PID_FILE=""
 
 # shellcheck source=lib/assert.sh
 source "$SCRIPT_DIR/lib/assert.sh"
@@ -54,6 +56,8 @@ cleanup() {
     fi
     for cleanup_pid_file in "$BLOCKED_HEAD_CHILD_PID_FILE" \
             "$BLOCKED_HEAD_DESCENDANT_PID_FILE" \
+            "$PROVIDER_SIGNAL_CHILD_PID_FILE" \
+            "$PROVIDER_SIGNAL_DESCENDANT_PID_FILE" \
             "${PRELOCK_HEAD_CHILD_PID:-}" \
             "${PRELOCK_HEAD_DESCENDANT_PID:-}"; do
         [ -n "$cleanup_pid_file" ] && [ -f "$cleanup_pid_file" ] || continue
@@ -880,7 +884,7 @@ if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
                 echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
             fi
             ;;
-        *) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PRRT_open","isResolved":false,"isOutdated":false,"path":"a.js","line":1,"comments":{"nodes":[{"id":"c","databaseId":1,"body":"check this","author":{"login":"rev"},"createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/1#discussion_r1"}]}}]}}}}}' ;;
+        *) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PRRT_open","isResolved":false,"isOutdated":false,"path":"a.js","line":1,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"c","databaseId":1,"body":"check this","author":{"login":"rev"},"createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/1#discussion_r1"}]}}]}}}}}' ;;
     esac
     exit 0
 fi
@@ -1453,6 +1457,11 @@ assert_jq "$PREPARED/analysis-context.json" '.coverage.diff.status == "completed
     "successful diff preparation is recorded as completed coverage"
 assert_jq "$PREPARED/analysis-context.json" '.pr.repository == "o/r" and .pr.number == 1' \
     "the fingerprinted context binds repository and PR identity"
+PREPARED_DISCUSSION_FINGERPRINT=$("$GH_PR_ENRICH" --test-call \
+    analysis_discussion_fingerprint_from_files "$PREPARED")
+assert_jq "$PREPARED/analysis-context.json" \
+    ".coverage.discussion.fingerprint == \"$PREPARED_DISCUSSION_FINGERPRINT\"" \
+    "the context fingerprint binds the exact collected discussion snapshot"
 assert_not_contains "$PREP_OUT" "Claude analysis" \
     "context preparation does not invoke an external analyzer"
 
@@ -1695,15 +1704,22 @@ for VISIBILITY in INTERNAL UNKNOWN; do
 done
 
 AUTHORIZED_DIR="$TEST_OUTPUT_DIR/private-authorized"
-env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PRIVATE GH_PR_ENRICH_CODE_ACCESS=false \
+rc=0
+AUTHORIZED_OUT=$(env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PRIVATE \
+    GH_PR_ENRICH_CODE_ACCESS=false \
     CLAUDE_INVOKED_LOG="$CLAUDE_LOG" \
     "$GH_PR_ENRICH" 1 --enrich --allow-external --diff \
-    --output-dir "$AUTHORIZED_DIR" >/dev/null 2>&1
+    --output-dir "$AUTHORIZED_DIR" 2>&1) || rc=$?
+assert_eq "0" "$rc" \
+    "authorized private enrichment completes provider publication" \
+    "$AUTHORIZED_OUT"
 
 assert_true "$([ -s "$CLAUDE_LOG" ] && echo 0 || echo 1)" \
     "--allow-external authorizes Claude for a private repository"
 assert_jq "$AUTHORIZED_DIR/analysis.json" '._metadata.repository_visibility == "PRIVATE"' \
     "the analysis provenance records repository visibility"
+AUTHORIZED_CLAUDE_FIXTURE="$TEST_OUTPUT_DIR/authorized-claude-fixture.json"
+cp "$AUTHORIZED_DIR/claude-analysis.json" "$AUTHORIZED_CLAUDE_FIXTURE"
 
 # The provider's combined-data publication uses the same no-clobber
 # transaction as selection/invalidation. A noncooperating destination that
@@ -1718,8 +1734,7 @@ cat > "$PROVIDER_COLLISION_STUBS/mv" << 'STUB'
 case "$1:$2" in
     "$PROVIDER_COLLISION_REPORT/combined-data.json:"*\
 "/.selected-analysis-quarantine."*"/combined-data.json")
-        if [ -f "$PROVIDER_COLLISION_REPORT/claude-analysis.json" ] && \
-           [ ! -f "$PROVIDER_COLLISION_MARKER" ]; then
+        if [ ! -f "$PROVIDER_COLLISION_MARKER" ]; then
             : > "$PROVIDER_COLLISION_MARKER"
             printf '%s\n' '{"concurrent_provider_replacement":true}' \
                 > "$PROVIDER_COLLISION_REPORT/combined-data.json"
@@ -1748,6 +1763,262 @@ assert_true "$([ -n "$PROVIDER_COLLISION_QUARANTINE" ] && \
     [ -f "$PROVIDER_COLLISION_QUARANTINE/combined-data.json" ] && \
     echo 0 || echo 1)" \
     "provider collision preserves the original combined view for reconciliation"
+
+# Claude source files remain private until the same transaction that updates
+# combined-data. A comment added after private provider staging must fail the
+# final hosted-state check and publish none of those provider views.
+PROVIDER_DISCUSSION_DIR="$TEST_OUTPUT_DIR/provider-discussion-drift"
+PROVIDER_DISCUSSION_STUBS="$TEST_OUTPUT_DIR/provider-discussion-stubs"
+PROVIDER_DISCUSSION_MARKER="$TEST_OUTPUT_DIR/provider-discussion-fired"
+mkdir -p "$PROVIDER_DISCUSSION_STUBS"
+cat > "$PROVIDER_DISCUSSION_STUBS/cp" << 'STUB'
+#!/bin/bash
+destination=""
+for argument in "$@"; do destination="$argument"; done
+case "$destination" in
+    "$PROVIDER_DISCUSSION_REPORT"/.selected-analysis-replacements.*/claude-analysis.json)
+        : > "$PROVIDER_DISCUSSION_MARKER"
+        ;;
+esac
+exec "$PROVIDER_DISCUSSION_REAL_CP" "$@"
+STUB
+cat > "$PROVIDER_DISCUSSION_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1" = "api" ] && [ "$2" != "graphql" ] && \
+   [ -e "$PROVIDER_DISCUSSION_MARKER" ]; then
+    case "$*" in
+        *repos/o/r/issues/1/comments*)
+            echo '[{"id":99,"body":"late provider comment","user":{"login":"reviewer"},"created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-99"}]'
+            exit 0
+            ;;
+    esac
+fi
+exec "$PROVIDER_DISCUSSION_BASE_GH" "$@"
+STUB
+chmod +x "$PROVIDER_DISCUSSION_STUBS/cp" "$PROVIDER_DISCUSSION_STUBS/gh"
+rc=0
+PROVIDER_DISCUSSION_OUT=$(env PATH="$PROVIDER_DISCUSSION_STUBS:$STUB_DIR:$PATH" \
+    REPO_VISIBILITY=PRIVATE GH_PR_ENRICH_CODE_ACCESS=false \
+    CLAUDE_INVOKED_LOG="$CLAUDE_LOG" \
+    PROVIDER_DISCUSSION_REPORT="$PROVIDER_DISCUSSION_DIR" \
+    PROVIDER_DISCUSSION_MARKER="$PROVIDER_DISCUSSION_MARKER" \
+    PROVIDER_DISCUSSION_REAL_CP="$(command -v cp)" \
+    PROVIDER_DISCUSSION_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" 1 --enrich --allow-external \
+    --output-dir "$PROVIDER_DISCUSSION_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$PROVIDER_DISCUSSION_MARKER" ] && \
+    echo 0 || echo 1)" \
+    "provider publication detects discussion drift after private staging" \
+    "$PROVIDER_DISCUSSION_OUT"
+assert_contains "$PROVIDER_DISCUSSION_OUT" \
+    "Hosted PR head and discussion could not be attested before provider publication" \
+    "provider rejection names the final hosted discussion boundary"
+assert_true "$([ ! -e "$PROVIDER_DISCUSSION_DIR/claude-analysis.json" ] && \
+    [ ! -e "$PROVIDER_DISCUSSION_DIR/claude-analysis.md" ] && \
+    [ ! -e "$PROVIDER_DISCUSSION_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "late provider discussion drift publishes no provider or selected analysis"
+assert_no_selection_transaction_residue "$PROVIDER_DISCUSSION_DIR" \
+    "late provider discussion drift cleans every publication transaction"
+
+# The atomic hosted attestation brackets the stable discussion snapshot with
+# head reads. Advance only the second attestation head read so deleting that
+# final comparison would make this regression publish stale provider data.
+PROVIDER_HEAD_DIR="$TEST_OUTPUT_DIR/provider-attestation-head-drift"
+PROVIDER_HEAD_STUBS="$TEST_OUTPUT_DIR/provider-attestation-head-stubs"
+PROVIDER_HEAD_MARKER="$TEST_OUTPUT_DIR/provider-attestation-head-staged"
+PROVIDER_HEAD_COUNT="$TEST_OUTPUT_DIR/provider-attestation-head-count"
+mkdir -p "$PROVIDER_HEAD_STUBS"
+cat > "$PROVIDER_HEAD_STUBS/cp" << 'STUB'
+#!/bin/bash
+destination=""
+for argument in "$@"; do destination="$argument"; done
+case "$destination" in
+    "$PROVIDER_HEAD_REPORT"/.selected-analysis-replacements.*/claude-analysis.json)
+        : > "$PROVIDER_HEAD_MARKER"
+        ;;
+esac
+exec "$PROVIDER_HEAD_REAL_CP" "$@"
+STUB
+cat > "$PROVIDER_HEAD_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ] && [ -e "$PROVIDER_HEAD_MARKER" ]; then
+    count=$(cat "$PROVIDER_HEAD_COUNT" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$PROVIDER_HEAD_COUNT"
+    if [ "$count" -ge 2 ]; then
+        PR_HEAD_OID=new-hosted-head exec "$PROVIDER_HEAD_BASE_GH" "$@"
+    fi
+fi
+exec "$PROVIDER_HEAD_BASE_GH" "$@"
+STUB
+chmod +x "$PROVIDER_HEAD_STUBS/cp" "$PROVIDER_HEAD_STUBS/gh"
+rc=0
+PROVIDER_HEAD_OUT=$(env PATH="$PROVIDER_HEAD_STUBS:$STUB_DIR:$PATH" \
+    REPO_VISIBILITY=PRIVATE GH_PR_ENRICH_CODE_ACCESS=false \
+    CLAUDE_INVOKED_LOG="$CLAUDE_LOG" \
+    PROVIDER_HEAD_REPORT="$PROVIDER_HEAD_DIR" \
+    PROVIDER_HEAD_MARKER="$PROVIDER_HEAD_MARKER" \
+    PROVIDER_HEAD_COUNT="$PROVIDER_HEAD_COUNT" \
+    PROVIDER_HEAD_REAL_CP="$(command -v cp)" \
+    PROVIDER_HEAD_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" 1 --enrich --allow-external \
+    --output-dir "$PROVIDER_HEAD_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ "$(cat "$PROVIDER_HEAD_COUNT" \
+    2>/dev/null || echo 0)" -eq 2 ] && echo 0 || echo 1)" \
+    "provider attestation rejects a head advance on its second head read" \
+    "$PROVIDER_HEAD_OUT"
+assert_true "$([ ! -e "$PROVIDER_HEAD_DIR/claude-analysis.json" ] && \
+    [ ! -e "$PROVIDER_HEAD_DIR/claude-analysis.md" ] && \
+    [ ! -e "$PROVIDER_HEAD_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "second-head attestation drift publishes no provider or selected analysis"
+assert_no_selection_transaction_residue "$PROVIDER_HEAD_DIR" \
+    "second-head attestation drift cleans every publication transaction"
+
+# TERM sent to the top-level CLI while the provider's hosted attestation is
+# blocked must reach the managed provider transaction and its active API
+# descendant before any provider or selected view is published.
+PROVIDER_SIGNAL_DIR="$TEST_OUTPUT_DIR/provider-signal"
+PROVIDER_SIGNAL_STUBS="$TEST_OUTPUT_DIR/provider-signal-stubs"
+PROVIDER_SIGNAL_MARKER="$TEST_OUTPUT_DIR/provider-signal-staged"
+PROVIDER_SIGNAL_READY="$TEST_OUTPUT_DIR/provider-signal-ready"
+PROVIDER_SIGNAL_CHILD_PID_FILE="$TEST_OUTPUT_DIR/provider-signal-child-pid"
+PROVIDER_SIGNAL_DESCENDANT_PID_FILE="$TEST_OUTPUT_DIR/provider-signal-descendant-pid"
+PROVIDER_SIGNAL_LIVE_DIR_FILE="$TEST_OUTPUT_DIR/provider-signal-live-dir"
+PROVIDER_SIGNAL_LIVE_BASELINE_FILE="$TEST_OUTPUT_DIR/provider-signal-live-baseline"
+PROVIDER_SIGNAL_SOURCE_DIR_FILE="$TEST_OUTPUT_DIR/provider-signal-source-dir"
+PROVIDER_SIGNAL_BACKUP_DIR_FILE="$TEST_OUTPUT_DIR/provider-signal-backup-dir"
+PROVIDER_SIGNAL_OUT="$TEST_OUTPUT_DIR/provider-signal.out"
+mkdir -p "$PROVIDER_SIGNAL_STUBS"
+cat > "$PROVIDER_SIGNAL_STUBS/cp" << 'STUB'
+#!/bin/bash
+destination=""
+source_path=""
+for argument in "$@"; do destination="$argument"; done
+for argument in "$@"; do
+    case "$argument" in -*) continue ;; esac
+    source_path="$argument"
+    break
+done
+case "$destination" in
+    "$PROVIDER_SIGNAL_REPORT"/.selected-analysis-replacements.*/claude-analysis.json)
+        dirname "$source_path" > "$PROVIDER_SIGNAL_SOURCE_DIR_FILE"
+        : > "$PROVIDER_SIGNAL_MARKER"
+        ;;
+    "$PROVIDER_SIGNAL_REPORT"/.selected-analysis-replacements.*/combined-data.json)
+        case "$source_path" in
+            /tmp/gh-pr-enrich-provider-update.*/combined-data.json)
+                dirname "$source_path" > "$PROVIDER_SIGNAL_BACKUP_DIR_FILE"
+                ;;
+        esac
+        ;;
+esac
+exec "$PROVIDER_SIGNAL_REAL_CP" "$@"
+STUB
+cat > "$PROVIDER_SIGNAL_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1" = "api" ] && [ "$2" != "graphql" ] && \
+   [ -e "$PROVIDER_SIGNAL_MARKER" ]; then
+    case "$*" in
+        *repos/o/r/issues/1/comments*)
+            printf '%s\n' "$$" > "$PROVIDER_SIGNAL_CHILD_PID_FILE"
+            (
+                trap '' TERM INT
+                while :; do sleep 1; done
+            ) &
+            descendant_pid=$!
+            printf '%s\n' "$descendant_pid" \
+                > "$PROVIDER_SIGNAL_DESCENDANT_PID_FILE"
+            : > "$PROVIDER_SIGNAL_LIVE_DIR_FILE"
+            for live_dir in /tmp/gh-pr-enrich-live-discussion.*; do
+                [ -d "$live_dir" ] || continue
+                if ! grep -Fxq "$live_dir" \
+                        "$PROVIDER_SIGNAL_LIVE_BASELINE_FILE" 2>/dev/null; then
+                    printf '%s\n' "$live_dir" \
+                        > "$PROVIDER_SIGNAL_LIVE_DIR_FILE"
+                    break
+                fi
+            done
+            : > "$PROVIDER_SIGNAL_READY"
+            trap 'exit 143' TERM
+            trap 'exit 130' INT
+            wait "$descendant_pid"
+            exit $?
+            ;;
+    esac
+fi
+exec "$PROVIDER_SIGNAL_BASE_GH" "$@"
+STUB
+chmod +x "$PROVIDER_SIGNAL_STUBS/cp" "$PROVIDER_SIGNAL_STUBS/gh"
+find /tmp -maxdepth 1 -type d \
+    -name 'gh-pr-enrich-live-discussion.*' -print \
+    > "$PROVIDER_SIGNAL_LIVE_BASELINE_FILE"
+RUNTIME_BACKGROUND_PID=""
+env PATH="$PROVIDER_SIGNAL_STUBS:$STUB_DIR:$PATH" \
+    REPO_VISIBILITY=PRIVATE GH_PR_ENRICH_CODE_ACCESS=false \
+    CLAUDE_INVOKED_LOG="$CLAUDE_LOG" \
+    PROVIDER_SIGNAL_REPORT="$PROVIDER_SIGNAL_DIR" \
+    PROVIDER_SIGNAL_MARKER="$PROVIDER_SIGNAL_MARKER" \
+    PROVIDER_SIGNAL_READY="$PROVIDER_SIGNAL_READY" \
+    PROVIDER_SIGNAL_CHILD_PID_FILE="$PROVIDER_SIGNAL_CHILD_PID_FILE" \
+    PROVIDER_SIGNAL_DESCENDANT_PID_FILE="$PROVIDER_SIGNAL_DESCENDANT_PID_FILE" \
+    PROVIDER_SIGNAL_LIVE_DIR_FILE="$PROVIDER_SIGNAL_LIVE_DIR_FILE" \
+    PROVIDER_SIGNAL_LIVE_BASELINE_FILE="$PROVIDER_SIGNAL_LIVE_BASELINE_FILE" \
+    PROVIDER_SIGNAL_SOURCE_DIR_FILE="$PROVIDER_SIGNAL_SOURCE_DIR_FILE" \
+    PROVIDER_SIGNAL_BACKUP_DIR_FILE="$PROVIDER_SIGNAL_BACKUP_DIR_FILE" \
+    PROVIDER_SIGNAL_REAL_CP="$(command -v cp)" \
+    PROVIDER_SIGNAL_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" 1 --enrich --allow-external \
+    --output-dir "$PROVIDER_SIGNAL_DIR" \
+    > "$PROVIDER_SIGNAL_OUT" 2>&1 &
+RUNTIME_BACKGROUND_PID=$!
+for (( _provider_wait=0; _provider_wait < 200; _provider_wait++ )); do
+    [ -e "$PROVIDER_SIGNAL_READY" ] && break
+    kill -0 "$RUNTIME_BACKGROUND_PID" 2>/dev/null || break
+    sleep 0.05
+done
+assert_true "$([ -e "$PROVIDER_SIGNAL_READY" ] && echo 0 || echo 1)" \
+    "provider TERM fixture blocks inside final hosted attestation" \
+    "$(cat "$PROVIDER_SIGNAL_OUT" 2>/dev/null || true)"
+PROVIDER_SIGNAL_LIVE_DIR=$(cat "$PROVIDER_SIGNAL_LIVE_DIR_FILE" \
+    2>/dev/null || echo "")
+assert_true "$([ -n "$PROVIDER_SIGNAL_LIVE_DIR" ] && \
+    [ -d "$PROVIDER_SIGNAL_LIVE_DIR" ] && echo 0 || echo 1)" \
+    "provider TERM fixture captures its live-discussion staging directory"
+PROVIDER_SIGNAL_SOURCE_DIR=$(cat "$PROVIDER_SIGNAL_SOURCE_DIR_FILE" \
+    2>/dev/null || echo "")
+PROVIDER_SIGNAL_BACKUP_DIR=$(cat "$PROVIDER_SIGNAL_BACKUP_DIR_FILE" \
+    2>/dev/null || echo "")
+assert_true "$([ -n "$PROVIDER_SIGNAL_SOURCE_DIR" ] && \
+    [ -d "$PROVIDER_SIGNAL_SOURCE_DIR" ] && \
+    [ -n "$PROVIDER_SIGNAL_BACKUP_DIR" ] && \
+    [ -d "$PROVIDER_SIGNAL_BACKUP_DIR" ] && echo 0 || echo 1)" \
+    "provider TERM fixture captures its exact source and backup staging directories"
+PROVIDER_SIGNAL_TOP_PID="$RUNTIME_BACKGROUND_PID"
+kill -TERM "$PROVIDER_SIGNAL_TOP_PID" 2>/dev/null || true
+rc=0
+wait "$PROVIDER_SIGNAL_TOP_PID" || rc=$?
+RUNTIME_BACKGROUND_PID=""
+assert_eq "143" "$rc" \
+    "top-level TERM during provider attestation preserves the conventional status"
+PROVIDER_SIGNAL_CHILD_PID=$(cat "$PROVIDER_SIGNAL_CHILD_PID_FILE" 2>/dev/null || echo "")
+PROVIDER_SIGNAL_DESCENDANT_PID=$(cat \
+    "$PROVIDER_SIGNAL_DESCENDANT_PID_FILE" 2>/dev/null || echo "")
+assert_process_reaped "$PROVIDER_SIGNAL_CHILD_PID" \
+    "provider TERM reaps the active hosted-attestation child"
+assert_process_reaped "$PROVIDER_SIGNAL_DESCENDANT_PID" \
+    "provider TERM escalates and reaps a TERM-ignoring attestation descendant"
+assert_true "$([ ! -e "$PROVIDER_SIGNAL_DIR/claude-analysis.json" ] && \
+    [ ! -e "$PROVIDER_SIGNAL_DIR/claude-analysis.md" ] && \
+    [ ! -e "$PROVIDER_SIGNAL_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "provider TERM publishes no provider or selected analysis"
+assert_true "$([ ! -e "$PROVIDER_SIGNAL_LIVE_DIR" ] && echo 0 || echo 1)" \
+    "provider TERM removes the live-discussion staging directory"
+assert_true "$([ ! -e "$PROVIDER_SIGNAL_SOURCE_DIR" ] && \
+    [ ! -e "$PROVIDER_SIGNAL_BACKUP_DIR" ] && echo 0 || echo 1)" \
+    "provider TERM removes source and backup staging directories" \
+    "source: $PROVIDER_SIGNAL_SOURCE_DIR; backup: $PROVIDER_SIGNAL_BACKUP_DIR"
+assert_no_selection_transaction_residue "$PROVIDER_SIGNAL_DIR" \
+    "provider TERM cleans every lock and publication transaction"
 
 # Read-only freezing binds each copied file to the initial baseline, not merely
 # to a later live value. A coherent A->B->A swap during cp cannot return B while
@@ -2523,6 +2794,77 @@ assert_true "$([ ! -e "$SELECTION_REPORT/analysis.json" ] && echo 0 || echo 1)" 
     "late hosted-head drift invalidates stale selected artifacts"
 assert_no_selection_transaction_residue "$SELECTION_REPORT" \
     "late hosted-head rejection leaves no selection transaction residue"
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null)
+
+# Keep the hosted head fixed, but add an issue comment after private replacement
+# staging. The final discussion check must reject the candidate and invalidate
+# the now-stale prior selection.
+cp "$AUTHORIZED_CLAUDE_FIXTURE" "$SELECTION_REPORT/claude-analysis.json"
+printf '%s\n' '# Stale Claude provider report' \
+    > "$SELECTION_REPORT/claude-analysis.md"
+jq -n --slurpfile selected "$SELECTION_REPORT/analysis.json" \
+    --slurpfile provider "$AUTHORIZED_CLAUDE_FIXTURE" \
+    '{base:true, analysis:$selected[0], analysis_context_coverage:{},
+      claude_analysis:$provider[0]}' \
+    > "$SELECTION_REPORT/combined-data.json"
+LATE_DISCUSSION_STUBS="$TEST_OUTPUT_DIR/late-discussion-stubs"
+LATE_DISCUSSION_MARKER="$TEST_OUTPUT_DIR/late-discussion-fired"
+mkdir -p "$LATE_DISCUSSION_STUBS"
+cat > "$LATE_DISCUSSION_STUBS/cp" << 'STUB'
+#!/bin/bash
+destination=""
+for argument in "$@"; do destination="$argument"; done
+case "$destination" in
+    "$LATE_DISCUSSION_REPORT"/.selected-analysis-replacements.*/analysis.json)
+        : > "$LATE_DISCUSSION_MARKER"
+        ;;
+esac
+exec "$LATE_DISCUSSION_REAL_CP" "$@"
+STUB
+cat > "$LATE_DISCUSSION_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1" = "api" ] && [ "$2" != "graphql" ]; then
+    case "$*" in
+        *issues/o/r/issues/1/comments*|*repos/o/r/issues/1/comments*)
+            if [ -e "$LATE_DISCUSSION_MARKER" ]; then
+                cat << 'JSON'
+[{"id":99,"body":"new same-head comment","user":{"login":"reviewer"},"created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-99"}]
+JSON
+                exit 0
+            fi
+            ;;
+    esac
+fi
+exec "$LATE_DISCUSSION_BASE_GH" "$@"
+STUB
+chmod +x "$LATE_DISCUSSION_STUBS/cp" "$LATE_DISCUSSION_STUBS/gh"
+rc=0
+LATE_DISCUSSION_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$LATE_DISCUSSION_STUBS:$PATH" \
+    LATE_DISCUSSION_REPORT="$SELECTION_REPORT" \
+    LATE_DISCUSSION_MARKER="$LATE_DISCUSSION_MARKER" \
+    LATE_DISCUSSION_REAL_CP="$(command -v cp)" \
+    LATE_DISCUSSION_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$LATE_DISCUSSION_MARKER" ] && echo 0 || echo 1)" \
+    "selection detects same-head discussion drift after rendering begins" \
+    "$LATE_DISCUSSION_OUT"
+assert_contains "$LATE_DISCUSSION_OUT" "GitHub discussion state changed during selection" \
+    "late discussion rejection identifies the prepublication boundary"
+assert_true "$([ ! -e "$SELECTION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "late discussion drift invalidates stale selected artifacts"
+assert_true "$([ ! -e "$SELECTION_REPORT/claude-analysis.json" ] && \
+    [ ! -e "$SELECTION_REPORT/claude-analysis.md" ] && echo 0 || echo 1)" \
+    "late discussion drift invalidates stale provider artifacts"
+assert_jq "$SELECTION_REPORT/combined-data.json" \
+    '(has("analysis") | not) and
+     (has("analysis_context_coverage") | not) and
+     (has("claude_analysis") | not)' \
+    "late discussion drift removes every embedded stale analysis payload"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "late discussion rejection leaves no selection transaction residue"
 (cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
     "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null)
 
@@ -3434,7 +3776,7 @@ assert_jq "$TRUNCATION_POSITIVE_DIR/analysis.json" \
 CURRENT_REJECTED_DIR="$TEST_OUTPUT_DIR/current-rejected"
 mkdir -p "$CURRENT_REJECTED_DIR"
 cp "$AUTHORIZED_DIR/analysis-context.json" "$CURRENT_REJECTED_DIR/analysis-context.json"
-cp "$AUTHORIZED_DIR/claude-analysis.json" "$CURRENT_REJECTED_DIR/claude-analysis.json"
+cp "$AUTHORIZED_CLAUDE_FIXTURE" "$CURRENT_REJECTED_DIR/claude-analysis.json"
 rc=0
 "$GH_PR_ENRICH" --test-call select_analysis_file "$CURRENT_REJECTED_DIR" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
@@ -3443,7 +3785,7 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
 LEGACY_WITH_CONTEXT_DIR="$TEST_OUTPUT_DIR/legacy-with-current-context"
 mkdir -p "$LEGACY_WITH_CONTEXT_DIR"
 cp "$AUTHORIZED_DIR/analysis-context.json" "$LEGACY_WITH_CONTEXT_DIR/analysis-context.json"
-jq 'del(._metadata)' "$AUTHORIZED_DIR/claude-analysis.json" \
+jq 'del(._metadata)' "$AUTHORIZED_CLAUDE_FIXTURE" \
     > "$LEGACY_WITH_CONTEXT_DIR/claude-analysis.json"
 rc=0
 "$GH_PR_ENRICH" --test-call select_analysis_file "$LEGACY_WITH_CONTEXT_DIR" >/dev/null 2>&1 || rc=$?
@@ -3452,7 +3794,7 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
 
 LEGACY_READ_ONLY_DIR="$TEST_OUTPUT_DIR/legacy-read-only"
 mkdir -p "$LEGACY_READ_ONLY_DIR"
-jq 'del(._metadata)' "$AUTHORIZED_DIR/claude-analysis.json" \
+jq 'del(._metadata)' "$AUTHORIZED_CLAUDE_FIXTURE" \
     > "$LEGACY_READ_ONLY_DIR/claude-analysis.json"
 chmod 555 "$LEGACY_READ_ONLY_DIR"
 rc=0

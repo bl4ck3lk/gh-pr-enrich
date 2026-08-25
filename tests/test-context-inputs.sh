@@ -49,16 +49,16 @@ if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
         *) paginate=false ;;
     esac
     cat << 'PAGE1'
-{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":true,"endCursor":"CUR1"},"nodes":[
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"pageInfo":{"hasNextPage":true,"endCursor":"CUR1"},"nodes":[
   {"id":"PRRT_page1","isResolved":false,"isOutdated":false,"path":"src/a.js","line":10,
-   "comments":{"nodes":[{"id":"c1","databaseId":1,"body":"first page thread","author":{"login":"rev1"},"createdAt":"2026-01-01T00:00:00Z","url":"u1"}]}}
+   "comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"c1","databaseId":1,"body":"first page thread","author":{"login":"rev1"},"createdAt":"2026-01-01T00:00:00Z","url":"u1"}]}}
 ]}}}}}
 PAGE1
     if [ "$paginate" = true ]; then
         cat << 'PAGE2'
-{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
   {"id":"PRRT_page2","isResolved":false,"isOutdated":true,"path":"src/b.js","line":20,
-   "comments":{"nodes":[{"id":"c2","databaseId":2,"body":"second page thread","author":{"login":"rev2"},"createdAt":"2026-01-02T00:00:00Z","url":"u2"}]}}
+   "comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"c2","databaseId":2,"body":"second page thread","author":{"login":"rev2"},"createdAt":"2026-01-02T00:00:00Z","url":"u2"}]}}
 ]}}}}}
 PAGE2
     fi
@@ -82,6 +82,60 @@ assert_jq_eq "$THREADS" '[.data.repository.pullRequest.reviewThreads.nodes[]] | 
     "review threads from both pages are merged (pagination works)"
 assert_jq "$THREADS" '[.data.repository.pullRequest.reviewThreads.nodes[].id] | index("PRRT_page2") != null' \
     "thread from the second page is not dropped"
+
+# One live discussion identity spans several API requests. Two consecutive
+# complete snapshots must agree before the hosted state is considered stable.
+STABILITY_STUB_DIR="$TEST_OUTPUT_DIR/discussion-stability"
+STABILITY_COUNT="$TEST_OUTPUT_DIR/discussion-stability-count"
+mkdir -p "$STABILITY_STUB_DIR"
+cat > "$STABILITY_STUB_DIR/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "api graphql" ]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+    exit 0
+fi
+if [ "$1" = "api" ]; then
+    case "$*" in
+        *repos/o/r/issues/1/comments*)
+            count=$(cat "$STABILITY_COUNT" 2>/dev/null || echo 0)
+            count=$((count + 1))
+            printf '%s\n' "$count" > "$STABILITY_COUNT"
+            printf '[{"id":%s,"body":"state-%s","user":{"login":"u"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-%s"}]\n' \
+                "$count" "$count" "$count"
+            ;;
+        *) echo '[]' ;;
+    esac
+    exit 0
+fi
+exit 1
+STUB
+chmod +x "$STABILITY_STUB_DIR/gh"
+rc=0
+env STABILITY_COUNT="$STABILITY_COUNT" PATH="$STABILITY_STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call fetch_live_analysis_discussion_fingerprint \
+        o/r 1 >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a discussion mutation between composite snapshots fails revalidation"
+assert_eq "2" "$(cat "$STABILITY_COUNT")" \
+    "discussion revalidation requires two consecutive complete snapshots"
+
+# A terminal page whose unique node count does not match totalCount is partial,
+# even when GitHub reports hasNextPage=false.
+COUNT_MISMATCH_STUB_DIR="$TEST_OUTPUT_DIR/thread-count-mismatch"
+mkdir -p "$COUNT_MISMATCH_STUB_DIR"
+cat > "$COUNT_MISMATCH_STUB_DIR/gh" << 'STUB'
+#!/bin/bash
+echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PRRT_only","isResolved":false,"isOutdated":false,"comments":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}]}}}}}'
+STUB
+chmod +x "$COUNT_MISMATCH_STUB_DIR/gh"
+COUNT_MISMATCH_OUT="$TEST_OUTPUT_DIR/thread-count-mismatch.json"
+rc=0
+PATH="$COUNT_MISMATCH_STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call \
+    fetch_review_threads owner repo 1 "$COUNT_MISMATCH_OUT" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "thread pagination rejects a terminal page short of totalCount"
+assert_true "$([ ! -e "$COUNT_MISMATCH_OUT" ] && echo 0 || echo 1)" \
+    "incomplete thread pagination publishes no partial thread document"
 
 # ---------------------------------------------------------------------------
 # A failing fetch must not leave an empty file behind

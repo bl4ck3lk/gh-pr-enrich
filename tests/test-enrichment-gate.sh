@@ -54,7 +54,17 @@ if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
 fi
 if [ "$1" = "api" ]; then
     case "$*" in
-        *issues/*/comments*) cat "$FIXTURE_DIR/issue-comments.json" ;;
+        *issues/*/comments*)
+            if [ -n "${CLAUDE_DISCUSSION_DRIFT_MARKER:-}" ] && \
+               [ -e "$CLAUDE_DISCUSSION_DRIFT_MARKER" ]; then
+                jq '. + [{id:99,body:"new same-head comment",user:{login:"reviewer"},
+                    created_at:"2026-01-02T00:00:00Z",updated_at:"2026-01-02T00:00:00Z",
+                    html_url:"https://github.com/o/r/pull/1#issuecomment-99"}]' \
+                    "$FIXTURE_DIR/issue-comments.json"
+            else
+                cat "$FIXTURE_DIR/issue-comments.json"
+            fi
+            ;;
         *) echo '[]' ;;
     esac
     exit 0
@@ -68,6 +78,8 @@ cat > "$STUB_DIR/claude" << 'STUB'
 # Records that it ran, drains stdin, returns a minimal valid analysis.
 echo "invoked" >> "$CLAUDE_INVOKED_LOG"
 cat > /dev/null
+[ -z "${CLAUDE_DISCUSSION_DRIFT_MARKER:-}" ] || \
+    : > "$CLAUDE_DISCUSSION_DRIFT_MARKER"
 jq -nc '
   ["logic_error","boundary_condition","concurrency","error_handling","resource_lifecycle","security","secrets_exposure","data_integrity","api_contract","performance","test_gap","observability","maintainability","documentation","build_ci","dependency_risk"] as $categories
   | {structured_output:{issue_categories:[],
@@ -86,13 +98,13 @@ exec "$@"
 STUB
 chmod +x "$STUB_DIR/timeout"
 
-THREAD_JSON='{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+THREAD_JSON='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
   {"id":"PRRT_open","isResolved":false,"isOutdated":false,"path":"a.js","line":1,
-   "comments":{"nodes":[{"id":"c","databaseId":1,"body":"needs a guard","author":{"login":"rev"},"createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/1#discussion_r1"}]}}
+   "comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"c","databaseId":1,"body":"needs a guard","author":{"login":"rev"},"createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/1#discussion_r1"}]}}
 ]}}}}}'
-NO_THREADS='{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+NO_THREADS='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
 # Raw GitHub REST shape: the script maps .user.login itself.
-ONE_COMMENT='[{"id":1,"body":"CI failed on lint","user":{"login":"github-actions[bot]"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-1"}]'
+ONE_COMMENT='[{"id":1,"body":"CI failed on lint","user":null,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-1"}]'
 
 # Runs the real script end to end for one scenario.
 # $1 = scenario name, $2 = threads json, $3 = issue-comments json
@@ -114,6 +126,7 @@ run_scenario() {
 EOF
 
     env FIXTURE_DIR="$fixtures" CLAUDE_INVOKED_LOG="$TEST_OUTPUT_DIR/$name/claude-invoked.txt" \
+        CLAUDE_DISCUSSION_DRIFT_MARKER="${CLAUDE_DISCUSSION_DRIFT_MARKER:-}" \
         PATH="$STUB_DIR:$PATH" \
         "$GH_PR_ENRICH" 1 --enrich --diff --output-dir "$out" 2>&1 || true
 }
@@ -144,6 +157,23 @@ assert_jq "$TEST_OUTPUT_DIR/threads-only/report/analysis-context.json" '.coverag
 OUT=$(run_scenario "comments-only" "$NO_THREADS" "$ONE_COMMENT")
 assert_eq "yes" "$(claude_ran comments-only)" "an issue comment alone triggers the analysis"
 assert_contains "$OUT" "1 issue comment" "the script reports the issue comment it found"
+assert_jq "$TEST_OUTPUT_DIR/comments-only/report/issue-comments.json" \
+    '.[0].user == ""' \
+    "a deleted GitHub comment author is retained with an empty normalized identity"
+
+# A same-head discussion change while Claude is running invalidates the result.
+# The head remains abc123; only the issue-comment snapshot changes after the
+# analyzer has consumed its captured context.
+CLAUDE_DISCUSSION_DRIFT_MARKER="$TEST_OUTPUT_DIR/discussion-drift-fired"
+OUT=$(run_scenario "discussion-drift" "$NO_THREADS" "$ONE_COMMENT")
+assert_true "$([ -e "$CLAUDE_DISCUSSION_DRIFT_MARKER" ] && echo 0 || echo 1)" \
+    "the same-head drift fixture changes discussion state after Claude runs"
+assert_contains "$OUT" "discussion state changed" \
+    "same-head discussion drift rejects the Claude response"
+assert_true "$([ ! -e "$TEST_OUTPUT_DIR/discussion-drift/report/claude-analysis.json" ] && \
+    [ ! -e "$TEST_OUTPUT_DIR/discussion-drift/report/analysis.json" ] && echo 0 || echo 1)" \
+    "same-head discussion drift publishes no analyzer or selected artifact"
+unset CLAUDE_DISCUSSION_DRIFT_MARKER
 
 # Watch integration: the first poll simultaneously replaces an issue-comment
 # ID, adds another issue comment, and deletes an inline comment. Total comments
@@ -320,13 +350,13 @@ if [ "$1" = "api" ] && [ "$2" = "--paginate" ]; then
                 if [ "$watch_projection" = true ]; then
                     printf '101\n102\n'
                 else
-                    echo '[{"id":101,"body":"old","user":{"login":"u"}},{"id":102,"body":"keep","user":{"login":"u"}}]'
+                    echo '[{"id":101,"body":"old","user":{"login":"u"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-101"},{"id":102,"body":"keep","user":{"login":"u"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-102"}]'
                 fi
             else
                 if [ "$watch_projection" = true ]; then
                     printf '103\n102\n104\n'
                 else
-                    echo '[{"id":103,"body":"new","user":{"login":"u"}},{"id":102,"body":"keep","user":{"login":"u"}},{"id":104,"body":"added","user":{"login":"u"}}]'
+                    echo '[{"id":103,"body":"new","user":{"login":"u"},"created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-103"},{"id":102,"body":"keep","user":{"login":"u"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-102"},{"id":104,"body":"added","user":{"login":"u"},"created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-104"}]'
                 fi
             fi
             ;;
@@ -339,7 +369,10 @@ if [ "$1" = "api" ] && [ "$2" = "--paginate" ]; then
                     jq -nr 'range(1001; 1101)'
                 fi
             else
-                jq -nc '[range(1001; 1101) | {id: ., body:"common", user:{login:"u"}}]'
+                jq -nc '[range(1001; 1101) | {
+                    id: ., body:"common", user:{login:"u"}, state:"COMMENTED",
+                    submitted_at:"2026-01-01T00:00:00Z", commit_id:"abc123",
+                    html_url:("https://github.com/o/r/pull/1#pullrequestreview-" + tostring)}]'
             fi
             if [ "${WATCH_INCOMPLETE_BASE:-}" = "reviews" ]; then
                 exit 42
@@ -348,13 +381,13 @@ if [ "$1" = "api" ] && [ "$2" = "--paginate" ]; then
                 if [ "$watch_projection" = true ]; then
                     echo '1101'
                 else
-                    echo '[{"id":1101,"body":"old","user":{"login":"u"}}]'
+                    echo '[{"id":1101,"body":"old","user":{"login":"u"},"state":"COMMENTED","submitted_at":"2026-01-01T00:00:00Z","commit_id":"abc123","html_url":"https://github.com/o/r/pull/1#pullrequestreview-1101"}]'
                 fi
             else
                 if [ "$watch_projection" = true ]; then
                     echo '1102'
                 else
-                    echo '[{"id":1102,"body":"new","user":{"login":"u"}}]'
+                    echo '[{"id":1102,"body":"new","user":{"login":"u"},"state":"COMMENTED","submitted_at":"2026-01-02T00:00:00Z","commit_id":"abc123","html_url":"https://github.com/o/r/pull/1#pullrequestreview-1102"}]'
                 fi
             fi
             ;;

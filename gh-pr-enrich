@@ -95,6 +95,18 @@ sha256_file() {
     fi
 }
 
+sha256_stream() {
+    if command -v shasum > /dev/null 2>&1; then
+        shasum -a 256 | awk '{print $1}'
+    elif command -v sha256sum > /dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    elif command -v openssl > /dev/null 2>&1; then
+        openssl dgst -sha256 | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
 positive_integer_or_default() {
     local value="${1:-}" fallback="$2" maximum="${3:-2147483647}"
     local value_length=${#value} maximum_length=${#maximum}
@@ -747,6 +759,7 @@ write_input_status() {
 REPORT_RUN_CHILD_PID=""
 REPORT_RUN_CHILD_STARTING=false
 REPORT_RUN_CHILD_GROUP_OWNED=false
+REPORT_RUN_CHILD_SUPERVISOR=false
 REPORT_RUN_MANAGED=false
 REPORT_RUN_OWNER_PID=""
 REPORT_RUN_WATCHDOG_PID=""
@@ -776,6 +789,7 @@ run_report_command() {
     set +m
     REPORT_RUN_CHILD_PID="$command_pid"
     REPORT_RUN_CHILD_GROUP_OWNED="$command_group_owned"
+    REPORT_RUN_CHILD_SUPERVISOR=false
     REPORT_RUN_CHILD_STARTING=false
     if [ -n "${selected_writer_signal:-}" ]; then
         terminate_report_run_child
@@ -819,6 +833,7 @@ run_report_command() {
         if [ "$REPORT_RUN_CHILD_PID" = "$command_pid" ]; then
             REPORT_RUN_CHILD_PID=""
             REPORT_RUN_CHILD_GROUP_OWNED=false
+            REPORT_RUN_CHILD_SUPERVISOR=false
         fi
         REPORT_RUN_WATCHDOG_STATUS=0
         return 124
@@ -831,6 +846,7 @@ run_report_command() {
     if [ "$REPORT_RUN_CHILD_PID" = "$command_pid" ]; then
         REPORT_RUN_CHILD_PID=""
         REPORT_RUN_CHILD_GROUP_OWNED=false
+        REPORT_RUN_CHILD_SUPERVISOR=false
     fi
     return "$command_rc"
 }
@@ -848,7 +864,12 @@ stop_report_run_watchdog() {
 terminate_report_run_child() {
     local command_pid="$REPORT_RUN_CHILD_PID"
     local command_group_owned="$REPORT_RUN_CHILD_GROUP_OWNED"
-    local terminate_attempt=0
+    local command_supervisor="$REPORT_RUN_CHILD_SUPERVISOR"
+    local terminate_attempt=0 terminate_limit=20
+    # A provider supervisor must outlive the nested command's own watchdog,
+    # TERM grace, KILL/reap, and EXIT cleanup. Its longer bound is still finite
+    # but prevents the parent from killing the cleanup owner prematurely.
+    [ "$command_supervisor" != true ] || terminate_limit=100
     stop_report_run_watchdog
     if [ -z "$command_pid" ]; then
         return 0
@@ -858,7 +879,7 @@ terminate_report_run_child() {
     else
         kill -TERM "$command_pid" 2>/dev/null || true
     fi
-    while [ "$terminate_attempt" -lt 20 ]; do
+    while [ "$terminate_attempt" -lt "$terminate_limit" ]; do
         if [ "$command_group_owned" = true ]; then
             kill -0 -- "-$command_pid" 2>/dev/null || break
         else
@@ -879,6 +900,7 @@ terminate_report_run_child() {
     wait "$command_pid" 2>/dev/null || true
     REPORT_RUN_CHILD_PID=""
     REPORT_RUN_CHILD_GROUP_OWNED=false
+    REPORT_RUN_CHILD_SUPERVISOR=false
 }
 
 cleanup_report_run_temp_files() {
@@ -1344,6 +1366,7 @@ selected_analysis_replacement_identity() (
     local -a names=(
         analysis.json analysis.md context-coverage.md
         combined-data.json comprehensive-report.md
+        claude-analysis.json claude-analysis.md
     )
     [ -d "$replacement_dir" ] && [ ! -L "$replacement_dir" ] && \
         ! path_has_symlink_component "$replacement_dir" || return 1
@@ -1351,7 +1374,8 @@ selected_analysis_replacement_identity() (
         name="$(basename "$entry")"
         case "$name" in
             analysis.json|analysis.md|context-coverage.md|\
-            combined-data.json|comprehensive-report.md) ;;
+            combined-data.json|comprehensive-report.md|\
+            claude-analysis.json|claude-analysis.md) ;;
             *) return 1 ;;
         esac
         [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
@@ -1370,7 +1394,34 @@ selected_analysis_replacement_identity() (
     done
 )
 
-# Replace or delete the five selected-analysis views as one recoverable
+# Identity of the public analysis view set without rejecting unrelated report
+# inputs in the same directory. Used to make deferred invalidation conditional:
+# a fresh concurrent publication must never be deleted for an older mismatch.
+selected_analysis_live_identity() (
+    local report_dir="$1" name entry digest mode
+    local -a names=(
+        analysis.json analysis.md context-coverage.md
+        combined-data.json comprehensive-report.md
+        claude-analysis.json claude-analysis.md
+    )
+    [ -d "$report_dir" ] && [ ! -L "$report_dir" ] && \
+        ! path_has_symlink_component "$report_dir" || return 1
+    for name in "${names[@]}"; do
+        entry="$report_dir/$name"
+        if [ -e "$entry" ] || [ -L "$entry" ]; then
+            [ -f "$entry" ] && [ ! -L "$entry" ] && \
+                ! path_is_git_tracked "$entry" || return 1
+            digest="$(sha256_file "$entry" 2>/dev/null || echo "")"
+            mode="$(workspace_file_mode "$entry" 2>/dev/null || echo "")"
+            [ -n "$digest" ] && [ -n "$mode" ] || return 1
+            printf '%s\tfile\t%s\t%s\n' "$name" "$mode" "$digest"
+        else
+            printf '%s\tabsent\n' "$name"
+        fi
+    done
+)
+
+# Replace or delete the seven selected-analysis views as one recoverable
 # transaction. Live originals are atomically quarantined and verified against
 # the caller's capture. Hard-link publication and restoration fail rather than
 # clobbering a pathname that reappears at a boundary.
@@ -1385,6 +1436,7 @@ publish_selected_analysis_transaction() (
     local -a names=(
         analysis.json analysis.md context-coverage.md
         combined-data.json comprehensive-report.md
+        claude-analysis.json claude-analysis.md
     )
     current_replacement_identity="$(selected_analysis_replacement_identity \
         "$replacement_dir" 2>/dev/null || echo "")"
@@ -1576,7 +1628,8 @@ publish_selected_analysis_transaction() (
 )
 
 invalidate_selected_analysis() (
-    local report_dir="$1" invalidation_backup_dir="" replacement_dir=""
+    local report_dir="$1" expected_live_identity="${2:-}"
+    local invalidation_backup_dir="" replacement_dir=""
     local selected_lock_dir="" selected_lock_token="" selected_lock_owned=false
     local selected_writer_signal=""
     local publication_rc=0
@@ -1588,6 +1641,8 @@ invalidate_selected_analysis() (
         "$report_dir/context-coverage.md"
         "$report_dir/combined-data.json"
         "$report_dir/comprehensive-report.md"
+        "$report_dir/claude-analysis.json"
+        "$report_dir/claude-analysis.md"
     )
     cleanup_invalidation_temps() {
         [ -z "$invalidation_backup_dir" ] || \
@@ -1619,6 +1674,12 @@ invalidate_selected_analysis() (
     selected_lock_dir="$SELECTED_ANALYSIS_LOCK_DIR"
     selected_lock_token="$SELECTED_ANALYSIS_LOCK_TOKEN"
     selected_lock_owned="$SELECTED_ANALYSIS_LOCK_OWNED"
+    if [ -n "$expected_live_identity" ] && \
+       [ "$(selected_analysis_live_identity "$report_dir" 2>/dev/null || echo "")" != \
+         "$expected_live_identity" ]; then
+        echo "Error: Selected-analysis views changed before stale invalidation; the newer publication was preserved." >&2
+        return 1
+    fi
 
     # Capture every current view before deriving replacements. Rendering from
     # these verified backups ensures a source that changes before its own copy
@@ -1675,14 +1736,13 @@ invalidate_selected_analysis() (
 
     backup_file="$invalidation_backup_dir/combined-data.json"
     if [ -f "$backup_file" ]; then
-        if ! jq 'del(.analysis, .analysis_context_coverage)' \
+        if ! jq 'del(.analysis, .analysis_context_coverage, .claude_analysis)' \
                 "$backup_file" > "$replacement_dir/combined-data.json" 2>/dev/null; then
             return 1
         fi
         source_mode="$(workspace_file_mode "$backup_file")" || return 1
         chmod "$source_mode" "$replacement_dir/combined-data.json" || return 1
     fi
-
     # Close the render-phase TOCTOU window and verify that paths which were
     # absent when captured remain absent immediately before publication.
     validate_invalidation_artifacts || return 1
@@ -1864,7 +1924,7 @@ validate_output_directory_for_writes() {
 # screen or fake this tool's own prompts, misrepresenting what the user is
 # approving. Newlines and tabs are kept; every other control byte is dropped.
 sanitize_for_terminal() {
-    printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037\177'
+    printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177'
 }
 
 # The fingerprinted context is the grant. Later boundaries require the same
@@ -5771,6 +5831,7 @@ fetch_review_threads() {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $prNumber) {
           reviewThreads(first: 100, after: $endCursor) {
+            totalCount
             pageInfo { hasNextPage endCursor }
             nodes {
               id
@@ -5781,6 +5842,7 @@ fetch_review_threads() {
               originalLine
               diffSide
               comments(first: '"$THREAD_COMMENT_LIMIT"') {
+                totalCount
                 pageInfo { hasNextPage endCursor }
                 nodes {
                   id
@@ -5805,10 +5867,49 @@ fetch_review_threads() {
         rm -f "$pages_file"
         return 1
     fi
-    if [ ! -s "$pages_file" ] || ! jq -s -e '
-        length > 0 and all(.[];
+    if [ ! -s "$pages_file" ] || ! jq -s -e --argjson comment_limit \
+            "$THREAD_COMMENT_LIMIT" '
+        def threads: .data.repository.pullRequest.reviewThreads;
+        length > 0 and
+        all(.[];
             (((.errors // []) | length) == 0) and
-            ((.data.repository.pullRequest.reviewThreads.nodes | type) == "array"))
+            ((threads.nodes | type) == "array") and
+            ((threads.totalCount | type) == "number") and
+            (threads.totalCount >= 0) and
+            ((threads.pageInfo.hasNextPage | type) == "boolean") and
+            ((threads.pageInfo.endCursor | type) == "string" or
+                threads.pageInfo.endCursor == null) and
+            (if threads.pageInfo.hasNextPage then
+                ((threads.pageInfo.endCursor | type) == "string" and
+                    (threads.pageInfo.endCursor | length) > 0)
+             else true end) and
+            all(threads.nodes[];
+                (.id | type) == "string" and (.id | length) > 0 and
+                (.isResolved | type) == "boolean" and
+                (.isOutdated | type) == "boolean" and
+                (.comments.nodes | type) == "array" and
+                (.comments.totalCount | type) == "number" and
+                .comments.totalCount >= 0 and
+                (.comments.nodes | length) <= $comment_limit and
+                (.comments.nodes | length) <= .comments.totalCount and
+                ((.comments.pageInfo.hasNextPage | type) == "boolean") and
+                (if .comments.pageInfo.hasNextPage then
+                    .comments.totalCount > (.comments.nodes | length) and
+                    ((.comments.pageInfo.endCursor | type) == "string" and
+                        (.comments.pageInfo.endCursor | length) > 0)
+                 else .comments.totalCount == (.comments.nodes | length) end) and
+                ([.comments.nodes[].id] | length) ==
+                    ([.comments.nodes[].id] | unique | length))) and
+        ([.[].data.repository.pullRequest.reviewThreads.totalCount] | unique | length) == 1 and
+        ([.[].data.repository.pullRequest.reviewThreads.nodes[]] | map(.id) | length) ==
+            ([.[].data.repository.pullRequest.reviewThreads.nodes[]] | map(.id) | unique | length) and
+        ([.[].data.repository.pullRequest.reviewThreads.nodes[]] | length) ==
+            .[0].data.repository.pullRequest.reviewThreads.totalCount and
+        (.[-1].data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage == false) and
+        (if length > 1 then
+            all(.[0:-1][];
+                .data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage == true)
+         else true end)
     ' "$pages_file" > /dev/null 2>&1; then
         rm -f "$pages_file"
         return 1
@@ -5821,6 +5922,7 @@ fetch_review_threads() {
                 pullRequest: {
                     reviewThreads: {
                         nodes: (map(.data.repository.pullRequest.reviewThreads.nodes // []) | add // []),
+                        totalCount: .[0].data.repository.pullRequest.reviewThreads.totalCount,
                         pages_fetched: length
                     }
                 }
@@ -5830,6 +5932,346 @@ fetch_review_threads() {
     local rc=$?
     rm -f "$pages_file"
     return $rc
+}
+
+# Canonical identity for every GitHub discussion input supplied to an analyzer.
+# Arrays are treated as sets keyed by GitHub IDs so harmless API ordering does
+# not invalidate a result, while additions, edits, deletions, thread moves, and
+# resolution changes all do. Inline comments cover every review-thread reply,
+# including replies beyond the bounded thread excerpt supplied to the model.
+analysis_discussion_snapshot_from_files() {
+    local report_dir="$1"
+    local issue_file="$report_dir/issue-comments.json"
+    local review_file="$report_dir/review-comments.json"
+    local inline_file="$report_dir/inline-comments.json"
+    local threads_file="$report_dir/comment-threads.json"
+    local discussion_file
+
+    for discussion_file in "$issue_file" "$review_file" "$inline_file" "$threads_file"; do
+        [ -f "$discussion_file" ] && ! [ -L "$discussion_file" ] && \
+            jq -e . "$discussion_file" > /dev/null 2>&1 || return 1
+    done
+
+    jq -cS -n \
+        --slurpfile issue_doc "$issue_file" \
+        --slurpfile review_doc "$review_file" \
+        --slurpfile inline_doc "$inline_file" \
+        --slurpfile threads_doc "$threads_file" '
+        def text: if . == null then "" else tostring end;
+        def stable_sort: sort_by(.id);
+        ($issue_doc[0] // []) as $issues
+        | ($review_doc[0] // []) as $reviews
+        | ($inline_doc[0] // []) as $inline
+        | (($threads_doc[0].data.repository.pullRequest.reviewThreads.nodes // [])) as $threads
+        | if ($issues | type) != "array" or
+             ($reviews | type) != "array" or
+             ($inline | type) != "array" or
+             ($threads | type) != "array" or
+             any($issues[]; (.id | (type == "number" or type == "string") | not) or
+                 ((.id | tostring | length) == 0) or (.body | type) != "string") or
+             any($reviews[]; (.id | (type == "number" or type == "string") | not) or
+                 ((.id | tostring | length) == 0) or (.body | type) != "string") or
+             any($inline[]; (.id | (type == "number" or type == "string") | not) or
+                 ((.id | tostring | length) == 0) or (.body | type) != "string") or
+             ([$issues[].id | tostring] | length) !=
+                 ([$issues[].id | tostring] | unique | length) or
+             ([$reviews[].id | tostring] | length) !=
+                 ([$reviews[].id | tostring] | unique | length) or
+             ([$inline[].id | tostring] | length) !=
+                 ([$inline[].id | tostring] | unique | length) or
+             any($threads[];
+                 (.id | type) != "string" or (.id | length) == 0 or
+                 (.isResolved | type) != "boolean" or
+                 (.isOutdated | type) != "boolean" or
+                 (.comments.nodes | type) != "array" or
+                 any(.comments.nodes[];
+                     (.id | type) != "string" or (.id | length) == 0 or
+                     (.body | type) != "string") or
+                 ([.comments.nodes[].id] | length) !=
+                     ([.comments.nodes[].id] | unique | length)) or
+             ([$threads[].id] | length) != ([$threads[].id] | unique | length)
+          then error("discussion inputs have invalid shapes")
+          else {
+            issue_comments: ([$issues[] | {
+                id: (.id | text), body: (.body | text), user: (.user | text),
+                created_at: (.created_at | text), updated_at: (.updated_at | text),
+                html_url: (.html_url | text)
+            }] | stable_sort),
+            reviews: ([$reviews[] | {
+                id: (.id | text), body: (.body | text), user: (.user | text),
+                state: (.state | text), submitted_at: (.submitted_at | text),
+                commit_id: (.commit_id | text), html_url: (.html_url | text)
+            }] | stable_sort),
+            inline_comments: ([$inline[] | {
+                id: (.id | text), body: (.body | text), user: (.user | text),
+                path: (.path | text), position: (.position | text),
+                line: (.line | text), created_at: (.created_at | text),
+                updated_at: (.updated_at | text), html_url: (.html_url | text)
+            }] | stable_sort),
+            review_threads: ([$threads[] | {
+                id: (.id | text),
+                is_resolved: .isResolved,
+                is_outdated: .isOutdated,
+                path: (.path | text), line: (.line | text),
+                original_line: (.originalLine | text), diff_side: (.diffSide | text),
+                comments: ([((.comments.nodes // [])[]) | {
+                    id: (.id | text), database_id: (.databaseId | text),
+                    body: (.body | text), author: (.author.login | text),
+                    created_at: (.createdAt | text), last_edited_at: (.lastEditedAt | text),
+                    url: (.url | text)
+                }] | stable_sort)
+            }] | stable_sort)
+          }
+          end
+    '
+}
+
+analysis_discussion_fingerprint_from_files() {
+    local report_dir="$1" digest=""
+    digest="$(
+        set -o pipefail
+        analysis_discussion_snapshot_from_files "$report_dir" | sha256_stream
+    )" || return 1
+    [ -n "$digest" ] || return 1
+    printf '%s\n' "$digest"
+}
+
+LIVE_DISCUSSION_TEMP_DIR=""
+CURRENT_DISCUSSION_TEMP_FILE=""
+DISCUSSION_STABILITY_FIRST=""
+DISCUSSION_STABILITY_SECOND=""
+cleanup_live_analysis_discussion_temps() {
+    case "$LIVE_DISCUSSION_TEMP_DIR" in
+        /tmp/gh-pr-enrich-live-discussion.*)
+            rm -rf "$LIVE_DISCUSSION_TEMP_DIR" 2>/dev/null || true
+            ;;
+    esac
+    case "$CURRENT_DISCUSSION_TEMP_FILE" in
+        /tmp/gh-pr-enrich-current-discussion.*)
+            rm -f "$CURRENT_DISCUSSION_TEMP_FILE" 2>/dev/null || true
+            ;;
+    esac
+    case "$DISCUSSION_STABILITY_FIRST" in
+        /tmp/gh-pr-enrich-discussion-stability.*)
+            rm -f "$DISCUSSION_STABILITY_FIRST" 2>/dev/null || true
+            ;;
+    esac
+    case "$DISCUSSION_STABILITY_SECOND" in
+        /tmp/gh-pr-enrich-discussion-stability.*)
+            rm -f "$DISCUSSION_STABILITY_SECOND" 2>/dev/null || true
+            ;;
+    esac
+    LIVE_DISCUSSION_TEMP_DIR=""
+    CURRENT_DISCUSSION_TEMP_FILE=""
+    DISCUSSION_STABILITY_FIRST=""
+    DISCUSSION_STABILITY_SECOND=""
+}
+
+# Re-fetch the same normalized inputs used by the original collection. The
+# temporary snapshot stays outside the report directory so an untrusted branch
+# cannot preplant any of its paths or observe a partially collected identity.
+fetch_live_analysis_discussion_fingerprint_once() {
+    local repository="$1" pr_number="$2"
+    local owner="${repository%%/*}" repo_name="${repository#*/}"
+    local live_dir pages_file fingerprint=""
+    [ -n "$owner" ] && [ -n "$repo_name" ] && [ "$owner" != "$repo_name" ] || return 1
+    live_dir="$(mktemp -d "/tmp/gh-pr-enrich-live-discussion.XXXXXX")" || return 1
+    LIVE_DISCUSSION_TEMP_DIR="$live_dir"
+    chmod 700 "$live_dir" || {
+        rmdir "$live_dir" 2>/dev/null || true
+        LIVE_DISCUSSION_TEMP_DIR=""
+        return 1
+    }
+
+    pages_file="$live_dir/issue-comments.pages"
+    run_report_command gh api --paginate \
+        "repos/$repository/issues/$pr_number/comments" > "$pages_file" 2>/dev/null && \
+        jq -s 'if length > 0 and all(.[]; type == "array")
+            then (add // []) else error("invalid issue-comment pagination") end
+            | if all(.[];
+                type == "object" and
+                (.id | type == "number" and . > 0) and
+                (.body | type == "string") and
+                (has("user") and
+                    (.user == null or (.user.login | type) == "string")) and
+                (.created_at | type == "string") and
+                (.updated_at | type == "string") and
+                (.html_url | type == "string")) then .
+              else error("invalid issue-comment item") end | map({
+                id: .id, body: .body, user: (.user.login // ""),
+                created_at: .created_at, updated_at: .updated_at,
+                type: "issue_comment", html_url: .html_url
+            })' "$pages_file" > "$live_dir/issue-comments.json" 2>/dev/null || {
+        rm -rf "$live_dir"
+        LIVE_DISCUSSION_TEMP_DIR=""
+        return 1
+    }
+
+    pages_file="$live_dir/review-comments.pages"
+    run_report_command gh api --paginate \
+        "repos/$repository/pulls/$pr_number/reviews" > "$pages_file" 2>/dev/null && \
+        jq -s 'if length > 0 and all(.[]; type == "array")
+            then (add // []) else error("invalid review pagination") end
+            | if all(.[];
+                type == "object" and
+                (.id | type == "number" and . > 0) and
+                (.body | type == "string") and
+                (has("user") and
+                    (.user == null or (.user.login | type) == "string")) and
+                (.state | type == "string") and
+                ((.submitted_at | type) == "string" or .submitted_at == null) and
+                (.commit_id | type == "string") and
+                (.html_url | type == "string")) then .
+              else error("invalid review item") end | map({
+                id: .id, body: .body, user: (.user.login // ""),
+                state: .state, submitted_at: .submitted_at,
+                type: "review_comment", commit_id: .commit_id,
+                html_url: .html_url
+            })' "$pages_file" > "$live_dir/review-comments.json" 2>/dev/null || {
+        rm -rf "$live_dir"
+        LIVE_DISCUSSION_TEMP_DIR=""
+        return 1
+    }
+
+    pages_file="$live_dir/inline-comments.pages"
+    run_report_command gh api --paginate \
+        "repos/$repository/pulls/$pr_number/comments" > "$pages_file" 2>/dev/null && \
+        jq -s 'if length > 0 and all(.[]; type == "array")
+            then (add // []) else error("invalid inline-comment pagination") end
+            | if all(.[];
+                type == "object" and
+                (.id | type == "number" and . > 0) and
+                (.body | type == "string") and
+                (.path | type == "string") and
+                ((.position | type) == "number" or .position == null) and
+                ((.original_line | type) == "number" or .original_line == null) and
+                (has("user") and
+                    (.user == null or (.user.login | type) == "string")) and
+                (.created_at | type == "string") and
+                (.updated_at | type == "string") and
+                (.html_url | type == "string")) then .
+              else error("invalid inline-comment item") end | map({
+                id: .id, body: .body, path: .path,
+                position: .position, line: .original_line,
+                user: (.user.login // ""), created_at: .created_at,
+                updated_at: .updated_at, type: "inline_comment",
+                html_url: .html_url
+            })' "$pages_file" > "$live_dir/inline-comments.json" 2>/dev/null || {
+        rm -rf "$live_dir"
+        LIVE_DISCUSSION_TEMP_DIR=""
+        return 1
+    }
+
+    fetch_review_threads "$owner" "$repo_name" "$pr_number" \
+        "$live_dir/comment-threads.json" || {
+        rm -rf "$live_dir"
+        LIVE_DISCUSSION_TEMP_DIR=""
+        return 1
+    }
+    fingerprint="$(analysis_discussion_fingerprint_from_files \
+        "$live_dir" 2>/dev/null || echo "")"
+    rm -rf "$live_dir"
+    LIVE_DISCUSSION_TEMP_DIR=""
+    [ -n "$fingerprint" ] || return 1
+    printf '%s\n' "$fingerprint"
+}
+
+# A discussion snapshot is assembled from four independently paginated API
+# surfaces. Require two consecutive complete snapshots to agree so a mutation
+# between requests cannot be accepted as one coherent hosted state.
+fetch_live_analysis_discussion_fingerprint() {
+    local repository="$1" pr_number="$2" fingerprint=""
+    DISCUSSION_STABILITY_FIRST="$(mktemp \
+        "/tmp/gh-pr-enrich-discussion-stability.XXXXXX")" || return 1
+    DISCUSSION_STABILITY_SECOND="$(mktemp \
+        "/tmp/gh-pr-enrich-discussion-stability.XXXXXX")" || {
+        rm -f "$DISCUSSION_STABILITY_FIRST"
+        DISCUSSION_STABILITY_FIRST=""
+        return 1
+    }
+    if ! fetch_live_analysis_discussion_fingerprint_once \
+            "$repository" "$pr_number" > "$DISCUSSION_STABILITY_FIRST" || \
+       ! fetch_live_analysis_discussion_fingerprint_once \
+            "$repository" "$pr_number" > "$DISCUSSION_STABILITY_SECOND" || \
+       ! cmp -s "$DISCUSSION_STABILITY_FIRST" "$DISCUSSION_STABILITY_SECOND"; then
+        rm -f "$DISCUSSION_STABILITY_FIRST" "$DISCUSSION_STABILITY_SECOND"
+        DISCUSSION_STABILITY_FIRST=""
+        DISCUSSION_STABILITY_SECOND=""
+        return 1
+    fi
+    fingerprint="$(cat "$DISCUSSION_STABILITY_FIRST" 2>/dev/null || echo "")"
+    rm -f "$DISCUSSION_STABILITY_FIRST" "$DISCUSSION_STABILITY_SECOND"
+    DISCUSSION_STABILITY_FIRST=""
+    DISCUSSION_STABILITY_SECOND=""
+    [ -n "$fingerprint" ] || return 1
+    printf '%s\n' "$fingerprint"
+}
+
+DISCUSSION_VERIFICATION_STATUS="unavailable"
+verify_analysis_discussion_unchanged() {
+    local context_file="$1"
+    local expected repository pr_number current current_file
+    DISCUSSION_VERIFICATION_STATUS="unavailable"
+    expected="$(jq -r '.coverage.discussion.fingerprint // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    repository="$(jq -r '.pr.repository // ""' "$context_file" 2>/dev/null || echo "")"
+    pr_number="$(jq -r '.pr.number // ""' "$context_file" 2>/dev/null || echo "")"
+    if [ -z "$expected" ] || [ -z "$repository" ] || [ -z "$pr_number" ]; then
+        echo "Error: Analysis context is missing its captured discussion identity." >&2
+        return 1
+    fi
+    current_file="$(mktemp "/tmp/gh-pr-enrich-current-discussion.XXXXXX")" || return 1
+    CURRENT_DISCUSSION_TEMP_FILE="$current_file"
+    if fetch_live_analysis_discussion_fingerprint \
+            "$repository" "$pr_number" > "$current_file" 2>/dev/null; then
+        current="$(cat "$current_file" 2>/dev/null || echo "")"
+    else
+        current=""
+    fi
+    rm -f "$current_file"
+    CURRENT_DISCUSSION_TEMP_FILE=""
+    if [ -z "$current" ]; then
+        echo "Error: Current GitHub discussion state could not be revalidated." >&2
+        return 1
+    fi
+    if [ "$current" != "$expected" ]; then
+        DISCUSSION_VERIFICATION_STATUS="mismatch"
+        echo "Error: GitHub discussion state changed after analysis inputs were captured." >&2
+        return 1
+    fi
+    DISCUSSION_VERIFICATION_STATUS="unchanged"
+}
+
+# Treat the hosted head and complete discussion snapshot as one final
+# attestation. The head is checked on both sides of the stabilized discussion
+# read, and callers perform every local validation before invoking this helper.
+# Nothing except signal handling and the atomic rename transaction may follow.
+HOSTED_ATTESTATION_COMPONENT=""
+verify_analysis_hosted_attestation() {
+    local context_file="$1"
+    local expected_head repository pr_number first_head expected_discussion
+    HOSTED_ATTESTATION_COMPONENT="head"
+    expected_head="$(jq -r '.pr.head_sha // .coverage.code_access.pr_head_sha // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    repository="$(jq -r '.pr.repository // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    pr_number="$(jq -r '.pr.number // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    expected_discussion="$(jq -r '.coverage.discussion.fingerprint // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    [ -n "$expected_head" ] && [ -n "$repository" ] && \
+        [ -n "$pr_number" ] && [ -n "$expected_discussion" ] || return 1
+    verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
+    first_head="$CURRENT_HOSTED_HEAD"
+    HOSTED_ATTESTATION_COMPONENT="discussion"
+    verify_analysis_discussion_unchanged "$context_file" || return 1
+    HOSTED_ATTESTATION_COMPONENT="head"
+    verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
+    [ "$CURRENT_HOSTED_HEAD" = "$first_head" ] || {
+        HOSTED_HEAD_VERIFICATION_STATUS="mismatch"
+        return 1
+    }
+    HOSTED_ATTESTATION_COMPONENT=""
 }
 
 # Fetch the issues this PR closes, for the intent the diff cannot show.
@@ -6121,6 +6563,10 @@ build_analysis_context() (
     if [ ! -f "$output_dir/inline-comments.json" ]; then
         echo '[]' > "$output_dir/inline-comments.json"
     fi
+    if [ ! -f "$output_dir/comment-threads.json" ]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pages_fetched":0}}}}}' \
+            > "$output_dir/comment-threads.json"
+    fi
 
     # The main CLI records each remote fetch explicitly. Direct callers from
     # older versions have no status files, so preserve compatibility without
@@ -6286,6 +6732,23 @@ build_analysis_context() (
         fi
     fi
 
+    local discussion_fingerprint=""
+    if jq -e -n \
+        --slurpfile issue_status "$output_dir/issue-comments-status.json" \
+        --slurpfile review_status "$output_dir/review-comments-status.json" \
+        --slurpfile inline_status "$output_dir/inline-comments-status.json" \
+        --slurpfile threads_status "$output_dir/review-threads-status.json" '
+        [$issue_status[0], $review_status[0], $inline_status[0], $threads_status[0]]
+        | all(.[]; .requested == true and .status == "completed")
+    ' > /dev/null 2>&1; then
+        discussion_fingerprint="$(analysis_discussion_fingerprint_from_files \
+            "$output_dir" 2>/dev/null || echo "")"
+        if [ -z "$discussion_fingerprint" ]; then
+            echo "Error: Complete GitHub discussion inputs could not be fingerprinted." >&2
+            return 1
+        fi
+    fi
+
     # One jq program builds the whole context. The coverage block records what was
     # dropped or shortened, so a truncated input can never read as a complete one.
     jq -n \
@@ -6315,6 +6778,7 @@ build_analysis_context() (
         --arg access_state "$access_state" \
         --arg access_reason "$access_reason" \
         --arg workspace_fingerprint "$workspace_fingerprint" \
+        --arg discussion_fingerprint "$discussion_fingerprint" \
         --arg repository "$repository" \
         --argjson thread_comment_limit "$THREAD_COMMENT_LIMIT" \
         '
@@ -6402,6 +6866,10 @@ build_analysis_context() (
                     revision_matches: ($pr_head_sha != "" and $pr_head_sha == $local_head),
                     workspace_fingerprint: (if $workspace_fingerprint == ""
                         then null else $workspace_fingerprint end)
+                },
+                discussion: {
+                    fingerprint: (if $discussion_fingerprint == ""
+                        then null else $discussion_fingerprint end)
                 },
                 issue_comments: {
                     total: ($raw | length),
@@ -7530,6 +7998,7 @@ select_analysis_artifact() {
     local live_context_file="$report_dir/analysis-context.json"
     local frozen_source frozen_context frozen_path frozen_abs report_abs repo_root
     local captured_context_fingerprint rc=0
+    local stale_selected_identity=""
     local source_digest="" source_mode="" frozen_digest="" frozen_mode=""
     local live_digest="" live_mode=""
     if path_has_symlink_component "$report_dir" || [ -L "$source_file" ] || \
@@ -7539,6 +8008,11 @@ select_analysis_artifact() {
         echo "Error: Refusing unsafe analysis source artifact: $source_file" >&2
         return 1
     fi
+    # Bind deferred invalidation to the views that existed before this stale
+    # selection began. A newer publication that lands while inputs are frozen
+    # must never become the invalidation target.
+    stale_selected_identity="$(selected_analysis_live_identity \
+        "$report_dir" 2>/dev/null || echo "")"
     source_digest="$(sha256_file "$source_file" 2>/dev/null || echo "")"
     source_mode="$(workspace_file_mode "$source_file" 2>/dev/null || echo "")"
     [ -n "$source_digest" ] && [ -n "$source_mode" ] || return 1
@@ -7590,6 +8064,12 @@ select_analysis_artifact() {
     _select_analysis_artifact "$report_dir" "$frozen_source" "$frozen_context" \
         "$captured_context_fingerprint" || rc=$?
     rm -f "$frozen_source" "$frozen_context"
+    if [ "$rc" -eq 42 ]; then
+        [ -n "$stale_selected_identity" ] || return 1
+        invalidate_selected_analysis "$report_dir" \
+            "$stale_selected_identity" || return 1
+        return 1
+    fi
     return "$rc"
 }
 
@@ -7608,6 +8088,7 @@ _select_analysis_artifact() (
     local replacement_identity="" current_replacement_identity=""
     cleanup_selection_transaction() {
         terminate_report_run_child
+        cleanup_live_analysis_discussion_temps
         REPORT_RUN_MANAGED=false
         REPORT_RUN_OWNER_PID=""
         [ -z "$selection_backup_dir" ] || \
@@ -7643,7 +8124,8 @@ _select_analysis_artifact() (
     for guarded_path in "$context_file" "$live_context_file" "$report_dir/pr-summary.json" \
             "$source_file" "$selected_file" \
             "$report_dir/analysis.md" "$report_dir/context-coverage.md" \
-            "$report_dir/combined-data.json" "$report_dir/comprehensive-report.md"; do
+            "$report_dir/combined-data.json" "$report_dir/comprehensive-report.md" \
+            "$report_dir/claude-analysis.json" "$report_dir/claude-analysis.md"; do
         if [ -L "$guarded_path" ] || path_is_git_tracked "$guarded_path"; then
             echo "Error: Refusing tracked or symlinked analysis artifact: $guarded_path" >&2
             return 1
@@ -7849,6 +8331,19 @@ _select_analysis_artifact() (
         fi
         return 1
     fi
+    if ! verify_analysis_discussion_unchanged "$context_file"; then
+        case "$selected_writer_signal" in
+            INT) return 130 ;;
+            TERM) return 143 ;;
+        esac
+        if [ "$DISCUSSION_VERIFICATION_STATUS" = "mismatch" ]; then
+            echo "Error: GitHub discussion state changed before selection; stale selected artifacts will be invalidated. Rebuild the analysis context." >&2
+            return 42
+        else
+            echo "Error: GitHub discussion state could not be revalidated before selection; prior selected artifacts were preserved." >&2
+        fi
+        return 1
+    fi
     if ! validate_selected_workspace "$report_dir" "$source_file" "$context_file"; then
         echo "Error: Selected analysis contains confirmed findings without enabled repository code access in a current matching fingerprinted context." >&2
         return 1
@@ -7872,6 +8367,8 @@ _select_analysis_artifact() (
         "$report_dir/context-coverage.md"
         "$report_dir/combined-data.json"
         "$report_dir/comprehensive-report.md"
+        "$report_dir/claude-analysis.json"
+        "$report_dir/claude-analysis.md"
     )
     for selection_artifact in "${selection_artifacts[@]}"; do
         [ -f "$selection_artifact" ] || continue
@@ -7946,6 +8443,12 @@ _select_analysis_artifact() (
         chmod "$source_mode" "$replacement_dir/$selection_artifact" || return 1
     done
 
+    for selection_artifact in claude-analysis.json claude-analysis.md; do
+        [ ! -f "$selection_backup_dir/$selection_artifact" ] || \
+            cp -p "$selection_backup_dir/$selection_artifact" \
+                "$replacement_dir/$selection_artifact" || return 1
+    done
+
     local live_context_fingerprint live_embedded_fingerprint
     live_context_fingerprint="$(analysis_context_fingerprint \
         "$live_context_file" 2>/dev/null || echo "")"
@@ -8002,6 +8505,27 @@ _select_analysis_artifact() (
         "$replacement_dir" 2>/dev/null || echo "")"
     if [ "$current_replacement_identity" != "$replacement_identity" ]; then
         echo "Error: Staged selected-analysis views changed before publication; prior selected artifacts were preserved." >&2
+        return 1
+    fi
+    if ! verify_analysis_hosted_attestation "$context_file"; then
+        case "$selected_writer_signal" in
+            INT) return 130 ;;
+            TERM) return 143 ;;
+        esac
+        if [ "$HOSTED_ATTESTATION_COMPONENT" = "discussion" ] && \
+           [ "$DISCUSSION_VERIFICATION_STATUS" = "mismatch" ]; then
+            echo "Error: GitHub discussion state changed during selection; no selected artifacts were published and stale selected artifacts will be invalidated. Rebuild the analysis context." >&2
+            return 42
+        elif [ "$HOSTED_ATTESTATION_COMPONENT" = "head" ]; then
+            invalidate_on_confirmed_hosted_head_mismatch "$report_dir" || return 1
+            if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
+                echo "Error: Hosted PR head changed during final hosted-state attestation; no selected artifacts were published (expected $context_head, found $CURRENT_HOSTED_HEAD). Rebuild the analysis context." >&2
+            else
+                echo "Error: Hosted PR head could not be revalidated during final hosted-state attestation; prior selected artifacts were preserved." >&2
+            fi
+        else
+            echo "Error: GitHub discussion state could not be revalidated during selection; prior selected artifacts were preserved." >&2
+        fi
         return 1
     fi
     if [ -n "$selected_writer_signal" ]; then
@@ -8216,7 +8740,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues verify_pr_head_unchanged validate_output_directory_for_writes"
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues verify_pr_head_unchanged validate_output_directory_for_writes"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in
@@ -8254,6 +8778,7 @@ RUN_LOCK_ACQUIRING=false
 RUN_LOCK_PENDING_SIGNAL=""
 RUN_LOCK_PENDING_EXIT_CODE=""
 cleanup_report_run_lock() {
+    cleanup_live_analysis_discussion_temps
     if [ "$RUN_LOCK_OWNED" = true ]; then
         if ! cleanup_report_run_temp_files; then
             echo "Error: Report pagination staging remains after cleanup in $OUTPUT_DIR." >&2
@@ -8333,10 +8858,21 @@ echo "Fetching all comments..."
 ISSUE_COMMENTS_PAGES="$OUTPUT_DIR/issue-comments.pages"
 if run_report_command gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
         > "$ISSUE_COMMENTS_PAGES" 2>/dev/null && \
-   jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
+   jq -s 'if length > 0 and all(.[]; type == "array")
+        then (add // []) else error("invalid issue-comment pagination") end
+      | if all(.[];
+            type == "object" and
+            (.id | type == "number" and . > 0) and
+            (.body | type == "string") and
+            (has("user") and
+                (.user == null or (.user.login | type) == "string")) and
+            (.created_at | type == "string") and
+            (.updated_at | type == "string") and
+            (.html_url | type == "string")) then .
+        else error("invalid issue-comment item") end | map({
         id: .id,
-        body: (.body // ""),
-        user: .user.login,
+        body: .body,
+        user: (.user.login // ""),
         created_at: .created_at,
         updated_at: .updated_at,
         type: "issue_comment",
@@ -8355,10 +8891,22 @@ rm -f "$ISSUE_COMMENTS_PAGES" "$OUTPUT_DIR/issue-comments.tmp.json"
 REVIEW_COMMENTS_PAGES="$OUTPUT_DIR/review-comments.pages"
 if run_report_command gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
         > "$REVIEW_COMMENTS_PAGES" 2>/dev/null && \
-   jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
+   jq -s 'if length > 0 and all(.[]; type == "array")
+        then (add // []) else error("invalid review pagination") end
+      | if all(.[];
+            type == "object" and
+            (.id | type == "number" and . > 0) and
+            (.body | type == "string") and
+            (has("user") and
+                (.user == null or (.user.login | type) == "string")) and
+            (.state | type == "string") and
+            ((.submitted_at | type) == "string" or .submitted_at == null) and
+            (.commit_id | type == "string") and
+            (.html_url | type == "string")) then .
+        else error("invalid review item") end | map({
         id: .id,
-        body: (.body // ""),
-        user: .user.login,
+        body: .body,
+        user: (.user.login // ""),
         state: .state,
         submitted_at: .submitted_at,
         type: "review_comment",
@@ -8378,13 +8926,27 @@ rm -f "$REVIEW_COMMENTS_PAGES" "$OUTPUT_DIR/review-comments.tmp.json"
 INLINE_COMMENTS_PAGES="$OUTPUT_DIR/inline-comments.pages"
 if run_report_command gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/comments" \
         > "$INLINE_COMMENTS_PAGES" 2>/dev/null && \
-   jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
+   jq -s 'if length > 0 and all(.[]; type == "array")
+        then (add // []) else error("invalid inline-comment pagination") end
+      | if all(.[];
+            type == "object" and
+            (.id | type == "number" and . > 0) and
+            (.body | type == "string") and
+            (.path | type == "string") and
+            ((.position | type) == "number" or .position == null) and
+            ((.original_line | type) == "number" or .original_line == null) and
+            (has("user") and
+                (.user == null or (.user.login | type) == "string")) and
+            (.created_at | type == "string") and
+            (.updated_at | type == "string") and
+            (.html_url | type == "string")) then .
+        else error("invalid inline-comment item") end | map({
         id: .id,
-        body: (.body // ""),
+        body: .body,
         path: .path,
         position: .position,
         line: .original_line,
-        user: .user.login,
+        user: (.user.login // ""),
         created_at: .created_at,
         updated_at: .updated_at,
         type: "inline_comment",
@@ -8576,7 +9138,8 @@ BASE_REPLACEMENT_DIR="$(mktemp -d \
     "$OUTPUT_DIR/.selected-analysis-replacements.XXXXXX")"
 chmod 700 "$BASE_REPLACEMENT_DIR"
 for BASE_VIEW in analysis.json analysis.md context-coverage.md \
-        combined-data.json comprehensive-report.md; do
+        combined-data.json comprehensive-report.md \
+        claude-analysis.json claude-analysis.md; do
     [ ! -f "$OUTPUT_DIR/$BASE_VIEW" ] || \
         cp -p "$OUTPUT_DIR/$BASE_VIEW" "$BASE_BACKUP_DIR/$BASE_VIEW"
 done
@@ -8735,6 +9298,13 @@ if [ "$REFRESH_EXISTING_ANALYSIS" = true ] || [ "$PREPARE_ANALYSIS" = true ] || 
         exit 1
     fi
     build_analysis_context "$OUTPUT_DIR" "$INCLUDE_DIFF" "$RUN_SAST" "$REPO"
+    if jq -e '.coverage.discussion.fingerprint | type == "string" and length > 0' \
+            "$OUTPUT_DIR/analysis-context.json" > /dev/null 2>&1 && \
+       ! verify_analysis_discussion_unchanged "$OUTPUT_DIR/analysis-context.json"; then
+        echo "Error: GitHub discussion state changed or could not be revalidated while analysis inputs were collected." >&2
+        echo "Re-run to collect one coherent snapshot." >&2
+        exit 1
+    fi
 fi
 
 # 9. Optional external Claude enrichment
@@ -8754,14 +9324,11 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                 echo "⚠️  PR head changed or could not be revalidated during Claude analysis; the response was not published." >&2
                 [ -z "$CURRENT_HOSTED_HEAD" ] || \
                     echo "   Expected $CAPTURED_PR_HEAD, now $CURRENT_HOSTED_HEAD. Re-run the analysis." >&2
+            elif ! verify_analysis_discussion_unchanged \
+                    "$OUTPUT_DIR/analysis-context.json"; then
+                echo "⚠️  GitHub discussion state changed or could not be revalidated during Claude analysis; the response was not published." >&2
+                echo "   Re-run the analysis against the current comments and review threads." >&2
             elif jq -e '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" > /dev/null 2>&1; then
-                jq '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" \
-                    > "$OUTPUT_DIR/claude-analysis.raw.tmp.json"
-                write_claude_analysis_artifact "$OUTPUT_DIR/claude-analysis.raw.tmp.json" \
-                    "$OUTPUT_DIR/claude-analysis.json" "$REPOSITORY_VISIBILITY" \
-                    "$CLAUDE_CAPTURED_PR_HEAD" "$CLAUDE_CAPTURED_CONTEXT_FINGERPRINT" \
-                    "$CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT"
-                rm -f "$OUTPUT_DIR/claude-analysis.raw.tmp.json"
                 ANALYSIS_USABLE=true
             else
                 # The CLI exited cleanly but returned no structured output. Copying
@@ -8773,17 +9340,28 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
             fi
 
             if [ "$ANALYSIS_USABLE" = true ]; then
-                generate_analysis_report "$OUTPUT_DIR/claude-analysis.json" "$OUTPUT_DIR/claude-analysis.md"
-
+                PROVIDER_TRANSACTION_RC=0
+                REPORT_RUN_CHILD_STARTING=true
+                set -m
                 (
+                PROVIDER_SOURCE_DIR=""
                 PROVIDER_BACKUP_DIR=""
                 PROVIDER_REPLACEMENT_DIR=""
                 PROVIDER_LOCK_DIR=""
                 PROVIDER_LOCK_TOKEN=""
                 PROVIDER_LOCK_OWNED=false
                 PROVIDER_WRITER_SIGNAL=""
+                selected_writer_signal=""
                 PROVIDER_PUBLICATION_RC=0
+                PROVIDER_CONTEXT_FINGERPRINT=""
+                PROVIDER_EMBEDDED_FINGERPRINT=""
                 cleanup_provider_combined_writer() {
+                    terminate_report_run_child
+                    cleanup_live_analysis_discussion_temps
+                    REPORT_RUN_MANAGED=false
+                    REPORT_RUN_OWNER_PID=""
+                    [ -z "$PROVIDER_SOURCE_DIR" ] || \
+                        rm -rf "$PROVIDER_SOURCE_DIR" 2>/dev/null || true
                     [ -z "$PROVIDER_BACKUP_DIR" ] || \
                         rm -rf "$PROVIDER_BACKUP_DIR" 2>/dev/null || true
                     [ -z "$PROVIDER_REPLACEMENT_DIR" ] || \
@@ -8795,9 +9373,33 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                         fi
                     fi
                 }
+                handle_provider_writer_signal() {
+                    PROVIDER_WRITER_SIGNAL="$1"
+                    selected_writer_signal="$1"
+                    terminate_report_run_child
+                }
                 trap cleanup_provider_combined_writer EXIT
-                trap 'PROVIDER_WRITER_SIGNAL=INT' INT
-                trap 'PROVIDER_WRITER_SIGNAL=TERM' TERM
+                trap 'handle_provider_writer_signal INT' INT
+                trap 'handle_provider_writer_signal TERM' TERM
+                selected_analysis_worker_pid || exit 1
+                REPORT_RUN_OWNER_PID="$SELECTED_ANALYSIS_WORKER_PID"
+                REPORT_RUN_MANAGED=true
+                PROVIDER_SOURCE_DIR="$(mktemp -d \
+                    "/tmp/gh-pr-enrich-provider-source.XXXXXX")" || exit 1
+                chmod 700 "$PROVIDER_SOURCE_DIR" || exit 1
+                jq '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" \
+                    > "$PROVIDER_SOURCE_DIR/claude-analysis.raw.json" || exit 1
+                write_claude_analysis_artifact \
+                    "$PROVIDER_SOURCE_DIR/claude-analysis.raw.json" \
+                    "$PROVIDER_SOURCE_DIR/claude-analysis.json" \
+                    "$REPOSITORY_VISIBILITY" "$CLAUDE_CAPTURED_PR_HEAD" \
+                    "$CLAUDE_CAPTURED_CONTEXT_FINGERPRINT" \
+                    "$CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT" || exit 1
+                rm -f "$PROVIDER_SOURCE_DIR/claude-analysis.raw.json"
+                generate_analysis_report \
+                    "$PROVIDER_SOURCE_DIR/claude-analysis.json" \
+                    "$PROVIDER_SOURCE_DIR/claude-analysis.md" || exit 1
+
                 acquire_selected_analysis_lock "$OUTPUT_DIR"
                 PROVIDER_LOCK_DIR="$SELECTED_ANALYSIS_LOCK_DIR"
                 PROVIDER_LOCK_TOKEN="$SELECTED_ANALYSIS_LOCK_TOKEN"
@@ -8808,7 +9410,8 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                     "$OUTPUT_DIR/.selected-analysis-replacements.XXXXXX")"
                 chmod 700 "$PROVIDER_REPLACEMENT_DIR"
                 for PROVIDER_VIEW in analysis.json analysis.md context-coverage.md \
-                        combined-data.json comprehensive-report.md; do
+                        combined-data.json comprehensive-report.md \
+                        claude-analysis.json claude-analysis.md; do
                     [ ! -f "$OUTPUT_DIR/$PROVIDER_VIEW" ] || \
                         cp -p "$OUTPUT_DIR/$PROVIDER_VIEW" \
                             "$PROVIDER_BACKUP_DIR/$PROVIDER_VIEW"
@@ -8816,7 +9419,13 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                         cp -p "$PROVIDER_BACKUP_DIR/$PROVIDER_VIEW" \
                             "$PROVIDER_REPLACEMENT_DIR/$PROVIDER_VIEW"
                 done
-                jq --slurpfile provider_analysis "$OUTPUT_DIR/claude-analysis.json" \
+                cp -p "$PROVIDER_SOURCE_DIR/claude-analysis.json" \
+                    "$PROVIDER_REPLACEMENT_DIR/claude-analysis.json" || exit 1
+                cp -p "$PROVIDER_SOURCE_DIR/claude-analysis.md" \
+                    "$PROVIDER_REPLACEMENT_DIR/claude-analysis.md" || exit 1
+                [ -f "$PROVIDER_BACKUP_DIR/combined-data.json" ] || exit 1
+                jq --slurpfile provider_analysis \
+                   "$PROVIDER_SOURCE_DIR/claude-analysis.json" \
                    '.claude_analysis = $provider_analysis[0]' \
                    "$PROVIDER_BACKUP_DIR/combined-data.json" \
                    > "$PROVIDER_REPLACEMENT_DIR/combined-data.json"
@@ -8824,6 +9433,28 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                     "$PROVIDER_BACKUP_DIR/combined-data.json")"
                 chmod "$PROVIDER_MODE" \
                     "$PROVIDER_REPLACEMENT_DIR/combined-data.json"
+
+                PROVIDER_CONTEXT_FINGERPRINT="$(analysis_context_fingerprint \
+                    "$OUTPUT_DIR/analysis-context.json" 2>/dev/null || echo "")"
+                PROVIDER_EMBEDDED_FINGERPRINT="$(jq -r \
+                    '.coverage.context_fingerprint // ""' \
+                    "$OUTPUT_DIR/analysis-context.json" 2>/dev/null || echo "")"
+                if [ -z "$PROVIDER_CONTEXT_FINGERPRINT" ] || \
+                   [ "$PROVIDER_CONTEXT_FINGERPRINT" != \
+                     "$CLAUDE_CAPTURED_CONTEXT_FINGERPRINT" ] || \
+                   [ "$PROVIDER_EMBEDDED_FINGERPRINT" != \
+                     "$CLAUDE_CAPTURED_CONTEXT_FINGERPRINT" ]; then
+                    echo "Error: Analysis context changed before provider publication." >&2
+                    exit 1
+                fi
+                if [ "$(jq -r '.coverage.code_access.state // "disabled"' \
+                        "$OUTPUT_DIR/analysis-context.json")" = "enabled" ] && \
+                   ! validate_code_access_grant \
+                        "$OUTPUT_DIR/analysis-context.json" "$OUTPUT_DIR" \
+                        "$PROVIDER_REPLACEMENT_DIR"; then
+                    echo "Error: Local workspace changed before provider publication." >&2
+                    exit 1
+                fi
                 if [ -n "$PROVIDER_WRITER_SIGNAL" ]; then
                     echo "Error: Cancellation arrived during provider update." >&2
                     case "$PROVIDER_WRITER_SIGNAL" in
@@ -8834,6 +9465,21 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                 PROVIDER_REPLACEMENT_IDENTITY="$(selected_analysis_replacement_identity \
                     "$PROVIDER_REPLACEMENT_DIR" 2>/dev/null || echo "")"
                 [ -n "$PROVIDER_REPLACEMENT_IDENTITY" ] || exit 1
+                if ! verify_analysis_hosted_attestation \
+                        "$OUTPUT_DIR/analysis-context.json"; then
+                    [ "$HOSTED_ATTESTATION_COMPONENT" != "head" ] || \
+                        invalidate_on_confirmed_hosted_head_mismatch \
+                            "$OUTPUT_DIR" || true
+                    echo "Error: Hosted PR head and discussion could not be attested before provider publication." >&2
+                    exit 1
+                fi
+                if [ -n "$PROVIDER_WRITER_SIGNAL" ]; then
+                    echo "Error: Cancellation arrived before provider publication." >&2
+                    case "$PROVIDER_WRITER_SIGNAL" in
+                        INT) exit 130 ;;
+                        TERM) exit 143 ;;
+                    esac
+                fi
                 publish_selected_analysis_transaction \
                     "$OUTPUT_DIR" "$PROVIDER_BACKUP_DIR" \
                     "$PROVIDER_REPLACEMENT_DIR" \
@@ -8854,7 +9500,29 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                     INT) exit 130 ;;
                     TERM) exit 143 ;;
                 esac
-                )
+                ) &
+                PROVIDER_TRANSACTION_PID=$!
+                if kill -0 -- "-$PROVIDER_TRANSACTION_PID" 2>/dev/null; then
+                    REPORT_RUN_CHILD_GROUP_OWNED=true
+                else
+                    REPORT_RUN_CHILD_GROUP_OWNED=false
+                fi
+                set +m
+                REPORT_RUN_CHILD_PID="$PROVIDER_TRANSACTION_PID"
+                REPORT_RUN_CHILD_SUPERVISOR=true
+                REPORT_RUN_CHILD_STARTING=false
+                if [ -n "$RUN_LOCK_PENDING_SIGNAL" ]; then
+                    handle_report_run_signal "$RUN_LOCK_PENDING_SIGNAL" \
+                        "$RUN_LOCK_PENDING_EXIT_CODE"
+                fi
+                wait "$PROVIDER_TRANSACTION_PID" || PROVIDER_TRANSACTION_RC=$?
+                if [ "$REPORT_RUN_CHILD_PID" = "$PROVIDER_TRANSACTION_PID" ]; then
+                    REPORT_RUN_CHILD_PID=""
+                    REPORT_RUN_CHILD_GROUP_OWNED=false
+                    REPORT_RUN_CHILD_SUPERVISOR=false
+                fi
+                [ "$PROVIDER_TRANSACTION_RC" -eq 0 ] || \
+                    exit "$PROVIDER_TRANSACTION_RC"
 
                 # The prompt requires a verdict for every category. The schema cannot
                 # express "all 16 present", so it is checked here — an incomplete

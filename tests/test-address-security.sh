@@ -297,7 +297,7 @@ run_address_with_task() {
 #  is a real escape byte once jq -r decodes it.
 HOSTILE_TASK=$(jq -n '{
     priority: "high[2J[H",
-    task: "Harmless looking[31m FAKE PROMPT: [y]es to grant admin",
+    task: "Harmless looking[31m FAKE PROMPT: [y]es to grant admin\rCARRIAGE RETURN PAYLOAD",
     thread_ids: [],
     file: "a.js", line: 1,
     suggested_fix: "fix[1;32m",
@@ -321,6 +321,14 @@ else
 fi
 
 assert_contains "$TERM_OUT" "FAKE PROMPT" "the task text itself is still shown to the user"
+if printf '%s' "$TERM_OUT" | grep -q $'\r'; then
+    fail "carriage returns in analyzer output are neutralized" \
+        "a raw carriage return reached the terminal"
+else
+    pass "carriage returns in analyzer output are neutralized"
+fi
+assert_contains "$TERM_OUT" "CARRIAGE RETURN PAYLOAD" \
+    "printable task text after a carriage return is retained"
 
 # A current, provenance-valid selected artifact must still satisfy the task to
 # confirmed-finding relationship at consumption time. Local replacement of a
