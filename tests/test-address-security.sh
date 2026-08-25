@@ -39,7 +39,12 @@ cat > "$STUB_DIR/gh" << 'STUB'
 #!/bin/bash
 case "$1 $2" in
     "pr view")
-        if [ "${GH_HEAD_MODE:-}" = "advance_after_mutation" ] && \
+        if [ -n "${GH_WORKSPACE_MUTATION:-}" ]; then
+            printf 'changed during hosted verification\n' >> "$GH_WORKSPACE_MUTATION"
+            echo '{"headRefOid":"captured-head"}'
+        elif [ "${GH_HEAD_MODE:-}" = "captured" ]; then
+            echo '{"headRefOid":"captured-head"}'
+        elif [ "${GH_HEAD_MODE:-}" = "advance_after_mutation" ] && \
            [ ! -s "$GH_MUTATIONS_LOG" ]; then
             echo '{"headRefOid":"captured-head"}'
         else
@@ -48,6 +53,61 @@ case "$1 $2" in
         exit 0
         ;;
     "api graphql")
+        case "$*" in
+            *"unresolveReviewThread"*)
+                for arg in "$@"; do
+                    case "$arg" in
+                        threadId=*)
+                            printf 'unresolve:%s\n' "${arg#threadId=}" >> "$GH_MUTATIONS_LOG"
+                            ;;
+                    esac
+                done
+                echo '{"data":{"unresolveReviewThread":{"thread":{"isResolved":false}}}}'
+                exit 0
+                ;;
+            *"resolveReviewThread"*)
+                for arg in "$@"; do
+                    case "$arg" in
+                        threadId=*) printf '%s\n' "$arg" >> "$GH_MUTATIONS_LOG" ;;
+                    esac
+                done
+                if [ "${GH_RESOLVE_MODE:-}" = "applied_nonzero" ]; then
+                    echo 'transport failed after apply' >&2
+                    exit 1
+                fi
+                if [ "${GH_RESOLVE_MODE:-}" = "applied_malformed" ]; then
+                    echo 'not-json-after-apply'
+                    exit 0
+                fi
+                echo '{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}'
+                exit 0
+                ;;
+            *"PullRequestReviewThread"*)
+                thread_id=""
+                for arg in "$@"; do
+                    case "$arg" in threadId=*) thread_id="${arg#threadId=}" ;; esac
+                done
+                resolved=false
+                comments='[]'
+                has_next_page=false
+                [ "${GH_LIVE_INCOMPLETE:-}" != true ] || has_next_page=true
+                if [ -n "${GH_MUTATIONS_LOG:-}" ] && \
+                   grep -q "^threadId=$thread_id$" "$GH_MUTATIONS_LOG" 2>/dev/null && \
+                   ! grep -q "^unresolve:$thread_id$" "$GH_MUTATIONS_LOG" 2>/dev/null; then
+                    resolved=true
+                    if [ "${GH_REPLY_AFTER_MUTATION:-}" = true ]; then
+                        comments='[{"id":"PRRC_reply","databaseId":2,"author":{"login":"reviewer"},"createdAt":"2026-01-02T00:00:00Z","lastEditedAt":null,"url":"https://github.com/o/r/pull/999#discussion_r2"}]'
+                    fi
+                fi
+                jq -n --arg thread_id "$thread_id" --argjson resolved "$resolved" \
+                    --argjson has_next_page "$has_next_page" \
+                    --argjson comments "$comments" '{data:{node:{
+                        __typename:"PullRequestReviewThread",id:$thread_id,
+                        isResolved:$resolved,comments:{pageInfo:{
+                            hasNextPage:$has_next_page,endCursor:null},nodes:$comments}}}}'
+                exit 0
+                ;;
+        esac
         for arg in "$@"; do
             case "$arg" in
                 threadId=*) printf '%s\n' "$arg" >> "$GH_MUTATIONS_LOG" ;;
@@ -60,6 +120,36 @@ esac
 exit 1
 STUB
 chmod +x "$STUB_DIR/gh"
+
+# Give address a current provider-neutral selection. Strict mutation consumers
+# no longer accept metadata-less legacy reports, even for task display.
+write_current_selection() {
+    local ws="$1"
+    local source_file="$2"
+    local thread_id="${3:-}"
+    local report_dir="$ws/.reports/pr-reviews/pr-999"
+    local context_file="$report_dir/analysis-context.json"
+    local context_fingerprint
+
+    jq -n --arg tid "$thread_id" '{
+        pr: {repository:"o/r", number:999},
+        unresolved_threads: (if ($tid | test("^PRRT_[A-Za-z0-9_-]+$"))
+            then [{thread_id:$tid,comments_complete:true,comment_identity:[]}]
+            else [] end),
+        coverage: {code_access:{state:"disabled", pr_head_sha:"captured-head"}}
+    }' > "$context_file"
+    context_fingerprint=$("$GH_PR_ENRICH" --test-call \
+        analysis_context_fingerprint "$context_file")
+    jq --arg fingerprint "$context_fingerprint" \
+        '.coverage.context_fingerprint = $fingerprint' "$context_file" \
+        > "$context_file.tmp"
+    mv "$context_file.tmp" "$context_file"
+    jq --arg fingerprint "$context_fingerprint" '. + {_metadata:{
+        provider:"claude", repository:"o/r", pr_number:999,
+        pr_head_sha:"captured-head", context_fingerprint:$fingerprint
+    }}' "$source_file" > "$report_dir/analysis.json"
+    rm -f "$source_file"
+}
 
 # Build a workspace with a hostile analysis file and run `address` in it.
 # $1 = thread id planted in analysis.json
@@ -82,6 +172,9 @@ run_address() {
         }],
         process_improvements: [], pr_template_suggestions: []
     }' > "$ws/.reports/pr-reviews/pr-999/claude-analysis.json"
+
+    write_current_selection "$ws" \
+        "$ws/.reports/pr-reviews/pr-999/claude-analysis.json" "$thread_id"
 
     jq -n --arg url "$planted_url" '{
         data: {repository: {pullRequest: {reviewThreads: {nodes: [
@@ -108,7 +201,7 @@ OPENED=$(cat "$OPENED_LOG" 2>/dev/null || echo "")
 
 assert_not_contains "$OPENED" "evil.example" "a jq-breakout thread id cannot open an attacker URL"
 assert_not_contains "$OPENED" "GH_TOKEN" "environment variables cannot be exfiltrated through the URL"
-assert_contains "$OUT" "thread ID" "the malformed thread id is reported to the user"
+assert_contains "$OUT" "Analysis not found" "the malformed thread id is rejected before task display"
 
 # A plain quote is enough to corrupt the program even without a payload.
 OUT=$(run_address 'PRRT_abc" or "1"=="1')
@@ -152,6 +245,8 @@ run_address_with_task() {
         systemic_issues: [], adjacent_problems: [], task_list: [$task],
         process_improvements: [], pr_template_suggestions: []
     }' > "$ws/.reports/pr-reviews/pr-999/claude-analysis.json"
+    write_current_selection "$ws" \
+        "$ws/.reports/pr-reviews/pr-999/claude-analysis.json"
     echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}' \
         > "$ws/.reports/pr-reviews/pr-999/comment-threads.json"
 
@@ -255,6 +350,10 @@ STALE_MUTATION_REPORT="$STALE_MUTATION_WS/.reports/pr-reviews/pr-999"
 MUTATION_LOG="$STALE_MUTATION_WS/mutations.log"
 mkdir -p "$STALE_MUTATION_REPORT"
 jq -n '{pr:{repository:"o/r",number:999},
+    unresolved_threads:[
+        {thread_id:"PRRT_stale",comments_complete:true,comment_identity:[]},
+        {thread_id:"PRRT_first",comments_complete:true,comment_identity:[]},
+        {thread_id:"PRRT_second",comments_complete:true,comment_identity:[]}],
     coverage:{code_access:{pr_head_sha:"captured-head"}}}' \
     > "$STALE_MUTATION_REPORT/analysis-context.tmp.json"
 STALE_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
@@ -268,6 +367,18 @@ jq -n --arg fingerprint "$STALE_FINGERPRINT" '{
     _metadata:{provider:"codex",repository:"o/r",pr_number:999,
         pr_head_sha:"captured-head",context_fingerprint:$fingerprint}
 }' > "$STALE_MUTATION_REPORT/analysis.json"
+STALE_BATCH_TEMPLATE="$TEST_OUTPUT_DIR/stale-batch-analysis.json"
+cp "$STALE_MUTATION_REPORT/analysis.json" "$STALE_BATCH_TEMPLATE"
+: > "$MUTATION_LOG"
+INCOMPLETE_THREAD_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_LIVE_INCOMPLETE=true \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1) || true)
+assert_contains "$INCOMPLETE_THREAD_OUT" "could not be fetched completely" \
+    "address rejects a live discussion whose complete comments were not fetched"
+assert_eq "" "$(cat "$MUTATION_LOG")" \
+    "an incomplete live discussion sends no resolution mutation"
+cp "$STALE_BATCH_TEMPLATE" "$STALE_MUTATION_REPORT/analysis.json"
 : > "$MUTATION_LOG"
 STALE_MUTATION_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
     env GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
@@ -290,11 +401,179 @@ jq -n --arg fingerprint "$STALE_FINGERPRINT" '{
 BATCH_MUTATION_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
     env GH_HEAD_MODE=advance_after_mutation GH_MUTATIONS_LOG="$MUTATION_LOG" \
     PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" address 999 2>&1) || true)
-assert_contains "$BATCH_MUTATION_OUT" "Resolved: PRRT_first" \
-    "address may resolve the first thread while the captured head is current"
-assert_contains "$BATCH_MUTATION_OUT" "Hosted PR head changed" \
-    "address revalidates the hosted head before every mutation in a task"
-assert_eq "1" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
-    "a mid-batch PR push blocks all later thread mutations"
+assert_contains "$BATCH_MUTATION_OUT" "reopened PRRT_first" \
+    "a head change during mutation compensates by reopening the thread"
+assert_not_contains "$BATCH_MUTATION_OUT" "Resolved: PRRT_first" \
+    "a compensated head-race resolution is not reported as successful"
+assert_eq "2" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
+    "a head race sends one resolve and one compensating unresolve mutation"
+assert_not_contains "$(cat "$MUTATION_LOG")" "PRRT_second" \
+    "a head race blocks all later thread mutations"
+
+# The hosted-head read is itself a trust boundary. If the local tree changes
+# during that read, the final workspace check must reject the selected result
+# before resolveReviewThread is sent.
+LOCAL_MUTATION_WS="$TEST_OUTPUT_DIR/ws-local-mutation"
+LOCAL_MUTATION_REPORT="$LOCAL_MUTATION_WS/.reports/pr-reviews/pr-999"
+LOCAL_MUTATION_CONTEXT_TMP="$TEST_OUTPUT_DIR/local-mutation-context.tmp.json"
+LOCAL_MUTATION_LOG="$TEST_OUTPUT_DIR/local-mutation.log"
+mkdir -p "$LOCAL_MUTATION_WS"
+(cd "$LOCAL_MUTATION_WS" && git init -q . && git config user.email t@t && \
+    git config user.name t)
+printf 'stable\n' > "$LOCAL_MUTATION_WS/base.txt"
+(cd "$LOCAL_MUTATION_WS" && git add base.txt && git commit -qm init)
+mkdir -p "$LOCAL_MUTATION_REPORT"
+LOCAL_WORKSPACE_FINGERPRINT=$(cd "$LOCAL_MUTATION_WS" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint \
+        .reports/pr-reviews/pr-999)
+jq -n --arg workspace_fingerprint "$LOCAL_WORKSPACE_FINGERPRINT" \
+    '{pr:{repository:"o/r",number:999},
+    unresolved_threads:[{thread_id:"PRRT_local",comments_complete:true,
+        comment_identity:[]}],coverage:{code_access:{
+        state:"enabled",pr_head_sha:"captured-head",
+        workspace_fingerprint:$workspace_fingerprint}}}' \
+    > "$LOCAL_MUTATION_CONTEXT_TMP"
+LOCAL_CONTEXT_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+    "$LOCAL_MUTATION_CONTEXT_TMP")
+jq --arg fingerprint "$LOCAL_CONTEXT_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$LOCAL_MUTATION_CONTEXT_TMP" > "$LOCAL_MUTATION_REPORT/analysis-context.json"
+jq -n --arg fingerprint "$LOCAL_CONTEXT_FINGERPRINT" \
+    --arg workspace_fingerprint "$LOCAL_WORKSPACE_FINGERPRINT" '{
+    issue_categories:[{name:"correctness",severity:"high",verdict:"confirmed"}],
+    task_list:[{priority:"high",task:"LOCAL MUTATION TASK",
+        thread_ids:["PRRT_local"],file:"base.txt",line:1,
+        suggested_fix:"fix",verification:"test"}],
+    _metadata:{provider:"codex",repository:"o/r",pr_number:999,
+        pr_head_sha:"captured-head",context_fingerprint:$fingerprint,
+        workspace_fingerprint:$workspace_fingerprint}
+}' > "$LOCAL_MUTATION_REPORT/analysis.json"
+LOCAL_CONTEXT_TEMPLATE="$TEST_OUTPUT_DIR/local-context-template.json"
+LOCAL_ANALYSIS_TEMPLATE="$TEST_OUTPUT_DIR/local-analysis-template.json"
+cp "$LOCAL_MUTATION_REPORT/analysis-context.json" "$LOCAL_CONTEXT_TEMPLATE"
+cp "$LOCAL_MUTATION_REPORT/analysis.json" "$LOCAL_ANALYSIS_TEMPLATE"
+: > "$LOCAL_MUTATION_LOG"
+LOCAL_MUTATION_OUT=$(printf 'f' | (cd "$LOCAL_MUTATION_WS" && \
+    env GH_WORKSPACE_MUTATION="$LOCAL_MUTATION_WS/base.txt" \
+    GH_MUTATIONS_LOG="$LOCAL_MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1) || true)
+assert_contains "$LOCAL_MUTATION_OUT" "State changed during resolution" \
+    "address detects a workspace mutation during final hosted-head verification"
+assert_contains "$(cat "$LOCAL_MUTATION_LOG")" "threadId=PRRT_local" \
+    "a mutation occurring inside the final head check is detected post-resolution"
+assert_contains "$(cat "$LOCAL_MUTATION_LOG")" "unresolve:PRRT_local" \
+    "a last-moment workspace mutation is compensated by reopening the thread"
+assert_true "$([ ! -e "$LOCAL_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "a last-moment workspace mutation invalidates the selected artifact"
+
+# A same-head reply posted while resolveReviewThread is in flight is concurrent
+# reviewer-owned state. Invalidate locally, but never overwrite it by reopening.
+git -C "$LOCAL_MUTATION_WS" checkout -- base.txt
+cp "$LOCAL_CONTEXT_TEMPLATE" "$LOCAL_MUTATION_REPORT/analysis-context.json"
+cp "$LOCAL_ANALYSIS_TEMPLATE" "$LOCAL_MUTATION_REPORT/analysis.json"
+: > "$LOCAL_MUTATION_LOG"
+SAME_HEAD_REPLY_OUT=$(printf 'f' | (cd "$LOCAL_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_REPLY_AFTER_MUTATION=true \
+    GH_MUTATIONS_LOG="$LOCAL_MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1) || true)
+assert_contains "$SAME_HEAD_REPLY_OUT" "reviewer-owned state changed" \
+    "a same-head reply during mutation requires manual reconciliation"
+assert_not_contains "$(cat "$LOCAL_MUTATION_LOG")" "unresolve:PRRT_local" \
+    "same-head discussion drift does not overwrite concurrent reviewer state"
+assert_not_contains "$SAME_HEAD_REPLY_OUT" "Resolved: PRRT_local" \
+    "same-head discussion drift is not reported as successful resolution"
+
+# A failed or malformed GraphQL response is ambiguous because GitHub can apply
+# the mutation before the transport fails. Live captured identity resolves that
+# ambiguity and still runs the normal post-mutation validation.
+for RESOLVE_MODE in applied_nonzero applied_malformed; do
+    git -C "$LOCAL_MUTATION_WS" checkout -- base.txt
+    cp "$LOCAL_CONTEXT_TEMPLATE" "$LOCAL_MUTATION_REPORT/analysis-context.json"
+    cp "$LOCAL_ANALYSIS_TEMPLATE" "$LOCAL_MUTATION_REPORT/analysis.json"
+    : > "$LOCAL_MUTATION_LOG"
+    AMBIGUOUS_APPLY_OUT=$(printf 'f' | (cd "$LOCAL_MUTATION_WS" && \
+        env GH_HEAD_MODE=captured GH_RESOLVE_MODE="$RESOLVE_MODE" \
+        GH_MUTATIONS_LOG="$LOCAL_MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" address 999 2>&1) || true)
+    assert_contains "$AMBIGUOUS_APPLY_OUT" "Resolved: PRRT_local" \
+        "$RESOLVE_MODE is accepted only after live state proves application"
+    assert_not_contains "$(cat "$LOCAL_MUTATION_LOG")" "unresolve:PRRT_local" \
+        "$RESOLVE_MODE does not compensate a verified stable resolution"
+done
+
+# Freeze the bytes the operator reviewed. A valid same-provenance replacement
+# while the prompt is open must not change the task that is later authorized.
+git -C "$LOCAL_MUTATION_WS" checkout -- base.txt
+cp "$LOCAL_CONTEXT_TEMPLATE" "$LOCAL_MUTATION_REPORT/analysis-context.json"
+cp "$LOCAL_ANALYSIS_TEMPLATE" "$LOCAL_MUTATION_REPORT/analysis.json"
+ANALYSIS_RACE_FIFO="$TEST_OUTPUT_DIR/analysis-race.fifo"
+ANALYSIS_RACE_OUT_FILE="$TEST_OUTPUT_DIR/analysis-race.out"
+rm -f "$ANALYSIS_RACE_FIFO"
+mkfifo "$ANALYSIS_RACE_FIFO"
+: > "$ANALYSIS_RACE_OUT_FILE"
+: > "$LOCAL_MUTATION_LOG"
+exec 3<> "$ANALYSIS_RACE_FIFO"
+(cd "$LOCAL_MUTATION_WS" && env GH_HEAD_MODE=captured \
+    GH_MUTATIONS_LOG="$LOCAL_MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 < "$ANALYSIS_RACE_FIFO" \
+    > "$ANALYSIS_RACE_OUT_FILE" 2>&1) &
+ANALYSIS_RACE_PID=$!
+for _attempt in $(seq 1 100); do
+    grep -q '\[f\]ixed' "$ANALYSIS_RACE_OUT_FILE" 2>/dev/null && break
+    sleep 0.02
+done
+jq '.task_list[0].task = "REPLACED AFTER DISPLAY"' \
+    "$LOCAL_ANALYSIS_TEMPLATE" > "$LOCAL_MUTATION_REPORT/analysis.json"
+printf 'f' >&3
+exec 3>&-
+wait "$ANALYSIS_RACE_PID" || true
+ANALYSIS_RACE_OUT=$(cat "$ANALYSIS_RACE_OUT_FILE")
+assert_contains "$ANALYSIS_RACE_OUT" "LOCAL MUTATION TASK" \
+    "address displays tasks from its private frozen analysis"
+assert_contains "$ANALYSIS_RACE_OUT" "Selected analysis or thread provenance changed" \
+    "address rejects selected-analysis replacement while the prompt is open"
+assert_eq "" "$(cat "$LOCAL_MUTATION_LOG")" \
+    "analysis replacement sends no thread-resolution mutation"
+
+# A self-consistent context refresh while the prompt is open also invalidates
+# the selected metadata binding before any GraphQL mutation.
+cp "$LOCAL_CONTEXT_TEMPLATE" "$LOCAL_MUTATION_REPORT/analysis-context.json"
+cp "$LOCAL_ANALYSIS_TEMPLATE" "$LOCAL_MUTATION_REPORT/analysis.json"
+CONTEXT_RACE_TMP="$TEST_OUTPUT_DIR/address-context-race.tmp.json"
+CONTEXT_RACE_REPLACEMENT="$TEST_OUTPUT_DIR/address-context-race.json"
+jq 'del(.coverage.context_fingerprint)
+    | .unresolved_threads = [{thread_id:"PRRT_from_another_pr",
+        comments_complete:true,comment_identity:[]}]' \
+    "$LOCAL_CONTEXT_TEMPLATE" > "$CONTEXT_RACE_TMP"
+ADDRESS_CONTEXT_RACE_FINGERPRINT=$("$GH_PR_ENRICH" --test-call \
+    analysis_context_fingerprint "$CONTEXT_RACE_TMP")
+jq --arg fingerprint "$ADDRESS_CONTEXT_RACE_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$CONTEXT_RACE_TMP" > "$CONTEXT_RACE_REPLACEMENT"
+CONTEXT_RACE_FIFO="$TEST_OUTPUT_DIR/context-race.fifo"
+CONTEXT_RACE_OUT_FILE="$TEST_OUTPUT_DIR/context-race.out"
+rm -f "$CONTEXT_RACE_FIFO"
+mkfifo "$CONTEXT_RACE_FIFO"
+: > "$CONTEXT_RACE_OUT_FILE"
+: > "$LOCAL_MUTATION_LOG"
+exec 4<> "$CONTEXT_RACE_FIFO"
+(cd "$LOCAL_MUTATION_WS" && env GH_HEAD_MODE=captured \
+    GH_MUTATIONS_LOG="$LOCAL_MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 < "$CONTEXT_RACE_FIFO" \
+    > "$CONTEXT_RACE_OUT_FILE" 2>&1) &
+CONTEXT_RACE_PID=$!
+for _attempt in $(seq 1 100); do
+    grep -q '\[f\]ixed' "$CONTEXT_RACE_OUT_FILE" 2>/dev/null && break
+    sleep 0.02
+done
+cp "$CONTEXT_RACE_REPLACEMENT" "$LOCAL_MUTATION_REPORT/analysis-context.json"
+printf 'f' >&4
+exec 4>&-
+wait "$CONTEXT_RACE_PID" || true
+CONTEXT_RACE_OUT=$(cat "$CONTEXT_RACE_OUT_FILE")
+assert_contains "$CONTEXT_RACE_OUT" "Selected analysis or thread provenance changed" \
+    "address rejects context replacement while the prompt is open"
+assert_eq "" "$(cat "$LOCAL_MUTATION_LOG")" \
+    "context replacement sends no thread-resolution mutation"
 
 suite_end

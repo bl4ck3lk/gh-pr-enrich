@@ -22,6 +22,29 @@ mkdir -p "$STUB_DIR"
 
 suite_start "gh pr-enrich runtime compatibility suite"
 
+# GNU stat accepts -c while BSD stat accepts -f. Probe GNU first and never
+# mistake a failed probe's diagnostic text for a permission mode.
+GNU_STAT_STUBS="$TEST_OUTPUT_DIR/gnu-stat-stubs"
+GNU_STAT_LOG="$TEST_OUTPUT_DIR/gnu-stat.log"
+mkdir -p "$GNU_STAT_STUBS"
+cat > "$GNU_STAT_STUBS/stat" << 'STUB'
+#!/bin/bash
+printf '%s\n' "$1" >> "$GNU_STAT_LOG"
+case "$1" in
+    -c) echo 640; exit 0 ;;
+    -f) echo 777; exit 0 ;;
+esac
+exit 1
+STUB
+chmod +x "$GNU_STAT_STUBS/stat"
+MODE_FIXTURE="$TEST_OUTPUT_DIR/mode-fixture"
+: > "$MODE_FIXTURE"
+GNU_MODE=$(env GNU_STAT_LOG="$GNU_STAT_LOG" PATH="$GNU_STAT_STUBS:$PATH" \
+    "$GH_PR_ENRICH" --test-call workspace_file_mode "$MODE_FIXTURE")
+assert_eq "640" "$GNU_MODE" "GNU stat mode probing uses -c output"
+assert_eq "-c" "$(cat "$GNU_STAT_LOG")" \
+    "a valid GNU mode does not fall through to the BSD probe"
+
 CODEX_ADAPTER="$PROJECT_DIR/.agents/skills/gh-pr-enrich/SKILL.md"
 CANONICAL_SKILL="$PROJECT_DIR/.claude/skills/gh-pr-enrich/SKILL.md"
 assert_contains "$(cat "$CODEX_ADAPTER")" "../../../.claude/skills/gh-pr-enrich/SKILL.md" \
@@ -37,6 +60,18 @@ assert_contains "$(cat "$CANONICAL_SKILL")" "hybrid-analysis.json" \
     "the canonical skill defines a truthful hybrid artifact"
 assert_contains "$(cat "$CANONICAL_SKILL")" "--allow-external" \
     "the canonical skill enforces the external disclosure gate"
+assert_contains "$(cat "$CANONICAL_SKILL")" \
+    'materialize-analysis-snapshot "$REPORT_DIR"' \
+    "native orchestrators materialize the verified immutable workspace"
+assert_contains "$(cat "$CANONICAL_SKILL")" \
+    'MUST read code only under `SNAPSHOT_PATH`' \
+    "every native root and subagent is confined to the materialized path"
+assert_contains "$(cat "$CANONICAL_SKILL")" \
+    'cleanup-analysis-snapshot "$SNAPSHOT_PATH"' \
+    "the native workflow requires explicit snapshot cleanup"
+assert_contains "$(cat "$CANONICAL_SKILL")" \
+    '`_metadata.workspace_fingerprint`' \
+    "native artifacts bind the materialized workspace fingerprint"
 
 # ---------------------------------------------------------------------------
 # Skill installation
@@ -98,6 +133,15 @@ case "$1 $2" in
         exit 0
         ;;
     "pr view")
+        if [ -n "${MUTATE_ANALYSIS_SOURCE:-}" ] && [ -f "$MUTATE_ANALYSIS_SOURCE" ]; then
+            jq '.task_list[0].task = "mutated after selector freeze"' \
+                "$MUTATE_ANALYSIS_SOURCE" > "$MUTATE_ANALYSIS_SOURCE.tmp"
+            mv "$MUTATE_ANALYSIS_SOURCE.tmp" "$MUTATE_ANALYSIS_SOURCE"
+        fi
+        if [ -n "${MUTATE_ANALYSIS_CONTEXT:-}" ] && \
+           [ -f "${REPLACEMENT_ANALYSIS_CONTEXT:-}" ]; then
+            cp "$REPLACEMENT_ANALYSIS_CONTEXT" "$MUTATE_ANALYSIS_CONTEXT"
+        fi
         cat << JSON
 {"number":1,"title":"t","body":"b","author":{"login":"u"},"state":"OPEN",
  "url":"https://github.com/o/r/pull/1","createdAt":"2026-01-01T00:00:00Z",
@@ -294,6 +338,36 @@ assert_true "$([ -s "$CLAUDE_LOG" ] && echo 0 || echo 1)" \
 assert_jq "$AUTHORIZED_DIR/analysis.json" '._metadata.repository_visibility == "PRIVATE"' \
     "the analysis provenance records repository visibility"
 
+# The writer receives the values captured by run_claude_analysis; it must not
+# reread a context that may refresh in the narrow gap before publication.
+PROVENANCE_DIR="$TEST_OUTPUT_DIR/provenance-race"
+mkdir -p "$PROVENANCE_DIR"
+cp "$AUTHORIZED_DIR/pr-summary.json" "$PROVENANCE_DIR/pr-summary.json"
+CAPTURED_HEAD=$(jq -r '.coverage.code_access.pr_head_sha' "$AUTHORIZED_DIR/analysis-context.json")
+CAPTURED_FINGERPRINT=$(jq -r '.coverage.context_fingerprint' "$AUTHORIZED_DIR/analysis-context.json")
+jq 'del(._metadata)' "$AUTHORIZED_DIR/claude-analysis.json" > "$PROVENANCE_DIR/raw-analysis.json"
+jq 'del(.coverage.context_fingerprint)
+    | .issue_comments += [{user:"race",body:"refreshed",url:"u",created_at:"t"}]' \
+    "$AUTHORIZED_DIR/analysis-context.json" > "$PROVENANCE_DIR/context.tmp.json"
+REFRESHED_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+    "$PROVENANCE_DIR/context.tmp.json")
+jq --arg fingerprint "$REFRESHED_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$PROVENANCE_DIR/context.tmp.json" > "$PROVENANCE_DIR/analysis-context.json"
+env REPO=o/r PR_NUMBER=1 "$GH_PR_ENRICH" --test-call write_claude_analysis_artifact \
+    "$PROVENANCE_DIR/raw-analysis.json" "$PROVENANCE_DIR/claude-analysis.json" \
+    PRIVATE "$CAPTURED_HEAD" "$CAPTURED_FINGERPRINT"
+assert_jq "$PROVENANCE_DIR/claude-analysis.json" \
+    "._metadata.pr_head_sha == \"$CAPTURED_HEAD\" and ._metadata.context_fingerprint == \"$CAPTURED_FINGERPRINT\"" \
+    "artifact provenance uses captured values instead of rereading refreshed context"
+rc=0
+PROVENANCE_RACE_OUT=$(PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" select-analysis \
+    "$PROVENANCE_DIR" "$PROVENANCE_DIR/claude-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects captured artifact metadata against a later context refresh"
+assert_contains "$PROVENANCE_RACE_OUT" "context fingerprint" \
+    "the post-verification context race fails at immutable identity validation"
+
 HYBRID_SOURCE="$AUTHORIZED_DIR/hybrid-analysis.json"
 jq '.task_list = [{
         priority: "high", task: "Hybrid-selected task", thread_ids: [],
@@ -318,6 +392,56 @@ assert_jq "$AUTHORIZED_DIR/combined-data.json" \
     '.analysis._metadata.provider == "hybrid" and .analysis.task_list[0].task == "Hybrid-selected task"' \
     "select-analysis refreshes the combined-data selected view"
 
+FROZEN_SOURCE="$AUTHORIZED_DIR/freeze-race-analysis.json"
+jq '.task_list[0].task = "frozen before hosted verification"' \
+    "$HYBRID_SOURCE" > "$FROZEN_SOURCE"
+TMPDIR="$AUTHORIZED_DIR" MUTATE_ANALYSIS_SOURCE="$FROZEN_SOURCE" \
+    "$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$FROZEN_SOURCE" >/dev/null
+assert_jq "$AUTHORIZED_DIR/analysis.json" \
+    '.task_list[0].task == "frozen before hosted verification"' \
+    "selection publishes the private frozen source when the original changes mid-validation"
+assert_jq "$FROZEN_SOURCE" '.task_list[0].task == "mutated after selector freeze"' \
+    "the GitHub revalidation stub deterministically mutates the original source"
+
+CONTEXT_RACE_ORIGINAL="$TEST_OUTPUT_DIR/context-race-original.json"
+CONTEXT_RACE_TMP="$TEST_OUTPUT_DIR/context-race.tmp.json"
+CONTEXT_RACE_REPLACEMENT="$TEST_OUTPUT_DIR/context-race-replacement.json"
+CONTEXT_RACE_SOURCE="$AUTHORIZED_DIR/context-race-analysis.json"
+cp "$AUTHORIZED_DIR/analysis-context.json" "$CONTEXT_RACE_ORIGINAL"
+jq 'del(.coverage.context_fingerprint)
+    | .issue_comments += [{user:"race",body:"refreshed",url:"u",created_at:"t"}]' \
+    "$CONTEXT_RACE_ORIGINAL" > "$CONTEXT_RACE_TMP"
+CONTEXT_RACE_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+    "$CONTEXT_RACE_TMP")
+jq --arg fingerprint "$CONTEXT_RACE_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$CONTEXT_RACE_TMP" > "$CONTEXT_RACE_REPLACEMENT"
+jq '.task_list[0].task = "must not publish refreshed-context race"' \
+    "$HYBRID_SOURCE" > "$CONTEXT_RACE_SOURCE"
+rc=0
+CONTEXT_SELECTION_RACE_OUT=$(MUTATE_ANALYSIS_CONTEXT="$AUTHORIZED_DIR/analysis-context.json" \
+    REPLACEMENT_ANALYSIS_CONTEXT="$CONTEXT_RACE_REPLACEMENT" \
+    "$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$CONTEXT_RACE_SOURCE" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects a context refresh during hosted verification"
+assert_contains "$CONTEXT_SELECTION_RACE_OUT" "context changed during selection" \
+    "the selector reports the live-context publication race"
+assert_jq "$AUTHORIZED_DIR/analysis.json" \
+    '.task_list[0].task == "frozen before hosted verification"' \
+    "a context refresh race preserves the previously selected analysis"
+cp "$CONTEXT_RACE_ORIGINAL" "$AUTHORIZED_DIR/analysis-context.json"
+
+UNKNOWN_THREAD_SOURCE="$AUTHORIZED_DIR/unknown-thread-analysis.json"
+jq '.task_list[0].thread_ids = ["PRRT_from_another_pr"]' \
+    "$HYBRID_SOURCE" > "$UNKNOWN_THREAD_SOURCE"
+rc=0
+UNKNOWN_THREAD_OUT=$("$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+    "$UNKNOWN_THREAD_SOURCE" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects task thread IDs absent from the PR context"
+assert_contains "$UNKNOWN_THREAD_OUT" "fingerprinted context" \
+    "the unknown-thread rejection is attributed to selected-analysis provenance"
+
 assert_jq "$AUTHORIZED_DIR/analysis-context.json" \
     '.coverage.code_access.state == "disabled"' \
     "the selection fixture records disabled repository code access"
@@ -339,6 +463,98 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "disabled code access prevents publishing confirmed findings"
 assert_contains "$NO_CODE_CONFIRMED_OUT" "without enabled repository code access" \
     "the no-code confirmation error identifies the verdict contract"
+
+# Confirmed findings also require the current local workspace to remain the
+# exact one captured in the immutable context. An explicit code-access override
+# still permits a stable non-head checkout, but it does not waive this binding.
+SELECTION_REPO="$TEST_OUTPUT_DIR/selection-workspace"
+SELECTION_REPORT="$SELECTION_REPO/report"
+mkdir -p "$SELECTION_REPORT"
+(cd "$SELECTION_REPO" && git init -q . && git config user.email t@t && git config user.name t \
+    && echo stable > tracked.txt && git add tracked.txt && git commit -qm init)
+SELECTION_HEAD=$(git -C "$SELECTION_REPO" rev-parse HEAD)
+SELECTION_CONTEXT_BASE="$TEST_OUTPUT_DIR/selection-context-base.json"
+SELECTION_CONTEXT_TMP="$TEST_OUTPUT_DIR/selection-context.tmp.json"
+SELECTION_SOURCE_BASE="$TEST_OUTPUT_DIR/selection-source-base.json"
+cp "$AUTHORIZED_DIR/analysis-context.json" "$SELECTION_CONTEXT_BASE"
+cp "$AUTHORIZED_DIR/pr-summary.json" "$SELECTION_REPORT/pr-summary.json"
+cp "$NO_CODE_CONFIRMED_SOURCE" "$SELECTION_SOURCE_BASE"
+SELECTION_WORKSPACE_FINGERPRINT=$(cd "$SELECTION_REPO" && \
+    "$GH_PR_ENRICH" --test-call \
+        code_access_workspace_fingerprint "$SELECTION_REPORT")
+jq --arg inspected_sha "$SELECTION_HEAD" --arg workspace_fingerprint "$SELECTION_WORKSPACE_FINGERPRINT" '
+    del(.coverage.context_fingerprint)
+    | .coverage.code_access.state = "enabled"
+    | .coverage.code_access.reason = "explicit fixture override"
+    | .coverage.code_access.inspected_sha = $inspected_sha
+    | .coverage.code_access.revision_matches = false
+    | .coverage.code_access.workspace_fingerprint = $workspace_fingerprint
+' "$SELECTION_CONTEXT_BASE" > "$SELECTION_CONTEXT_TMP"
+SELECTION_CONTEXT_FINGERPRINT=$(
+    "$GH_PR_ENRICH" --test-call analysis_context_fingerprint "$SELECTION_CONTEXT_TMP"
+)
+jq --arg fingerprint "$SELECTION_CONTEXT_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$SELECTION_CONTEXT_TMP" > "$SELECTION_REPORT/analysis-context.json"
+jq --arg fingerprint "$SELECTION_CONTEXT_FINGERPRINT" \
+    --arg workspace_fingerprint "$SELECTION_WORKSPACE_FINGERPRINT" \
+    '._metadata.context_fingerprint = $fingerprint
+     | ._metadata.workspace_fingerprint = $workspace_fingerprint' \
+    "$SELECTION_SOURCE_BASE" > "$SELECTION_REPORT/hybrid-analysis.json"
+MISSING_NATIVE_FINGERPRINT="$SELECTION_REPORT/missing-workspace-fingerprint.json"
+jq 'del(._metadata.workspace_fingerprint)' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$MISSING_NATIVE_FINGERPRINT"
+rc=0
+(cd "$SELECTION_REPO" && \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$MISSING_NATIVE_FINGERPRINT" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "confirmed native analysis without the snapshot fingerprint is rejected"
+rm -f "$MISSING_NATIVE_FINGERPRINT"
+(cd "$SELECTION_REPO" && \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null)
+assert_jq "$SELECTION_REPORT/analysis.json" \
+    'any(.issue_categories[]; .verdict == "confirmed")' \
+    "a captured code-access grant persists without replaying its original override"
+assert_jq_eq "$SELECTION_REPORT/analysis.json" \
+    '._metadata.workspace_fingerprint' "$SELECTION_WORKSPACE_FINGERPRINT" \
+    "confirmed native analysis binds the materialized workspace fingerprint"
+
+rc=0
+CODE_ACCESS_VETO_OUT=$(cd "$SELECTION_REPO" && GH_PR_ENRICH_CODE_ACCESS=false \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a current explicit code-access opt-out vetoes the captured grant"
+assert_contains "$CODE_ACCESS_VETO_OUT" "revoked by --no-code-access" \
+    "the current opt-out failure identifies the revocation"
+
+echo changed-after-analysis >> "$SELECTION_REPO/tracked.txt"
+rc=0
+LOCAL_CODE_MISMATCH_OUT=$(cd "$SELECTION_REPO" && \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "select-analysis rejects confirmed findings after the local workspace changes"
+assert_contains "$LOCAL_CODE_MISMATCH_OUT" "Current local code access no longer matches" \
+    "the provider-neutral selection error identifies the stale local workspace"
+
+READ_ONLY_SELECTED=$(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" --test-call \
+    select_analysis_file "$SELECTION_REPORT")
+assert_eq "$SELECTION_REPORT/analysis.json" "$READ_ONLY_SELECTED" \
+    "read-only consumers retain immutable historical analysis after workspace changes"
+assert_true "$([ -e "$SELECTION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "read-only selection does not delete historical analysis"
+
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" --test-call \
+    select_analysis_file "$SELECTION_REPORT" require-current-workspace \
+    >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "strict consumers reject selected analysis after the workspace changes"
+assert_true "$([ ! -e "$SELECTION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "strict workspace rejection invalidates stale selected artifacts"
 
 rc=0
 echo "do not overwrite" > "$TEST_OUTPUT_DIR/selection-temp-target.json"
@@ -548,6 +764,21 @@ rc=0
 "$GH_PR_ENRICH" --test-call select_analysis_file "$LEGACY_WITH_CONTEXT_DIR" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "metadata-less legacy fallback is rejected beside a current analysis context"
+
+LEGACY_READ_ONLY_DIR="$TEST_OUTPUT_DIR/legacy-read-only"
+mkdir -p "$LEGACY_READ_ONLY_DIR"
+jq 'del(._metadata)' "$AUTHORIZED_DIR/claude-analysis.json" \
+    > "$LEGACY_READ_ONLY_DIR/claude-analysis.json"
+rc=0
+"$GH_PR_ENRICH" --test-call select_analysis_file "$LEGACY_READ_ONLY_DIR" \
+    >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" \
+    "read-only discovery retains metadata-less legacy reports"
+rc=0
+"$GH_PR_ENRICH" --test-call select_analysis_file "$LEGACY_READ_ONLY_DIR" \
+    require-current-workspace >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "strict consumers reject legacy reports without current provenance"
 
 cp "$AUTHORIZED_DIR/pr-summary.json" "$AUTHORIZED_DIR/pr-summary-before-head-refresh.json"
 jq '.headRefOid = "new-hosted-head"' "$AUTHORIZED_DIR/pr-summary.json" \

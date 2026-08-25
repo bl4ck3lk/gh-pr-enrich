@@ -34,6 +34,16 @@ cat > "$STUB_DIR/claude" << 'STUB'
 #!/bin/bash
 # Records the argv it was invoked with, drains stdin, emits a valid response.
 printf '%s\n' "$@" > "$CLAUDE_ARG_LOG"
+[ -z "${CLAUDE_TIMEOUT_LOG:-}" ] || \
+    printf '%s' "$GH_PR_ENRICH_ANALYZER_TIMEOUT_SECONDS" > "$CLAUDE_TIMEOUT_LOG"
+previous=""
+for argument in "$@"; do
+    if [ "$previous" = "--settings" ]; then
+        printf '%s\n' "$argument" > "$CLAUDE_SETTINGS_PATH_LOG"
+        cp "$argument" "$CLAUDE_SETTINGS_LOG"
+    fi
+    previous="$argument"
+done
 cat > /dev/null
 echo "stub claude stderr line" >&2
 echo '{"structured_output": {"issue_categories": [], "category_coverage": [], "disputed_comments": [], "systemic_issues": [], "adjacent_problems": [], "task_list": [], "process_improvements": [], "pr_template_suggestions": []}}'
@@ -54,6 +64,15 @@ printf '%s' "$DURATION" > "$CLAUDE_TIMEOUT_LOG"
 exec "$@"
 STUB
 chmod +x "$STUB_DIR/timeout"
+
+PS_CALLED_LOG="$TEST_OUTPUT_DIR/ps-called.log"
+: > "$PS_CALLED_LOG"
+cat > "$STUB_DIR/ps" << 'STUB'
+#!/bin/bash
+printf 'ps invoked\n' >> "$PS_CALLED_LOG"
+exit 97
+STUB
+chmod +x "$STUB_DIR/ps"
 
 cat > "$STUB_DIR/semgrep" << 'STUB'
 #!/bin/bash
@@ -115,16 +134,165 @@ mkdir -p "$CODE_ACCESS_REPO"
 (cd "$CODE_ACCESS_REPO" && git init -q . && git config user.email t@t && git config user.name t \
     && printf '.env\n' > .gitignore && echo clean > tracked.txt && git add -A && git commit -qm init)
 HEAD_SHA=$(git -C "$CODE_ACCESS_REPO" rev-parse HEAD)
-jq -n --arg sha "$HEAD_SHA" '{
+
+# Generated report files change during analysis and are excluded individually.
+# An unexpected file beside them remains part of the bound workspace.
+FINGERPRINT_REPORT="$CODE_ACCESS_REPO/report"
+mkdir -p "$FINGERPRINT_REPORT"
+FINGERPRINT_BASE=$(cd "$CODE_ACCESS_REPO" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$FINGERPRINT_REPORT")
+echo generated > "$FINGERPRINT_REPORT/claude-raw-response.json"
+FINGERPRINT_WITH_GENERATED=$(cd "$CODE_ACCESS_REPO" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$FINGERPRINT_REPORT")
+assert_eq "$FINGERPRINT_BASE" "$FINGERPRINT_WITH_GENERATED" \
+    "allowlisted generated report artifacts do not change the workspace fingerprint"
+echo unexpected > "$FINGERPRINT_REPORT/unexpected.txt"
+FINGERPRINT_WITH_UNEXPECTED=$(cd "$CODE_ACCESS_REPO" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$FINGERPRINT_REPORT")
+assert_true "$([ "$FINGERPRINT_WITH_GENERATED" != "$FINGERPRINT_WITH_UNEXPECTED" ] && echo 0 || echo 1)" \
+    "unexpected output-directory files change the workspace fingerprint"
+rm "$FINGERPRINT_REPORT/unexpected.txt"
+mkdir -p "$FINGERPRINT_REPORT/analysis.json"
+echo nested > "$FINGERPRINT_REPORT/analysis.json/payload"
+FINGERPRINT_WITH_DESCENDANT=$(cd "$CODE_ACCESS_REPO" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$FINGERPRINT_REPORT")
+assert_true "$([ "$FINGERPRINT_WITH_GENERATED" != "$FINGERPRINT_WITH_DESCENDANT" ] && echo 0 || echo 1)" \
+    "descendants of allowlisted artifact names remain bound to the workspace"
+rm "$FINGERPRINT_REPORT/analysis.json/payload"
+rmdir "$FINGERPRINT_REPORT/analysis.json"
+
+ln -s ../tracked.txt "$FINGERPRINT_REPORT/claude-analysis.json"
+rc=0
+(cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
+    code_access_workspace_fingerprint "$FINGERPRINT_REPORT" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "repository-visible symlinks fail closed even when their names are allowlisted"
+rm "$FINGERPRINT_REPORT/claude-analysis.json" "$FINGERPRINT_REPORT/claude-raw-response.json"
+rmdir "$FINGERPRINT_REPORT"
+
+ln -s tracked.txt "$CODE_ACCESS_REPO/.env"
+rc=0
+(cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
+    code_access_workspace_fingerprint "$TEST_OUTPUT_DIR" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "ignored repository-visible symlinks fail closed"
+rm "$CODE_ACCESS_REPO/.env"
+
+ln -s tracked.txt "$CODE_ACCESS_REPO/tracked-link"
+git -C "$CODE_ACCESS_REPO" add tracked-link
+rc=0
+(cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
+    code_access_workspace_fingerprint "$TEST_OUTPUT_DIR" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "tracked repository-visible symlinks fail closed"
+git -C "$CODE_ACCESS_REPO" reset -q HEAD -- tracked-link
+rm "$CODE_ACCESS_REPO/tracked-link"
+
+NESTED_REPO="$CODE_ACCESS_REPO/nested-repo"
+mkdir -p "$NESTED_REPO"
+(cd "$NESTED_REPO" && git init -q . && git config user.email t@t && \
+    git config user.name t && echo nested > nested.txt && git add nested.txt && \
+    git commit -qm init)
+rc=0
+(cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
+    code_access_workspace_fingerprint "$TEST_OUTPUT_DIR" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "nested repositories fail closed instead of hashing only their directory entry"
+rm -rf "$NESTED_REPO"
+
+git -C "$CODE_ACCESS_REPO" update-index --skip-worktree tracked.txt
+SKIP_WORKTREE_BASE=$(cd "$CODE_ACCESS_REPO" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$TEST_OUTPUT_DIR")
+echo hidden-from-git-diff > "$CODE_ACCESS_REPO/tracked.txt"
+SKIP_WORKTREE_CHANGED=$(cd "$CODE_ACCESS_REPO" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$TEST_OUTPUT_DIR")
+assert_true "$([ "$SKIP_WORKTREE_BASE" != "$SKIP_WORKTREE_CHANGED" ] && echo 0 || echo 1)" \
+    "skip-worktree cannot hide changed tracked bytes from the workspace fingerprint"
+git -C "$CODE_ACCESS_REPO" update-index --no-skip-worktree tracked.txt
+git -C "$CODE_ACCESS_REPO" checkout -- tracked.txt
+
+WORKSPACE_FINGERPRINT=$(cd "$CODE_ACCESS_REPO" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$TEST_OUTPUT_DIR")
+jq -n --arg sha "$HEAD_SHA" --arg workspace_fingerprint "$WORKSPACE_FINGERPRINT" '{
     pr: {title: "t"}, unresolved_threads: [], issue_comments: [],
-    coverage: {code_access: {pr_head_sha: $sha}}
-}' > "$CONTEXT"
+    coverage: {code_access: {
+        state: "enabled", reason: "fixture",
+        pr_head_sha: $sha, inspected_sha: $sha, revision_matches: true,
+        workspace_fingerprint: $workspace_fingerprint
+    }}
+}' > "$CONTEXT.tmp"
+CONTEXT_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint "$CONTEXT.tmp")
+jq --arg fingerprint "$CONTEXT_FINGERPRINT" '.coverage.context_fingerprint = $fingerprint' \
+    "$CONTEXT.tmp" > "$CONTEXT"
+rm "$CONTEXT.tmp"
 RESPONSE="$TEST_OUTPUT_DIR/response.json"
 
-run_analysis() {
-    (cd "$CODE_ACCESS_REPO" && env CLAUDE_ARG_LOG="$ARG_LOG" CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+NATIVE_REPORT="$CODE_ACCESS_REPO/report"
+mkdir -p "$NATIVE_REPORT"
+cp "$CONTEXT" "$NATIVE_REPORT/analysis-context.json"
+NATIVE_SNAPSHOT_JSON=$(cd "$CODE_ACCESS_REPO" && \
+    env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" materialize-analysis-snapshot "$NATIVE_REPORT")
+NATIVE_SNAPSHOT_PATH=$(printf '%s' "$NATIVE_SNAPSHOT_JSON" | jq -r '.path')
+assert_eq "$WORKSPACE_FINGERPRINT" \
+    "$(printf '%s' "$NATIVE_SNAPSHOT_JSON" | jq -r '.workspace_fingerprint')" \
+    "native snapshot materialization reports the validated workspace fingerprint"
+assert_eq "clean" "$(cat "$NATIVE_SNAPSHOT_PATH/tracked.txt")" \
+    "native snapshot materialization copies the bound repository bytes"
+assert_true "$([ ! -w "$NATIVE_SNAPSHOT_PATH/tracked.txt" ] && echo 0 || echo 1)" \
+    "native snapshot materialization produces read-only files"
+NATIVE_JANITOR_SIDECAR="$NATIVE_SNAPSHOT_PATH.janitor"
+NATIVE_JANITOR_PID=$(awk -F '\t' 'NR == 1 { print $2 }' "$NATIVE_JANITOR_SIDECAR")
+assert_true "$([ -n "$NATIVE_JANITOR_PID" ] && kill -0 "$NATIVE_JANITOR_PID" 2>/dev/null && echo 0 || echo 1)" \
+    "native snapshot materialization records a live bounded-lease janitor"
+env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" cleanup-analysis-snapshot "$NATIVE_SNAPSHOT_PATH"
+assert_true "$([ ! -e "$NATIVE_SNAPSHOT_PATH" ] && echo 0 || echo 1)" \
+    "native snapshot cleanup removes the leased private directory"
+for _attempt in $(seq 1 100); do
+    ! kill -0 "$NATIVE_JANITOR_PID" 2>/dev/null && break
+    sleep 0.01
+done
+assert_true "$([ ! -e "$NATIVE_JANITOR_SIDECAR" ] && ! kill -0 "$NATIVE_JANITOR_PID" 2>/dev/null && echo 0 || echo 1)" \
+    "explicit snapshot cleanup stops the recorded janitor and removes its sidecar"
+
+EXPIRING_SNAPSHOT_JSON=$(cd "$CODE_ACCESS_REPO" && \
+    env GH_PR_ENRICH_SNAPSHOT_TTL_SECONDS=1 \
+    PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" materialize-analysis-snapshot "$NATIVE_REPORT")
+EXPIRING_SNAPSHOT_PATH=$(printf '%s' "$EXPIRING_SNAPSHOT_JSON" | jq -r '.path')
+EXPIRING_JANITOR_SIDECAR="$EXPIRING_SNAPSHOT_PATH.janitor"
+EXPIRING_JANITOR_PID=$(awk -F '\t' 'NR == 1 { print $2 }' "$EXPIRING_JANITOR_SIDECAR")
+assert_eq "1" "$(printf '%s' "$EXPIRING_SNAPSHOT_JSON" | jq -r '.expires_in_seconds')" \
+    "native snapshot materialization reports its bounded lease"
+for _attempt in $(seq 1 100); do
+    [ ! -e "$EXPIRING_SNAPSHOT_PATH" ] && break
+    sleep 0.05
+done
+assert_true "$([ ! -e "$EXPIRING_SNAPSHOT_PATH" ] && echo 0 || echo 1)" \
+    "the native snapshot janitor reaps an abandoned short lease"
+for _attempt in $(seq 1 100); do
+    ! kill -0 "$EXPIRING_JANITOR_PID" 2>/dev/null && break
+    sleep 0.01
+done
+assert_true "$([ ! -e "$EXPIRING_JANITOR_SIDECAR" ] && ! kill -0 "$EXPIRING_JANITOR_PID" 2>/dev/null && echo 0 || echo 1)" \
+    "TTL expiry removes the lease sidecar and leaves no janitor process"
+rm -f "$NATIVE_REPORT/analysis-context.json"
+rmdir "$NATIVE_REPORT"
+
+run_analysis_context() {
+    local context_file="$1"
+    shift
+    (cd "$CODE_ACCESS_REPO" && env CLAUDE_ARG_LOG="$ARG_LOG" \
+        CLAUDE_SETTINGS_LOG="$TEST_OUTPUT_DIR/claude-settings.json" \
+        CLAUDE_SETTINGS_PATH_LOG="$TEST_OUTPUT_DIR/claude-settings-path.txt" \
+        CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
         PATH="$STUB_DIR:$PATH" "$@" \
-        "$GH_PR_ENRICH" --test-call run_claude_analysis "$CONTEXT" "$RESPONSE" >/dev/null 2>&1) || true
+        "$GH_PR_ENRICH" --test-call run_claude_analysis "$context_file" "$RESPONSE" >/dev/null 2>&1) || true
+}
+
+run_analysis() {
+    run_analysis_context "$CONTEXT" "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -134,7 +302,7 @@ run_analysis
 ARGS=$(cat "$ARG_LOG" 2>/dev/null || echo "")
 
 assert_contains "$ARGS" "--allowedTools" "analyzer is granted tools by default"
-assert_contains "$ARGS" "Read" "analyzer may read files"
+assert_contains "$ARGS" "Read(./**)" "analyzer read access is scoped to the snapshot"
 assert_contains "$ARGS" "Grep" "analyzer may grep the repository"
 assert_contains "$ARGS" "Glob" "analyzer may glob the repository"
 assert_not_contains "$ARGS" "Bash" "analyzer is not granted Bash"
@@ -145,13 +313,183 @@ assert_contains "$ARGS" "--tools" "the available Claude tools are explicitly res
 assert_contains "$ARGS" "--permission-mode" "Claude cannot pause for permission prompts"
 assert_contains "$ARGS" "dontAsk" "Claude uses the non-interactive permission mode"
 assert_contains "$ARGS" "--no-session-persistence" "Claude analysis does not persist a session"
+TOOLS_ARGS=$(awk '/^--tools$/{capture=1;next} /^--allowedTools$/{capture=0} capture' "$ARG_LOG")
+ALLOWED_ARGS=$(awk '/^--allowedTools$/{capture=1;next} /^--settings$/{capture=0} capture' "$ARG_LOG")
+assert_eq $'Read\nGrep\nGlob' "$TOOLS_ARGS" \
+    "Claude --tools receives only bare built-in tool names"
+assert_eq $'Read(./**)\nGrep\nGlob' "$ALLOWED_ARGS" \
+    "Claude --allowedTools scopes Read to the immutable snapshot"
+EXPECTED_DENY="Read(//${CODE_ACCESS_REPO#/}/**)"
+rc=0
+jq -e --arg expected "$EXPECTED_DENY" \
+    '.permissions.deny == [$expected]' \
+    "$TEST_OUTPUT_DIR/claude-settings.json" > /dev/null 2>&1 || rc=$?
+assert_true "$rc" "Claude settings deny the original repository by absolute path"
+CLAUDE_SETTINGS_PATH=$(cat "$TEST_OUTPUT_DIR/claude-settings-path.txt")
+assert_true "$([ ! -e "$CLAUDE_SETTINGS_PATH" ] && echo 0 || echo 1)" \
+    "the isolated Claude settings file is removed after analysis"
 
-# Opt-out for sandboxed environments
-run_analysis GH_PR_ENRICH_CODE_ACCESS=false
+# A context that deliberately withheld code access still runs without tools.
+NO_CODE_CONTEXT="$TEST_OUTPUT_DIR/no-code-context.json"
+jq '.coverage.code_access = {
+        state: "disabled", reason: "fixture opt-out",
+        pr_head_sha: .coverage.code_access.pr_head_sha,
+        inspected_sha: .coverage.code_access.inspected_sha,
+        revision_matches: true, workspace_fingerprint: null
+    } | del(.coverage.context_fingerprint)' "$CONTEXT" > "$NO_CODE_CONTEXT.tmp"
+NO_CODE_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint "$NO_CODE_CONTEXT.tmp")
+jq --arg fingerprint "$NO_CODE_FINGERPRINT" '.coverage.context_fingerprint = $fingerprint' \
+    "$NO_CODE_CONTEXT.tmp" > "$NO_CODE_CONTEXT"
+rm "$NO_CODE_CONTEXT.tmp"
+run_analysis_context "$NO_CODE_CONTEXT" GH_PR_ENRICH_CODE_ACCESS=false
 ARGS_NO_CODE=$(cat "$ARG_LOG" 2>/dev/null || echo "")
 assert_not_contains "$ARGS_NO_CODE" "--allowedTools" "code access can be disabled"
 assert_contains "$ARGS_NO_CODE" "--tools" "the no-code run explicitly disables Claude tools"
 assert_not_contains "$ARGS_NO_CODE" "Read" "the no-code run cannot read repository files"
+
+# A tree that stopped matching after context capture cannot silently downgrade
+# an enabled run and later publish confirmed output against the old context.
+rm -f "$ARG_LOG" "$RESPONSE"
+echo pre-run-mutation >> "$CODE_ACCESS_REPO/tracked.txt"
+rc=0
+PRE_RUN_MISMATCH=$(cd "$CODE_ACCESS_REPO" && env CLAUDE_ARG_LOG="$ARG_LOG" \
+    CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call run_claude_analysis "$CONTEXT" "$RESPONSE" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "an enabled context fails closed when code access is withheld before the run"
+assert_contains "$PRE_RUN_MISMATCH" "no longer matches the fingerprinted context" \
+    "the pre-run mismatch identifies the stale code-access grant"
+assert_true "$([ ! -s "$ARG_LOG" ] && echo 0 || echo 1)" \
+    "a pre-run workspace mismatch is rejected before invoking Claude"
+git -C "$CODE_ACCESS_REPO" checkout -- tracked.txt
+
+# Mutating the workspace from inside the analyzer stub deterministically models
+# another process changing local code during a long Claude run.
+MUTATION_STUB_DIR="$TEST_OUTPUT_DIR/mutation-stubs"
+mkdir -p "$MUTATION_STUB_DIR"
+cp "$STUB_DIR/timeout" "$MUTATION_STUB_DIR/timeout"
+cat > "$MUTATION_STUB_DIR/claude" << 'STUB'
+#!/bin/bash
+cat > /dev/null
+[ -z "${SNAPSHOT_CWD_LOG:-}" ] || printf '%s\n' "$PWD" > "$SNAPSHOT_CWD_LOG"
+[ -z "${SNAPSHOT_READ_LOG:-}" ] || cat tracked.txt > "$SNAPSHOT_READ_LOG"
+[ -z "${MUTATION_TARGET:-}" ] || echo changed-during-run >> "$MUTATION_TARGET"
+[ -z "${MUTATION_BACKUP:-}" ] || cp "$MUTATION_BACKUP" "$MUTATION_TARGET"
+[ -z "${SNAPSHOT_READ_LOG:-}" ] || cat tracked.txt >> "$SNAPSHOT_READ_LOG"
+if [ -n "${CONTEXT_MUTATION_TARGET:-}" ]; then
+    jq '.issue_comments += [{user:"race",body:"changed",url:"u",created_at:"t"}]' \
+        "$CONTEXT_MUTATION_TARGET" > "$CONTEXT_MUTATION_TARGET.tmp"
+    mv "$CONTEXT_MUTATION_TARGET.tmp" "$CONTEXT_MUTATION_TARGET"
+fi
+echo '{"structured_output": {"issue_categories": [], "category_coverage": [], "disputed_comments": [], "systemic_issues": [], "adjacent_problems": [], "task_list": [], "process_improvements": [], "pr_template_suggestions": []}}'
+STUB
+chmod +x "$MUTATION_STUB_DIR/claude"
+rm -f "$RESPONSE"
+rc=0
+DURING_RUN_MISMATCH=$(cd "$CODE_ACCESS_REPO" && env MUTATION_TARGET="$CODE_ACCESS_REPO/tracked.txt" \
+    CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" PATH="$MUTATION_STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call run_claude_analysis "$CONTEXT" "$RESPONSE" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "an analyzer response is rejected when the workspace changes during the run"
+assert_contains "$DURING_RUN_MISMATCH" "workspace changed during Claude analysis" \
+    "the during-run failure identifies the local workspace race"
+assert_true "$([ ! -e "$RESPONSE" ] && echo 0 || echo 1)" \
+    "a response produced across two workspace states is removed"
+git -C "$CODE_ACCESS_REPO" checkout -- tracked.txt
+
+MUTATION_BACKUP="$TEST_OUTPUT_DIR/tracked-backup.txt"
+SNAPSHOT_CWD_LOG="$TEST_OUTPUT_DIR/snapshot-cwd.txt"
+SNAPSHOT_READ_LOG="$TEST_OUTPUT_DIR/snapshot-read.txt"
+cp "$CODE_ACCESS_REPO/tracked.txt" "$MUTATION_BACKUP"
+rm -f "$RESPONSE" "$SNAPSHOT_CWD_LOG" "$SNAPSHOT_READ_LOG"
+rc=0
+(cd "$CODE_ACCESS_REPO" && env MUTATION_TARGET="$CODE_ACCESS_REPO/tracked.txt" \
+    MUTATION_BACKUP="$MUTATION_BACKUP" SNAPSHOT_CWD_LOG="$SNAPSHOT_CWD_LOG" \
+    SNAPSHOT_READ_LOG="$SNAPSHOT_READ_LOG" \
+    CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" PATH="$MUTATION_STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call run_claude_analysis "$CONTEXT" "$RESPONSE" \
+    >/dev/null 2>&1) || rc=$?
+SNAPSHOT_CWD=$(cat "$SNAPSHOT_CWD_LOG" 2>/dev/null || echo "")
+assert_eq "0" "$rc" \
+    "an analyzer isolated from the live tree accepts an original-tree ABA mutation"
+assert_not_contains "$SNAPSHOT_CWD" "$CODE_ACCESS_REPO" \
+    "code-enabled Claude runs outside the original repository"
+assert_eq $'clean\nclean' "$(cat "$SNAPSHOT_READ_LOG")" \
+    "the analyzer reads stable bytes from the frozen snapshot across the ABA mutation"
+assert_true "$([ ! -d "$SNAPSHOT_CWD" ] && echo 0 || echo 1)" \
+    "the private analyzer snapshot is removed after success"
+
+SIGNAL_STUB_DIR="$TEST_OUTPUT_DIR/signal-stubs"
+mkdir -p "$SIGNAL_STUB_DIR"
+cp "$STUB_DIR/timeout" "$SIGNAL_STUB_DIR/timeout"
+cp "$STUB_DIR/ps" "$SIGNAL_STUB_DIR/ps"
+cat > "$SIGNAL_STUB_DIR/claude" << 'STUB'
+#!/bin/bash
+previous=""
+for argument in "$@"; do
+    if [ "$previous" = "--settings" ]; then
+        printf '%s\n' "$argument" > "$SIGNAL_SETTINGS_PATH_LOG"
+    fi
+    previous="$argument"
+done
+printf '%s\n' "$PWD" > "$SIGNAL_SNAPSHOT_PATH_LOG"
+printf '%s\n' "$$" > "$SIGNAL_CHILD_PID_LOG"
+cat > /dev/null
+trap '' TERM INT
+kill -TERM "$GH_PR_ENRICH_CLEANUP_OWNER_PID"
+while true; do :; done
+STUB
+chmod +x "$SIGNAL_STUB_DIR/claude"
+SIGNAL_SNAPSHOT_PATH_LOG="$TEST_OUTPUT_DIR/signal-snapshot-path.txt"
+SIGNAL_SETTINGS_PATH_LOG="$TEST_OUTPUT_DIR/signal-settings-path.txt"
+SIGNAL_CHILD_PID_LOG="$TEST_OUTPUT_DIR/signal-child-pid.txt"
+rm -f "$SIGNAL_SNAPSHOT_PATH_LOG" "$SIGNAL_SETTINGS_PATH_LOG" \
+    "$SIGNAL_CHILD_PID_LOG" "$RESPONSE"
+rc=0
+SIGNAL_STARTED_AT=$(date +%s)
+(cd "$CODE_ACCESS_REPO" && env \
+    SIGNAL_SNAPSHOT_PATH_LOG="$SIGNAL_SNAPSHOT_PATH_LOG" \
+    SIGNAL_SETTINGS_PATH_LOG="$SIGNAL_SETTINGS_PATH_LOG" \
+    SIGNAL_CHILD_PID_LOG="$SIGNAL_CHILD_PID_LOG" \
+    PS_CALLED_LOG="$PS_CALLED_LOG" \
+    CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+    PATH="$SIGNAL_STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call run_claude_analysis "$CONTEXT" "$RESPONSE" \
+    >/dev/null 2>&1) || rc=$?
+SIGNAL_ELAPSED=$(( $(date +%s) - SIGNAL_STARTED_AT ))
+TERMINATED_SNAPSHOT=$(cat "$SIGNAL_SNAPSHOT_PATH_LOG" 2>/dev/null || echo "")
+TERMINATED_SETTINGS=$(cat "$SIGNAL_SETTINGS_PATH_LOG" 2>/dev/null || echo "")
+TERMINATED_CHILD=$(cat "$SIGNAL_CHILD_PID_LOG" 2>/dev/null || echo "")
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "terminating a code-enabled analyzer interrupts the run"
+assert_true "$([ -n "$TERMINATED_SNAPSHOT" ] && [ ! -e "$TERMINATED_SNAPSHOT" ] && echo 0 || echo 1)" \
+    "TERM removes the private analyzer snapshot"
+assert_true "$([ -n "$TERMINATED_SETTINGS" ] && [ ! -e "$TERMINATED_SETTINGS" ] && echo 0 || echo 1)" \
+    "TERM removes the isolated Claude settings file"
+assert_true "$([ "$SIGNAL_ELAPSED" -lt 5 ] && echo 0 || echo 1)" \
+    "TERM promptly interrupts a hung analyzer that ignores TERM"
+for _attempt in $(seq 1 100); do
+    [ -z "$TERMINATED_CHILD" ] || ! kill -0 "$TERMINATED_CHILD" 2>/dev/null && break
+    sleep 0.02
+done
+assert_true "$([ -n "$TERMINATED_CHILD" ] && ! kill -0 "$TERMINATED_CHILD" 2>/dev/null && echo 0 || echo 1)" \
+    "TERM reaps the analyzer descendant without leaking a child process"
+assert_eq "" "$(cat "$PS_CALLED_LOG")" \
+    "analyzer cancellation and janitor cleanup do not require process-table discovery"
+
+RACE_CONTEXT="$TEST_OUTPUT_DIR/race-context.json"
+cp "$CONTEXT" "$RACE_CONTEXT"
+rm -f "$RESPONSE"
+rc=0
+CONTEXT_RACE_OUT=$(cd "$CODE_ACCESS_REPO" && env CONTEXT_MUTATION_TARGET="$RACE_CONTEXT" \
+    CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" PATH="$MUTATION_STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call run_claude_analysis "$RACE_CONTEXT" "$RESPONSE" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "an analyzer response is rejected when its immutable context changes during the run"
+assert_contains "$CONTEXT_RACE_OUT" "Analysis context changed during Claude analysis" \
+    "the context-refresh race is reported explicitly"
+assert_true "$([ ! -e "$RESPONSE" ] && echo 0 || echo 1)" \
+    "a response produced across two context snapshots is removed"
 
 # ---------------------------------------------------------------------------
 # Model selection
@@ -309,6 +647,27 @@ mkdir -p "$UNRELATED"
 UNRELATED_OUT=$( (cd "$UNRELATED" && "$GH_PR_ENRICH" --test-call resolve_code_access "$BASE_SHA" 2>&1) || true)
 assert_contains "$UNRELATED_OUT" "disabled" "an unrelated history does not count as ahead of the PR head"
 
+# Gitlinks hide a second mutable workspace behind one parent-tree entry. The
+# bounded implementation takes the simple safe route and rejects all submodules.
+SUBMODULE_SOURCE="$TEST_OUTPUT_DIR/submodule-source"
+SUBMODULE_REPO="$TEST_OUTPUT_DIR/submodule-repo"
+mkdir -p "$SUBMODULE_SOURCE" "$SUBMODULE_REPO"
+(cd "$SUBMODULE_SOURCE" && git init -q . && git config user.email t@t && git config user.name t \
+    && echo child > child.txt && git add child.txt && git commit -qm init)
+(cd "$SUBMODULE_REPO" && git init -q . && git config user.email t@t && git config user.name t \
+    && echo parent > parent.txt && git add parent.txt && git commit -qm init \
+    && git -c protocol.file.allow=always submodule add -q "$SUBMODULE_SOURCE" module \
+    && git commit -qam submodule)
+SUBMODULE_PARENT_HEAD=$(git -C "$SUBMODULE_REPO" rev-parse HEAD)
+echo dirty >> "$SUBMODULE_REPO/module/child.txt"
+assert_eq "$SUBMODULE_PARENT_HEAD" "$(git -C "$SUBMODULE_REPO" rev-parse HEAD)" \
+    "dirty submodule contents leave the parent gitlink revision unchanged"
+rc=0
+(cd "$SUBMODULE_REPO" && "$GH_PR_ENRICH" --test-call \
+    code_access_workspace_fingerprint "$SUBMODULE_REPO/report" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a repository containing a gitlink fails closed for code-enabled analysis"
+
 # Not a git checkout at all. This has to live outside the repository, or git
 # walks up and finds this checkout's HEAD.
 NOGIT=$(mktemp -d)
@@ -356,6 +715,9 @@ assert_jq "$REV_DIR/claude-context.json" '.coverage.code_access.pr_head_sha != n
     "coverage records the PR head revision"
 assert_jq "$REV_DIR/claude-context.json" '.coverage.code_access.revision_matches == true' \
     "coverage records whether the inspected tree matches the PR"
+assert_jq "$REV_DIR/claude-context.json" \
+    '(.coverage.code_access.workspace_fingerprint // "") | startswith("sha256:")' \
+    "coverage fingerprints the exact workspace granted to the analyzer"
 
 # ---------------------------------------------------------------------------
 # Failure paths must be diagnosable, and must not leak shell internals
@@ -363,6 +725,34 @@ assert_jq "$REV_DIR/claude-context.json" '.coverage.code_access.revision_matches
 FAIL_STUBS="$TEST_OUTPUT_DIR/fail-stubs"
 mkdir -p "$FAIL_STUBS"
 cp "$STUB_DIR/timeout" "$FAIL_STUBS/timeout"
+cp "$STUB_DIR/ps" "$FAIL_STUBS/ps"
+
+# The wrapper owns both the direct Claude child and the timeout watcher. A real
+# deadline kills and reaps a Claude process that ignores cooperative shutdown.
+TIMEOUT_CHILD_PID_LOG="$TEST_OUTPUT_DIR/timeout-child-pid.txt"
+cat > "$FAIL_STUBS/claude" << 'STUB'
+#!/bin/bash
+printf '%s\n' "$$" > "$TIMEOUT_CHILD_PID_LOG"
+cat > /dev/null
+trap '' TERM INT
+while true; do :; done
+STUB
+chmod +x "$FAIL_STUBS/claude"
+rc=0
+REAL_TIMEOUT_OUT=$(cd "$CODE_ACCESS_REPO" && env CLAUDE_TIMEOUT=1 \
+    TIMEOUT_CHILD_PID_LOG="$TIMEOUT_CHILD_PID_LOG" PS_CALLED_LOG="$PS_CALLED_LOG" \
+    PATH="$FAIL_STUBS:$PATH" "$GH_PR_ENRICH" --test-call run_claude_analysis \
+    "$REV_DIR/analysis-context.json" "$TEST_OUTPUT_DIR/real-timeout.json" 2>&1) || rc=$?
+TIMED_OUT_CHILD=$(cat "$TIMEOUT_CHILD_PID_LOG" 2>/dev/null || echo "")
+assert_eq "137" "$rc" "the internal timeout preserves the killed-analyzer exit status"
+assert_contains "$REAL_TIMEOUT_OUT" "timed out after 1s" \
+    "the internal timeout reports the configured deadline"
+for _attempt in $(seq 1 100); do
+    [ -z "$TIMED_OUT_CHILD" ] || ! kill -0 "$TIMED_OUT_CHILD" 2>/dev/null && break
+    sleep 0.01
+done
+assert_true "$([ -n "$TIMED_OUT_CHILD" ] && ! kill -0 "$TIMED_OUT_CHILD" 2>/dev/null && echo 0 || echo 1)" \
+    "the timeout wrapper reaps its direct Claude child"
 
 # Analyzer killed by a signal (what a real timeout looks like)
 cat > "$FAIL_STUBS/claude" << 'STUB'
@@ -372,9 +762,9 @@ kill -9 $$
 STUB
 chmod +x "$FAIL_STUBS/claude"
 
-KILLED_OUT=$(env CLAUDE_ARG_LOG="$ARG_LOG" CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+KILLED_OUT=$(cd "$CODE_ACCESS_REPO" && env CLAUDE_ARG_LOG="$ARG_LOG" CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
     PATH="$FAIL_STUBS:$PATH" "$GH_PR_ENRICH" --test-call run_claude_analysis \
-    "$CONTEXT" "$TEST_OUTPUT_DIR/killed.json" 2>&1 || true)
+    "$REV_DIR/analysis-context.json" "$TEST_OUTPUT_DIR/killed.json" 2>&1 || true)
 
 assert_contains "$KILLED_OUT" "timed out" "a killed analyzer is reported as a timeout"
 assert_not_contains "$KILLED_OUT" "Killed: 9" \
@@ -392,9 +782,9 @@ STUB
 chmod +x "$FAIL_STUBS/claude"
 
 rc=0
-FAILED_OUT=$(env CLAUDE_ARG_LOG="$ARG_LOG" CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+FAILED_OUT=$(cd "$CODE_ACCESS_REPO" && env CLAUDE_ARG_LOG="$ARG_LOG" CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
     PATH="$FAIL_STUBS:$PATH" "$GH_PR_ENRICH" --test-call run_claude_analysis \
-    "$CONTEXT" "$TEST_OUTPUT_DIR/failed.json" 2>&1) || rc=$?
+    "$REV_DIR/analysis-context.json" "$TEST_OUTPUT_DIR/failed.json" 2>&1) || rc=$?
 
 assert_eq "3" "$rc" "the analyzer's exit code is propagated to the caller"
 assert_contains "$FAILED_OUT" "credit balance too low" \

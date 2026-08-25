@@ -62,6 +62,17 @@ canonicalize_path() {
     fi
 }
 
+absolute_path_for_write() {
+    local path="$1" parent
+    case "$path" in
+        /*) printf '%s\n' "$path" ;;
+        *)
+            parent="$(cd "$(dirname "$path")" && pwd -P)" || return 1
+            printf '%s/%s\n' "$parent" "$(basename "$path")"
+            ;;
+    esac
+}
+
 # Keep the legacy compatibility artifact byte-identical but inode-independent.
 # A hard link lets an old consumer mutate the canonical immutable snapshot.
 copy_compatibility_file() {
@@ -69,6 +80,19 @@ copy_compatibility_file() {
     local target_file="$2"
     cp "$source_file" "$target_file.tmp"
     mv "$target_file.tmp" "$target_file"
+}
+
+sha256_file() {
+    local source_file="$1"
+    if command -v shasum > /dev/null 2>&1; then
+        shasum -a 256 "$source_file" | awk '{print $1}'
+    elif command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$source_file" | awk '{print $1}'
+    elif command -v openssl > /dev/null 2>&1; then
+        openssl dgst -sha256 "$source_file" | awk '{print $NF}'
+    else
+        return 1
+    fi
 }
 
 # Stable content identity for one analysis snapshot. Recompute this digest at
@@ -81,13 +105,7 @@ analysis_context_fingerprint() {
         rm -f "$canonical_file"
         return 1
     fi
-    if command -v shasum > /dev/null 2>&1; then
-        digest="$(shasum -a 256 "$canonical_file" | awk '{print $1}')"
-    elif command -v sha256sum > /dev/null 2>&1; then
-        digest="$(sha256sum "$canonical_file" | awk '{print $1}')"
-    elif command -v openssl > /dev/null 2>&1; then
-        digest="$(openssl dgst -sha256 "$canonical_file" | awk '{print $NF}')"
-    else
+    if ! digest="$(sha256_file "$canonical_file")"; then
         echo "Error: SHA-256 implementation not found (need shasum, sha256sum, or openssl)." >&2
         rm -f "$canonical_file"
         return 1
@@ -95,6 +113,346 @@ analysis_context_fingerprint() {
     rm -f "$canonical_file"
     [ -n "$digest" ] || return 1
     printf 'sha256:%s\n' "$digest"
+}
+
+# Return the working-tree permission bits on both BSD and GNU stat.
+workspace_file_mode() {
+    local mode=""
+    if mode="$(stat -c '%a' "$1" 2>/dev/null)" && \
+       [[ "$mode" =~ ^[0-7]+$ ]]; then
+        printf '%s\n' "$mode"
+        return 0
+    fi
+    if mode="$(stat -f '%Lp' "$1" 2>/dev/null)" && \
+       [[ "$mode" =~ ^[0-7]+$ ]]; then
+        printf '%s\n' "$mode"
+        return 0
+    fi
+    return 1
+}
+
+# Write a canonical NUL-delimited manifest for every repository-visible path.
+# HEAD and index identity bind staged state; hashing every working-tree file also
+# catches bytes hidden from `git diff` by skip-worktree or assume-unchanged bits.
+build_code_access_workspace_manifest() {
+    local ignored_output_dir="${1:-}"
+    local manifest="$2"
+    local repo_root output_abs="" output_rel="" output_is_repo_root=false
+    local records index_state head index_digest record metadata index_mode index_stage
+    local relative origin file_hash file_mode artifact_relative
+    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
+    [ -n "$repo_root" ] || return 1
+
+    if [ -n "$ignored_output_dir" ]; then
+        output_abs="$(canonicalize_path "$ignored_output_dir")"
+        case "$output_abs" in
+            "$repo_root") output_is_repo_root=true ;;
+            "$repo_root"/*) output_rel="${output_abs#"$repo_root/"}" ;;
+        esac
+    fi
+
+    records="$(mktemp "/tmp/gh-pr-enrich-workspace-records.XXXXXX")" || return 1
+    index_state="$(mktemp "/tmp/gh-pr-enrich-index-state.XXXXXX")" || {
+        rm -f "$records"
+        return 1
+    }
+    if ! head="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null)" || \
+       ! { git -C "$repo_root" ls-files --stage -z -- .; \
+           git -C "$repo_root" ls-files -v -z -- .; } > "$index_state" 2>/dev/null || \
+       ! index_digest="$(sha256_file "$index_state")"; then
+        rm -f "$records" "$index_state"
+        return 1
+    fi
+    printf 'head\0%s\0index\0sha256:%s\0' "$head" "$index_digest" > "$manifest"
+
+    if ! git -C "$repo_root" ls-files --stage -z -- . > "$records" 2>/dev/null; then
+        rm -f "$records" "$index_state" "$manifest"
+        return 1
+    fi
+    while IFS= read -r -d '' record; do
+        metadata="${record%%$'\t'*}"
+        relative="${record#*$'\t'}"
+        index_mode="${metadata%% *}"
+        index_stage="${metadata##* }"
+        if [ "$index_stage" != "0" ] || [ "$index_mode" = "120000" ] || \
+           [ "$index_mode" = "160000" ] || \
+           path_has_symlink_component "$repo_root/$relative"; then
+            rm -f "$records" "$index_state" "$manifest"
+            return 1
+        fi
+        if [ ! -e "$repo_root/$relative" ]; then
+            printf 'missing\0tracked\0%s\0' "$relative" >> "$manifest"
+            continue
+        fi
+        if [ ! -f "$repo_root/$relative" ] || \
+           ! file_mode="$(workspace_file_mode "$repo_root/$relative")" || \
+           ! file_hash="$(sha256_file "$repo_root/$relative")"; then
+            rm -f "$records" "$index_state" "$manifest"
+            return 1
+        fi
+        printf 'file\0tracked\0%s\0%s\0%s\0' \
+            "$relative" "$file_mode" "$file_hash" >> "$manifest"
+    done < "$records"
+
+    for origin in untracked ignored; do
+        if [ "$origin" = "untracked" ]; then
+            git -C "$repo_root" ls-files --others --exclude-standard -z -- . \
+                > "$records" 2>/dev/null || {
+                    rm -f "$records" "$index_state" "$manifest"
+                    return 1
+                }
+        else
+            git -C "$repo_root" ls-files --others --ignored --exclude-standard -z -- . \
+                > "$records" 2>/dev/null || {
+                    rm -f "$records" "$index_state" "$manifest"
+                    return 1
+                }
+        fi
+        while IFS= read -r -d '' relative; do
+            if path_has_symlink_component "$repo_root/$relative" || \
+               [ ! -f "$repo_root/$relative" ]; then
+                # Includes nested repositories, which Git reports as directory
+                # entries whose mutable descendants are otherwise invisible.
+                rm -f "$records" "$index_state" "$manifest"
+                return 1
+            fi
+            artifact_relative=""
+            if [ "$output_is_repo_root" = true ]; then
+                artifact_relative="$relative"
+            elif [ -n "$output_rel" ]; then
+                case "$relative" in
+                    "$output_rel"/*) artifact_relative="${relative#"$output_rel/"}" ;;
+                esac
+            fi
+            if [ -n "$artifact_relative" ] && \
+               is_generated_report_artifact "$artifact_relative"; then
+                continue
+            fi
+            if ! file_mode="$(workspace_file_mode "$repo_root/$relative")" || \
+               ! file_hash="$(sha256_file "$repo_root/$relative")"; then
+                rm -f "$records" "$index_state" "$manifest"
+                return 1
+            fi
+            printf 'file\0%s\0%s\0%s\0%s\0' \
+                "$origin" "$relative" "$file_mode" "$file_hash" >> "$manifest"
+        done < "$records"
+    done
+    rm -f "$records" "$index_state"
+}
+
+# Bind repository tools to one exact local workspace. Generated report
+# artifacts are excluded individually; every other visible path is manifested.
+code_access_workspace_fingerprint() {
+    local manifest digest
+    manifest="$(mktemp "/tmp/gh-pr-enrich-workspace.XXXXXX")" || return 1
+    if ! build_code_access_workspace_manifest "${1:-}" "$manifest" || \
+       ! digest="$(sha256_file "$manifest")"; then
+        rm -f "$manifest"
+        return 1
+    fi
+    rm -f "$manifest"
+    printf 'sha256:%s\n' "$digest"
+}
+
+CODE_ACCESS_SNAPSHOT_DIR=""
+CODE_ACCESS_SETTINGS_FILE=""
+CODE_ACCESS_TRAPS_ACTIVE=false
+CODE_ACCESS_PREVIOUS_EXIT_TRAP=""
+CODE_ACCESS_PREVIOUS_INT_TRAP=""
+CODE_ACCESS_PREVIOUS_TERM_TRAP=""
+ANALYZER_CHILD_PID=""
+ANALYZER_HEARTBEAT_PID=""
+ANALYZER_PROMPT_FILE=""
+
+terminate_analyzer_child() {
+    local analyzer_pid="$ANALYZER_CHILD_PID"
+    [ -n "$analyzer_pid" ] || return 0
+    kill -TERM "$analyzer_pid" 2>/dev/null || true
+    wait "$analyzer_pid" 2>/dev/null || true
+    ANALYZER_CHILD_PID=""
+}
+
+terminate_analyzer_heartbeat() {
+    [ -n "$ANALYZER_HEARTBEAT_PID" ] || return 0
+    kill -TERM "$ANALYZER_HEARTBEAT_PID" 2>/dev/null || true
+    wait "$ANALYZER_HEARTBEAT_PID" 2>/dev/null || true
+    ANALYZER_HEARTBEAT_PID=""
+}
+
+is_private_code_snapshot_path() {
+    local candidate="$1" parent expected_parent basename
+    case "$candidate" in
+        /tmp/gh-pr-enrich-code-snapshot.*|/private/tmp/gh-pr-enrich-code-snapshot.*) ;;
+        *) return 1 ;;
+    esac
+    [ -d "$candidate" ] && [ ! -L "$candidate" ] || return 1
+    parent="$(cd "$(dirname "$candidate")" && pwd -P)" || return 1
+    expected_parent="$(cd /tmp && pwd -P)" || return 1
+    basename="$(basename "$candidate")"
+    [ "$parent" = "$expected_parent" ] && \
+        [[ "$basename" =~ ^gh-pr-enrich-code-snapshot\.[A-Za-z0-9]+$ ]]
+}
+
+restore_code_access_cleanup_traps() {
+    [ "$CODE_ACCESS_TRAPS_ACTIVE" = true ] || return 0
+    trap - EXIT INT TERM
+    [ -z "$CODE_ACCESS_PREVIOUS_EXIT_TRAP" ] || eval "$CODE_ACCESS_PREVIOUS_EXIT_TRAP"
+    [ -z "$CODE_ACCESS_PREVIOUS_INT_TRAP" ] || eval "$CODE_ACCESS_PREVIOUS_INT_TRAP"
+    [ -z "$CODE_ACCESS_PREVIOUS_TERM_TRAP" ] || eval "$CODE_ACCESS_PREVIOUS_TERM_TRAP"
+    CODE_ACCESS_TRAPS_ACTIVE=false
+    CODE_ACCESS_PREVIOUS_EXIT_TRAP=""
+    CODE_ACCESS_PREVIOUS_INT_TRAP=""
+    CODE_ACCESS_PREVIOUS_TERM_TRAP=""
+}
+
+cleanup_code_access_artifacts() {
+    if is_private_code_snapshot_path "$CODE_ACCESS_SNAPSHOT_DIR"; then
+        chmod -R u+w "$CODE_ACCESS_SNAPSHOT_DIR" 2>/dev/null || true
+        rm -rf "$CODE_ACCESS_SNAPSHOT_DIR"
+    fi
+    case "$CODE_ACCESS_SETTINGS_FILE" in
+        /tmp/gh-pr-enrich-claude-settings.*|/private/tmp/gh-pr-enrich-claude-settings.*)
+            rm -f "$CODE_ACCESS_SETTINGS_FILE"
+            ;;
+    esac
+    case "$ANALYZER_PROMPT_FILE" in
+        /tmp/gh-pr-enrich-claude-prompt.*|/private/tmp/gh-pr-enrich-claude-prompt.*)
+            rm -f "$ANALYZER_PROMPT_FILE"
+            ;;
+    esac
+    CODE_ACCESS_SNAPSHOT_DIR=""
+    CODE_ACCESS_SETTINGS_FILE=""
+    ANALYZER_PROMPT_FILE=""
+}
+
+handle_code_access_cleanup_signal() {
+    local exit_status=$?
+    local signal_name="$1"
+    terminate_analyzer_child
+    terminate_analyzer_heartbeat
+    cleanup_code_access_artifacts
+    restore_code_access_cleanup_traps
+    if [ "$signal_name" = "EXIT" ]; then
+        return "$exit_status"
+    fi
+    kill -s "$signal_name" "$$"
+}
+
+install_code_access_cleanup_traps() {
+    [ "$CODE_ACCESS_TRAPS_ACTIVE" != true ] || return 0
+    CODE_ACCESS_PREVIOUS_EXIT_TRAP="$(trap -p EXIT)"
+    CODE_ACCESS_PREVIOUS_INT_TRAP="$(trap -p INT)"
+    CODE_ACCESS_PREVIOUS_TERM_TRAP="$(trap -p TERM)"
+    CODE_ACCESS_TRAPS_ACTIVE=true
+    trap 'handle_code_access_cleanup_signal EXIT' EXIT
+    trap 'handle_code_access_cleanup_signal INT' INT
+    trap 'handle_code_access_cleanup_signal TERM' TERM
+}
+
+cleanup_code_access_snapshot() {
+    cleanup_code_access_artifacts
+    restore_code_access_cleanup_traps
+}
+
+create_code_access_snapshot() {
+    local ignored_output_dir="$1"
+    local expected_fingerprint="$2"
+    local repo_root manifest manifest_digest kind header_value origin relative mode expected_hash
+    local destination destination_hash destination_mode
+    cleanup_code_access_snapshot
+    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
+    [ -n "$repo_root" ] || return 1
+    manifest="$(mktemp "/tmp/gh-pr-enrich-snapshot-manifest.XXXXXX")" || return 1
+    if ! build_code_access_workspace_manifest "$ignored_output_dir" "$manifest" || \
+       ! manifest_digest="$(sha256_file "$manifest")" || \
+       [ "sha256:$manifest_digest" != "$expected_fingerprint" ]; then
+        rm -f "$manifest"
+        return 1
+    fi
+    CODE_ACCESS_SNAPSHOT_DIR="$(mktemp -d "/tmp/gh-pr-enrich-code-snapshot.XXXXXX")" || {
+        rm -f "$manifest"
+        return 1
+    }
+    install_code_access_cleanup_traps
+    while IFS= read -r -d '' kind <&3; do
+        case "$kind" in
+            head|index)
+                IFS= read -r -d '' header_value <&3 || {
+                    rm -f "$manifest"
+                    cleanup_code_access_snapshot
+                    return 1
+                }
+                ;;
+            missing)
+                IFS= read -r -d '' origin <&3 && \
+                    IFS= read -r -d '' relative <&3 || {
+                        rm -f "$manifest"
+                        cleanup_code_access_snapshot
+                        return 1
+                    }
+                ;;
+            file)
+                IFS= read -r -d '' origin <&3 && \
+                    IFS= read -r -d '' relative <&3 && \
+                    IFS= read -r -d '' mode <&3 && \
+                    IFS= read -r -d '' expected_hash <&3 || {
+                        rm -f "$manifest"
+                        cleanup_code_access_snapshot
+                        return 1
+                    }
+                case "$relative" in ""|/*|../*|*/../*|*/..)
+                    rm -f "$manifest"
+                    cleanup_code_access_snapshot
+                    return 1
+                    ;;
+                esac
+                destination="$CODE_ACCESS_SNAPSHOT_DIR/$relative"
+                mkdir -p "$(dirname "$destination")" || {
+                    rm -f "$manifest"
+                    cleanup_code_access_snapshot
+                    return 1
+                }
+                if [ -L "$repo_root/$relative" ] || [ ! -f "$repo_root/$relative" ] || \
+                   ! cp "$repo_root/$relative" "$destination" || \
+                   ! chmod "$mode" "$destination" || \
+                   ! destination_hash="$(sha256_file "$destination")" || \
+                   ! destination_mode="$(workspace_file_mode "$destination")" || \
+                   [ "$destination_hash" != "$expected_hash" ] || \
+                   [ "$destination_mode" != "$mode" ]; then
+                    rm -f "$manifest"
+                    cleanup_code_access_snapshot
+                    return 1
+                fi
+                ;;
+            *)
+                rm -f "$manifest"
+                cleanup_code_access_snapshot
+                return 1
+                ;;
+        esac
+    done 3< "$manifest"
+    rm -f "$manifest"
+    chmod -R a-w "$CODE_ACCESS_SNAPSHOT_DIR" || {
+        cleanup_code_access_snapshot
+        return 1
+    }
+}
+
+create_claude_code_access_settings() {
+    local repository_root="$1" claude_absolute_root
+    [ -n "$repository_root" ] || return 1
+    claude_absolute_root="//${repository_root#/}"
+    CODE_ACCESS_SETTINGS_FILE="$(mktemp "/tmp/gh-pr-enrich-claude-settings.XXXXXX")" || return 1
+    install_code_access_cleanup_traps
+    if ! jq -n --arg repository_root "$claude_absolute_root" '{
+        permissions: {
+            deny: ["Read(" + $repository_root + "/**)"]
+        }
+    }' > "$CODE_ACCESS_SETTINGS_FILE" || \
+       ! chmod 600 "$CODE_ACCESS_SETTINGS_FILE"; then
+        cleanup_code_access_snapshot
+        return 1
+    fi
 }
 
 write_input_status() {
@@ -119,6 +477,135 @@ verify_pr_head_unchanged() {
     fi
     CURRENT_HOSTED_HEAD="$(printf '%s' "$head_json" | jq -r '.headRefOid // ""' 2>/dev/null || echo "")"
     [ -n "$expected_head" ] && [ "$CURRENT_HOSTED_HEAD" = "$expected_head" ]
+}
+
+fetch_live_review_thread() {
+    local thread_id="$1"
+    local output_file="$2"
+    local comment_limit="${THREAD_COMMENT_LIMIT:-20}"
+    local query='query($threadId: ID!) {
+      node(id: $threadId) {
+        __typename
+        ... on PullRequestReviewThread {
+          id
+          isResolved
+          comments(first: '"$comment_limit"') {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              databaseId
+              author { login }
+              createdAt
+              lastEditedAt
+              url
+            }
+          }
+        }
+      }
+    }'
+    if ! gh api graphql -F threadId="$thread_id" -f query="$query" \
+            > "$output_file" 2>/dev/null || \
+       ! jq -e '
+            ((.errors // []) | length) == 0 and
+            .data.node.__typename == "PullRequestReviewThread" and
+            (.data.node.comments.nodes | type) == "array" and
+            (.data.node.comments.pageInfo.hasNextPage | type) == "boolean"
+       ' "$output_file" > /dev/null 2>&1; then
+        rm -f "$output_file"
+        return 1
+    fi
+}
+
+live_review_thread_identity_matches_context() {
+    local context_file="$1"
+    local thread_id="$2"
+    local live_file="$3"
+    jq -e -n \
+            --arg thread_id "$thread_id" \
+            --slurpfile context "$context_file" \
+            --slurpfile live "$live_file" '
+          def identity_is_complete:
+            (.id | type == "string" and length > 0) and
+            (.database_id | type == "number") and
+            (.author | type == "string" and length > 0) and
+            (.created_at | type == "string" and length > 0) and
+            (.last_edited_at == null or (.last_edited_at | type == "string")) and
+            (.url | type == "string" and startswith("https://"));
+          [($context[0].unresolved_threads // [])[]
+            | select(.thread_id == $thread_id)] as $captured
+          | ($live[0].data.node) as $current
+          | ($current.comments.nodes | map({
+                id: (.id // null),
+                database_id: (.databaseId // null),
+                author: (.author.login // "unknown"),
+                created_at: (.createdAt // null),
+                last_edited_at: (.lastEditedAt // null),
+                url: (.url // null)
+            })) as $live_identity
+          | ($captured | length) == 1 and
+            ($captured[0].comments_complete == true) and
+            (($captured[0].comment_identity | type) == "array") and
+            (all($captured[0].comment_identity[]; identity_is_complete)) and
+            ($current.id == $thread_id) and
+            ($current.comments.pageInfo.hasNextPage == false) and
+            (all($live_identity[]; identity_is_complete)) and
+            (($captured[0].comment_identity | sort_by(.id)) ==
+                ($live_identity | sort_by(.id)))
+       ' > /dev/null 2>&1
+}
+
+validate_live_review_thread_snapshot() {
+    local context_file="$1"
+    local thread_id="$2"
+    local expected_resolved="$3"
+    local live_file="$4"
+    live_review_thread_identity_matches_context "$context_file" "$thread_id" \
+        "$live_file" || return 1
+    jq -e --arg thread_id "$thread_id" --argjson expected "$expected_resolved" '
+        .data.node.id == $thread_id and .data.node.isResolved == $expected
+    ' "$live_file" > /dev/null 2>&1
+}
+
+validate_live_review_thread() {
+    local context_file="$1"
+    local thread_id="$2"
+    local expected_resolved="$3"
+    local live_file
+    live_file="$(mktemp "/tmp/gh-pr-enrich-live-thread.XXXXXX")" || return 1
+    if ! fetch_live_review_thread "$thread_id" "$live_file" || \
+       ! validate_live_review_thread_snapshot "$context_file" "$thread_id" \
+            "$expected_resolved" "$live_file"; then
+        rm -f "$live_file"
+        return 1
+    fi
+    rm -f "$live_file"
+}
+
+unresolve_review_thread_and_verify() {
+    local context_file="$1"
+    local thread_id="$2"
+    local result
+    result="$(gh api graphql \
+        -F threadId="$thread_id" \
+        -f query='mutation($threadId: ID!) {
+            unresolveReviewThread(input: {threadId: $threadId}) {
+                thread { isResolved }
+            }
+        }' 2>&1)" || return 1
+    echo "$result" | jq -e \
+        '.data.unresolveReviewThread.thread.isResolved == false' \
+        > /dev/null 2>&1 || return 1
+    local live_file
+    live_file="$(mktemp "/tmp/gh-pr-enrich-reopened-thread.XXXXXX")" || return 1
+    if ! fetch_live_review_thread "$thread_id" "$live_file" || \
+       ! jq -e --arg thread_id "$thread_id" '
+            .data.node.id == $thread_id and
+            .data.node.isResolved == false
+       ' "$live_file" > /dev/null 2>&1; then
+        rm -f "$live_file"
+        return 1
+    fi
+    rm -f "$live_file"
 }
 
 invalidate_selected_analysis() {
@@ -265,12 +752,332 @@ sanitize_for_terminal() {
     printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037\177'
 }
 
+# The fingerprinted context is the grant. Later boundaries require the same
+# workspace; they never replay the override that created the grant. A current
+# explicit opt-out can still revoke it.
+validate_code_access_grant() {
+    local context_file="$1"
+    local report_dir="$2"
+    local expected_fingerprint current_fingerprint
+    if [ "${GH_PR_ENRICH_CODE_ACCESS:-}" = "false" ]; then
+        echo "Error: Repository code access was revoked by --no-code-access." >&2
+        return 1
+    fi
+    if [ "$(jq -r '.coverage.code_access.state // "disabled"' \
+            "$context_file" 2>/dev/null || echo "disabled")" != "enabled" ]; then
+        echo "Error: Repository code access is not enabled in the fingerprinted context." >&2
+        return 1
+    fi
+    expected_fingerprint="$(jq -r \
+        '.coverage.code_access.workspace_fingerprint // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    current_fingerprint="$(code_access_workspace_fingerprint \
+        "$report_dir" 2>/dev/null || echo "")"
+    if [ -z "$expected_fingerprint" ] || \
+       [ "$current_fingerprint" != "$expected_fingerprint" ]; then
+        echo "Error: Current local code access no longer matches the fingerprinted context." >&2
+        return 1
+    fi
+}
+
+analysis_snapshot_sidecar_matches() {
+    local snapshot_path="$1" sidecar_path="$2" expected_token="${3:-}"
+    local expected_state="${4:-}" token janitor_pid state parent expected_parent
+    [ "$sidecar_path" = "$snapshot_path.janitor" ] || return 1
+    [ -f "$sidecar_path" ] && [ ! -L "$sidecar_path" ] || return 1
+    parent="$(cd "$(dirname "$sidecar_path")" && pwd -P)" || return 1
+    expected_parent="$(cd /tmp && pwd -P)" || return 1
+    [ "$parent" = "$expected_parent" ] || return 1
+    IFS=$'\t' read -r token janitor_pid state < "$sidecar_path" || return 1
+    [[ "$token" =~ ^[A-Za-z0-9]+$ ]] || return 1
+    [[ "$janitor_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    case "$state" in active|cancel) ;; *) return 1 ;; esac
+    { [ -z "$expected_token" ] || [ "$token" = "$expected_token" ]; } && \
+        { [ -z "$expected_state" ] || [ "$state" = "$expected_state" ]; }
+}
+
+run_analysis_snapshot_janitor() {
+    local snapshot_path="$1" sidecar_path="$2" token="$3" ttl_seconds="$4"
+    local poll_seconds="${GH_PR_ENRICH_SNAPSHOT_POLL_SECONDS:-0.1}"
+    local recorded_token recorded_pid state sleep_pid="" deadline
+    is_private_code_snapshot_path "$snapshot_path" || return 1
+    [[ "$ttl_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$poll_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    [ "$poll_seconds" != "0" ] && [ "$poll_seconds" != "0.0" ] || return 1
+    if ! (umask 077; set -o noclobber; \
+            printf '%s\t%s\tactive\n' "$token" "$$" > "$sidecar_path") \
+            2>/dev/null; then
+        return 1
+    fi
+    trap '' HUP
+    trap '[ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null; [ -z "$sleep_pid" ] || wait "$sleep_pid" 2>/dev/null; exit 0' TERM INT
+    deadline=$((SECONDS + ttl_seconds))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        analysis_snapshot_sidecar_matches "$snapshot_path" "$sidecar_path" \
+            "$token" || return 0
+        IFS=$'\t' read -r recorded_token recorded_pid state \
+            < "$sidecar_path" || return 0
+        [ "$recorded_pid" = "$$" ] || return 0
+        if [ "$state" = "cancel" ]; then
+            rm -f "$sidecar_path"
+            return 0
+        fi
+        sleep "$poll_seconds" &
+        sleep_pid=$!
+        wait "$sleep_pid" 2>/dev/null || return 0
+        sleep_pid=""
+    done
+    trap - TERM INT
+    analysis_snapshot_sidecar_matches "$snapshot_path" "$sidecar_path" \
+        "$token" active || return 0
+    IFS=$'\t' read -r recorded_token recorded_pid state \
+        < "$sidecar_path" || return 0
+    [ "$recorded_pid" = "$$" ] || return 0
+    chmod -R u+w "$snapshot_path" 2>/dev/null || true
+    rm -rf "$snapshot_path"
+    rm -f "$sidecar_path"
+}
+
+stop_analysis_snapshot_janitor() {
+    local snapshot_path="$1" sidecar_path="$snapshot_path.janitor"
+    local token janitor_pid state attempt cancel_tmp
+    if ! analysis_snapshot_sidecar_matches "$snapshot_path" "$sidecar_path"; then
+        rm -f "$sidecar_path" 2>/dev/null || true
+        return 0
+    fi
+    IFS=$'\t' read -r token janitor_pid state < "$sidecar_path" || return 0
+    cancel_tmp="$(mktemp "$sidecar_path.cancel.XXXXXX")" || return 1
+    if ! printf '%s\t%s\tcancel\n' "$token" "$janitor_pid" > "$cancel_tmp" || \
+       ! chmod 600 "$cancel_tmp" || ! mv "$cancel_tmp" "$sidecar_path"; then
+        rm -f "$cancel_tmp"
+        return 1
+    fi
+    for attempt in $(seq 1 300); do
+        [ ! -e "$sidecar_path" ] && return 0
+        sleep 0.01
+    done
+    rm -f "$sidecar_path"
+}
+
+start_analysis_snapshot_janitor() {
+    local snapshot_path="$1" ttl_seconds="$2"
+    local cleanup_command sidecar_path token_file token janitor_pid attempt
+    local recorded_token recorded_pid state ready=false
+    is_private_code_snapshot_path "$snapshot_path" || return 1
+    [[ "$ttl_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+    cleanup_command="$(canonicalize_path "${BASH_SOURCE[0]}")"
+    [ -f "$cleanup_command" ] && [ -x "$cleanup_command" ] || return 1
+    sidecar_path="$snapshot_path.janitor"
+    token_file="$(mktemp "/tmp/gh-pr-enrich-janitor-token.XXXXXX")" || return 1
+    token="${token_file##*.}"
+    rm -f "$token_file"
+    "$cleanup_command" __snapshot-janitor "$snapshot_path" "$sidecar_path" \
+        "$token" "$ttl_seconds" </dev/null >/dev/null 2>&1 &
+    janitor_pid=$!
+    for attempt in $(seq 1 300); do
+        if analysis_snapshot_sidecar_matches "$snapshot_path" "$sidecar_path" \
+                "$token" active; then
+            IFS=$'\t' read -r recorded_token recorded_pid state \
+                < "$sidecar_path" || break
+            if [ "$recorded_pid" = "$janitor_pid" ]; then
+                ready=true
+                break
+            fi
+        fi
+        kill -0 "$janitor_pid" 2>/dev/null || break
+        sleep 0.01
+    done
+    if [ "$ready" != true ]; then
+        stop_analysis_snapshot_janitor "$snapshot_path" || true
+        wait "$janitor_pid" 2>/dev/null || true
+        return 1
+    fi
+    disown "$janitor_pid" 2>/dev/null || true
+}
+
+materialize_analysis_snapshot() {
+    local report_dir="$1"
+    local context_file="$report_dir/analysis-context.json"
+    local embedded_context_fingerprint current_context_fingerprint
+    local expected_workspace_fingerprint current_workspace_fingerprint
+    local captured_pr_head snapshot_path result
+    local snapshot_ttl_seconds="${GH_PR_ENRICH_SNAPSHOT_TTL_SECONDS:-3600}"
+    if [ ! -f "$context_file" ] || [ -L "$context_file" ] || \
+       path_is_git_tracked "$context_file"; then
+        echo "Error: A safe analysis-context.json is required to materialize a snapshot." >&2
+        return 1
+    fi
+    embedded_context_fingerprint="$(jq -r '.coverage.context_fingerprint // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    current_context_fingerprint="$(analysis_context_fingerprint \
+        "$context_file" 2>/dev/null || echo "")"
+    if [ -z "$current_context_fingerprint" ] || \
+       [ "$embedded_context_fingerprint" != "$current_context_fingerprint" ]; then
+        echo "Error: Analysis context fingerprint is missing or invalid." >&2
+        return 1
+    fi
+    validate_code_access_grant "$context_file" "$report_dir" || return 1
+    expected_workspace_fingerprint="$(jq -r \
+        '.coverage.code_access.workspace_fingerprint // ""' "$context_file")"
+    captured_pr_head="$(jq -r '.coverage.code_access.pr_head_sha // ""' \
+        "$context_file")"
+    if [ -z "$captured_pr_head" ] || \
+       ! create_code_access_snapshot "$report_dir" "$expected_workspace_fingerprint"; then
+        echo "Error: Could not materialize a verified immutable analysis snapshot." >&2
+        return 1
+    fi
+    current_workspace_fingerprint="$(code_access_workspace_fingerprint \
+        "$report_dir" 2>/dev/null || echo "")"
+    if [ "$current_workspace_fingerprint" != "$expected_workspace_fingerprint" ]; then
+        cleanup_code_access_snapshot
+        echo "Error: Local workspace changed while the analysis snapshot was materialized." >&2
+        return 1
+    fi
+    snapshot_path="$CODE_ACCESS_SNAPSHOT_DIR"
+    if ! start_analysis_snapshot_janitor "$snapshot_path" \
+            "$snapshot_ttl_seconds"; then
+        cleanup_code_access_snapshot
+        echo "Error: Could not start the bounded analysis-snapshot lease." >&2
+        return 1
+    fi
+    result="$(jq -n \
+        --arg path "$snapshot_path" \
+        --arg workspace_fingerprint "$expected_workspace_fingerprint" \
+        --arg context_fingerprint "$current_context_fingerprint" \
+        --arg pr_head_sha "$captured_pr_head" \
+        --argjson expires_in_seconds "$snapshot_ttl_seconds" \
+        '{path:$path, workspace_fingerprint:$workspace_fingerprint,
+          context_fingerprint:$context_fingerprint, pr_head_sha:$pr_head_sha,
+          expires_in_seconds:$expires_in_seconds}')" || {
+        cleanup_code_access_snapshot
+        return 1
+    }
+
+    # The native orchestrator owns this lease after the command returns and
+    # must call cleanup-analysis-snapshot when every subagent is done.
+    CODE_ACCESS_SNAPSHOT_DIR=""
+    restore_code_access_cleanup_traps
+    printf '%s\n' "$result"
+}
+
+cleanup_materialized_analysis_snapshot() {
+    local snapshot_path="$1"
+    if ! is_private_code_snapshot_path "$snapshot_path"; then
+        echo "Error: Refusing to remove an invalid analysis snapshot path." >&2
+        return 1
+    fi
+    stop_analysis_snapshot_janitor "$snapshot_path"
+    chmod -R u+w "$snapshot_path" 2>/dev/null || true
+    rm -rf "$snapshot_path"
+}
+
+validate_analysis_thread_ids() {
+    local context_file="$1"
+    local analysis_file="$2"
+    [ -f "$context_file" ] && [ -f "$analysis_file" ] || return 1
+    jq -e --slurpfile analysis "$analysis_file" '
+        [(.unresolved_threads // [])[] | .thread_id
+            | select(type == "string" and test("^PRRT_[A-Za-z0-9_-]+$"))] as $allowed
+        | ($analysis[0]) as $a
+        | def known_thread:
+            type == "string" and test("^PRRT_[A-Za-z0-9_-]+$") and
+            (. as $id | $allowed | index($id) != null);
+          all($a.task_list[]?.thread_ids[]?; known_thread) and
+          all($a.issue_categories[]?.thread_ids[]?; known_thread) and
+          all($a.disputed_comments[]?.thread_id; known_thread)
+    ' "$context_file" > /dev/null 2>&1
+}
+
+validate_selected_provenance() {
+    local report_dir="$1"
+    local analysis_file="$2"
+    local context_file="${3:-$report_dir/analysis-context.json}"
+    local context_fingerprint embedded_fingerprint
+    local context_repository context_pr context_head
+    local analysis_repository analysis_pr analysis_head analysis_fingerprint
+    local expected_workspace_fingerprint analysis_workspace_fingerprint
+    if [ ! -f "$analysis_file" ] || [ ! -f "$context_file" ] || \
+       [ -L "$analysis_file" ] || [ -L "$context_file" ] || \
+       path_is_git_tracked "$analysis_file" || path_is_git_tracked "$context_file" || \
+       ! jq -e 'type == "object" and (._metadata | type == "object")' \
+            "$analysis_file" > /dev/null 2>&1 || \
+       ! jq -e 'type == "object" and (.pr | type == "object") and
+            (.coverage | type == "object")' "$context_file" > /dev/null 2>&1; then
+        return 1
+    fi
+    context_fingerprint="$(analysis_context_fingerprint "$context_file" 2>/dev/null || echo "")"
+    embedded_fingerprint="$(jq -r '.coverage.context_fingerprint // ""' "$context_file")"
+    context_repository="$(jq -r '.pr.repository // ""' "$context_file")"
+    context_pr="$(jq -r '.pr.number // ""' "$context_file")"
+    context_head="$(jq -r '.coverage.code_access.pr_head_sha // ""' "$context_file")"
+    analysis_repository="$(jq -r '._metadata.repository // ""' "$analysis_file")"
+    analysis_pr="$(jq -r '._metadata.pr_number // ""' "$analysis_file")"
+    analysis_head="$(jq -r '._metadata.pr_head_sha // ""' "$analysis_file")"
+    analysis_fingerprint="$(jq -r '._metadata.context_fingerprint // ""' "$analysis_file")"
+    expected_workspace_fingerprint="$(jq -r \
+        '.coverage.code_access.workspace_fingerprint // ""' "$context_file")"
+    analysis_workspace_fingerprint="$(jq -r \
+        '._metadata.workspace_fingerprint // ""' "$analysis_file")"
+    if [ -z "$context_fingerprint" ] || [ "$embedded_fingerprint" != "$context_fingerprint" ] || \
+       [ -z "$context_repository" ] || [ -z "$context_pr" ] || [ -z "$context_head" ] || \
+       [ "$analysis_repository" != "$context_repository" ] || \
+       [ "$analysis_pr" != "$context_pr" ] || [ "$analysis_head" != "$context_head" ] || \
+       [ "$analysis_fingerprint" != "$context_fingerprint" ]; then
+        return 1
+    fi
+    if jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
+            "$analysis_file" > /dev/null 2>&1 && \
+       { [ -z "$expected_workspace_fingerprint" ] || \
+         [ "$analysis_workspace_fingerprint" != "$expected_workspace_fingerprint" ]; }; then
+        return 1
+    fi
+    validate_analysis_thread_ids "$context_file" "$analysis_file"
+}
+
+validate_selected_workspace() {
+    local report_dir="$1"
+    local analysis_file="$2"
+    local context_file="${3:-$report_dir/analysis-context.json}"
+    validate_selected_provenance "$report_dir" "$analysis_file" "$context_file" || return 1
+    if jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
+            "$analysis_file" > /dev/null 2>&1; then
+        validate_code_access_grant "$context_file" "$report_dir"
+    fi
+}
+
+validate_address_selection_pair() {
+    local report_dir="$1"
+    local frozen_analysis_file="$2"
+    local live_analysis_file="$3"
+    local context_file="${4:-$report_dir/analysis-context.json}"
+    local require_workspace=false
+    validate_selected_provenance "$report_dir" "$frozen_analysis_file" \
+        "$context_file" || return 1
+    validate_selected_provenance "$report_dir" "$live_analysis_file" \
+        "$context_file" || return 1
+    if [ "$(jq -r '.coverage.code_access.state // "disabled"' \
+            "$context_file" 2>/dev/null || echo "disabled")" = "enabled" ] || \
+       jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
+            "$frozen_analysis_file" > /dev/null 2>&1 || \
+       jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
+            "$live_analysis_file" > /dev/null 2>&1; then
+        require_workspace=true
+    fi
+    [ "$require_workspace" = false ] || \
+        validate_code_access_grant "$context_file" "$report_dir"
+}
+
 # Prefer the provider-neutral selected analysis while retaining compatibility
 # with reports generated before v2.1.
 select_analysis_file() {
     local report_dir="$1"
+    local selection_mode="${2:-read-only}"
     local expected_head="" expected_fingerprint="" expected_repository=""
     local expected_pr_number="" has_current_context=false
+    case "$selection_mode" in
+        read-only|require-current-workspace) ;;
+        *) return 1 ;;
+    esac
     if [ -f "$report_dir/analysis-context.json" ]; then
         local embedded_fingerprint
         has_current_context=true
@@ -302,7 +1109,7 @@ select_analysis_file() {
     fi
 
     if [ -f "$report_dir/analysis.json" ]; then
-        local selected_head selected_fingerprint selected_has_metadata
+        local selected_has_metadata
         selected_has_metadata="$(jq -r 'type == "object" and has("_metadata")' \
             "$report_dir/analysis.json" 2>/dev/null || echo false)"
         # Provider-neutral analysis.json exists only in the v2.1 selection
@@ -319,26 +1126,21 @@ select_analysis_file() {
            path_is_git_tracked "$report_dir/analysis-context.json"; then
             return 1
         fi
-        selected_head="$(jq -r '._metadata.pr_head_sha // ""' \
-            "$report_dir/analysis.json" 2>/dev/null || echo "")"
-        selected_fingerprint="$(jq -r '._metadata.context_fingerprint // ""' \
-            "$report_dir/analysis.json" 2>/dev/null || echo "")"
-        if [ -n "$expected_head" ] && [ "$selected_head" != "$expected_head" ]; then
-            return 1
-        fi
-        if [ -n "$expected_fingerprint" ] && \
-           [ "$selected_fingerprint" != "$expected_fingerprint" ]; then
-            return 1
-        fi
-        if [ "$(jq -r '._metadata.repository // ""' "$report_dir/analysis.json")" \
-                != "$expected_repository" ] || \
-           [ "$(jq -r '._metadata.pr_number // ""' "$report_dir/analysis.json")" \
-                != "$expected_pr_number" ]; then
+        if [ "$selection_mode" = "require-current-workspace" ]; then
+            if ! validate_selected_workspace "$report_dir" "$report_dir/analysis.json"; then
+                invalidate_selected_analysis "$report_dir" || true
+                return 1
+            fi
+        elif ! validate_selected_provenance "$report_dir" \
+                "$report_dir/analysis.json"; then
             return 1
         fi
         printf '%s\n' "$report_dir/analysis.json"
     elif [ -f "$report_dir/claude-analysis.json" ]; then
         # Old Claude-only reports had no provider-neutral provenance metadata.
+        # Read-only retrospective discovery may still inspect them, but strict
+        # mutation consumers cannot prove their workspace or PR identity.
+        [ "$selection_mode" = "read-only" ] || return 1
         # A current source file can exist even when selection rejected it (for
         # example, incomplete category coverage or failed source fetches). Never
         # let a downstream consumer bypass that rejection by treating the source
@@ -364,6 +1166,8 @@ select_analysis_file() {
 # reaches both.
 #
 # Usage: invoke_claude LABEL TIMEOUT OUT_FILE SYSTEM_PROMPT SCHEMA USER_PROMPT [TOOL...]
+ANALYZER_WORKING_DIRECTORY=""
+ANALYZER_SETTINGS_FILE=""
 invoke_claude() {
     local label="$1"
     local timeout_secs="$2"
@@ -380,7 +1184,32 @@ invoke_claude() {
 
     local -a tool_args=(--tools "")
     if [ "${#tools[@]}" -gt 0 ]; then
-        tool_args=(--tools "${tools[@]}" --allowedTools "${tools[@]}")
+        local -a available_tools=()
+        local tool_rule
+        for tool_rule in "${tools[@]}"; do
+            case "$tool_rule" in
+                Read\(*\)) available_tools+=("Read") ;;
+                *) available_tools+=("$tool_rule") ;;
+            esac
+        done
+        tool_args=(--tools "${available_tools[@]}" \
+            --allowedTools "${tools[@]}")
+    fi
+    local -a settings_args=()
+    if [ -n "$ANALYZER_SETTINGS_FILE" ]; then
+        settings_args=(--settings "$ANALYZER_SETTINGS_FILE")
+    fi
+    [[ "$timeout_secs" =~ ^[1-9][0-9]*$ ]] || {
+        echo "Error: Analyzer timeout must be a positive integer." >&2
+        return 1
+    }
+    ANALYZER_PROMPT_FILE="$(mktemp "/tmp/gh-pr-enrich-claude-prompt.XXXXXX")" || \
+        return 1
+    install_code_access_cleanup_traps
+    if ! chmod 600 "$ANALYZER_PROMPT_FILE" || \
+       ! printf '%s\n' "$user_prompt" > "$ANALYZER_PROMPT_FILE"; then
+        cleanup_code_access_artifacts
+        return 1
     fi
 
     # Elapsed time is the only progress signal available: --output-format json
@@ -406,33 +1235,85 @@ invoke_claude() {
             echo "   ⏳ still running ${label} — ${waited}s elapsed of ${timeout_secs}s" >&2
         done
     ) &
-    local heartbeat_pid=$!
-    disown "$heartbeat_pid" 2>/dev/null || true
+    ANALYZER_HEARTBEAT_PID=$!
+    disown "$ANALYZER_HEARTBEAT_PID" 2>/dev/null || true
 
     local exit_code=0
     # --setting-sources "" bypasses plugin loading, which can hang.
-    # --signal=KILL --foreground because claude --print ignores SIGTERM during init.
     # CLAUDECODE is unset so this can run nested inside a Claude Code session.
     # stderr goes to a log rather than /dev/null: a discarded error message is the
     # difference between a diagnosable failure and a mysterious empty analysis.
     # The subshell's own stderr is dropped so the shell's job-death diagnostic
     # ("Killed: 9" plus the whole command line) never reaches the user.
-    if ( echo "$user_prompt" | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
-        timeout --signal=KILL --foreground "$timeout_secs" claude --print \
-        --setting-sources "" \
-        --permission-mode dontAsk \
-        --no-session-persistence \
-        --model "$model" \
-        --output-format json \
-        --json-schema "$schema" \
-        --system-prompt "$system_prompt" \
-        "${tool_args[@]+"${tool_args[@]}"}" \
-        > "$output_file" 2> "$stderr_log" ) 2>/dev/null; then
-        kill "$heartbeat_pid" 2>/dev/null || true
+    (
+        claude_pid=""
+        timeout_watcher_pid=""
+        stop_timeout_watcher() {
+            [ -n "$timeout_watcher_pid" ] || return 0
+            kill -TERM "$timeout_watcher_pid" 2>/dev/null || true
+            wait "$timeout_watcher_pid" 2>/dev/null || true
+            timeout_watcher_pid=""
+        }
+        stop_claude_child() {
+            [ -n "$claude_pid" ] || return 0
+            kill -KILL "$claude_pid" 2>/dev/null || true
+            wait "$claude_pid" 2>/dev/null || true
+            claude_pid=""
+        }
+        stop_analyzer_wrapper() {
+            local signal_exit="$1"
+            stop_timeout_watcher
+            stop_claude_child
+            exit "$signal_exit"
+        }
+        trap 'stop_analyzer_wrapper 143' TERM
+        trap 'stop_analyzer_wrapper 130' INT
+
+        if [ -n "$ANALYZER_WORKING_DIRECTORY" ]; then
+            cd "$ANALYZER_WORKING_DIRECTORY" || exit 1
+        fi
+        env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+            GH_PR_ENRICH_CLEANUP_OWNER_PID="$$" \
+            GH_PR_ENRICH_ANALYZER_TIMEOUT_SECONDS="$timeout_secs" \
+            claude --print \
+            --setting-sources "" \
+            "${settings_args[@]+"${settings_args[@]}"}" \
+            --permission-mode dontAsk \
+            --no-session-persistence \
+            --model "$model" \
+            --output-format json \
+            --json-schema "$schema" \
+            --system-prompt "$system_prompt" \
+            "${tool_args[@]+"${tool_args[@]}"}" \
+            < "$ANALYZER_PROMPT_FILE" > "$output_file" 2> "$stderr_log" &
+        claude_pid=$!
+
+        (
+            watcher_sleep_pid=""
+            trap '[ -n "$watcher_sleep_pid" ] && kill "$watcher_sleep_pid" 2>/dev/null; [ -z "$watcher_sleep_pid" ] || wait "$watcher_sleep_pid" 2>/dev/null; exit 0' TERM INT
+            sleep "$timeout_secs" &
+            watcher_sleep_pid=$!
+            wait "$watcher_sleep_pid" 2>/dev/null || exit 0
+            watcher_sleep_pid=""
+            kill -KILL "$claude_pid" 2>/dev/null || true
+        ) &
+        timeout_watcher_pid=$!
+
+        claude_exit=0
+        wait "$claude_pid" || claude_exit=$?
+        claude_pid=""
+        stop_timeout_watcher
+        exit "$claude_exit"
+    ) 2>/dev/null &
+    ANALYZER_CHILD_PID=$!
+    if wait "$ANALYZER_CHILD_PID"; then
+        ANALYZER_CHILD_PID=""
+        terminate_analyzer_heartbeat
         echo "✅ ${label} complete ($((SECONDS - start_ts))s)" >&2
     else
         exit_code=$?
-        kill "$heartbeat_pid" 2>/dev/null || true
+        ANALYZER_CHILD_PID=""
+        terminate_analyzer_heartbeat
         # 124 = timeout with SIGTERM, 137 = timeout with SIGKILL (128 + 9)
         if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
             echo "⏱️  ${label} timed out after ${timeout_secs}s (set CLAUDE_TIMEOUT to increase)" >&2
@@ -445,10 +1326,43 @@ invoke_claude() {
         fi
     fi
 
+    rm -f "$ANALYZER_PROMPT_FILE"
+    ANALYZER_PROMPT_FILE=""
+
     return $exit_code
 }
 
 # Re-enter through the function dispatcher after all helpers are defined.
+if [ "$1" = "__snapshot-janitor" ]; then
+    shift
+    [ $# -eq 4 ] || exit 1
+    run_analysis_snapshot_janitor "$1" "$2" "$3" "$4"
+    exit $?
+fi
+
+if [ "$1" = "materialize-analysis-snapshot" ]; then
+    shift
+    if [ "${1:-}" = "--help" ] || [ $# -ne 1 ]; then
+        echo "Usage: gh pr-enrich materialize-analysis-snapshot <REPORT_DIR>"
+        echo "Validate the recorded code-access grant and create a private immutable workspace snapshot."
+        [ "${1:-}" = "--help" ] && exit 0
+        exit 1
+    fi
+    materialize_analysis_snapshot "$1"
+    exit $?
+fi
+
+if [ "$1" = "cleanup-analysis-snapshot" ]; then
+    shift
+    if [ "${1:-}" = "--help" ] || [ $# -ne 1 ]; then
+        echo "Usage: gh pr-enrich cleanup-analysis-snapshot <SNAPSHOT_PATH>"
+        [ "${1:-}" = "--help" ] && exit 0
+        exit 1
+    fi
+    cleanup_materialized_analysis_snapshot "$1"
+    exit $?
+fi
+
 if [ "$1" = "select-analysis" ]; then
     shift
     if [ "${1:-}" = "--help" ] || [ $# -ne 2 ]; then
@@ -740,16 +1654,12 @@ RETRO_HELP
         exit 1
     fi
 
-    # Check Claude CLI and timeout command if enrichment requested
+    # Check Claude CLI if enrichment was requested.
     check_claude_cli() {
         if [ "$RETRO_ENRICH" = true ]; then
             if ! command -v claude &> /dev/null; then
                 echo "Warning: Claude CLI not found. Skipping enrichment." >&2
                 echo "Install from: https://claude.ai/code" >&2
-                RETRO_ENRICH=false
-            elif ! command -v timeout &> /dev/null; then
-                echo "Warning: 'timeout' command not found. Skipping enrichment." >&2
-                echo "On macOS: 'brew install coreutils' installs 'gtimeout' (create a 'timeout' alias or symlink), on Linux: 'apt install coreutils'." >&2
                 RETRO_ENRICH=false
             fi
         fi
@@ -1927,13 +2837,40 @@ if [ "$1" = "address" ]; then
     fi
 
     ANALYSIS_DIR=".reports/pr-reviews/pr-$ADDRESS_PR"
-    ANALYSIS_FILE="$(select_analysis_file "$ANALYSIS_DIR" 2>/dev/null || true)"
+    ANALYSIS_FILE="$(select_analysis_file "$ANALYSIS_DIR" require-current-workspace 2>/dev/null || true)"
 
     if [ -z "$ANALYSIS_FILE" ] || [ ! -f "$ANALYSIS_FILE" ]; then
         echo "Error: Analysis not found in $ANALYSIS_DIR"
         echo "Run 'gh pr-enrich $ADDRESS_PR --enrich' first"
         exit 1
     fi
+
+    ADDRESS_LIVE_ANALYSIS_FILE="$ANALYSIS_FILE"
+    ADDRESS_FROZEN_ANALYSIS="$(mktemp "/tmp/gh-pr-enrich-address-analysis.XXXXXX")" || exit 1
+    cleanup_address_analysis() {
+        rm -f "$ADDRESS_FROZEN_ANALYSIS"
+    }
+    trap cleanup_address_analysis EXIT
+    if ! cp "$ADDRESS_LIVE_ANALYSIS_FILE" "$ADDRESS_FROZEN_ANALYSIS"; then
+        echo "Error: Could not freeze selected analysis before displaying tasks"
+        exit 1
+    fi
+    ADDRESS_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_FROZEN_ANALYSIS" 2>/dev/null || echo "")"
+    LIVE_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+    if [ -z "$ADDRESS_ANALYSIS_DIGEST" ] || \
+       [ "$LIVE_ANALYSIS_DIGEST" != "$ADDRESS_ANALYSIS_DIGEST" ]; then
+        invalidate_selected_analysis "$ANALYSIS_DIR" || true
+        echo "Error: Selected analysis changed while address mode was starting"
+        exit 1
+    fi
+    if [ "$(basename "$ADDRESS_LIVE_ANALYSIS_FILE")" = "analysis.json" ] && \
+       ! validate_address_selection_pair "$ANALYSIS_DIR" \
+            "$ADDRESS_FROZEN_ANALYSIS" "$ADDRESS_LIVE_ANALYSIS_FILE"; then
+        invalidate_selected_analysis "$ANALYSIS_DIR" || true
+        echo "Error: Selected analysis provenance changed before tasks could be displayed"
+        exit 1
+    fi
+    ANALYSIS_FILE="$ADDRESS_FROZEN_ANALYSIS"
 
     # Validate JSON structure before use
     if ! jq -e '.task_list' "$ANALYSIS_FILE" > /dev/null 2>&1; then
@@ -1948,7 +2885,7 @@ if [ "$1" = "address" ]; then
     ADDRESS_CONTEXT_PR=""
     ADDRESS_CONTEXT_REPOSITORY=""
     ADDRESS_CONTEXT_HEAD=""
-    if [ "$(basename "$ANALYSIS_FILE")" = "analysis.json" ] && \
+    if [ "$(basename "$ADDRESS_LIVE_ANALYSIS_FILE")" = "analysis.json" ] && \
        [ -f "$ADDRESS_CONTEXT_FILE" ]; then
         ADDRESS_CONTEXT_PR="$(jq -r '.pr.number // ""' "$ADDRESS_CONTEXT_FILE")"
         ADDRESS_CONTEXT_REPOSITORY="$(jq -r '.pr.repository // ""' "$ADDRESS_CONTEXT_FILE")"
@@ -2040,26 +2977,122 @@ if [ "$1" = "address" ]; then
                                 ((RESOLVE_FAILED++))
                                 continue
                             fi
+                            LIVE_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+                            if [ -z "$LIVE_ANALYSIS_DIGEST" ] || \
+                               [ "$LIVE_ANALYSIS_DIGEST" != "$ADDRESS_ANALYSIS_DIGEST" ] || \
+                               ! validate_address_selection_pair "$ANALYSIS_DIR" \
+                                    "$ANALYSIS_FILE" "$ADDRESS_LIVE_ANALYSIS_FILE"; then
+                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                echo "  ❌ Selected analysis or thread provenance changed. Re-run before resolving threads."
+                                exit 1
+                            fi
+                            if ! validate_live_review_thread \
+                                    "$ADDRESS_CONTEXT_FILE" "$TID" false; then
+                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                echo "  ❌ Live review discussion changed or could not be fetched completely. Re-run before resolving threads."
+                                exit 1
+                            fi
+                            # Hosted head is the final check immediately before
+                            # the mutation; all local and discussion checks have
+                            # already succeeded against the captured context.
                             if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
                                     "$ADDRESS_CONTEXT_HEAD" "$ADDRESS_CONTEXT_REPOSITORY"; then
                                 invalidate_selected_analysis "$ANALYSIS_DIR" || true
                                 echo "  ❌ Hosted PR head changed since analysis (expected $ADDRESS_CONTEXT_HEAD, found ${CURRENT_HOSTED_HEAD:-unknown}). Re-run before resolving threads."
                                 exit 1
                             fi
+                            RESULT=""
+                            MUTATION_RC=0
                             RESULT=$(gh api graphql \
                                 -F threadId="$TID" \
                                 -f query='mutation($threadId: ID!) {
                                     resolveReviewThread(input: {threadId: $threadId}) {
                                         thread { isResolved }
                                     }
-                                }' 2>&1)
-                            if echo "$RESULT" | jq -e '.data.resolveReviewThread.thread.isResolved' > /dev/null 2>&1; then
-                                echo "  ✅ Resolved: $TID"
-                            else
-                                ERROR=$(echo "$RESULT" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "$RESULT")
-                                echo "  ❌ Failed to resolve $TID: $ERROR"
-                                ((RESOLVE_FAILED++))
+                                }' 2>&1) || MUTATION_RC=$?
+                            MUTATION_RESPONSE_RESOLVED=false
+                            if [ "$MUTATION_RC" -eq 0 ] && \
+                               echo "$RESULT" | jq -e \
+                                    '.data.resolveReviewThread.thread.isResolved == true' \
+                                    > /dev/null 2>&1; then
+                                MUTATION_RESPONSE_RESOLVED=true
                             fi
+
+                            # A transport failure or malformed response may still
+                            # have applied the mutation. Resolve the ambiguity from
+                            # the live captured discussion before deciding whether
+                            # compensation or success is possible.
+                            if [ "$MUTATION_RESPONSE_RESOLVED" != true ]; then
+                                AMBIGUOUS_LIVE_FILE="$(mktemp "/tmp/gh-pr-enrich-ambiguous-thread.XXXXXX")" || exit 1
+                                if ! fetch_live_review_thread "$TID" "$AMBIGUOUS_LIVE_FILE" || \
+                                   ! validate_live_review_thread_snapshot \
+                                        "$ADDRESS_CONTEXT_FILE" "$TID" true \
+                                        "$AMBIGUOUS_LIVE_FILE"; then
+                                    rm -f "$AMBIGUOUS_LIVE_FILE"
+                                    invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                    echo "  ❌ Resolution result for $TID is ambiguous; live state could not prove the captured discussion resolved. Manual reconciliation is required."
+                                    exit 1
+                                fi
+                                rm -f "$AMBIGUOUS_LIVE_FILE"
+                            fi
+
+                            POST_LOCAL_VALID=true
+                            LIVE_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+                            if [ -z "$LIVE_ANALYSIS_DIGEST" ] || \
+                               [ "$LIVE_ANALYSIS_DIGEST" != "$ADDRESS_ANALYSIS_DIGEST" ] || \
+                               ! validate_address_selection_pair "$ANALYSIS_DIR" \
+                                    "$ANALYSIS_FILE" "$ADDRESS_LIVE_ANALYSIS_FILE"; then
+                                POST_LOCAL_VALID=false
+                            fi
+
+                            POST_THREAD_IDENTITY_VALID=false
+                            POST_THREAD_RESOLVED=false
+                            POST_LIVE_FILE="$(mktemp "/tmp/gh-pr-enrich-post-thread.XXXXXX")" || exit 1
+                            if fetch_live_review_thread "$TID" "$POST_LIVE_FILE"; then
+                                if live_review_thread_identity_matches_context \
+                                        "$ADDRESS_CONTEXT_FILE" "$TID" \
+                                        "$POST_LIVE_FILE"; then
+                                    POST_THREAD_IDENTITY_VALID=true
+                                fi
+                                if jq -e --arg thread_id "$TID" '
+                                        .data.node.id == $thread_id and
+                                        .data.node.isResolved == true
+                                    ' "$POST_LIVE_FILE" > /dev/null 2>&1; then
+                                    POST_THREAD_RESOLVED=true
+                                fi
+                            fi
+                            rm -f "$POST_LIVE_FILE"
+
+                            POST_HEAD_VALID=true
+                            if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
+                                    "$ADDRESS_CONTEXT_HEAD" \
+                                    "$ADDRESS_CONTEXT_REPOSITORY"; then
+                                POST_HEAD_VALID=false
+                            fi
+
+                            if [ "$POST_THREAD_IDENTITY_VALID" != true ]; then
+                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                echo "  ❌ Live review discussion changed during resolution; the thread was not reopened because reviewer-owned state changed. Manual reconciliation is required."
+                                exit 1
+                            fi
+                            if [ "$POST_THREAD_RESOLVED" != true ]; then
+                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                echo "  ❌ Resolution state for $TID changed unexpectedly. Manual reconciliation is required."
+                                exit 1
+                            fi
+                            if [ "$POST_LOCAL_VALID" != true ] || \
+                               [ "$POST_HEAD_VALID" != true ]; then
+                                if unresolve_review_thread_and_verify \
+                                        "$ADDRESS_CONTEXT_FILE" "$TID"; then
+                                    invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                    echo "  ❌ State changed during resolution; reopened $TID and invalidated the analysis."
+                                else
+                                    invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                    echo "  ❌ State changed during resolution and $TID could not be verified reopened. Manual intervention is required."
+                                fi
+                                exit 1
+                            fi
+                            echo "  ✅ Resolved: $TID"
                         done
                     fi
                     if [ "$RESOLVE_FAILED" -gt 0 ]; then
@@ -2151,6 +3184,8 @@ USAGE:
 SUBCOMMANDS:
   install-skill       Install the skill for Codex and/or Claude Code
   uninstall-skill     Remove Codex and/or Claude Code skill registrations
+  materialize-analysis-snapshot  Create a private immutable native-analysis tree
+  cleanup-analysis-snapshot      Remove a materialized native-analysis tree
   select-analysis     Promote a root-verified result and refresh selected views
   resolve <ID...>     Resolve PR review threads by GraphQL ID
   watch <PR> [OPTS]   Monitor PR for new comments (--interval, --enrich, --notify)
@@ -2182,6 +3217,7 @@ EXAMPLES:
   gh pr-enrich install-skill --runtime codex
   gh pr-enrich 123                        # Basic PR report
   gh pr-enrich 123 --prepare-analysis --diff # Context for native Codex agents
+  gh pr-enrich materialize-analysis-snapshot .reports/pr-reviews/pr-123
   gh pr-enrich 123 --enrich               # With external Claude analysis
   gh pr-enrich 123 --enrich --diff        # Analysis with code context
   gh pr-enrich 123 --enrich --diff --sast # Analysis with diffs and semgrep
@@ -2418,10 +3454,6 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
         echo "Error: Claude CLI not found; requested enrichment cannot run." >&2
         echo "Install from: https://claude.ai/code" >&2
         exit 1
-    elif ! command -v timeout &> /dev/null; then
-        echo "Error: 'timeout' command not found; requested enrichment cannot run." >&2
-        echo "Install coreutils: brew install coreutils (macOS) or apt install coreutils (Linux)" >&2
-        exit 1
     fi
 fi
 
@@ -2490,12 +3522,14 @@ fetch_review_threads() {
               originalLine
               diffSide
               comments(first: '"$THREAD_COMMENT_LIMIT"') {
+                pageInfo { hasNextPage endCursor }
                 nodes {
                   id
                   databaseId
                   body
                   author { login }
                   createdAt
+                  lastEditedAt
                   url
                 }
               }
@@ -2606,6 +3640,15 @@ extract_unresolved_threads() {
                 author: (.author.login // "unknown"),
                 body: .body,
                 url: .url
+            }],
+            comments_complete: ((.comments.pageInfo.hasNextPage // false) == false),
+            comment_identity: [.comments.nodes[] | {
+                id: (.id // null),
+                database_id: (.databaseId // null),
+                author: (.author.login // "unknown"),
+                created_at: (.createdAt // null),
+                last_edited_at: (.lastEditedAt // null),
+                url: (.url // null)
             }]
         }]' "$threads_file" > "$output_file"
 }
@@ -2829,6 +3872,19 @@ build_analysis_context() {
     access_line="$(resolve_code_access "$pr_head_sha" "$output_dir")"
     access_state="${access_line%%:*}"
     access_reason="${access_line#*: }"
+    local workspace_fingerprint="" workspace_fingerprint_check=""
+    if [ "$access_state" = "enabled" ]; then
+        workspace_fingerprint="$(code_access_workspace_fingerprint "$output_dir" 2>/dev/null || echo "")"
+        workspace_fingerprint_check="$(code_access_workspace_fingerprint "$output_dir" 2>/dev/null || echo "")"
+        if [ -z "$workspace_fingerprint" ]; then
+            access_state="disabled"
+            access_reason="workspace state could not be fingerprinted, so repository access cannot be revalidated"
+        elif [ "$workspace_fingerprint" != "$workspace_fingerprint_check" ]; then
+            access_state="disabled"
+            access_reason="workspace changed while the analysis context was being built"
+            workspace_fingerprint=""
+        fi
+    fi
 
     # One jq program builds the whole context. The coverage block records what was
     # dropped or shortened, so a truncated input can never read as a complete one.
@@ -2858,6 +3914,7 @@ build_analysis_context() {
         --arg local_head "$local_head" \
         --arg access_state "$access_state" \
         --arg access_reason "$access_reason" \
+        --arg workspace_fingerprint "$workspace_fingerprint" \
         --arg repository "$repository" \
         --argjson thread_comment_limit "$THREAD_COMMENT_LIMIT" \
         --argjson linked_issue_limit "$LINKED_ISSUE_LIMIT" \
@@ -2938,7 +3995,9 @@ build_analysis_context() {
                     reason: $access_reason,
                     pr_head_sha: (if $pr_head_sha == "" then null else $pr_head_sha end),
                     inspected_sha: (if $local_head == "" then null else $local_head end),
-                    revision_matches: ($pr_head_sha != "" and $pr_head_sha == $local_head)
+                    revision_matches: ($pr_head_sha != "" and $pr_head_sha == $local_head),
+                    workspace_fingerprint: (if $workspace_fingerprint == ""
+                        then null else $workspace_fingerprint end)
                 },
                 issue_comments: {
                     total: ($raw | length),
@@ -3422,22 +4481,43 @@ resolve_code_access() {
     return 0
 }
 
+CLAUDE_CAPTURED_PR_HEAD=""
+CLAUDE_CAPTURED_CONTEXT_FINGERPRINT=""
+CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT=""
 run_claude_analysis() {
     local context_file="$1"
     local output_file="$2"
+    local analysis_output_file="$output_file"
+    CLAUDE_CAPTURED_PR_HEAD=""
+    CLAUDE_CAPTURED_CONTEXT_FINGERPRINT=""
+    CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT=""
+    ANALYZER_WORKING_DIRECTORY=""
+    ANALYZER_SETTINGS_FILE=""
+    cleanup_code_access_snapshot
 
-    # Decide here rather than trusting what the context recorded: the tree may
-    # have moved since it was built, and --no-code-access must apply either way.
-    local pr_head_sha
-    pr_head_sha="$(jq -r '.coverage.code_access.pr_head_sha // ""' "$context_file" 2>/dev/null || echo "")"
-    local access_line access_state access_reason
-    access_line="$(resolve_code_access "$pr_head_sha" "$(dirname "$context_file")")"
-    access_state="${access_line%%:*}"
-    access_reason="${access_line#*: }"
-    local code_access="true"
-    [ "$access_state" = "disabled" ] && code_access="false"
-    # Reading and verifying against the repository takes longer than paraphrasing
-    # comments; a 300s budget truncated that work.
+    local context_access_state access_reason captured_pr_head
+    local captured_context_fingerprint embedded_context_fingerprint
+    context_access_state="$(jq -r '.coverage.code_access.state // "disabled"' \
+        "$context_file" 2>/dev/null || echo "disabled")"
+    access_reason="$(jq -r '.coverage.code_access.reason // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    captured_pr_head="$(jq -r '.coverage.code_access.pr_head_sha // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    embedded_context_fingerprint="$(jq -r '.coverage.context_fingerprint // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    captured_context_fingerprint="$(analysis_context_fingerprint \
+        "$context_file" 2>/dev/null || echo "")"
+    if [ -z "$captured_pr_head" ] || [ -z "$captured_context_fingerprint" ] || \
+       [ "$embedded_context_fingerprint" != "$captured_context_fingerprint" ]; then
+        echo "Error: Analysis context identity is missing or invalid before Claude analysis." >&2
+        return 1
+    fi
+
+    local code_access="false"
+    if [ "$context_access_state" = "enabled" ]; then
+        validate_code_access_grant "$context_file" "$(dirname "$context_file")" || return 1
+        code_access="true"
+    fi
     local timeout_secs="${CLAUDE_TIMEOUT:-600}"
     local model="${GH_PR_ENRICH_MODEL:-sonnet}"
 
@@ -3454,11 +4534,9 @@ Verify each claim against the code before reporting it, sweep every category in 
 
 $context_payload"
 
-    # Read-only tools: the analyzer verifies claims against the repository but must
-    # never modify it or run commands. Bash, Write and Edit are deliberately absent.
     local -a tools=()
     if [ "$code_access" = "true" ]; then
-        tools=("Read" "Grep" "Glob")
+        tools=("Read(./**)" "Grep" "Glob")
         echo "🧠 Running Claude analysis with read-only repository access (model: $model, timeout: ${timeout_secs}s)..." >&2
     else
         echo "🧠 Running Claude analysis WITHOUT repository access (model: $model, timeout: ${timeout_secs}s)..." >&2
@@ -3466,9 +4544,74 @@ $context_payload"
     fi
     [ -n "$access_reason" ] && echo "   Code access: $access_reason" >&2
 
-    invoke_claude "Claude analysis" "$timeout_secs" "$output_file" \
+    if [ "$code_access" = "true" ]; then
+        local expected_workspace_fingerprint current_workspace_fingerprint repository_root
+        expected_workspace_fingerprint="$(jq -r \
+            '.coverage.code_access.workspace_fingerprint // ""' \
+            "$context_file" 2>/dev/null || echo "")"
+        if ! create_code_access_snapshot "$(dirname "$context_file")" \
+                "$expected_workspace_fingerprint"; then
+            echo "Error: Could not create a verified immutable repository snapshot for Claude analysis." >&2
+            return 1
+        fi
+        current_workspace_fingerprint="$(code_access_workspace_fingerprint \
+            "$(dirname "$context_file")" 2>/dev/null || echo "")"
+        if [ -z "$current_workspace_fingerprint" ] || \
+           [ "$current_workspace_fingerprint" != "$expected_workspace_fingerprint" ]; then
+            cleanup_code_access_snapshot
+            echo "Error: Local workspace changed while the immutable analyzer snapshot was being built." >&2
+            return 1
+        fi
+        if ! analysis_output_file="$(absolute_path_for_write "$output_file")"; then
+            cleanup_code_access_snapshot
+            return 1
+        fi
+        repository_root="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
+        if [ -z "$repository_root" ] || \
+           ! create_claude_code_access_settings "$repository_root"; then
+            cleanup_code_access_snapshot
+            echo "Error: Could not create isolated Claude code-access settings." >&2
+            return 1
+        fi
+        ANALYZER_WORKING_DIRECTORY="$CODE_ACCESS_SNAPSHOT_DIR"
+        ANALYZER_SETTINGS_FILE="$CODE_ACCESS_SETTINGS_FILE"
+    fi
+
+    local invoke_rc=0
+    invoke_claude "Claude analysis" "$timeout_secs" "$analysis_output_file" \
         "$system_prompt" "$ANALYSIS_SCHEMA" "$user_prompt" \
-        "${tools[@]+"${tools[@]}"}"
+        "${tools[@]+"${tools[@]}"}" || invoke_rc=$?
+    ANALYZER_WORKING_DIRECTORY=""
+    ANALYZER_SETTINGS_FILE=""
+    cleanup_code_access_snapshot
+    [ "$invoke_rc" -eq 0 ] || return "$invoke_rc"
+
+    local current_pr_head current_embedded_fingerprint current_context_fingerprint
+    current_pr_head="$(jq -r '.coverage.code_access.pr_head_sha // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    current_embedded_fingerprint="$(jq -r '.coverage.context_fingerprint // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    current_context_fingerprint="$(analysis_context_fingerprint \
+        "$context_file" 2>/dev/null || echo "")"
+    if [ "$current_pr_head" != "$captured_pr_head" ] || \
+       [ "$current_embedded_fingerprint" != "$captured_context_fingerprint" ] || \
+       [ "$current_context_fingerprint" != "$captured_context_fingerprint" ]; then
+        rm -f "$analysis_output_file"
+        echo "Error: Analysis context changed during Claude analysis; the response was rejected." >&2
+        return 1
+    fi
+    if [ "$code_access" = "true" ] && \
+       ! validate_code_access_grant "$context_file" "$(dirname "$context_file")"; then
+        rm -f "$analysis_output_file"
+        echo "Error: Local workspace changed during Claude analysis; the response was rejected. Rebuild the analysis context." >&2
+        return 1
+    fi
+
+    CLAUDE_CAPTURED_PR_HEAD="$captured_pr_head"
+    CLAUDE_CAPTURED_CONTEXT_FINGERPRINT="$captured_context_fingerprint"
+    if [ "$code_access" = "true" ]; then
+        CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT="$expected_workspace_fingerprint"
+    fi
 }
 
 # Add provenance without changing the analyzer's task-list contract. Source
@@ -3478,14 +4621,15 @@ write_claude_analysis_artifact() {
     local raw_analysis="$1"
     local output_file="$2"
     local visibility="${3:-UNKNOWN}"
+    local pr_head_sha="${4:-}"
+    local context_fingerprint="${5:-}"
+    local workspace_fingerprint="${6:-}"
     local provider="claude"
     local model="${GH_PR_ENRICH_MODEL:-sonnet}"
-    local output_dir
-    output_dir="$(dirname "$output_file")"
-    local pr_head_sha context_fingerprint
-    pr_head_sha="$(jq -r '.headRefOid // ""' "$output_dir/pr-summary.json" 2>/dev/null || echo "")"
-    context_fingerprint="$(jq -r '.coverage.context_fingerprint // ""' \
-        "$output_dir/analysis-context.json" 2>/dev/null || echo "")"
+    if [ -z "$pr_head_sha" ] || [ -z "$context_fingerprint" ]; then
+        echo "Error: Claude analysis provenance was not captured before invocation." >&2
+        return 1
+    fi
 
     jq \
         --arg schema_version "2.1" \
@@ -3496,6 +4640,7 @@ write_claude_analysis_artifact() {
         --arg pr_number "${PR_NUMBER:-}" \
         --arg pr_head_sha "$pr_head_sha" \
         --arg context_fingerprint "$context_fingerprint" \
+        --arg workspace_fingerprint "$workspace_fingerprint" \
         --arg generated_at "${TIMESTAMP:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}" \
         '. + {
             _metadata: {
@@ -3507,6 +4652,7 @@ write_claude_analysis_artifact() {
                 pr_number: ($pr_number | tonumber?),
                 pr_head_sha: (if $pr_head_sha == "" then null else $pr_head_sha end),
                 context_fingerprint: (if $context_fingerprint == "" then null else $context_fingerprint end),
+                workspace_fingerprint: (if $workspace_fingerprint == "" then null else $workspace_fingerprint end),
                 generated_at: $generated_at,
                 context_file: "analysis-context.json"
             }
@@ -3520,7 +4666,61 @@ write_claude_analysis_artifact() {
 select_analysis_artifact() {
     local report_dir="$1"
     local source_file="$2"
-    local context_file="$report_dir/analysis-context.json"
+    local live_context_file="$report_dir/analysis-context.json"
+    local frozen_source frozen_context frozen_path frozen_abs report_abs repo_root
+    local captured_context_fingerprint rc=0
+    if path_has_symlink_component "$report_dir" || [ -L "$source_file" ] || \
+       [ -L "$live_context_file" ] || path_is_git_tracked "$source_file" || \
+       path_is_git_tracked "$live_context_file" || [ ! -f "$source_file" ] || \
+       [ ! -f "$live_context_file" ]; then
+        echo "Error: Refusing unsafe analysis source artifact: $source_file" >&2
+        return 1
+    fi
+    frozen_source="$(mktemp "/tmp/gh-pr-enrich-analysis-source.XXXXXX")" || return 1
+    frozen_context="$(mktemp "/tmp/gh-pr-enrich-analysis-context.XXXXXX")" || {
+        rm -f "$frozen_source"
+        return 1
+    }
+    report_abs="$(canonicalize_path "$report_dir")"
+    repo_root="$(git -C "$report_dir" rev-parse --show-toplevel 2>/dev/null || echo "")"
+    for frozen_path in "$frozen_source" "$frozen_context"; do
+        frozen_abs="$(canonicalize_path "$frozen_path")"
+        case "$frozen_abs" in
+            "$report_abs"|"$report_abs"/*)
+                rm -f "$frozen_source" "$frozen_context"
+                echo "Error: Could not freeze analysis inputs outside the report directory." >&2
+                return 1
+                ;;
+        esac
+        if [ -n "$repo_root" ]; then
+            case "$frozen_abs" in
+                "$repo_root"|"$repo_root"/*)
+                    rm -f "$frozen_source" "$frozen_context"
+                    echo "Error: Could not freeze analysis inputs outside the repository." >&2
+                    return 1
+                    ;;
+            esac
+        fi
+    done
+    if ! cp "$source_file" "$frozen_source" || \
+       ! cp "$live_context_file" "$frozen_context"; then
+        rm -f "$frozen_source" "$frozen_context"
+        return 1
+    fi
+    captured_context_fingerprint="$(analysis_context_fingerprint \
+        "$frozen_context" 2>/dev/null || echo "")"
+    _select_analysis_artifact "$report_dir" "$frozen_source" "$frozen_context" \
+        "$captured_context_fingerprint" || rc=$?
+    rm -f "$frozen_source" "$frozen_context"
+    return "$rc"
+}
+
+_select_analysis_artifact() {
+    local report_dir="$1"
+    local source_file="$2"
+    local context_file="$3"
+    local captured_context_fingerprint="$4"
+    local live_context_file="$report_dir/analysis-context.json"
     local selected_file="$report_dir/analysis.json"
     local guarded_path
 
@@ -3528,7 +4728,7 @@ select_analysis_artifact() {
         echo "Error: Analysis report path contains a symbolic-link component: $report_dir" >&2
         return 1
     fi
-    for guarded_path in "$context_file" "$report_dir/pr-summary.json" \
+    for guarded_path in "$context_file" "$live_context_file" "$report_dir/pr-summary.json" \
             "$source_file" "$selected_file" \
             "$report_dir/analysis.md" "$report_dir/context-coverage.md" \
             "$report_dir/combined-data.json" "$report_dir/comprehensive-report.md"; do
@@ -3656,18 +4856,13 @@ select_analysis_artifact() {
     context_fingerprint="$(analysis_context_fingerprint "$context_file" 2>/dev/null || echo "")"
     source_fingerprint="$(jq -r '._metadata.context_fingerprint // ""' "$source_file")"
     if [ -z "$context_fingerprint" ] || \
+       [ "$context_fingerprint" != "$captured_context_fingerprint" ] || \
        [ "$embedded_fingerprint" != "$context_fingerprint" ]; then
         echo "Error: Analysis context fingerprint is missing or does not match the snapshot content." >&2
         return 1
     fi
     if [ "$source_fingerprint" != "$context_fingerprint" ]; then
         echo "Error: Selected analysis context fingerprint does not match the current snapshot." >&2
-        return 1
-    fi
-    if [ "$(jq -r '.coverage.code_access.state // "unknown"' "$context_file")" != "enabled" ] && \
-       jq -e 'any(.issue_categories[]; .verdict == "confirmed")' \
-           "$source_file" > /dev/null 2>&1; then
-        echo "Error: Selected analysis contains confirmed findings without enabled repository code access in the fingerprinted context." >&2
         return 1
     fi
     context_pr_number="$(jq -r '.pr.number // ""' "$context_file")"
@@ -3683,6 +4878,10 @@ select_analysis_artifact() {
     if ! verify_pr_head_unchanged "$context_pr_number" "$context_head" "$context_repository"; then
         invalidate_selected_analysis "$report_dir" || return 1
         echo "Error: Hosted PR head changed before selection (expected $context_head, found ${CURRENT_HOSTED_HEAD:-unknown}). Rebuild the analysis context." >&2
+        return 1
+    fi
+    if ! validate_selected_workspace "$report_dir" "$source_file" "$context_file"; then
+        echo "Error: Selected analysis contains confirmed findings without enabled repository code access in a current matching fingerprinted context." >&2
         return 1
     fi
 
@@ -3739,11 +4938,24 @@ select_analysis_artifact() {
         fi
     fi
 
-    local source_is_selected=false
+    local source_is_selected=false live_context_fingerprint live_embedded_fingerprint
     if [ "$(canonicalize_path "$source_file")" = "$(canonicalize_path "$selected_file")" ]; then
         source_is_selected=true
     elif ! cp "$source_file" "$selected_tmp"; then
         cleanup_selection_temps
+        return 1
+    fi
+
+    live_context_fingerprint="$(analysis_context_fingerprint \
+        "$live_context_file" 2>/dev/null || echo "")"
+    live_embedded_fingerprint="$(jq -r '.coverage.context_fingerprint // ""' \
+        "$live_context_file" 2>/dev/null || echo "")"
+    if [ -L "$live_context_file" ] || path_is_git_tracked "$live_context_file" || \
+       [ -z "$captured_context_fingerprint" ] || \
+       [ "$live_context_fingerprint" != "$captured_context_fingerprint" ] || \
+       [ "$live_embedded_fingerprint" != "$captured_context_fingerprint" ]; then
+        cleanup_selection_temps
+        echo "Error: Analysis context changed during selection; no selected artifacts were published." >&2
         return 1
     fi
 
@@ -3924,7 +5136,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint select_analysis_file select_analysis_artifact fetch_review_threads fetch_linked_issues verify_pr_head_unchanged validate_output_directory_for_writes"
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint select_analysis_file select_analysis_artifact fetch_review_threads fetch_linked_issues verify_pr_head_unchanged validate_output_directory_for_writes"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in
@@ -4304,7 +5516,9 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                 jq '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" \
                     > "$OUTPUT_DIR/claude-analysis.raw.tmp.json"
                 write_claude_analysis_artifact "$OUTPUT_DIR/claude-analysis.raw.tmp.json" \
-                    "$OUTPUT_DIR/claude-analysis.json" "$REPOSITORY_VISIBILITY"
+                    "$OUTPUT_DIR/claude-analysis.json" "$REPOSITORY_VISIBILITY" \
+                    "$CLAUDE_CAPTURED_PR_HEAD" "$CLAUDE_CAPTURED_CONTEXT_FINGERPRINT" \
+                    "$CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT"
                 rm -f "$OUTPUT_DIR/claude-analysis.raw.tmp.json"
                 ANALYSIS_USABLE=true
             else

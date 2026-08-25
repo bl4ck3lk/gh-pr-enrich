@@ -362,15 +362,20 @@ test_provider_neutral_analysis_is_discovered() {
         > "$report_root/pr-summary.tmp.json"
     mv "$report_root/pr-summary.tmp.json" "$report_root/pr-summary.json"
     jq -n '{pr:{repository:"o/r",number:1},
-        coverage:{code_access:{pr_head_sha:"fixture-head"}}}' \
+        unresolved_threads:[{thread_id:"PRRT_test1"}],
+        coverage:{code_access:{state:"enabled",pr_head_sha:"fixture-head",
+            workspace_fingerprint:"sha256:historical-workspace"}}}' \
         > "$report_root/analysis-context.tmp.json"
     fingerprint=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
         "$report_root/analysis-context.tmp.json")
     jq --arg fingerprint "$fingerprint" '.coverage.context_fingerprint = $fingerprint' \
         "$report_root/analysis-context.tmp.json" > "$report_root/analysis-context.json"
-    jq --arg fingerprint "$fingerprint" '. + {_metadata:{
+    jq --arg fingerprint "$fingerprint" \
+        --arg workspace_fingerprint "sha256:historical-workspace" '
+        . + {_metadata:{
         provider:"codex", repository:"o/r", pr_number:1,
         pr_head_sha:"fixture-head", context_fingerprint:$fingerprint,
+        workspace_fingerprint:$workspace_fingerprint,
         generated_at:"2026-01-01T00:00:00Z",
         analyzers:[{provider:"codex",role:"orchestrator"}]
     }}' "$FIXTURES_DIR/pr-1/claude-analysis.json" > "$report_root/analysis.json"
