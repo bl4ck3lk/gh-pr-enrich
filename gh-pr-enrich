@@ -416,8 +416,12 @@ build_code_access_workspace_manifest() {
             return 1
         fi
         if [ ! -e "$repo_root/$relative" ]; then
-            printf 'missing\0tracked\0%s\0' "$relative" >> "$manifest"
-            continue
+            # A sparse checkout or skip-worktree deletion must not turn a
+            # tracked path into an invisible omission from a code snapshot.
+            # Code access is granted only when every index entry can be
+            # inspected and fingerprinted from the working tree.
+            rm -f "$records" "$index_state" "$manifest"
+            return 1
         fi
         if [ ! -f "$repo_root/$relative" ] || \
            ! file_mode="$(workspace_file_mode "$repo_root/$relative")" || \
@@ -707,17 +711,97 @@ write_input_status() {
         '{requested: $requested, status: $status, reason: $reason}' > "$output_file"
 }
 
+# Run a GitHub CLI request as a managed child so the report-level signal
+# handler can terminate a stalled network operation before releasing the
+# shared report lock. Redirections applied by callers are inherited by the
+# child, preserving the existing fetch and normalization contracts.
+REPORT_RUN_CHILD_PID=""
+REPORT_RUN_CHILD_STARTING=false
+REPORT_RUN_MANAGED=false
+REPORT_RUN_OWNER_PID=""
+
+report_run_is_owner_shell() {
+    [ "$REPORT_RUN_MANAGED" = true ] && [ -n "$REPORT_RUN_OWNER_PID" ] || \
+        return 1
+    selected_analysis_worker_pid || return 1
+    [ "$SELECTED_ANALYSIS_WORKER_PID" = "$REPORT_RUN_OWNER_PID" ]
+}
+
+run_report_command() {
+    local command_pid command_rc=0
+    if ! report_run_is_owner_shell; then
+        "$@"
+        return $?
+    fi
+    REPORT_RUN_CHILD_STARTING=true
+    "$@" &
+    command_pid=$!
+    REPORT_RUN_CHILD_PID="$command_pid"
+    REPORT_RUN_CHILD_STARTING=false
+    if [ -n "${RUN_LOCK_PENDING_SIGNAL:-}" ]; then
+        handle_report_run_signal "$RUN_LOCK_PENDING_SIGNAL" \
+            "$RUN_LOCK_PENDING_EXIT_CODE"
+    fi
+    wait "$command_pid" || command_rc=$?
+    if [ "$REPORT_RUN_CHILD_PID" = "$command_pid" ]; then
+        REPORT_RUN_CHILD_PID=""
+    fi
+    return "$command_rc"
+}
+
+terminate_report_run_child() {
+    local command_pid="$REPORT_RUN_CHILD_PID"
+    local attempt
+    [ -n "$command_pid" ] || return 0
+    kill -TERM "$command_pid" 2>/dev/null || true
+    for attempt in $(seq 1 20); do
+        kill -0 "$command_pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    if kill -0 "$command_pid" 2>/dev/null; then
+        kill -KILL "$command_pid" 2>/dev/null || true
+    fi
+    wait "$command_pid" 2>/dev/null || true
+    REPORT_RUN_CHILD_PID=""
+}
+
+cleanup_report_run_temp_files() {
+    local temp_file restore_nullglob=false cleanup_failed=false
+    local -a temp_files=()
+    shopt -q nullglob || { shopt -s nullglob; restore_nullglob=true; }
+    temp_files=("$OUTPUT_DIR"/linked-issues.json.pages.* \
+        "$OUTPUT_DIR"/linked-issues.json.normalized.*)
+    [ "$restore_nullglob" = false ] || shopt -u nullglob
+    for temp_file in "${temp_files[@]}"; do
+        [ -f "$temp_file" ] && [ ! -L "$temp_file" ] && \
+            is_generated_report_artifact "$(basename "$temp_file")" || continue
+        rm -f "$temp_file" || cleanup_failed=true
+    done
+    [ "$cleanup_failed" = false ]
+}
+
 CURRENT_HOSTED_HEAD=""
 verify_pr_head_unchanged() {
     local pr_number="$1" expected_head="$2" repository="${3:-}" head_json
+    local head_json_file
     CURRENT_HOSTED_HEAD=""
+    head_json_file="$(mktemp "/tmp/gh-pr-enrich-hosted-head.XXXXXX")" || return 1
     if [ -n "$repository" ]; then
-        if ! head_json="$(gh pr view "$pr_number" --repo "$repository" --json headRefOid 2>/dev/null)"; then
+        if ! run_report_command gh pr view "$pr_number" --repo "$repository" \
+                --json headRefOid > "$head_json_file" 2>/dev/null; then
+            rm -f "$head_json_file"
             return 1
         fi
-    elif ! head_json="$(gh pr view "$pr_number" --json headRefOid 2>/dev/null)"; then
+    elif ! run_report_command gh pr view "$pr_number" --json headRefOid \
+            > "$head_json_file" 2>/dev/null; then
+        rm -f "$head_json_file"
         return 1
     fi
+    if ! head_json="$(cat "$head_json_file")"; then
+        rm -f "$head_json_file"
+        return 1
+    fi
+    rm -f "$head_json_file"
     CURRENT_HOSTED_HEAD="$(printf '%s' "$head_json" | jq -r '.headRefOid // ""' 2>/dev/null || echo "")"
     [ -n "$expected_head" ] && [ "$CURRENT_HOSTED_HEAD" = "$expected_head" ]
 }
@@ -1445,6 +1529,14 @@ invalidate_selected_analysis() (
 )
 
 is_generated_report_artifact() {
+    local temp_suffix=""
+    case "$1" in
+        linked-issues.json.pages.*|linked-issues.json.normalized.*)
+            temp_suffix="${1##*.}"
+            [[ "$temp_suffix" =~ ^[A-Za-z0-9]{6}$ ]]
+            return $?
+            ;;
+    esac
     case "$1" in
         .selected-analysis.lock/owner|\
         pr-summary.json|comment-threads.json|comment-threads.json.pages|unresolved-threads.json|id-mapping.txt|\
@@ -4637,7 +4729,7 @@ fetch_review_threads() {
     }'
 
     local pages_file="${output_file}.pages"
-    if ! gh api graphql --paginate \
+    if ! run_report_command gh api graphql --paginate \
             -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
             -f query="$query" > "$pages_file" 2>/dev/null; then
         rm -f "$pages_file"
@@ -4671,7 +4763,7 @@ fetch_review_threads() {
 }
 
 # Fetch the issues this PR closes, for the intent the diff cannot show.
-fetch_linked_issues() (
+fetch_linked_issues() {
     local owner="$1"
     local repo_name="$2"
     local pr_number="$3"
@@ -4699,14 +4791,17 @@ fetch_linked_issues() (
         rm -f "$pages_file"
         return 1
     }
-    trap 'rm -f "$pages_file" "$normalized_file"' EXIT INT TERM
-    chmod 600 "$pages_file" "$normalized_file" || return 1
+    if ! chmod 600 "$pages_file" "$normalized_file"; then
+        rm -f "$pages_file" "$normalized_file"
+        return 1
+    fi
 
-    if ! gh api graphql --paginate \
+    if ! run_report_command gh api graphql --paginate \
             -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
             -F pageSize="$LINKED_ISSUE_PAGE_SIZE" -f query="$query" \
             > "$pages_file" 2>/dev/null; then
         printf '[]\n' > "$output_file"
+        rm -f "$pages_file" "$normalized_file"
         return 1
     fi
 
@@ -4746,10 +4841,14 @@ fetch_linked_issues() (
         | if $valid then $nodes else error("incomplete linked-issue connection") end
     ' "$pages_file" > "$normalized_file" 2>/dev/null; then
         printf '[]\n' > "$output_file"
+        rm -f "$pages_file" "$normalized_file"
         return 1
     fi
-    mv "$normalized_file" "$output_file"
-)
+    local publish_rc=0
+    mv "$normalized_file" "$output_file" || publish_rc=$?
+    rm -f "$pages_file" "$normalized_file"
+    return "$publish_rc"
+}
 
 extract_unresolved_threads() {
     local threads_file="$1"
@@ -4833,7 +4932,8 @@ fetch_pr_diff() {
 
     # Fetch the unified diff for the PR
     local diff_status="completed" diff_reason=""
-    if ! gh pr diff "$pr_num" > "$output_dir/pr-diff.txt" 2>/dev/null; then
+    if ! run_report_command gh pr diff "$pr_num" \
+            > "$output_dir/pr-diff.txt" 2>/dev/null; then
         echo "⚠️  Could not fetch PR diff (binary files only, empty PR, or access denied)"
         echo "   Analysis will proceed without code context."
         echo "" > "$output_dir/pr-diff.txt"
@@ -6874,6 +6974,77 @@ if path_has_symlink_component "$OUTPUT_DIR"; then
 fi
 mkdir -p "$OUTPUT_DIR"
 validate_output_directory_for_writes "$OUTPUT_DIR" || exit 1
+
+# One report directory is one input/publication transaction. Hold the existing
+# crash-recoverable lock from before the first shared input write until every
+# consumer and provider has finished. Inner selected-analysis transactions are
+# re-entrant and must leave this outer owner responsible for final release.
+RUN_LOCK_DIR=""
+RUN_LOCK_TOKEN=""
+RUN_LOCK_OWNED=false
+RUN_LOCK_ACQUIRING=false
+RUN_LOCK_PENDING_SIGNAL=""
+RUN_LOCK_PENDING_EXIT_CODE=""
+cleanup_report_run_lock() {
+    if [ "$RUN_LOCK_OWNED" = true ]; then
+        if ! cleanup_report_run_temp_files; then
+            echo "Error: Report pagination staging remains after cleanup in $OUTPUT_DIR." >&2
+            return 1
+        fi
+        if ! release_selected_analysis_lock "$RUN_LOCK_DIR" "$RUN_LOCK_TOKEN"; then
+            echo "Error: Report run lock remains after cleanup: $RUN_LOCK_DIR" >&2
+            return 1
+        fi
+        RUN_LOCK_OWNED=false
+    fi
+}
+handle_report_run_signal() {
+    local signal="$1" exit_code="$2"
+    if [ "$RUN_LOCK_ACQUIRING" = true ] || \
+       [ "$REPORT_RUN_CHILD_STARTING" = true ]; then
+        if [ -z "$RUN_LOCK_PENDING_SIGNAL" ]; then
+            RUN_LOCK_PENDING_SIGNAL="$signal"
+            RUN_LOCK_PENDING_EXIT_CODE="$exit_code"
+        fi
+        return 0
+    fi
+    # Ignore a second signal while terminating the active child and performing
+    # the ownership-sensitive release. Keep EXIT installed so a transient
+    # release failure is retried from its authenticated release state.
+    trap '' INT TERM
+    terminate_report_run_child
+    cleanup_report_run_lock || true
+    echo "Error: Report generation was cancelled by $signal." >&2
+    exit "$exit_code"
+}
+RUN_LOCK_ACQUIRING=true
+trap cleanup_report_run_lock EXIT
+trap 'handle_report_run_signal INT 130' INT
+trap 'handle_report_run_signal TERM 143' TERM
+if ! acquire_selected_analysis_lock "$OUTPUT_DIR"; then
+    RUN_LOCK_ACQUIRING=false
+    if [ -n "$RUN_LOCK_PENDING_SIGNAL" ]; then
+        handle_report_run_signal "$RUN_LOCK_PENDING_SIGNAL" \
+            "$RUN_LOCK_PENDING_EXIT_CODE"
+    fi
+    echo "Error: Report input collection is already active for $OUTPUT_DIR." >&2
+    exit 1
+fi
+RUN_LOCK_DIR="$SELECTED_ANALYSIS_LOCK_DIR"
+RUN_LOCK_TOKEN="$SELECTED_ANALYSIS_LOCK_TOKEN"
+RUN_LOCK_OWNED="$SELECTED_ANALYSIS_LOCK_OWNED"
+REPORT_RUN_OWNER_PID="${RUN_LOCK_TOKEN%%.*}"
+REPORT_RUN_MANAGED=true
+RUN_LOCK_ACQUIRING=false
+if [ -n "$RUN_LOCK_PENDING_SIGNAL" ]; then
+    handle_report_run_signal "$RUN_LOCK_PENDING_SIGNAL" \
+        "$RUN_LOCK_PENDING_EXIT_CODE"
+fi
+if ! cleanup_report_run_temp_files; then
+    echo "Error: Stale report pagination staging could not be recovered in $OUTPUT_DIR." >&2
+    exit 1
+fi
+
 REFRESH_EXISTING_ANALYSIS=false
 [ ! -f "$OUTPUT_DIR/analysis-context.json" ] || REFRESH_EXISTING_ANALYSIS=true
 
@@ -6883,7 +7054,7 @@ echo "Saving report to: $OUTPUT_DIR"
 # 1. Fetch PR summary
 echo "Fetching PR summary..."
 PR_SUMMARY_FIELDS="number,title,body,author,state,url,createdAt,updatedAt,mergedAt,closedAt,labels,assignees,reviewRequests,reviews,milestone,projectCards,additions,deletions,changedFiles,mergeable,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,headRepository,headRepositoryOwner,files,commits,statusCheckRollup"
-gh pr view "$PR_NUMBER" --json "$PR_SUMMARY_FIELDS" \
+run_report_command gh pr view "$PR_NUMBER" --json "$PR_SUMMARY_FIELDS" \
     > "$OUTPUT_DIR/pr-summary.json" 2>/dev/null || {
         echo "Error fetching PR summary. Ensure PR #$PR_NUMBER exists and you have access."
         exit 1
@@ -6892,7 +7063,7 @@ gh pr view "$PR_NUMBER" --json "$PR_SUMMARY_FIELDS" \
 # 2. Fetch all comments
 echo "Fetching all comments..."
 ISSUE_COMMENTS_PAGES="$OUTPUT_DIR/issue-comments.pages"
-if gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+if run_report_command gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
         > "$ISSUE_COMMENTS_PAGES" 2>/dev/null && \
    jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
         id: .id,
@@ -6914,7 +7085,7 @@ fi
 rm -f "$ISSUE_COMMENTS_PAGES" "$OUTPUT_DIR/issue-comments.tmp.json"
 
 REVIEW_COMMENTS_PAGES="$OUTPUT_DIR/review-comments.pages"
-if gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+if run_report_command gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
         > "$REVIEW_COMMENTS_PAGES" 2>/dev/null && \
    jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
         id: .id,
@@ -6937,7 +7108,7 @@ fi
 rm -f "$REVIEW_COMMENTS_PAGES" "$OUTPUT_DIR/review-comments.tmp.json"
 
 INLINE_COMMENTS_PAGES="$OUTPUT_DIR/inline-comments.pages"
-if gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/comments" \
+if run_report_command gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/comments" \
         > "$INLINE_COMMENTS_PAGES" 2>/dev/null && \
    jq -s 'map(select(type == "array")) | (if length == 0 then [] else add end) | map(select(type == "object")) | map({
         id: .id,
@@ -7034,7 +7205,8 @@ echo "Fetching checks and status..."
 # wrote if it parses; only fall back to an empty set when there is nothing usable.
 # Otherwise a PR with pending or failing checks reports "no checks", exactly when
 # the failing-checks input matters most.
-if ! gh pr checks "$PR_NUMBER" --json name,state,bucket,workflow,startedAt,completedAt,event,link,description \
+if ! run_report_command gh pr checks "$PR_NUMBER" \
+        --json name,state,bucket,workflow,startedAt,completedAt,event,link,description \
         > "$OUTPUT_DIR/checks.json" 2>/dev/null; then
     if jq -e 'type == "array"' "$OUTPUT_DIR/checks.json" > /dev/null 2>&1; then
         echo "Note: gh pr checks exited non-zero (checks pending or failing); using the results it returned."
@@ -7226,11 +7398,13 @@ if [ "$BASE_PUBLICATION_RC" -ne 0 ]; then
     echo "Error: Base report views could not be published safely." >&2
     exit "$BASE_PUBLICATION_RC"
 fi
-if ! release_selected_analysis_lock "$BASE_LOCK_DIR" "$BASE_LOCK_TOKEN"; then
-    echo "Error: Base report was published, but its writer lock could not be released." >&2
-    exit 1
+if [ "$BASE_LOCK_OWNED" = true ]; then
+    if ! release_selected_analysis_lock "$BASE_LOCK_DIR" "$BASE_LOCK_TOKEN"; then
+        echo "Error: Base report was published, but its writer lock could not be released." >&2
+        exit 1
+    fi
+    BASE_LOCK_OWNED=false
 fi
-BASE_LOCK_OWNED=false
 case "$BASE_WRITER_SIGNAL" in
     INT) exit 130 ;;
     TERM) exit 143 ;;
@@ -7374,12 +7548,14 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                     echo "Error: Provider combined update could not be published safely." >&2
                     exit "$PROVIDER_PUBLICATION_RC"
                 fi
-                if ! release_selected_analysis_lock \
-                        "$PROVIDER_LOCK_DIR" "$PROVIDER_LOCK_TOKEN"; then
-                    echo "Error: Provider combined update was published, but its writer lock could not be released." >&2
-                    exit 1
+                if [ "$PROVIDER_LOCK_OWNED" = true ]; then
+                    if ! release_selected_analysis_lock \
+                            "$PROVIDER_LOCK_DIR" "$PROVIDER_LOCK_TOKEN"; then
+                        echo "Error: Provider combined update was published, but its writer lock could not be released." >&2
+                        exit 1
+                    fi
+                    PROVIDER_LOCK_OWNED=false
                 fi
-                PROVIDER_LOCK_OWNED=false
                 case "$PROVIDER_WRITER_SIGNAL" in
                     INT) exit 130 ;;
                     TERM) exit 143 ;;
@@ -7442,3 +7618,9 @@ case $OUTPUT_FORMAT in
         fi
         ;;
 esac
+
+if ! cleanup_report_run_lock; then
+    exit 1
+fi
+REPORT_RUN_MANAGED=false
+trap - EXIT INT TERM

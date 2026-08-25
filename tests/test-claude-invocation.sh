@@ -235,6 +235,14 @@ SKIP_WORKTREE_CHANGED=$(cd "$CODE_ACCESS_REPO" && \
     "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$TEST_OUTPUT_DIR")
 assert_true "$([ "$SKIP_WORKTREE_BASE" != "$SKIP_WORKTREE_CHANGED" ] && echo 0 || echo 1)" \
     "skip-worktree cannot hide changed tracked bytes from the workspace fingerprint"
+cp "$CODE_ACCESS_REPO/tracked.txt" "$TEST_OUTPUT_DIR/tracked-before-missing.txt"
+rm "$CODE_ACCESS_REPO/tracked.txt"
+rc=0
+(cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
+    code_access_workspace_fingerprint "$TEST_OUTPUT_DIR" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a missing skip-worktree path disables code access instead of omitting tracked code"
+cp "$TEST_OUTPUT_DIR/tracked-before-missing.txt" "$CODE_ACCESS_REPO/tracked.txt"
 git -C "$CODE_ACCESS_REPO" update-index --no-skip-worktree tracked.txt
 git -C "$CODE_ACCESS_REPO" checkout -- tracked.txt
 

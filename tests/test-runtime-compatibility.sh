@@ -11,11 +11,46 @@ GH_PR_ENRICH="$PROJECT_DIR/gh-pr-enrich"
 TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output/runtime-compatibility"
 STUB_DIR="$TEST_OUTPUT_DIR/stubs"
 TMP_ALIAS_OUTPUT="/tmp/gh-pr-enrich-runtime-$$"
+RUNTIME_BACKGROUND_PID=""
+COLLECTION_LOCK_RELEASE=""
+COLLECTION_ACQUIRE_RELEASE=""
+COLLECTION_SIGNAL_RM_RELEASE=""
+LINKED_CONCURRENT_RELEASE=""
+CHILD_START_PID_FILE=""
 
 # shellcheck source=lib/assert.sh
 source "$SCRIPT_DIR/lib/assert.sh"
 
-cleanup() { rm -rf "$TEST_OUTPUT_DIR" "$TMP_ALIAS_OUTPUT"; }
+cleanup() {
+    if [ -n "$RUNTIME_BACKGROUND_PID" ]; then
+        [ -z "$COLLECTION_LOCK_RELEASE" ] || \
+            : > "$COLLECTION_LOCK_RELEASE" 2>/dev/null || true
+        [ -z "$COLLECTION_ACQUIRE_RELEASE" ] || \
+            : > "$COLLECTION_ACQUIRE_RELEASE" 2>/dev/null || true
+        [ -z "$COLLECTION_SIGNAL_RM_RELEASE" ] || \
+            : > "$COLLECTION_SIGNAL_RM_RELEASE" 2>/dev/null || true
+        [ -z "$LINKED_CONCURRENT_RELEASE" ] || \
+            : > "$LINKED_CONCURRENT_RELEASE" 2>/dev/null || true
+        kill "$RUNTIME_BACKGROUND_PID" 2>/dev/null || true
+        for _cleanup_attempt in $(seq 1 40); do
+            kill -0 "$RUNTIME_BACKGROUND_PID" 2>/dev/null || break
+            sleep 0.05
+        done
+        if kill -0 "$RUNTIME_BACKGROUND_PID" 2>/dev/null; then
+            kill -KILL "$RUNTIME_BACKGROUND_PID" 2>/dev/null || true
+        fi
+        wait "$RUNTIME_BACKGROUND_PID" 2>/dev/null || true
+        RUNTIME_BACKGROUND_PID=""
+    fi
+    if [ -n "$CHILD_START_PID_FILE" ] && [ -f "$CHILD_START_PID_FILE" ]; then
+        cleanup_child_pid=$(cat "$CHILD_START_PID_FILE" 2>/dev/null || echo "")
+        if [ -n "$cleanup_child_pid" ] && \
+           kill -0 "$cleanup_child_pid" 2>/dev/null; then
+            kill -KILL "$cleanup_child_pid" 2>/dev/null || true
+        fi
+    fi
+    rm -rf "$TEST_OUTPUT_DIR" "$TMP_ALIAS_OUTPUT"
+}
 trap cleanup EXIT
 cleanup
 mkdir -p "$STUB_DIR"
@@ -252,6 +287,451 @@ cat << 'JSON'
 JSON
 STUB
 chmod +x "$STUB_DIR/semgrep"
+
+# Collection and all downstream consumers form one report-directory
+# transaction. A second run may resolve repository metadata, but it must not
+# reach the first shared PR input write while the original run owns the lock.
+COLLECTION_LOCK_STUBS="$TEST_OUTPUT_DIR/collection-lock-stubs"
+COLLECTION_LOCK_REPORT="$TEST_OUTPUT_DIR/collection-lock-report"
+COLLECTION_LOCK_READY="$TEST_OUTPUT_DIR/collection-lock-ready"
+COLLECTION_LOCK_RELEASE="$TEST_OUTPUT_DIR/collection-lock-release"
+COLLECTION_LOCK_PR_VIEWS="$TEST_OUTPUT_DIR/collection-lock-pr-views"
+COLLECTION_LOCK_FIRST_OUT="$TEST_OUTPUT_DIR/collection-lock-first.out"
+mkdir -p "$COLLECTION_LOCK_STUBS"
+cat > "$COLLECTION_LOCK_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ]; then
+    printf 'view\n' >> "$COLLECTION_LOCK_PR_VIEWS"
+    if [ ! -e "$COLLECTION_LOCK_READY" ]; then
+        : > "$COLLECTION_LOCK_READY"
+        while [ ! -e "$COLLECTION_LOCK_RELEASE" ]; do
+            sleep 0.05
+        done
+    fi
+fi
+exec "$COLLECTION_LOCK_BASE_GH" "$@"
+STUB
+chmod +x "$COLLECTION_LOCK_STUBS/gh"
+env PATH="$COLLECTION_LOCK_STUBS:$STUB_DIR:$PATH" \
+    COLLECTION_LOCK_BASE_GH="$STUB_DIR/gh" \
+    COLLECTION_LOCK_READY="$COLLECTION_LOCK_READY" \
+    COLLECTION_LOCK_RELEASE="$COLLECTION_LOCK_RELEASE" \
+    COLLECTION_LOCK_PR_VIEWS="$COLLECTION_LOCK_PR_VIEWS" \
+    "$GH_PR_ENRICH" 1 --prepare-analysis --diff \
+    --output-dir "$COLLECTION_LOCK_REPORT" \
+    > "$COLLECTION_LOCK_FIRST_OUT" 2>&1 &
+RUNTIME_BACKGROUND_PID=$!
+for _ in $(seq 1 200); do
+    [ ! -e "$COLLECTION_LOCK_READY" ] || break
+    sleep 0.05
+done
+assert_true "$([ -e "$COLLECTION_LOCK_READY" ] && echo 0 || echo 1)" \
+    "the first report run reaches collection while holding its lifecycle lock"
+rc=0
+COLLECTION_LOCK_SECOND_OUT=$(env PATH="$COLLECTION_LOCK_STUBS:$STUB_DIR:$PATH" \
+    COLLECTION_LOCK_BASE_GH="$STUB_DIR/gh" \
+    COLLECTION_LOCK_READY="$COLLECTION_LOCK_READY" \
+    COLLECTION_LOCK_RELEASE="$COLLECTION_LOCK_RELEASE" \
+    COLLECTION_LOCK_PR_VIEWS="$COLLECTION_LOCK_PR_VIEWS" \
+    "$GH_PR_ENRICH" 1 --prepare-analysis --diff \
+    --output-dir "$COLLECTION_LOCK_REPORT" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a concurrent run cannot overwrite another run's shared report inputs"
+assert_contains "$COLLECTION_LOCK_SECOND_OUT" "input collection is already active" \
+    "a concurrent run identifies the protected collection lifecycle"
+assert_eq "1" "$(wc -l < "$COLLECTION_LOCK_PR_VIEWS" | tr -d ' ')" \
+    "the rejected run performs no PR input fetches"
+: > "$COLLECTION_LOCK_RELEASE"
+rc=0
+wait "$RUNTIME_BACKGROUND_PID" || rc=$?
+RUNTIME_BACKGROUND_PID=""
+assert_true "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" \
+    "the lock owner completes after the concurrent run is rejected"
+assert_true "$([ ! -e "$COLLECTION_LOCK_REPORT/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "the report lifecycle lock is released after successful completion"
+
+COLLECTION_FAILURE_STUBS="$TEST_OUTPUT_DIR/collection-failure-stubs"
+COLLECTION_FAILURE_REPORT="$TEST_OUTPUT_DIR/collection-failure-report"
+mkdir -p "$COLLECTION_FAILURE_STUBS"
+cat > "$COLLECTION_FAILURE_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ]; then
+    exit 88
+fi
+exec "$COLLECTION_FAILURE_BASE_GH" "$@"
+STUB
+chmod +x "$COLLECTION_FAILURE_STUBS/gh"
+rc=0
+env PATH="$COLLECTION_FAILURE_STUBS:$STUB_DIR:$PATH" \
+    COLLECTION_FAILURE_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" 1 --output-dir "$COLLECTION_FAILURE_REPORT" \
+    >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && \
+    [ ! -e "$COLLECTION_FAILURE_REPORT/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "an input-fetch failure releases the whole-run report lock"
+env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" 1 \
+    --output-dir "$COLLECTION_FAILURE_REPORT" >/dev/null 2>&1
+assert_true "$([ -f "$COLLECTION_FAILURE_REPORT/pr-summary.json" ] && echo 0 || echo 1)" \
+    "a later report run succeeds after failure-path lock cleanup"
+
+# A signal delivered after mkdir publishes the lock directory but before the
+# owner globals are copied is recorded and honored after acquisition completes.
+COLLECTION_ACQUIRE_STUBS="$TEST_OUTPUT_DIR/collection-acquire-stubs"
+COLLECTION_ACQUIRE_REPORT="$TEST_OUTPUT_DIR/collection-acquire-report"
+COLLECTION_ACQUIRE_READY="$TEST_OUTPUT_DIR/collection-acquire-ready"
+COLLECTION_ACQUIRE_RELEASE="$TEST_OUTPUT_DIR/collection-acquire-release"
+COLLECTION_ACQUIRE_OUT="$TEST_OUTPUT_DIR/collection-acquire.out"
+mkdir -p "$COLLECTION_ACQUIRE_STUBS"
+cat > "$COLLECTION_ACQUIRE_STUBS/mkdir" << 'STUB'
+#!/bin/bash
+target="${!#}"
+"$COLLECTION_ACQUIRE_REAL_MKDIR" "$@" || exit $?
+if [ "$target" = "$COLLECTION_ACQUIRE_REPORT/.selected-analysis.lock" ]; then
+    : > "$COLLECTION_ACQUIRE_READY"
+    while [ ! -e "$COLLECTION_ACQUIRE_RELEASE" ]; do
+        sleep 0.05
+    done
+fi
+STUB
+chmod +x "$COLLECTION_ACQUIRE_STUBS/mkdir"
+env PATH="$COLLECTION_ACQUIRE_STUBS:$STUB_DIR:$PATH" \
+    COLLECTION_ACQUIRE_REAL_MKDIR="$(command -v mkdir)" \
+    COLLECTION_ACQUIRE_REPORT="$COLLECTION_ACQUIRE_REPORT" \
+    COLLECTION_ACQUIRE_READY="$COLLECTION_ACQUIRE_READY" \
+    COLLECTION_ACQUIRE_RELEASE="$COLLECTION_ACQUIRE_RELEASE" \
+    "$GH_PR_ENRICH" 1 --output-dir "$COLLECTION_ACQUIRE_REPORT" \
+    > "$COLLECTION_ACQUIRE_OUT" 2>&1 &
+RUNTIME_BACKGROUND_PID=$!
+for _ in $(seq 1 200); do
+    [ -e "$COLLECTION_ACQUIRE_READY" ] && break
+    sleep 0.05
+done
+assert_true "$([ -e "$COLLECTION_ACQUIRE_READY" ] && echo 0 || echo 1)" \
+    "the acquisition fixture reaches the owner-publication window"
+kill -TERM "$RUNTIME_BACKGROUND_PID"
+: > "$COLLECTION_ACQUIRE_RELEASE"
+rc=0
+wait "$RUNTIME_BACKGROUND_PID" || rc=$?
+RUNTIME_BACKGROUND_PID=""
+assert_eq "143" "$rc" \
+    "a signal during lock acquisition is honored after ownership is published"
+COLLECTION_ACQUIRE_RESIDUE=$(find "$COLLECTION_ACQUIRE_REPORT" -maxdepth 1 \
+    \( -name '.selected-analysis.lock' -o \
+       -name '.selected-analysis-release.*' \) -print -quit)
+assert_true "$([ -z "$COLLECTION_ACQUIRE_RESIDUE" ] && echo 0 || echo 1)" \
+    "signal-during-acquisition cleanup leaves no ownerless lock residue"
+
+# Signal cleanup uses the lock protocol's EXIT retry when its first release
+# attempt reaches a transient, authenticated release directory. The managed
+# GitHub child is deliberately never released by the test: cancellation must
+# terminate it directly rather than waiting for network work to return.
+COLLECTION_SIGNAL_STUBS="$TEST_OUTPUT_DIR/collection-signal-stubs"
+COLLECTION_SIGNAL_REPORT="$TEST_OUTPUT_DIR/collection-signal-report"
+COLLECTION_SIGNAL_READY="$TEST_OUTPUT_DIR/collection-signal-ready"
+COLLECTION_SIGNAL_RM_FAILED="$TEST_OUTPUT_DIR/collection-signal-rm-failed"
+COLLECTION_SIGNAL_RM_READY="$TEST_OUTPUT_DIR/collection-signal-rm-ready"
+COLLECTION_SIGNAL_RM_RELEASE="$TEST_OUTPUT_DIR/collection-signal-rm-release"
+COLLECTION_SIGNAL_OUT="$TEST_OUTPUT_DIR/collection-signal.out"
+mkdir -p "$COLLECTION_SIGNAL_STUBS"
+cat > "$COLLECTION_SIGNAL_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ]; then
+    : > "$COLLECTION_SIGNAL_READY"
+    while true; do
+        sleep 0.05
+    done
+fi
+exec "$COLLECTION_SIGNAL_BASE_GH" "$@"
+STUB
+cat > "$COLLECTION_SIGNAL_STUBS/rm" << 'STUB'
+#!/bin/bash
+for candidate in "$@"; do
+    case "$candidate" in
+        "$COLLECTION_SIGNAL_REPORT"/.selected-analysis-release.*/owner)
+            if [ ! -e "$COLLECTION_SIGNAL_RM_FAILED" ]; then
+                : > "$COLLECTION_SIGNAL_RM_FAILED"
+                : > "$COLLECTION_SIGNAL_RM_READY"
+                while [ ! -e "$COLLECTION_SIGNAL_RM_RELEASE" ]; do
+                    sleep 0.05
+                done
+                exit 79
+            fi
+            ;;
+    esac
+done
+exec "$COLLECTION_SIGNAL_REAL_RM" "$@"
+STUB
+chmod +x "$COLLECTION_SIGNAL_STUBS/gh" "$COLLECTION_SIGNAL_STUBS/rm"
+env PATH="$COLLECTION_SIGNAL_STUBS:$STUB_DIR:$PATH" \
+    COLLECTION_SIGNAL_BASE_GH="$STUB_DIR/gh" \
+    COLLECTION_SIGNAL_READY="$COLLECTION_SIGNAL_READY" \
+    COLLECTION_SIGNAL_REPORT="$COLLECTION_SIGNAL_REPORT" \
+    COLLECTION_SIGNAL_RM_FAILED="$COLLECTION_SIGNAL_RM_FAILED" \
+    COLLECTION_SIGNAL_RM_READY="$COLLECTION_SIGNAL_RM_READY" \
+    COLLECTION_SIGNAL_RM_RELEASE="$COLLECTION_SIGNAL_RM_RELEASE" \
+    COLLECTION_SIGNAL_REAL_RM="$(command -v rm)" \
+    "$GH_PR_ENRICH" 1 --output-dir "$COLLECTION_SIGNAL_REPORT" \
+    > "$COLLECTION_SIGNAL_OUT" 2>&1 &
+RUNTIME_BACKGROUND_PID=$!
+for _ in $(seq 1 200); do
+    [ ! -e "$COLLECTION_SIGNAL_READY" ] || break
+    sleep 0.05
+done
+assert_true "$([ -e "$COLLECTION_SIGNAL_READY" ] && echo 0 || echo 1)" \
+    "the signal fixture reaches collection while holding the report lock"
+kill -TERM "$RUNTIME_BACKGROUND_PID"
+for _ in $(seq 1 200); do
+    [ -e "$COLLECTION_SIGNAL_RM_READY" ] && break
+    sleep 0.05
+done
+assert_true "$([ -e "$COLLECTION_SIGNAL_RM_READY" ] && echo 0 || echo 1)" \
+    "TERM stops the managed GitHub child and reaches report lock cleanup"
+kill -TERM "$RUNTIME_BACKGROUND_PID"
+: > "$COLLECTION_SIGNAL_RM_RELEASE"
+rc=0
+wait "$RUNTIME_BACKGROUND_PID" || rc=$?
+RUNTIME_BACKGROUND_PID=""
+assert_eq "143" "$rc" \
+    "TERM during input collection preserves the conventional exit status"
+assert_true "$([ -e "$COLLECTION_SIGNAL_RM_FAILED" ] && echo 0 || echo 1)" \
+    "the signal regression exercises a transient first lock-release failure"
+COLLECTION_SIGNAL_RESIDUE=$(find "$COLLECTION_SIGNAL_REPORT" -maxdepth 1 \
+    \( -name '.selected-analysis.lock' -o \
+       -name '.selected-analysis-release.*' \) -print -quit)
+assert_true "$([ -z "$COLLECTION_SIGNAL_RESIDUE" ] && echo 0 || echo 1)" \
+    "EXIT retries signal cleanup and leaves no report lock residue"
+
+# A DEBUG hook signals the parent immediately before `command_pid=$!`, making
+# the launch-to-publication boundary deterministic rather than scheduler-
+# dependent. The starting-state guard must defer cleanup until that exact child
+# PID is known.
+CHILD_START_STUBS="$TEST_OUTPUT_DIR/child-start-stubs"
+CHILD_START_REPORT="$TEST_OUTPUT_DIR/child-start-report"
+CHILD_START_PID_FILE="$TEST_OUTPUT_DIR/child-start.pid"
+CHILD_START_BASH_ENV="$TEST_OUTPUT_DIR/child-start-bash-env"
+CHILD_START_HOOK_MARKER="$TEST_OUTPUT_DIR/child-start-hook-fired"
+mkdir -p "$CHILD_START_STUBS"
+cat > "$CHILD_START_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ]; then
+    printf '%s\n' "$$" > "$CHILD_START_PID_FILE"
+    while true; do
+        sleep 0.05
+    done
+fi
+exec "$CHILD_START_BASE_GH" "$@"
+STUB
+cat > "$CHILD_START_BASH_ENV" << 'STUB'
+__gh_pr_enrich_child_start_debug() {
+    if [ "$BASH_COMMAND" = 'command_pid=$!' ] && \
+       [ ! -e "$CHILD_START_HOOK_MARKER" ]; then
+        : > "$CHILD_START_HOOK_MARKER"
+        for _child_start_wait in $(seq 1 200); do
+            [ -e "$CHILD_START_PID_FILE" ] && break
+            sleep 0.05
+        done
+        kill -TERM "$$"
+    fi
+}
+set -T
+trap '__gh_pr_enrich_child_start_debug' DEBUG
+STUB
+chmod +x "$CHILD_START_STUBS/gh"
+env PATH="$CHILD_START_STUBS:$STUB_DIR:$PATH" \
+    BASH_ENV="$CHILD_START_BASH_ENV" \
+    CHILD_START_BASE_GH="$STUB_DIR/gh" \
+    CHILD_START_PID_FILE="$CHILD_START_PID_FILE" \
+    CHILD_START_HOOK_MARKER="$CHILD_START_HOOK_MARKER" \
+    "$GH_PR_ENRICH" 1 --output-dir "$CHILD_START_REPORT" \
+    >/dev/null 2>&1 &
+RUNTIME_BACKGROUND_PID=$!
+for _ in $(seq 1 200); do
+    kill -0 "$RUNTIME_BACKGROUND_PID" 2>/dev/null || break
+    sleep 0.05
+done
+if kill -0 "$RUNTIME_BACKGROUND_PID" 2>/dev/null; then
+    kill -KILL "$RUNTIME_BACKGROUND_PID" 2>/dev/null || true
+fi
+rc=0
+wait "$RUNTIME_BACKGROUND_PID" || rc=$?
+RUNTIME_BACKGROUND_PID=""
+assert_true "$([ -e "$CHILD_START_HOOK_MARKER" ] && echo 0 || echo 1)" \
+    "the child-start regression signals at the pre-publication boundary"
+assert_eq "143" "$rc" \
+    "a signal during child PID publication is deferred then honored"
+CHILD_START_PID=$(cat "$CHILD_START_PID_FILE")
+CHILD_START_REAPED=true
+if kill -0 "$CHILD_START_PID" 2>/dev/null; then
+    CHILD_START_REAPED=false
+    kill -KILL "$CHILD_START_PID" 2>/dev/null || true
+fi
+assert_true "$([ "$CHILD_START_REAPED" = true ] && \
+    [ ! -e "$CHILD_START_REPORT/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "child-start cancellation reaps the writer and releases its report lock"
+rm -f "$CHILD_START_PID_FILE"
+CHILD_START_PID_FILE=""
+
+# A rejected contender owns no cleanup authority. It must leave the active
+# owner's random linked-pagination staging intact until that owner resumes.
+LINKED_CONCURRENT_STUBS="$TEST_OUTPUT_DIR/linked-concurrent-stubs"
+LINKED_CONCURRENT_REPORT="$TEST_OUTPUT_DIR/linked-concurrent-report"
+LINKED_CONCURRENT_READY="$TEST_OUTPUT_DIR/linked-concurrent-ready"
+LINKED_CONCURRENT_RELEASE="$TEST_OUTPUT_DIR/linked-concurrent-release"
+mkdir -p "$LINKED_CONCURRENT_STUBS"
+cat > "$LINKED_CONCURRENT_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "api graphql" ]; then
+    case "$*" in
+        *closingIssuesReferences*)
+            if [ ! -e "$LINKED_CONCURRENT_READY" ]; then
+                : > "$LINKED_CONCURRENT_READY"
+                while [ ! -e "$LINKED_CONCURRENT_RELEASE" ]; do
+                    sleep 0.05
+                done
+            fi
+            ;;
+    esac
+fi
+exec "$LINKED_CONCURRENT_BASE_GH" "$@"
+STUB
+chmod +x "$LINKED_CONCURRENT_STUBS/gh"
+env PATH="$LINKED_CONCURRENT_STUBS:$STUB_DIR:$PATH" \
+    LINKED_CONCURRENT_BASE_GH="$STUB_DIR/gh" \
+    LINKED_CONCURRENT_READY="$LINKED_CONCURRENT_READY" \
+    LINKED_CONCURRENT_RELEASE="$LINKED_CONCURRENT_RELEASE" \
+    "$GH_PR_ENRICH" 1 --output-dir "$LINKED_CONCURRENT_REPORT" \
+    >/dev/null 2>&1 &
+RUNTIME_BACKGROUND_PID=$!
+for _ in $(seq 1 200); do
+    [ -e "$LINKED_CONCURRENT_READY" ] && break
+    sleep 0.05
+done
+assert_true "$([ -e "$LINKED_CONCURRENT_READY" ] && echo 0 || echo 1)" \
+    "the linked concurrency owner reaches private pagination staging"
+LINKED_OWNER_STAGE_BEFORE=$(find "$LINKED_CONCURRENT_REPORT" -maxdepth 1 \
+    \( -name 'linked-issues.json.pages.*' -o \
+       -name 'linked-issues.json.normalized.*' \) -type f | sort)
+assert_eq "2" "$(printf '%s\n' "$LINKED_OWNER_STAGE_BEFORE" | \
+    sed '/^$/d' | wc -l | tr -d ' ')" \
+    "the owner has both linked-pagination staging files"
+rc=0
+LINKED_CONTENDER_OUT=$(env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" 1 \
+    --output-dir "$LINKED_CONCURRENT_REPORT" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a contender is rejected while linked pagination owns the report"
+assert_contains "$LINKED_CONTENDER_OUT" "input collection is already active" \
+    "the linked-pagination contender fails at report ownership"
+LINKED_OWNER_STAGE_AFTER=$(find "$LINKED_CONCURRENT_REPORT" -maxdepth 1 \
+    \( -name 'linked-issues.json.pages.*' -o \
+       -name 'linked-issues.json.normalized.*' \) -type f | sort)
+assert_eq "$LINKED_OWNER_STAGE_BEFORE" "$LINKED_OWNER_STAGE_AFTER" \
+    "the rejected contender cannot delete the owner's pagination staging"
+: > "$LINKED_CONCURRENT_RELEASE"
+rc=0
+wait "$RUNTIME_BACKGROUND_PID" || rc=$?
+RUNTIME_BACKGROUND_PID=""
+assert_true "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" \
+    "the linked-pagination owner completes after its contender is rejected"
+assert_jq "$LINKED_CONCURRENT_REPORT/linked-issues-status.json" \
+    '.status == "completed"' \
+    "the owner publishes complete linked-issue coverage"
+
+# Linked-issue pagination uses private random staging files. Report-level
+# cancellation must remove them before releasing the lock so an immediate
+# retry passes output preflight and cannot observe partial issue intent.
+LINKED_SIGNAL_STUBS="$TEST_OUTPUT_DIR/linked-signal-stubs"
+LINKED_SIGNAL_REPORT="$TEST_OUTPUT_DIR/linked-signal-report"
+LINKED_SIGNAL_READY="$TEST_OUTPUT_DIR/linked-signal-ready"
+mkdir -p "$LINKED_SIGNAL_STUBS"
+cat > "$LINKED_SIGNAL_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "api graphql" ]; then
+    case "$*" in
+        *closingIssuesReferences*)
+            : > "$LINKED_SIGNAL_READY"
+            while true; do
+                sleep 0.05
+            done
+            ;;
+    esac
+fi
+exec "$LINKED_SIGNAL_BASE_GH" "$@"
+STUB
+chmod +x "$LINKED_SIGNAL_STUBS/gh"
+env PATH="$LINKED_SIGNAL_STUBS:$STUB_DIR:$PATH" \
+    LINKED_SIGNAL_BASE_GH="$STUB_DIR/gh" \
+    LINKED_SIGNAL_READY="$LINKED_SIGNAL_READY" \
+    "$GH_PR_ENRICH" 1 --output-dir "$LINKED_SIGNAL_REPORT" \
+    >/dev/null 2>&1 &
+RUNTIME_BACKGROUND_PID=$!
+for _ in $(seq 1 200); do
+    [ -e "$LINKED_SIGNAL_READY" ] && break
+    sleep 0.05
+done
+assert_true "$([ -e "$LINKED_SIGNAL_READY" ] && echo 0 || echo 1)" \
+    "the linked-issue cancellation fixture reaches private pagination staging"
+kill -TERM "$RUNTIME_BACKGROUND_PID"
+rc=0
+wait "$RUNTIME_BACKGROUND_PID" || rc=$?
+RUNTIME_BACKGROUND_PID=""
+assert_eq "143" "$rc" \
+    "TERM during linked-issue pagination cancels the report run"
+LINKED_SIGNAL_RESIDUE=$(find "$LINKED_SIGNAL_REPORT" -maxdepth 1 \
+    \( -name 'linked-issues.json.pages.*' -o \
+       -name 'linked-issues.json.normalized.*' -o \
+       -name '.selected-analysis.lock' \) -print -quit)
+assert_true "$([ -z "$LINKED_SIGNAL_RESIDUE" ] && echo 0 || echo 1)" \
+    "linked-issue cancellation removes private staging and lock residue"
+env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" 1 \
+    --output-dir "$LINKED_SIGNAL_REPORT" >/dev/null 2>&1
+assert_true "$([ -f "$LINKED_SIGNAL_REPORT/linked-issues.json" ] && echo 0 || echo 1)" \
+    "an immediate retry succeeds after linked-issue cancellation cleanup"
+
+STALE_LINKED_REPORT="$TEST_OUTPUT_DIR/stale-linked-report"
+mkdir -p "$STALE_LINKED_REPORT"
+printf 'partial\n' > "$STALE_LINKED_REPORT/linked-issues.json.pages.A1b2C3"
+printf 'partial\n' > "$STALE_LINKED_REPORT/linked-issues.json.normalized.Z9y8X7"
+env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" 1 \
+    --output-dir "$STALE_LINKED_REPORT" >/dev/null 2>&1
+STALE_LINKED_RESIDUE=$(find "$STALE_LINKED_REPORT" -maxdepth 1 \
+    \( -name 'linked-issues.json.pages.*' -o \
+       -name 'linked-issues.json.normalized.*' \) -print -quit)
+assert_true "$([ -z "$STALE_LINKED_RESIDUE" ] && echo 0 || echo 1)" \
+    "a new lock owner recovers exact-name pagination staging from a crashed run"
+
+PERSISTENT_RM_STUBS="$TEST_OUTPUT_DIR/persistent-pagination-rm-stubs"
+PERSISTENT_RM_REPORT="$TEST_OUTPUT_DIR/persistent-pagination-rm-report"
+mkdir -p "$PERSISTENT_RM_STUBS"
+cat > "$PERSISTENT_RM_STUBS/rm" << 'STUB'
+#!/bin/bash
+for candidate in "$@"; do
+    case "$candidate" in
+        "$PERSISTENT_RM_REPORT"/linked-issues.json.pages.*|\
+        "$PERSISTENT_RM_REPORT"/linked-issues.json.normalized.*)
+            exit 81
+            ;;
+    esac
+done
+exec "$PERSISTENT_RM_REAL" "$@"
+STUB
+chmod +x "$PERSISTENT_RM_STUBS/rm"
+rc=0
+PERSISTENT_RM_OUT=$(env PATH="$PERSISTENT_RM_STUBS:$STUB_DIR:$PATH" \
+    PERSISTENT_RM_REPORT="$PERSISTENT_RM_REPORT" \
+    PERSISTENT_RM_REAL="$(command -v rm)" \
+    "$GH_PR_ENRICH" 1 --output-dir "$PERSISTENT_RM_REPORT" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "persistent pagination cleanup failure fails the report run"
+assert_contains "$PERSISTENT_RM_OUT" "pagination staging remains" \
+    "persistent pagination cleanup failure is visible to the operator"
+env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" 1 \
+    --output-dir "$PERSISTENT_RM_REPORT" >/dev/null 2>&1
+PERSISTENT_RM_RESIDUE=$(find "$PERSISTENT_RM_REPORT" -maxdepth 1 \
+    \( -name 'linked-issues.json.pages.*' -o \
+       -name 'linked-issues.json.normalized.*' -o \
+       -name '.selected-analysis.lock' \) -print -quit)
+assert_true "$([ -z "$PERSISTENT_RM_RESIDUE" ] && echo 0 || echo 1)" \
+    "the next owner recovers a dead lock and persistent pagination residue"
 
 rc=0
 PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call verify_pr_head_unchanged \
