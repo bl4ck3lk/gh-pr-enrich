@@ -1059,7 +1059,7 @@ env PATH="$WORKER_OWNER_STUBS:$PATH" REAL_CP="$(command -v cp)" \
     "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \
     "$WORKER_OWNER_DIR" > "$TEST_OUTPUT_DIR/actual-worker-owner.out" 2>&1 &
 WORKER_TOP_PID=$!
-for _ in $(seq 1 200); do
+for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
     [ -f "$WORKER_OWNER_READY" ] && break
     /bin/sleep 0.01
 done
@@ -1079,7 +1079,7 @@ assert_contains "$WORKER_CONTENDER_OUT" "Another selected-analysis writer is act
     "the live worker lease is recognized as active after top-level termination"
 : > "$WORKER_OWNER_RELEASE"
 wait "$WORKER_TOP_PID" 2>/dev/null || true
-for _ in $(seq 1 200); do
+for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
     [ ! -e "$WORKER_OWNER_DIR/.selected-analysis.lock" ] && break
     /bin/sleep 0.01
 done
@@ -1492,7 +1492,7 @@ exec 3<> "$ANALYSIS_RACE_FIFO"
     "$GH_PR_ENRICH" address 999 < "$ANALYSIS_RACE_FIFO" \
     > "$ANALYSIS_RACE_OUT_FILE" 2>&1) &
 ANALYSIS_RACE_PID=$!
-for _attempt in $(seq 1 100); do
+for (( _attempt=0; _attempt < 100; _attempt++ )); do
     grep -q '\[f\]ixed' "$ANALYSIS_RACE_OUT_FILE" 2>/dev/null && break
     sleep 0.02
 done
@@ -1554,7 +1554,7 @@ exec 4<> "$CONTEXT_RACE_FIFO"
     "$GH_PR_ENRICH" address 999 < "$CONTEXT_RACE_FIFO" \
     > "$CONTEXT_RACE_OUT_FILE" 2>&1) &
 CONTEXT_RACE_PID=$!
-for _attempt in $(seq 1 100); do
+for (( _attempt=0; _attempt < 100; _attempt++ )); do
     grep -q '\[f\]ixed' "$CONTEXT_RACE_OUT_FILE" 2>/dev/null && break
     sleep 0.02
 done

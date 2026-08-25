@@ -35,7 +35,7 @@ cleanup() {
         [ -z "$LINKED_CONCURRENT_RELEASE" ] || \
             : > "$LINKED_CONCURRENT_RELEASE" 2>/dev/null || true
         kill "$RUNTIME_BACKGROUND_PID" 2>/dev/null || true
-        for _cleanup_attempt in $(seq 1 40); do
+        for (( _cleanup_attempt=0; _cleanup_attempt < 40; _cleanup_attempt++ )); do
             kill -0 "$RUNTIME_BACKGROUND_PID" 2>/dev/null || break
             sleep 0.05
         done
@@ -104,7 +104,7 @@ assert_selection_views_match() {
 assert_process_reaped() {
     local pid="$1" description="$2" reaped=true
     if [ -n "$pid" ]; then
-        for _ in $(seq 1 40); do
+        for (( _wait_attempt=0; _wait_attempt < 40; _wait_attempt++ )); do
             kill -0 "$pid" 2>/dev/null || break
             sleep 0.05
         done
@@ -166,6 +166,8 @@ assert_contains "$(cat "$CANONICAL_SKILL")" \
 assert_contains "$(cat "$CANONICAL_SKILL")" \
     '`_metadata.workspace_fingerprint`' \
     "native artifacts bind the materialized workspace fingerprint"
+assert_not_contains "$(cat "$GH_PR_ENRICH")" '$(seq ' \
+    "shipped wait loops do not require non-stock seq on macOS"
 
 # ---------------------------------------------------------------------------
 # Skill installation
@@ -870,7 +872,14 @@ JSON
 esac
 if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
     case "$*" in
-        *closingIssuesReferences*) echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' ;;
+        *closingIssuesReferences*)
+            if [ -n "${LINKED_ISSUE_VISIBILITY:-}" ]; then
+                printf '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"ISSUE_linked","number":42,"title":"linked intent","body":"linked repository secret","url":"https://github.com/intent/issues/42","repository":{"nameWithOwner":"intent/issues","visibility":"%s"}}]}}}}}\n' \
+                    "$LINKED_ISSUE_VISIBILITY"
+            else
+                echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+            fi
+            ;;
         *) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PRRT_open","isResolved":false,"isOutdated":false,"path":"a.js","line":1,"comments":{"nodes":[{"id":"c","databaseId":1,"body":"check this","author":{"login":"rev"},"createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/1#discussion_r1"}]}}]}}}}}' ;;
     esac
     exit 0
@@ -944,7 +953,7 @@ env PATH="$COLLECTION_LOCK_STUBS:$STUB_DIR:$PATH" \
     --output-dir "$COLLECTION_LOCK_REPORT" \
     > "$COLLECTION_LOCK_FIRST_OUT" 2>&1 &
 RUNTIME_BACKGROUND_PID=$!
-for _ in $(seq 1 200); do
+for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
     [ ! -e "$COLLECTION_LOCK_READY" ] || break
     sleep 0.05
 done
@@ -1026,7 +1035,7 @@ env PATH="$COLLECTION_ACQUIRE_STUBS:$STUB_DIR:$PATH" \
     "$GH_PR_ENRICH" 1 --output-dir "$COLLECTION_ACQUIRE_REPORT" \
     > "$COLLECTION_ACQUIRE_OUT" 2>&1 &
 RUNTIME_BACKGROUND_PID=$!
-for _ in $(seq 1 200); do
+for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
     [ -e "$COLLECTION_ACQUIRE_READY" ] && break
     sleep 0.05
 done
@@ -1097,14 +1106,14 @@ env PATH="$COLLECTION_SIGNAL_STUBS:$STUB_DIR:$PATH" \
     "$GH_PR_ENRICH" 1 --output-dir "$COLLECTION_SIGNAL_REPORT" \
     > "$COLLECTION_SIGNAL_OUT" 2>&1 &
 RUNTIME_BACKGROUND_PID=$!
-for _ in $(seq 1 200); do
+for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
     [ ! -e "$COLLECTION_SIGNAL_READY" ] || break
     sleep 0.05
 done
 assert_true "$([ -e "$COLLECTION_SIGNAL_READY" ] && echo 0 || echo 1)" \
     "the signal fixture reaches collection while holding the report lock"
 kill -TERM "$RUNTIME_BACKGROUND_PID"
-for _ in $(seq 1 200); do
+for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
     [ -e "$COLLECTION_SIGNAL_RM_READY" ] && break
     sleep 0.05
 done
@@ -1150,7 +1159,7 @@ __gh_pr_enrich_child_start_debug() {
     if [ "$BASH_COMMAND" = 'command_pid=$!' ] && \
        [ ! -e "$CHILD_START_HOOK_MARKER" ]; then
         : > "$CHILD_START_HOOK_MARKER"
-        for _child_start_wait in $(seq 1 200); do
+        for (( _child_start_wait=0; _child_start_wait < 200; _child_start_wait++ )); do
             [ -e "$CHILD_START_PID_FILE" ] && break
             sleep 0.05
         done
@@ -1169,7 +1178,7 @@ env PATH="$CHILD_START_STUBS:$STUB_DIR:$PATH" \
     "$GH_PR_ENRICH" 1 --output-dir "$CHILD_START_REPORT" \
     >/dev/null 2>&1 &
 RUNTIME_BACKGROUND_PID=$!
-for _ in $(seq 1 200); do
+for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
     kill -0 "$RUNTIME_BACKGROUND_PID" 2>/dev/null || break
     sleep 0.05
 done
@@ -1226,7 +1235,7 @@ env PATH="$LINKED_CONCURRENT_STUBS:$STUB_DIR:$PATH" \
     "$GH_PR_ENRICH" 1 --output-dir "$LINKED_CONCURRENT_REPORT" \
     >/dev/null 2>&1 &
 RUNTIME_BACKGROUND_PID=$!
-for _ in $(seq 1 200); do
+for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
     [ -e "$LINKED_CONCURRENT_READY" ] && break
     sleep 0.05
 done
@@ -1288,7 +1297,7 @@ env PATH="$LINKED_SIGNAL_STUBS:$STUB_DIR:$PATH" \
     "$GH_PR_ENRICH" 1 --output-dir "$LINKED_SIGNAL_REPORT" \
     >/dev/null 2>&1 &
 RUNTIME_BACKGROUND_PID=$!
-for _ in $(seq 1 200); do
+for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
     [ -e "$LINKED_SIGNAL_READY" ] && break
     sleep 0.05
 done
@@ -1447,6 +1456,79 @@ assert_jq "$PREPARED/analysis-context.json" '.pr.repository == "o/r" and .pr.num
 assert_not_contains "$PREP_OUT" "Claude analysis" \
     "context preparation does not invoke an external analyzer"
 
+PRIVATE_LINKED_LOCAL_DIR="$TEST_OUTPUT_DIR/private-linked-local"
+env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PUBLIC \
+    LINKED_ISSUE_VISIBILITY=PRIVATE \
+    "$GH_PR_ENRICH" 1 --prepare-analysis \
+    --output-dir "$PRIVATE_LINKED_LOCAL_DIR" >/dev/null 2>&1
+assert_jq "$PRIVATE_LINKED_LOCAL_DIR/analysis-context.json" \
+    '.pr.linked_issues[0]
+     | .body == "linked repository secret" and
+       .repository == {name_with_owner:"intent/issues",visibility:"PRIVATE"}' \
+    "native analysis retains private cross-repository linked issue intent and visibility"
+
+PRIVATE_LINKED_EXTERNAL_DIR="$TEST_OUTPUT_DIR/private-linked-external"
+PRIVATE_LINKED_CLAUDE_LOG="$TEST_OUTPUT_DIR/private-linked-claude-invoked.txt"
+rc=0
+PRIVATE_LINKED_OUT=$(env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PUBLIC \
+    LINKED_ISSUE_VISIBILITY=PRIVATE \
+    CLAUDE_INVOKED_LOG="$PRIVATE_LINKED_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich \
+    --output-dir "$PRIVATE_LINKED_EXTERNAL_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a public PR with a private linked issue fails the external disclosure gate"
+assert_true "$([ ! -s "$PRIVATE_LINKED_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "private cross-repository linked issue content is never sent to Claude implicitly"
+assert_contains "$PRIVATE_LINKED_OUT" "Linked issue source visibility is PRIVATE" \
+    "the cross-repository disclosure failure identifies the linked source visibility"
+assert_jq "$PRIVATE_LINKED_EXTERNAL_DIR/linked-issues.json" \
+    '.[0].body == "linked repository secret" and
+     .[0].repository.visibility == "PRIVATE"' \
+    "the blocked external run preserves private linked intent for local inspection"
+
+UNKNOWN_LINKED_EXTERNAL_DIR="$TEST_OUTPUT_DIR/unknown-linked-external"
+UNKNOWN_LINKED_CLAUDE_LOG="$TEST_OUTPUT_DIR/unknown-linked-claude-invoked.txt"
+rc=0
+UNKNOWN_LINKED_OUT=$(env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PUBLIC \
+    LINKED_ISSUE_VISIBILITY=UNKNOWN \
+    CLAUDE_INVOKED_LOG="$UNKNOWN_LINKED_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich \
+    --output-dir "$UNKNOWN_LINKED_EXTERNAL_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "unknown linked issue visibility fails the external disclosure gate"
+assert_true "$([ ! -s "$UNKNOWN_LINKED_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "unknown linked issue content is never sent to Claude implicitly"
+assert_contains "$UNKNOWN_LINKED_OUT" "Linked issue source visibility is UNKNOWN" \
+    "the fail-closed linked issue diagnostic identifies unknown visibility"
+
+AUTHORIZED_LINKED_DIR="$TEST_OUTPUT_DIR/authorized-private-linked-external"
+AUTHORIZED_LINKED_CLAUDE_LOG="$TEST_OUTPUT_DIR/authorized-linked-claude-invoked.txt"
+env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PUBLIC \
+    LINKED_ISSUE_VISIBILITY=PRIVATE \
+    CLAUDE_INVOKED_LOG="$AUTHORIZED_LINKED_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich --allow-external \
+    --output-dir "$AUTHORIZED_LINKED_DIR" >/dev/null 2>&1
+assert_true "$([ -s "$AUTHORIZED_LINKED_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "--allow-external authorizes disclosure of a private linked issue"
+assert_jq "$AUTHORIZED_LINKED_DIR/analysis-context.json" \
+    '.pr.linked_issues[0]
+     | .body == "linked repository secret" and
+       .repository.visibility == "PRIVATE"' \
+    "authorized private linked issue content and visibility reach the analyzer context"
+
+PUBLIC_LINKED_DIR="$TEST_OUTPUT_DIR/public-linked-external"
+PUBLIC_LINKED_CLAUDE_LOG="$TEST_OUTPUT_DIR/public-linked-claude-invoked.txt"
+env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PUBLIC \
+    LINKED_ISSUE_VISIBILITY=PUBLIC \
+    CLAUDE_INVOKED_LOG="$PUBLIC_LINKED_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich --output-dir "$PUBLIC_LINKED_DIR" \
+    >/dev/null 2>&1
+assert_true "$([ -s "$PUBLIC_LINKED_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "a public linked issue remains available to external Claude without an override"
+assert_jq "$PUBLIC_LINKED_DIR/analysis-context.json" \
+    '.pr.linked_issues[0].repository.visibility == "PUBLIC"' \
+    "public linked issue visibility is bound into the disclosed context"
+
 SAST_WORKSPACE="$TEST_OUTPUT_DIR/sast-workspace"
 SAST_PREPARED="$SAST_WORKSPACE/reports"
 mkdir -p "$SAST_WORKSPACE"
@@ -1462,6 +1544,127 @@ assert_jq "$SAST_PREPARED/analysis-context.json" \
     "--prepare-analysis --sast includes fresh Semgrep findings in the shared context"
 assert_jq "$SAST_PREPARED/analysis-context.json" '.coverage.sast.status == "completed"' \
     "successful SAST preparation is distinguished from a skipped clean result"
+
+# Full-CLI cancellation must restore the caller's EXIT trap so the report-run
+# lock is released after the SAST-specific handler publishes terminal state.
+SAST_CANCEL_STUBS="$TEST_OUTPUT_DIR/sast-cancel-stubs"
+SAST_CANCEL_READY="$TEST_OUTPUT_DIR/sast-cancel-ready"
+mkdir -p "$SAST_CANCEL_STUBS"
+cat > "$SAST_CANCEL_STUBS/semgrep" << 'STUB'
+#!/bin/bash
+printf '%s\n' '{"results":[{"check_id":"partial.cancel","path":"gh-pr-enrich","start":{"line":1},"extra":{"severity":"ERROR","message":"partial","metadata":{}}}],"errors":[]}'
+printf 'ready\n' > "$SAST_CANCEL_READY"
+if [ -n "${SAST_CANCEL_TARGET_PID:-}" ]; then
+    kill -INT "$SAST_CANCEL_TARGET_PID"
+fi
+trap '' TERM INT
+while :; do :; done
+STUB
+chmod +x "$SAST_CANCEL_STUBS/semgrep"
+
+SAST_TERM_REPORT="$SAST_WORKSPACE/term-reports"
+rm -f "$SAST_CANCEL_READY"
+/bin/sh -c '
+    cd "$1" || exit 1
+    shift
+    exec "$@"
+' sh "$SAST_WORKSPACE" env PATH="$SAST_CANCEL_STUBS:$STUB_DIR:$PATH" \
+    GH_PR_ENRICH_CODE_ACCESS=true SAST_CANCEL_READY="$SAST_CANCEL_READY" \
+    "$GH_PR_ENRICH" 1 --prepare-analysis --sast \
+    --output-dir term-reports >/dev/null 2>&1 &
+RUNTIME_BACKGROUND_PID=$!
+for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
+    [ -s "$SAST_CANCEL_READY" ] && break
+    sleep 0.05
+done
+assert_true "$([ -s "$SAST_CANCEL_READY" ] && echo 0 || echo 1)" \
+    "the full-CLI TERM fixture reaches SAST while holding the report lock"
+kill -TERM "$RUNTIME_BACKGROUND_PID"
+rc=0
+wait "$RUNTIME_BACKGROUND_PID" || rc=$?
+RUNTIME_BACKGROUND_PID=""
+assert_eq "143" "$rc" \
+    "full-CLI SAST cancellation preserves the conventional TERM status"
+assert_true "$([ ! -e "$SAST_TERM_REPORT/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "full-CLI TERM cancellation releases the report-run lock"
+assert_jq "$SAST_TERM_REPORT/sast-status.json" \
+    '.status == "failed" and .reason == "semgrep scan cancelled by TERM"' \
+    "full-CLI TERM cancellation publishes terminal SAST coverage"
+
+SAST_INT_REPORT="$SAST_WORKSPACE/int-reports"
+rm -f "$SAST_CANCEL_READY"
+set +e
+(cd "$SAST_WORKSPACE" && exec /bin/sh -c '
+    export SAST_CANCEL_TARGET_PID=$$
+    exec "$@"
+' sh env PATH="$SAST_CANCEL_STUBS:$STUB_DIR:$PATH" \
+    GH_PR_ENRICH_CODE_ACCESS=true SAST_CANCEL_READY="$SAST_CANCEL_READY" \
+    "$GH_PR_ENRICH" 1 --prepare-analysis --sast \
+    --output-dir int-reports >/dev/null 2>&1)
+rc=$?
+set -e
+assert_eq "130" "$rc" \
+    "full-CLI SAST cancellation preserves the conventional INT status"
+assert_true "$([ ! -e "$SAST_INT_REPORT/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "full-CLI INT cancellation releases the report-run lock"
+assert_jq "$SAST_INT_REPORT/sast-status.json" \
+    '.status == "failed" and .reason == "semgrep scan cancelled by INT"' \
+    "full-CLI INT cancellation publishes terminal SAST coverage"
+
+# Coverage becomes running before workspace fingerprinting. Self-signalling Git
+# fixtures make cancellation in that pre-snapshot phase deterministic and prove
+# both signal paths publish terminal coverage while releasing the outer lock.
+SAST_PRELAUNCH_STUBS="$TEST_OUTPUT_DIR/sast-prelaunch-stubs"
+SAST_PRELAUNCH_READY="$TEST_OUTPUT_DIR/sast-prelaunch-ready"
+mkdir -p "$SAST_PRELAUNCH_STUBS"
+cat > "$SAST_PRELAUNCH_STUBS/git" << 'STUB'
+#!/bin/bash
+case "$*" in
+    *"ls-files --stage"*)
+        if [ -n "${SAST_PRELAUNCH_SIGNAL:-}" ]; then
+            printf 'ready\n' > "$SAST_PRELAUNCH_READY"
+            kill -"$SAST_PRELAUNCH_SIGNAL" "$SAST_PRELAUNCH_TARGET_PID"
+            case "$SAST_PRELAUNCH_SIGNAL" in
+                TERM) exit 143 ;;
+                INT) exit 130 ;;
+            esac
+        fi
+        ;;
+esac
+exec "$SAST_PRELAUNCH_REAL_GIT" "$@"
+STUB
+chmod +x "$SAST_PRELAUNCH_STUBS/git"
+for SAST_PRELAUNCH_SIGNAL in TERM INT; do
+    case "$SAST_PRELAUNCH_SIGNAL" in
+        TERM) SAST_PRELAUNCH_EXPECTED_RC=143 ;;
+        INT) SAST_PRELAUNCH_EXPECTED_RC=130 ;;
+    esac
+    SAST_PRELAUNCH_REPORT="$SAST_WORKSPACE/prelaunch-$SAST_PRELAUNCH_SIGNAL-reports"
+    rm -f "$SAST_PRELAUNCH_READY"
+    set +e
+    (cd "$SAST_WORKSPACE" && exec /bin/sh -c '
+        export SAST_PRELAUNCH_TARGET_PID=$$
+        exec "$@"
+    ' sh env PATH="$SAST_PRELAUNCH_STUBS:$STUB_DIR:$PATH" \
+        SAST_PRELAUNCH_SIGNAL="$SAST_PRELAUNCH_SIGNAL" \
+        SAST_PRELAUNCH_READY="$SAST_PRELAUNCH_READY" \
+        SAST_PRELAUNCH_REAL_GIT="$(command -v git)" \
+        GH_PR_ENRICH_CODE_ACCESS=true \
+        "$GH_PR_ENRICH" 1 --prepare-analysis --sast \
+        --output-dir "prelaunch-$SAST_PRELAUNCH_SIGNAL-reports" \
+        >/dev/null 2>&1)
+    rc=$?
+    set -e
+    assert_true "$([ -s "$SAST_PRELAUNCH_READY" ] && echo 0 || echo 1)" \
+        "$SAST_PRELAUNCH_SIGNAL fixture cancels during pre-snapshot fingerprinting"
+    assert_eq "$SAST_PRELAUNCH_EXPECTED_RC" "$rc" \
+        "pre-snapshot $SAST_PRELAUNCH_SIGNAL preserves the conventional status"
+    assert_true "$([ ! -e "$SAST_PRELAUNCH_REPORT/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+        "pre-snapshot $SAST_PRELAUNCH_SIGNAL releases the report-run lock"
+    assert_jq "$SAST_PRELAUNCH_REPORT/sast-status.json" \
+        ".status == \"failed\" and .reason == \"semgrep scan cancelled by $SAST_PRELAUNCH_SIGNAL\"" \
+        "pre-snapshot $SAST_PRELAUNCH_SIGNAL publishes terminal SAST coverage"
+done
 
 PRIVATE_OUT_DIR="$TEST_OUTPUT_DIR/private"
 CLAUDE_LOG="$TEST_OUTPUT_DIR/claude-invoked.txt"
@@ -2704,7 +2907,7 @@ TERM_SELECTION_REPORT="$TERM_SELECTION_REPO/report"
     "$GH_PR_ENRICH" select-analysis "$TERM_SELECTION_REPORT" \
         "$TERM_SELECTION_REPORT/hybrid-analysis.json") > "$BLOCKED_HEAD_OUT" 2>&1 &
 RUNTIME_BACKGROUND_PID=$!
-for _ in $(seq 1 200); do
+for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
     [ -e "$BLOCKED_HEAD_READY" ] && break
     sleep 0.05
 done
@@ -2746,7 +2949,7 @@ set -m
         "$INT_SELECTION_REPORT/hybrid-analysis.json") >/dev/null 2>&1 &
 RUNTIME_BACKGROUND_PID=$!
 set +m
-for _ in $(seq 1 200); do
+for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
     [ -e "$BLOCKED_HEAD_READY" ] && break
     sleep 0.05
 done

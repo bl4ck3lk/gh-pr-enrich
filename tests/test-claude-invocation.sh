@@ -284,7 +284,7 @@ env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
     "$GH_PR_ENRICH" cleanup-analysis-snapshot "$NATIVE_SNAPSHOT_PATH"
 assert_true "$([ ! -e "$NATIVE_SNAPSHOT_PATH" ] && echo 0 || echo 1)" \
     "native snapshot cleanup removes the leased private directory"
-for _attempt in $(seq 1 100); do
+for (( _attempt=0; _attempt < 100; _attempt++ )); do
     ! kill -0 "$NATIVE_JANITOR_PID" 2>/dev/null && break
     sleep 0.01
 done
@@ -300,13 +300,13 @@ EXPIRING_JANITOR_SIDECAR="$EXPIRING_SNAPSHOT_PATH.janitor"
 EXPIRING_JANITOR_PID=$(awk -F '\t' 'NR == 1 { print $2 }' "$EXPIRING_JANITOR_SIDECAR")
 assert_eq "1" "$(printf '%s' "$EXPIRING_SNAPSHOT_JSON" | jq -r '.expires_in_seconds')" \
     "native snapshot materialization reports its bounded lease"
-for _attempt in $(seq 1 100); do
+for (( _attempt=0; _attempt < 100; _attempt++ )); do
     [ ! -e "$EXPIRING_SNAPSHOT_PATH" ] && break
     sleep 0.05
 done
 assert_true "$([ ! -e "$EXPIRING_SNAPSHOT_PATH" ] && echo 0 || echo 1)" \
     "the native snapshot janitor reaps an abandoned short lease"
-for _attempt in $(seq 1 100); do
+for (( _attempt=0; _attempt < 100; _attempt++ )); do
     ! kill -0 "$EXPIRING_JANITOR_PID" 2>/dev/null && break
     sleep 0.01
 done
@@ -626,7 +626,7 @@ assert_true "$([ -n "$TERMINATED_CONTEXT_COPY" ] && \
     "TERM removes the immutable analyzer context copy"
 assert_true "$([ "$SIGNAL_ELAPSED" -lt 5 ] && echo 0 || echo 1)" \
     "TERM promptly interrupts a hung analyzer that ignores TERM"
-for _attempt in $(seq 1 100); do
+for (( _attempt=0; _attempt < 100; _attempt++ )); do
     [ -z "$TERMINATED_CHILD" ] || ! kill -0 "$TERMINATED_CHILD" 2>/dev/null && break
     sleep 0.02
 done
@@ -944,7 +944,7 @@ TIMED_OUT_CHILD=$(cat "$TIMEOUT_CHILD_PID_LOG" 2>/dev/null || echo "")
 assert_eq "137" "$rc" "the internal timeout preserves the killed-analyzer exit status"
 assert_contains "$REAL_TIMEOUT_OUT" "timed out after 1s" \
     "the internal timeout reports the configured deadline"
-for _attempt in $(seq 1 100); do
+for (( _attempt=0; _attempt < 100; _attempt++ )); do
     [ -z "$TIMED_OUT_CHILD" ] || ! kill -0 "$TIMED_OUT_CHILD" 2>/dev/null && break
     sleep 0.01
 done
@@ -1176,10 +1176,13 @@ cat > "$WATCHDOG_STUBS/semgrep" << 'STUB'
 #!/bin/bash
 printf '%s\n' "$$" > "$SEMGREP_PID_LOG"
 [ -z "${SEMGREP_CWD_LOG:-}" ] || pwd > "$SEMGREP_CWD_LOG"
+printf '%s\n' '{"results":[{"check_id":"partial.before.timeout","path":"src/retry.js","start":{"line":1},"extra":{"severity":"ERROR","message":"must be discarded","metadata":{}}}],"errors":[]}'
+[ -z "${SEMGREP_PARTIAL_READY_LOG:-}" ] || printf 'ready\n' > "$SEMGREP_PARTIAL_READY_LOG"
 trap '' TERM INT
 "$SEMGREP_CHILD_STUB" &
 child_pid=$!
 printf '%s\n' "$child_pid" > "$SEMGREP_CHILD_PID_LOG"
+[ -z "${SEMGREP_CANCEL_TARGET_PID:-}" ] || kill -INT "$SEMGREP_CANCEL_TARGET_PID"
 wait "$child_pid"
 STUB
 chmod +x "$WATCHDOG_STUBS/semgrep"
@@ -1197,7 +1200,8 @@ STUB
 chmod +x "$WATCHDOG_STUBS/timeout"
 
 SECONDS=0
-WATCHDOG_OUT=$( (cd "$WORKSPACE" && env \
+set +e
+WATCHDOG_OUT=$(cd "$WORKSPACE" && env \
     PATH="$WATCHDOG_STUBS:$STUB_DIR:$PATH" \
     GH_PR_ENRICH_CODE_ACCESS=true GH_PR_ENRICH_SEMGREP_TIMEOUT=1 \
     SEMGREP_PID_LOG="$WATCHDOG_PID_LOG" \
@@ -1206,14 +1210,25 @@ WATCHDOG_OUT=$( (cd "$WORKSPACE" && env \
     SEMGREP_CWD_LOG="$WATCHDOG_CWD_LOG" \
     SEMGREP_GNU_TIMEOUT_LOG="$WATCHDOG_TIMEOUT_LOG" \
     "$GH_PR_ENRICH" --test-call collect_sast_findings \
-    "watchdog-reports" 2>&1) || true)
+    "watchdog-reports" 2>&1)
+WATCHDOG_RC=$?
+set -e
 WATCHDOG_ELAPSED=$SECONDS
+assert_eq "0" "$WATCHDOG_RC" \
+    "the top-level command survives the managed Semgrep timeout"
 assert_true "$([ "$WATCHDOG_ELAPSED" -ge 1 ] && [ "$WATCHDOG_ELAPSED" -lt 8 ] && echo 0 || echo 1)" \
     "the portable Semgrep watchdog enforces the configured timeout without spinning"
 assert_true "$([ ! -s "$WATCHDOG_TIMEOUT_LOG" ] && echo 0 || echo 1)" \
     "the portable Semgrep watchdog does not invoke GNU timeout even when one is present"
 assert_jq "$WATCHDOG_REPORTS/sast-status.json" '.status == "failed"' \
     "a watchdog-terminated Semgrep scan is recorded as failed coverage"
+assert_jq "$WATCHDOG_REPORTS/sast-status.json" \
+    '.reason == "semgrep timed out after 1 seconds"' \
+    "watchdog timeout coverage records the managed timeout distinctly"
+assert_jq_eq "$WATCHDOG_REPORTS/sast-findings.json" 'length' "0" \
+    "parseable Semgrep output written before a timeout is discarded"
+assert_true "$([ ! -e "$WATCHDOG_REPORTS/semgrep-raw.json" ] && echo 0 || echo 1)" \
+    "a timed-out scan removes its parseable partial Semgrep artifact"
 WATCHDOG_SEMGREP_PID=$(cat "$WATCHDOG_PID_LOG" 2>/dev/null || echo "")
 WATCHDOG_CHILD_PID=$(cat "$WATCHDOG_CHILD_PID_LOG" 2>/dev/null || echo "")
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -1231,8 +1246,53 @@ assert_true "$([ -n "$WATCHDOG_CHILD_PID" ] && [ "$child_alive" = false ] && ech
 WATCHDOG_SNAPSHOT=$(cat "$WATCHDOG_CWD_LOG" 2>/dev/null || echo "")
 assert_true "$([ -n "$WATCHDOG_SNAPSHOT" ] && [ ! -d "$WATCHDOG_SNAPSHOT" ] && echo 0 || echo 1)" \
     "a timed-out Semgrep scan removes its immutable snapshot"
-assert_contains "$WATCHDOG_OUT" "semgrep failed" \
-    "a watchdog timeout is reported as a failed Semgrep pre-pass"
+assert_contains "$WATCHDOG_OUT" "semgrep timed out" \
+    "a watchdog timeout is reported distinctly from a Semgrep exit error"
+
+# A timeout-watcher infrastructure failure must fail closed even when Semgrep
+# wrote parseable partial JSON before the watcher killed its process group.
+WATCHDOG_FAILURE_REPORTS="$WORKSPACE/watchdog-failure-reports"
+WATCHDOG_FAILURE_STUBS="$TEST_OUTPUT_DIR/semgrep-watchdog-failure-stubs"
+WATCHDOG_FAILURE_PARTIAL_READY="$TEST_OUTPUT_DIR/semgrep-watchdog-failure-partial-ready"
+mkdir -p "$WATCHDOG_FAILURE_REPORTS" "$WATCHDOG_FAILURE_STUBS"
+cp "$SAST_DIR/pr-summary.json" "$WATCHDOG_FAILURE_REPORTS/pr-summary.json"
+cat > "$WATCHDOG_FAILURE_STUBS/sleep" << 'STUB'
+#!/bin/bash
+[ -z "${SEMGREP_PARTIAL_READY_LOG:-}" ] && exit 8
+attempts=0
+while [ ! -s "$SEMGREP_PARTIAL_READY_LOG" ] && [ "$attempts" -lt 200 ]; do
+    /bin/sleep 0.01
+    attempts=$((attempts + 1))
+done
+[ -s "$SEMGREP_PARTIAL_READY_LOG" ] || exit 8
+exit 7
+STUB
+chmod +x "$WATCHDOG_FAILURE_STUBS/sleep"
+set +e
+WATCHDOG_FAILURE_OUT=$(cd "$WORKSPACE" && env \
+    PATH="$WATCHDOG_FAILURE_STUBS:$WATCHDOG_STUBS:$STUB_DIR:$PATH" \
+    GH_PR_ENRICH_CODE_ACCESS=true GH_PR_ENRICH_SEMGREP_TIMEOUT=30 \
+    SEMGREP_PARTIAL_READY_LOG="$WATCHDOG_FAILURE_PARTIAL_READY" \
+    SEMGREP_PID_LOG="$WATCHDOG_PID_LOG" \
+    SEMGREP_CHILD_PID_LOG="$WATCHDOG_CHILD_PID_LOG" \
+    SEMGREP_CHILD_STUB="$WATCHDOG_STUBS/semgrep-child" \
+    "$GH_PR_ENRICH" --test-call collect_sast_findings \
+    "watchdog-failure-reports" 2>&1)
+WATCHDOG_FAILURE_RC=$?
+set -e
+assert_true "$([ -s "$WATCHDOG_FAILURE_PARTIAL_READY" ] && echo 0 || echo 1)" \
+    "the timeout-watcher failure fixture writes partial JSON before failing"
+assert_eq "0" "$WATCHDOG_FAILURE_RC" \
+    "the top-level command survives a timeout-watcher infrastructure failure"
+assert_jq "$WATCHDOG_FAILURE_REPORTS/sast-status.json" \
+    '.status == "failed" and .reason == "semgrep execution wrapper failed before scan completion"' \
+    "a timeout-watcher infrastructure failure records failed SAST coverage"
+assert_jq_eq "$WATCHDOG_FAILURE_REPORTS/sast-findings.json" 'length' "0" \
+    "a timeout-watcher infrastructure failure cannot publish partial findings"
+assert_true "$([ ! -e "$WATCHDOG_FAILURE_REPORTS/semgrep-raw.json" ] && echo 0 || echo 1)" \
+    "a timeout-watcher infrastructure failure removes partial Semgrep output"
+assert_contains "$WATCHDOG_FAILURE_OUT" "execution wrapper failed" \
+    "a timeout-watcher infrastructure failure is reported distinctly"
 
 # Sending TERM only to the top-level CLI must propagate through the owned
 # wrapper and scanner process group instead of leaving a long-timeout orphan.
@@ -1277,6 +1337,15 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 assert_true "$([ "$CANCEL_RC" -ne 0 ] && [ "$CANCEL_ELAPSED" -lt 8 ] && echo 0 || echo 1)" \
     "TERM sent only to the CLI promptly cancels the long Semgrep run"
+assert_eq "143" "$CANCEL_RC" \
+    "Semgrep cancellation preserves the conventional TERM exit status"
+assert_jq "$CANCEL_REPORTS/sast-status.json" \
+    '.status == "failed" and .reason == "semgrep scan cancelled by TERM"' \
+    "Semgrep cancellation publishes terminal failed coverage"
+assert_jq_eq "$CANCEL_REPORTS/sast-findings.json" 'length' "0" \
+    "Semgrep cancellation cannot publish partial findings"
+assert_true "$([ ! -e "$CANCEL_REPORTS/semgrep-raw.json" ] && echo 0 || echo 1)" \
+    "Semgrep cancellation removes partial raw output"
 assert_true "$([ -n "$CANCEL_SCANNER_PID" ] && [ "$cancel_scanner_alive" = false ] && echo 0 || echo 1)" \
     "CLI cancellation reaps the owned Semgrep scanner"
 assert_true "$([ -n "$CANCEL_CHILD_PID" ] && [ "$cancel_child_alive" = false ] && echo 0 || echo 1)" \
@@ -1284,6 +1353,135 @@ assert_true "$([ -n "$CANCEL_CHILD_PID" ] && [ "$cancel_child_alive" = false ] &
 CANCEL_SNAPSHOT=$(cat "$CANCEL_CWD_LOG" 2>/dev/null || echo "")
 assert_true "$([ -n "$CANCEL_SNAPSHOT" ] && [ ! -d "$CANCEL_SNAPSHOT" ] && echo 0 || echo 1)" \
     "CLI cancellation removes the immutable Semgrep snapshot"
+
+# INT follows a distinct conventional status and diagnostic path.
+CANCEL_INT_REPORTS="$WORKSPACE/cancel-int-reports"
+CANCEL_INT_SCANNER_PID_LOG="$TEST_OUTPUT_DIR/semgrep-cancel-int.pid"
+CANCEL_INT_CHILD_PID_LOG="$TEST_OUTPUT_DIR/semgrep-cancel-int-child.pid"
+CANCEL_INT_CWD_LOG="$TEST_OUTPUT_DIR/semgrep-cancel-int-cwd.log"
+mkdir -p "$CANCEL_INT_REPORTS"
+cp "$SAST_DIR/pr-summary.json" "$CANCEL_INT_REPORTS/pr-summary.json"
+set +e
+(
+    cd "$WORKSPACE" || exit 1
+    exec /bin/sh -c '
+        export SEMGREP_CANCEL_TARGET_PID=$$
+        exec "$@"
+    ' sh env PATH="$WATCHDOG_STUBS:$STUB_DIR:$PATH" \
+        GH_PR_ENRICH_CODE_ACCESS=true GH_PR_ENRICH_SEMGREP_TIMEOUT=3600 \
+        SEMGREP_PID_LOG="$CANCEL_INT_SCANNER_PID_LOG" \
+        SEMGREP_CHILD_PID_LOG="$CANCEL_INT_CHILD_PID_LOG" \
+        SEMGREP_CHILD_STUB="$WATCHDOG_STUBS/semgrep-child" \
+        SEMGREP_CWD_LOG="$CANCEL_INT_CWD_LOG" \
+        SEMGREP_GNU_TIMEOUT_LOG="$WATCHDOG_TIMEOUT_LOG" \
+        "$GH_PR_ENRICH" --test-call collect_sast_findings "cancel-int-reports"
+) > "$TEST_OUTPUT_DIR/semgrep-cancel-int.out" 2>&1
+CANCEL_INT_RC=$?
+set -e
+CANCEL_INT_SCANNER_PID=$(cat "$CANCEL_INT_SCANNER_PID_LOG" 2>/dev/null || echo "")
+CANCEL_INT_CHILD_PID=$(cat "$CANCEL_INT_CHILD_PID_LOG" 2>/dev/null || echo "")
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    cancel_int_scanner_alive=false
+    cancel_int_child_alive=false
+    [ -z "$CANCEL_INT_SCANNER_PID" ] || ! kill -0 "$CANCEL_INT_SCANNER_PID" 2>/dev/null || cancel_int_scanner_alive=true
+    [ -z "$CANCEL_INT_CHILD_PID" ] || ! kill -0 "$CANCEL_INT_CHILD_PID" 2>/dev/null || cancel_int_child_alive=true
+    [ "$cancel_int_scanner_alive" = true ] || [ "$cancel_int_child_alive" = true ] || break
+    /bin/sleep 0.05
+done
+assert_eq "130" "$CANCEL_INT_RC" \
+    "Semgrep cancellation preserves the conventional INT exit status"
+assert_jq "$CANCEL_INT_REPORTS/sast-status.json" \
+    '.status == "failed" and .reason == "semgrep scan cancelled by INT"' \
+    "INT cancellation publishes terminal failed coverage"
+assert_jq_eq "$CANCEL_INT_REPORTS/sast-findings.json" 'length' "0" \
+    "INT cancellation cannot publish partial findings"
+assert_true "$([ ! -e "$CANCEL_INT_REPORTS/semgrep-raw.json" ] && echo 0 || echo 1)" \
+    "INT cancellation removes partial raw output"
+assert_true "$([ -n "$CANCEL_INT_SCANNER_PID" ] && [ "$cancel_int_scanner_alive" = false ] && echo 0 || echo 1)" \
+    "INT cancellation reaps the owned Semgrep scanner"
+assert_true "$([ -n "$CANCEL_INT_CHILD_PID" ] && [ "$cancel_int_child_alive" = false ] && echo 0 || echo 1)" \
+    "INT cancellation terminates Semgrep descendants"
+CANCEL_INT_SNAPSHOT=$(cat "$CANCEL_INT_CWD_LOG" 2>/dev/null || echo "")
+assert_true "$([ -n "$CANCEL_INT_SNAPSHOT" ] && [ ! -d "$CANCEL_INT_SNAPSHOT" ] && echo 0 || echo 1)" \
+    "INT cancellation removes the immutable Semgrep snapshot"
+
+# DEBUG hooks make the three launch-to-PID-publication signal windows
+# deterministic. A pending signal must be honored only after the new child PID
+# is owned, leaving no launch directories, snapshot, or partial output behind.
+SEMGREP_BOUNDARY_BASH_ENV="$TEST_OUTPUT_DIR/semgrep-boundary-bash-env"
+SEMGREP_BOUNDARY_TMP="/tmp/gh-pr-enrich-semgrep-boundary.$$"
+mkdir -p "$SEMGREP_BOUNDARY_TMP"
+cat > "$SEMGREP_BOUNDARY_BASH_ENV" << 'STUB'
+__gh_pr_enrich_semgrep_boundary_debug() {
+    [ ! -e "$SEMGREP_BOUNDARY_MARKER" ] || return 0
+    case "$SEMGREP_BOUNDARY:$BASH_COMMAND" in
+        outer:'semgrep_wrapper_pid=$!'|scanner:'semgrep_pid=$!'|watchdog:'watchdog_pid=$!')
+            printf 'fired\n' > "$SEMGREP_BOUNDARY_MARKER"
+            printf '%s\n' "$!" > "$SEMGREP_BOUNDARY_PID_FILE"
+            /bin/sh -c 'kill -TERM "$PPID"'
+            ;;
+    esac
+}
+set -T
+trap '__gh_pr_enrich_semgrep_boundary_debug' DEBUG
+STUB
+for SEMGREP_BOUNDARY in outer scanner watchdog; do
+    SEMGREP_BOUNDARY_REPORTS="$WORKSPACE/boundary-$SEMGREP_BOUNDARY-reports"
+    SEMGREP_BOUNDARY_MARKER="$TEST_OUTPUT_DIR/semgrep-boundary-$SEMGREP_BOUNDARY-fired"
+    SEMGREP_BOUNDARY_PID_FILE="$TEST_OUTPUT_DIR/semgrep-boundary-$SEMGREP_BOUNDARY-owned.pid"
+    mkdir -p "$SEMGREP_BOUNDARY_REPORTS"
+    cp "$SAST_DIR/pr-summary.json" "$SEMGREP_BOUNDARY_REPORTS/pr-summary.json"
+    rm -f "$SEMGREP_BOUNDARY_MARKER"
+    rm -f "$SEMGREP_BOUNDARY_PID_FILE"
+    set +e
+    SECONDS=0
+    (cd "$WORKSPACE" && env \
+        BASH_ENV="$SEMGREP_BOUNDARY_BASH_ENV" \
+        SEMGREP_BOUNDARY="$SEMGREP_BOUNDARY" \
+        SEMGREP_BOUNDARY_MARKER="$SEMGREP_BOUNDARY_MARKER" \
+        SEMGREP_BOUNDARY_PID_FILE="$SEMGREP_BOUNDARY_PID_FILE" \
+        TMPDIR="$SEMGREP_BOUNDARY_TMP" \
+        PATH="$WATCHDOG_STUBS:$STUB_DIR:$PATH" \
+        GH_PR_ENRICH_CODE_ACCESS=true GH_PR_ENRICH_SEMGREP_TIMEOUT=30 \
+        SEMGREP_PID_LOG="$TEST_OUTPUT_DIR/semgrep-boundary-$SEMGREP_BOUNDARY.pid" \
+        SEMGREP_CHILD_PID_LOG="$TEST_OUTPUT_DIR/semgrep-boundary-$SEMGREP_BOUNDARY-child.pid" \
+        SEMGREP_CHILD_STUB="$WATCHDOG_STUBS/semgrep-child" \
+        "$GH_PR_ENRICH" --test-call collect_sast_findings \
+        "boundary-$SEMGREP_BOUNDARY-reports" >/dev/null 2>&1)
+    SEMGREP_BOUNDARY_RC=$?
+    SEMGREP_BOUNDARY_ELAPSED=$SECONDS
+    set -e
+    assert_true "$([ -s "$SEMGREP_BOUNDARY_MARKER" ] && echo 0 || echo 1)" \
+        "$SEMGREP_BOUNDARY signal fixture reaches the PID-publication boundary"
+    if [ "$SEMGREP_BOUNDARY" = outer ]; then
+        assert_eq "143" "$SEMGREP_BOUNDARY_RC" \
+            "outer-wrapper PID publication defers then honors TERM"
+    else
+        assert_eq "0" "$SEMGREP_BOUNDARY_RC" \
+            "$SEMGREP_BOUNDARY PID publication is converted to failed SAST coverage"
+    fi
+    assert_true "$([ "$SEMGREP_BOUNDARY_ELAPSED" -lt 25 ] && echo 0 || echo 1)" \
+        "$SEMGREP_BOUNDARY PID-publication cancellation is honored before the watchdog timeout"
+    if [ "$SEMGREP_BOUNDARY" = outer ]; then
+        assert_jq "$SEMGREP_BOUNDARY_REPORTS/sast-status.json" \
+            '.status == "failed" and .reason == "semgrep scan cancelled by TERM"' \
+            "outer PID-publication cancellation publishes its signal reason"
+    else
+        assert_jq "$SEMGREP_BOUNDARY_REPORTS/sast-status.json" \
+            '.status == "failed" and .reason == "semgrep execution wrapper was interrupted before scan completion"' \
+            "$SEMGREP_BOUNDARY PID-publication cancellation publishes its interruption reason"
+    fi
+    SEMGREP_BOUNDARY_OWNED_PID=$(cat "$SEMGREP_BOUNDARY_PID_FILE" 2>/dev/null || echo "")
+    assert_true "$([ -n "$SEMGREP_BOUNDARY_OWNED_PID" ] && \
+        ! kill -0 "$SEMGREP_BOUNDARY_OWNED_PID" 2>/dev/null && echo 0 || echo 1)" \
+        "$SEMGREP_BOUNDARY PID-publication cancellation reaps the just-owned child"
+    assert_true "$([ ! -e "$SEMGREP_BOUNDARY_REPORTS/semgrep-raw.json" ] && echo 0 || echo 1)" \
+        "$SEMGREP_BOUNDARY PID-publication cancellation removes partial output"
+    SEMGREP_BOUNDARY_RESIDUE=$(find "$SEMGREP_BOUNDARY_TMP" -mindepth 1 -print -quit)
+    assert_true "$([ -z "$SEMGREP_BOUNDARY_RESIDUE" ] && echo 0 || echo 1)" \
+        "$SEMGREP_BOUNDARY PID-publication cancellation removes launch directories"
+done
+rmdir "$SEMGREP_BOUNDARY_TMP"
 
 # Timeout input is bounded before it reaches sleep. Invalid explicit values use
 # the documented safe default, while the upper boundary remains accepted.

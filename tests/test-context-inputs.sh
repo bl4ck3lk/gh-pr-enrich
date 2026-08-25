@@ -170,10 +170,15 @@ assert_contains "$LINKED_ARGS" 'after: $endCursor' \
     "the linked-issue query binds the pagination cursor"
 assert_contains "$LINKED_ARGS" "totalCount" \
     "the linked-issue query requests a completeness proof"
+assert_contains "$LINKED_ARGS" "nameWithOwner visibility" \
+    "the linked-issue query binds every issue to its source repository visibility"
 assert_jq_eq "$LINKED_PAGES_OUT" 'length' "101" \
     "linked issues from every page are merged"
 assert_jq "$LINKED_PAGES_OUT" 'any(.[]; .id == "ISSUE_101")' \
     "the linked issue after the first 100 is retained"
+assert_jq "$LINKED_PAGES_OUT" \
+    'all(.[]; .repository == {nameWithOwner:"",visibility:"UNKNOWN"})' \
+    "missing source visibility is retained as unknown for a fail-closed provider gate"
 
 # A transport that stops early or repeats an opaque node identity fails closed
 # and retains the valid-empty failure artifact expected by context builders.
@@ -345,7 +350,7 @@ cat > "$CTX_DIR/checks.json" << 'EOF'
 EOF
 
 cat > "$CTX_DIR/linked-issues.json" << 'EOF'
-[{"number": 42, "title": "Requests fail on flaky network", "body": "Users see 500s when upstream is slow.", "url": "https://gh/42"}]
+[{"number": 42, "title": "Requests fail on flaky network", "body": "Users see 500s when upstream is slow.", "url": "https://gh/42", "repository":{"nameWithOwner":"intent/issues","visibility":"PRIVATE"}}]
 EOF
 
 cat > "$CTX_DIR/review-comments.json" << 'EOF'
@@ -379,6 +384,9 @@ assert_jq_eq "$CTX" '.pr.commits | length' "2" "commit messages reach the contex
 assert_jq "$CTX" '.pr.commits[0].message | contains("Add retry with backoff")' "commit headline is included"
 assert_jq_eq "$CTX" '.pr.linked_issues | length' "1" "linked issue reaches the context"
 assert_jq "$CTX" '.pr.linked_issues[0].body | contains("upstream is slow")' "linked issue body is included"
+assert_jq "$CTX" \
+    '.pr.linked_issues[0].repository == {name_with_owner:"intent/issues",visibility:"PRIVATE"}' \
+    "linked issue source visibility remains bound in the native analysis context"
 assert_jq_eq "$CTX" '.failing_checks | length' "1" "only failing checks are included"
 assert_jq "$CTX" '.failing_checks[0].name == "unit-tests"' "failing check is named"
 assert_jq_eq "$CTX" '.sast_findings | length' "1" "sast findings reach the context when present"
@@ -650,7 +658,7 @@ mkdir -p "$EMPTY_LIMIT_DIR"
 cp "$BOUNDARY_DIR/pr-summary.json" "$EMPTY_LIMIT_DIR/pr-summary.json"
 cp "$BOUNDARY_DIR/issue-comments.json" "$EMPTY_LIMIT_DIR/issue-comments.json"
 cp "$BOUNDARY_DIR/unresolved-threads.json" "$EMPTY_LIMIT_DIR/unresolved-threads.json"
-GH_PR_ENRICH_TRUNCATE_CHARS= "$GH_PR_ENRICH" --test-call \
+GH_PR_ENRICH_TRUNCATE_CHARS='' "$GH_PR_ENRICH" --test-call \
     build_claude_context "$EMPTY_LIMIT_DIR" false >/dev/null
 assert_jq_eq "$EMPTY_LIMIT_DIR/claude-context.json" \
     '.coverage.truncation_limit_chars' "5000" \
@@ -724,7 +732,7 @@ env PATH="$CONCURRENT_CONTEXT_STUBS:$PATH" REAL_JQ="$(command -v jq)" \
     "$GH_PR_ENRICH" --test-call build_claude_context \
     "$CONCURRENT_CONTEXT_DIR" false >/dev/null 2>&1 &
 CONCURRENT_FIRST_PID=$!
-for _attempt in $(seq 1 200); do
+for (( _attempt=0; _attempt < 200; _attempt++ )); do
     [ -f "$CONCURRENT_CONTEXT_READY" ] && break
     /bin/sleep 0.01
 done

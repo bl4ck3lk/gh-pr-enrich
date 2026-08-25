@@ -792,10 +792,11 @@ run_report_command() {
         "${GH_PR_ENRICH_GITHUB_TIMEOUT:-}" 60 3600)"
     REPORT_RUN_WATCHDOG_STATUS=0
     (
-        watchdog_fired=false
+        watchdog_fired=false watchdog_attempt=0
         trap '[ "$watchdog_fired" = true ] || exit 0' TERM INT
-        for _ in $(seq 1 $((timeout_seconds * 5))); do
+        while [ "$watchdog_attempt" -lt $((timeout_seconds * 5)) ]; do
             sleep 0.2
+            watchdog_attempt=$((watchdog_attempt + 1))
         done
         watchdog_fired=true
         if [ "$command_group_owned" = true ]; then
@@ -847,6 +848,7 @@ stop_report_run_watchdog() {
 terminate_report_run_child() {
     local command_pid="$REPORT_RUN_CHILD_PID"
     local command_group_owned="$REPORT_RUN_CHILD_GROUP_OWNED"
+    local terminate_attempt=0
     stop_report_run_watchdog
     if [ -z "$command_pid" ]; then
         return 0
@@ -856,13 +858,14 @@ terminate_report_run_child() {
     else
         kill -TERM "$command_pid" 2>/dev/null || true
     fi
-    for _ in $(seq 1 20); do
+    while [ "$terminate_attempt" -lt 20 ]; do
         if [ "$command_group_owned" = true ]; then
             kill -0 -- "-$command_pid" 2>/dev/null || break
         else
             kill -0 "$command_pid" 2>/dev/null || break
         fi
         sleep 0.05
+        terminate_attempt=$((terminate_attempt + 1))
     done
     if [ "$command_group_owned" = true ]; then
         if kill -0 -- "-$command_pid" 2>/dev/null; then
@@ -1954,7 +1957,7 @@ run_analysis_snapshot_janitor() {
 stop_analysis_snapshot_janitor() {
     local snapshot_path="$1"
     local sidecar_path="$snapshot_path.janitor"
-    local token janitor_pid state cancel_tmp
+    local token janitor_pid state cancel_tmp wait_attempt=0
     if ! analysis_snapshot_sidecar_matches "$snapshot_path" "$sidecar_path"; then
         rm -f "$sidecar_path" 2>/dev/null || true
         return 0
@@ -1966,9 +1969,10 @@ stop_analysis_snapshot_janitor() {
         rm -f "$cancel_tmp"
         return 1
     fi
-    for _ in $(seq 1 300); do
+    while [ "$wait_attempt" -lt 300 ]; do
         [ ! -e "$sidecar_path" ] && return 0
         sleep 0.01
+        wait_attempt=$((wait_attempt + 1))
     done
     rm -f "$sidecar_path"
 }
@@ -1976,7 +1980,7 @@ stop_analysis_snapshot_janitor() {
 start_analysis_snapshot_janitor() {
     local snapshot_path="$1" ttl_seconds="$2"
     local cleanup_command sidecar_path token_file token janitor_pid
-    local recorded_token recorded_pid state ready=false
+    local recorded_token recorded_pid state ready=false wait_attempt=0
     is_private_code_snapshot_path "$snapshot_path" || return 1
     [[ "$ttl_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
     cleanup_command="$(canonicalize_path "${BASH_SOURCE[0]}")"
@@ -1988,7 +1992,7 @@ start_analysis_snapshot_janitor() {
     "$cleanup_command" __snapshot-janitor "$snapshot_path" "$sidecar_path" \
         "$token" "$ttl_seconds" </dev/null >/dev/null 2>&1 &
     janitor_pid=$!
-    for _ in $(seq 1 300); do
+    while [ "$wait_attempt" -lt 300 ]; do
         if analysis_snapshot_sidecar_matches "$snapshot_path" "$sidecar_path" \
                 "$token" active; then
             IFS=$'\t' read -r recorded_token recorded_pid state \
@@ -2000,6 +2004,7 @@ start_analysis_snapshot_janitor() {
         fi
         kill -0 "$janitor_pid" 2>/dev/null || break
         sleep 0.01
+        wait_attempt=$((wait_attempt + 1))
     done
     if [ "$ready" != true ]; then
         stop_analysis_snapshot_janitor "$snapshot_path" || true
@@ -2634,7 +2639,7 @@ fi
 run_standalone_analysis_selection() {
     local report_dir="$1" source_file="$2"
     local selection_pid="" selection_rc=0 selection_signal=""
-    local selection_group_owned=false
+    local selection_group_owned=false selection_wait_attempt=0
 
     forward_selection_signal() {
         [ -n "$selection_signal" ] || selection_signal="$1"
@@ -2664,9 +2669,10 @@ run_standalone_analysis_selection() {
     # the lock owner. Wait for that worker to finish its signal-aware cleanup
     # before the public command returns the conventional signal status.
     if [ -n "$selection_signal" ] && [ "$selection_group_owned" = true ]; then
-        for _ in $(seq 1 200); do
+        while [ "$selection_wait_attempt" -lt 200 ]; do
             kill -0 -- "-$selection_pid" 2>/dev/null || break
             sleep 0.05
+            selection_wait_attempt=$((selection_wait_attempt + 1))
         done
         if kill -0 -- "-$selection_pid" 2>/dev/null; then
             kill -KILL -- "-$selection_pid" 2>/dev/null || true
@@ -5408,7 +5414,10 @@ fetch_linked_issues() {
           closingIssuesReferences(first: $pageSize, after: $endCursor) {
             totalCount
             pageInfo { hasNextPage endCursor }
-            nodes { id number title body url }
+            nodes {
+              id number title body url
+              repository { nameWithOwner visibility }
+            }
           }
         }
       }
@@ -5470,7 +5479,12 @@ fetch_linked_issues() {
               (.number == (.number | floor)))) and
             (([$nodes[].id] | unique | length) == ($nodes | length))
           ) as $valid
-        | if $valid then $nodes else error("incomplete linked-issue connection") end
+        | if $valid then
+            $nodes | map(.repository = {
+              nameWithOwner: (.repository.nameWithOwner // ""),
+              visibility: ((.repository.visibility // "UNKNOWN") | ascii_upcase)
+            })
+          else error("incomplete linked-issue connection") end
     ' "$pages_file" > "$normalized_file" 2>/dev/null; then
         printf '[]\n' > "$output_file"
         rm -f "$pages_file" "$normalized_file"
@@ -5909,7 +5923,11 @@ build_analysis_context() (
                     number: .number,
                     title: .title,
                     url: .url,
-                    body: trunc(.body)
+                    body: trunc(.body),
+                    repository: {
+                        name_with_owner: (.repository.nameWithOwner // ""),
+                        visibility: ((.repository.visibility // "UNKNOWN") | ascii_upcase)
+                    }
                 }]
             },
             unresolved_threads: [$thread_list[]
@@ -6247,7 +6265,9 @@ run_semgrep_with_watchdog() {
     local working_directory="$5"
     shift 5
     local -a targets=("$@")
-    local semgrep_pid="" watchdog_pid="" semgrep_rc=0 semgrep_group_owned=false
+    local semgrep_pid="" watchdog_pid="" semgrep_rc=0 watchdog_rc=0
+    local semgrep_group_owned=false
+    local semgrep_starting=false watchdog_starting=false semgrep_wrapper_signal=""
     local launch_attempts=0
     local semgrep_launch_dir="" watchdog_launch_dir=""
     cleanup_semgrep_launch() {
@@ -6259,7 +6279,8 @@ run_semgrep_with_watchdog() {
     cleanup_semgrep_watchdog_launch() {
         [ -n "$watchdog_launch_dir" ] || return 0
         rm -f "$watchdog_launch_dir/ready" "$watchdog_launch_dir/go" \
-            "$watchdog_launch_dir/started" 2>/dev/null || true
+            "$watchdog_launch_dir/started" \
+            "$watchdog_launch_dir/completed" 2>/dev/null || true
         rmdir "$watchdog_launch_dir" 2>/dev/null || true
         watchdog_launch_dir=""
     }
@@ -6293,8 +6314,19 @@ run_semgrep_with_watchdog() {
         stop_semgrep_group
         exit "$signal_exit"
     }
-    trap 'stop_semgrep_wrapper 143' TERM
-    trap 'stop_semgrep_wrapper 130' INT
+    handle_semgrep_wrapper_signal() {
+        local signal_name="$1"
+        [ -n "$semgrep_wrapper_signal" ] || semgrep_wrapper_signal="$signal_name"
+        if [ "$semgrep_starting" = true ] || [ "$watchdog_starting" = true ]; then
+            return 0
+        fi
+        case "$semgrep_wrapper_signal" in
+            TERM) stop_semgrep_wrapper 143 ;;
+            INT) stop_semgrep_wrapper 130 ;;
+        esac
+    }
+    trap 'handle_semgrep_wrapper_signal TERM' TERM
+    trap 'handle_semgrep_wrapper_signal INT' INT
     is_private_code_snapshot_path "$working_directory" || return 125
 
     # Keep the direct child behind a private launch gate while the wrapper proves
@@ -6303,6 +6335,7 @@ run_semgrep_with_watchdog() {
     # must not target the caller's process group.
     semgrep_launch_dir="$(mktemp -d "${TMPDIR:-/tmp}/gh-pr-enrich-semgrep-launch.XXXXXX")" || return 125
     set -m
+    semgrep_starting=true
     GH_PR_ENRICH_SEMGREP_TIMEOUT_SECONDS="$timeout_secs" \
         /bin/sh -c '
             launch_dir="$1"
@@ -6316,6 +6349,8 @@ run_semgrep_with_watchdog() {
             semgrep --config "$config" --json --quiet -- "${targets[@]}" \
         > "$raw_file" 2> "$stderr_file" &
     semgrep_pid=$!
+    semgrep_starting=false
+    [ -z "$semgrep_wrapper_signal" ] || handle_semgrep_wrapper_signal "$semgrep_wrapper_signal"
     launch_attempts=0
     while [ ! -f "$semgrep_launch_dir/ready" ] && [ "$launch_attempts" -lt 100 ]; do
         kill -0 "$semgrep_pid" 2>/dev/null || break
@@ -6337,29 +6372,39 @@ run_semgrep_with_watchdog() {
         stop_semgrep_group
         return 125
     }
+    watchdog_starting=true
     (
-        watchdog_sleep_pid=""
-        trap '[ -z "$watchdog_sleep_pid" ] || kill "$watchdog_sleep_pid" 2>/dev/null; [ -z "$watchdog_sleep_pid" ] || wait "$watchdog_sleep_pid" 2>/dev/null; exit 0' TERM INT
+        watchdog_fired=false watchdog_attempt=0
+        watchdog_limit=$((timeout_secs * 10))
+        trap '[ "$watchdog_fired" = true ] || exit 0' TERM INT
         : > "$watchdog_launch_dir/ready"
         while [ ! -f "$watchdog_launch_dir/go" ]; do :; done
-        sleep "$timeout_secs" &
-        watchdog_sleep_pid=$!
         : > "$watchdog_launch_dir/started"
-        if ! wait "$watchdog_sleep_pid" 2>/dev/null; then
-            watchdog_sleep_pid=""
-            [ "$semgrep_group_owned" != true ] || \
-                kill -TERM -- "-$semgrep_pid" 2>/dev/null || true
-            [ "$semgrep_group_owned" != true ] || \
-                kill -KILL -- "-$semgrep_pid" 2>/dev/null || true
-            exit 1
-        fi
-        watchdog_sleep_pid=""
-        [ "$semgrep_group_owned" != true ] || \
+        while [ "$watchdog_attempt" -lt "$watchdog_limit" ]; do
+            [ ! -f "$watchdog_launch_dir/completed" ] || exit 0
+            if ! sleep 0.1; then
+                [ "$semgrep_group_owned" != true ] || \
+                    kill -TERM -- "-$semgrep_pid" 2>/dev/null || true
+                [ "$semgrep_group_owned" != true ] || \
+                    kill -KILL -- "-$semgrep_pid" 2>/dev/null || true
+                exit 1
+            fi
+            watchdog_attempt=$((watchdog_attempt + 1))
+        done
+        [ ! -f "$watchdog_launch_dir/completed" ] || exit 0
+        watchdog_fired=true
+        if [ "$semgrep_group_owned" = true ]; then
             kill -TERM -- "-$semgrep_pid" 2>/dev/null || true
-        [ "$semgrep_group_owned" != true ] || \
             kill -KILL -- "-$semgrep_pid" 2>/dev/null || true
+        else
+            kill -TERM "$semgrep_pid" 2>/dev/null || true
+            kill -KILL "$semgrep_pid" 2>/dev/null || true
+        fi
+        exit 124
     ) &
     watchdog_pid=$!
+    watchdog_starting=false
+    [ -z "$semgrep_wrapper_signal" ] || handle_semgrep_wrapper_signal "$semgrep_wrapper_signal"
     launch_attempts=0
     while [ ! -f "$watchdog_launch_dir/ready" ] && [ "$launch_attempts" -lt 100 ]; do
         kill -0 "$watchdog_pid" 2>/dev/null || break
@@ -6389,7 +6434,23 @@ run_semgrep_with_watchdog() {
     wait "$semgrep_pid" || semgrep_rc=$?
     semgrep_pid=""
     cleanup_semgrep_launch
-    stop_semgrep_watchdog
+    if [ -n "$watchdog_pid" ]; then
+        if ! : > "$watchdog_launch_dir/completed"; then
+            stop_semgrep_watchdog
+            echo "Error: Could not notify the Semgrep timeout watcher of scan completion." >&2
+            return 125
+        fi
+        wait "$watchdog_pid" 2>/dev/null || watchdog_rc=$?
+        watchdog_pid=""
+    fi
+    cleanup_semgrep_watchdog_launch
+    if [ "$watchdog_rc" -eq 124 ]; then
+        return 124
+    fi
+    if [ "$watchdog_rc" -ne 0 ]; then
+        echo "Error: Semgrep timeout watcher failed (exit $watchdog_rc)." >&2
+        return 125
+    fi
     return "$semgrep_rc"
 }
 
@@ -6410,6 +6471,12 @@ collect_sast_findings() {
     local output_file="$output_dir/sast-findings.json"
     local status_file="$output_dir/sast-status.json"
     local sast_workspace_fingerprint=""
+    local raw_file="$output_dir/semgrep-raw.json"
+    local rc=0 semgrep_wrapper_pid="" semgrep_signal=""
+    local semgrep_wrapper_starting=false
+    local sast_previous_term_trap sast_previous_int_trap
+    sast_previous_term_trap="$(trap -p TERM)"
+    sast_previous_int_trap="$(trap -p INT)"
     write_sast_status() {
         local requested="$1" status="$2" reason="$3"
         jq -n --argjson requested "$requested" --arg status "$status" \
@@ -6422,14 +6489,58 @@ collect_sast_findings() {
               end
         ' > "$status_file"
     }
+    stop_owned_semgrep_wrapper() {
+        [ -n "$semgrep_wrapper_pid" ] || return 0
+        kill -TERM "$semgrep_wrapper_pid" 2>/dev/null || true
+        wait "$semgrep_wrapper_pid" 2>/dev/null || true
+        semgrep_wrapper_pid=""
+    }
+    restore_sast_signal_traps() {
+        restore_code_access_cleanup_traps || true
+        trap - TERM INT
+        [ -z "$sast_previous_term_trap" ] || eval "$sast_previous_term_trap"
+        [ -z "$sast_previous_int_trap" ] || eval "$sast_previous_int_trap"
+    }
+    finish_sast_cancellation() {
+        local signal_name="$1" signal_exit="$2"
+        # Repeated signals and report-write failures cannot interrupt cleanup or
+        # replace the conventional signal status. The private snapshot is the
+        # authoritative cleanup boundary; report artifacts are best-effort.
+        trap '' TERM INT
+        stop_owned_semgrep_wrapper || true
+        cleanup_code_access_artifacts || true
+        trap '' TERM INT
+        rm -f "$raw_file" 2>/dev/null || true
+        printf '[]\n' > "$output_file" 2>/dev/null || true
+        write_sast_status true "failed" \
+            "semgrep scan cancelled by $signal_name" 2>/dev/null || true
+        restore_sast_signal_traps
+        trap '' TERM INT
+        exit "$signal_exit"
+    }
+    handle_sast_signal() {
+        local signal_name="$1"
+        [ -n "$semgrep_signal" ] || semgrep_signal="$signal_name"
+        [ "$semgrep_wrapper_starting" != true ] || return 0
+        case "$semgrep_signal" in
+            TERM) finish_sast_cancellation TERM 143 ;;
+            INT) finish_sast_cancellation INT 130 ;;
+        esac
+    }
+    install_sast_signal_traps() {
+        trap 'handle_sast_signal TERM' TERM
+        trap 'handle_sast_signal INT' INT
+    }
 
     echo '[]' > "$output_file"
     write_sast_status true "running" ""
+    install_sast_signal_traps
 
     if ! command -v semgrep > /dev/null 2>&1; then
         echo "⚠️  semgrep not found — skipping the static-analysis pre-pass." >&2
         echo "   Install it (pip install semgrep) or drop --sast." >&2
         write_sast_status true "skipped" "semgrep executable not found"
+        restore_sast_signal_traps
         return 0
     fi
 
@@ -6446,6 +6557,7 @@ collect_sast_findings() {
     if [ "${access_line%%:*}" = "disabled" ]; then
         echo "⚠️  Skipping the semgrep pre-pass: ${access_line#*: }" >&2
         write_sast_status true "skipped" "${access_line#*: }"
+        restore_sast_signal_traps
         return 0
     fi
 
@@ -6460,9 +6572,11 @@ collect_sast_findings() {
         echo "⚠️  Could not create an immutable workspace snapshot for semgrep." >&2
         write_sast_status true "failed" \
             "immutable workspace snapshot could not be created"
+        restore_sast_signal_traps
         return 0
     fi
     local sast_snapshot_path="$CODE_ACCESS_SNAPSHOT_DIR"
+    install_sast_signal_traps
 
     # Scan only changed regular files represented by the captured manifest.
     local -a targets=()
@@ -6477,57 +6591,67 @@ collect_sast_findings() {
         write_sast_status true "skipped" \
             "no changed files were present in the matched workspace snapshot"
         cleanup_code_access_snapshot
+        restore_sast_signal_traps
         return 0
     fi
 
-    local raw_file="$output_dir/semgrep-raw.json"
-    local rc=0 semgrep_wrapper_pid="" semgrep_signal=""
-    local previous_term_trap previous_int_trap
-    previous_term_trap="$(trap -p TERM)"
-    previous_int_trap="$(trap -p INT)"
-    stop_owned_semgrep_wrapper() {
-        [ -n "$semgrep_wrapper_pid" ] || return 0
-        kill -TERM "$semgrep_wrapper_pid" 2>/dev/null || true
-        wait "$semgrep_wrapper_pid" 2>/dev/null || true
-        semgrep_wrapper_pid=""
-    }
-    trap 'semgrep_signal=TERM; stop_owned_semgrep_wrapper' TERM
-    trap 'semgrep_signal=INT; stop_owned_semgrep_wrapper' INT
+    semgrep_wrapper_starting=true
     run_semgrep_with_watchdog "$timeout_secs" "$raw_file" \
         "$output_dir/semgrep-stderr.log" "$config" "$sast_snapshot_path" \
         "${targets[@]}" &
     semgrep_wrapper_pid=$!
+    semgrep_wrapper_starting=false
+    [ -z "$semgrep_signal" ] || handle_sast_signal "$semgrep_signal"
     wait "$semgrep_wrapper_pid" || rc=$?
     semgrep_wrapper_pid=""
-    if [ -n "$previous_term_trap" ]; then eval "$previous_term_trap"; else trap - TERM; fi
-    if [ -n "$previous_int_trap" ]; then eval "$previous_int_trap"; else trap - INT; fi
-    case "$semgrep_signal" in
-        TERM)
-            cleanup_code_access_snapshot
-            return 143
-            ;;
-        INT)
-            cleanup_code_access_snapshot
-            return 130
-            ;;
-    esac
 
     local current_workspace_fingerprint
     current_workspace_fingerprint="$(code_access_workspace_fingerprint \
         "$output_dir" 2>/dev/null || echo "")"
-    cleanup_code_access_snapshot
+    cleanup_code_access_artifacts
     if [ -z "$current_workspace_fingerprint" ] || \
        [ "$current_workspace_fingerprint" != "$sast_workspace_fingerprint" ]; then
         rm -f "$raw_file"
         echo "⚠️  Workspace changed during the semgrep pre-pass; discarding its output." >&2
         write_sast_status true "failed" \
             "workspace fingerprint changed during immutable snapshot scan"
+        restore_sast_signal_traps
+        return 0
+    fi
+
+    if [ "$rc" -eq 124 ]; then
+        rm -f "$raw_file"
+        echo '[]' > "$output_file"
+        echo "⚠️  semgrep timed out after $timeout_secs seconds; discarding partial output." >&2
+        write_sast_status true "failed" \
+            "semgrep timed out after $timeout_secs seconds"
+        restore_sast_signal_traps
+        return 0
+    fi
+
+    if [ "$rc" -eq 125 ]; then
+        rm -f "$raw_file"
+        echo '[]' > "$output_file"
+        echo "⚠️  Semgrep execution wrapper failed; discarding partial output." >&2
+        write_sast_status true "failed" \
+            "semgrep execution wrapper failed before scan completion"
+        restore_sast_signal_traps
+        return 0
+    fi
+
+    if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then
+        rm -f "$raw_file"
+        echo '[]' > "$output_file"
+        write_sast_status true "failed" \
+            "semgrep execution wrapper was interrupted before scan completion"
+        restore_sast_signal_traps
         return 0
     fi
 
     if [ "$rc" -ne 0 ] && [ ! -s "$raw_file" ]; then
         echo "⚠️  semgrep failed (exit $rc). See $output_dir/semgrep-stderr.log" >&2
         write_sast_status true "failed" "semgrep exited $rc without usable JSON"
+        restore_sast_signal_traps
         return 0
     fi
 
@@ -6537,6 +6661,7 @@ collect_sast_findings() {
         echo '[]' > "$output_file"
         write_sast_status true "failed" \
             "semgrep output root was not an object with a results array"
+        restore_sast_signal_traps
         return 0
     fi
 
@@ -6562,6 +6687,7 @@ collect_sast_findings() {
     }]' "$raw_file" > "$output_file" 2>/dev/null; then
         echo '[]' > "$output_file"
         write_sast_status true "failed" "semgrep output was not valid snapshot-bound result JSON"
+        restore_sast_signal_traps
         return 0
     fi
 
@@ -6574,6 +6700,7 @@ collect_sast_findings() {
         write_sast_status true "completed_with_errors" \
             "semgrep exited $rc after returning parseable results"
     fi
+    restore_sast_signal_traps
     return 0
 }
 
@@ -7863,6 +7990,24 @@ else
     echo "Note: Could not fetch linked issues; analysis input coverage will remain incomplete."
     write_input_status "$OUTPUT_DIR/linked-issues-status.json" true "failed" \
         "GitHub linked-issue fetch or normalization failed"
+fi
+
+# Linked issues may belong to a different repository than the public PR. Keep
+# their intent available to native/local analysis, but do not disclose content
+# from PRIVATE, INTERNAL, or indeterminate source repositories to Claude unless
+# the user explicitly authorized external disclosure.
+if [ "$ENRICH_WITH_CLAUDE" = true ] && [ "$ALLOW_EXTERNAL" != true ]; then
+    LINKED_ISSUE_RESTRICTED_VISIBILITIES=$(jq -r '
+        [.[]
+         | ((.repository.visibility // "UNKNOWN") | ascii_upcase)
+         | select(. != "PUBLIC")]
+        | unique | join(", ")
+    ' "$OUTPUT_DIR/linked-issues.json" 2>/dev/null || echo "UNKNOWN")
+    if [ -n "$LINKED_ISSUE_RESTRICTED_VISIBILITIES" ]; then
+        echo "Error: Linked issue source visibility is $LINKED_ISSUE_RESTRICTED_VISIBILITIES; external Claude enrichment is blocked." >&2
+        echo "Re-run with --allow-external only after the user explicitly authorizes disclosure." >&2
+        exit 1
+    fi
 fi
 
 # Process comment threads to create ID mapping
