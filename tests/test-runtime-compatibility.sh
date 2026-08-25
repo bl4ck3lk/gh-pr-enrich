@@ -102,9 +102,9 @@ assert_selection_views_match() {
 }
 
 assert_process_reaped() {
-    local pid="$1" description="$2" reaped=true attempt
+    local pid="$1" description="$2" reaped=true
     if [ -n "$pid" ]; then
-        for attempt in $(seq 1 40); do
+        for _ in $(seq 1 40); do
             kill -0 "$pid" 2>/dev/null || break
             sleep 0.05
         done
@@ -173,6 +173,31 @@ assert_contains "$(cat "$CANONICAL_SKILL")" \
 TEST_HOME="$TEST_OUTPUT_DIR/home"
 mkdir -p "$TEST_HOME"
 
+assert_no_skill_install_residue() {
+    local description="$1" residue="" skills_dir candidate
+    for skills_dir in "$TEST_HOME/.codex/skills" "$TEST_HOME/.claude/skills"; do
+        for candidate in "$skills_dir"/.gh-pr-enrich-install.*; do
+            if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+                residue="$candidate"
+                break 2
+            fi
+        done
+    done
+    assert_true "$([ -z "$residue" ] && echo 0 || echo 1)" "$description" \
+        "residue: ${residue:-none}"
+}
+
+PLANTED_INSTALL_RESIDUE="$TEST_HOME/.codex/skills/.gh-pr-enrich-install.planted"
+mkdir -p "$PLANTED_INSTALL_RESIDUE"
+planted_residue_detected=false
+for planted_candidate in "$TEST_HOME/.codex/skills"/.gh-pr-enrich-install.*; do
+    [ "$planted_candidate" != "$PLANTED_INSTALL_RESIDUE" ] || \
+        planted_residue_detected=true
+done
+assert_true "$([ "$planted_residue_detected" = true ] && echo 0 || echo 1)" \
+    "the portable residue scan detects a planted transaction directory"
+rmdir "$PLANTED_INSTALL_RESIDUE"
+
 HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill >/dev/null
 
 CLAUDE_SKILL="$TEST_HOME/.claude/skills/gh-pr-enrich"
@@ -186,10 +211,53 @@ assert_eq "$(cd "$CLAUDE_SKILL" && pwd -P)" "$(cd "$CODEX_SKILL" && pwd -P)" \
     "both runtimes use one canonical skill source"
 
 HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill >/dev/null
+
+# A pending signal while validating an existing Codex registration must stop
+# before the transaction publishes a missing Claude registration.
+HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill --runtime codex >/dev/null
+EXISTING_CODEX_SIGNAL_STUBS="$TEST_OUTPUT_DIR/existing-codex-signal-stubs"
+mkdir -p "$EXISTING_CODEX_SIGNAL_STUBS"
+cat > "$EXISTING_CODEX_SIGNAL_STUBS/mkdir" << 'STUB'
+#!/bin/bash
+target="${!#}"
+/bin/mkdir "$@" || exit $?
+if [ "$target" = "$SIGNAL_CODEX_SKILLS_DIR" ]; then
+    kill -INT "$PPID"
+fi
+exit 0
+STUB
+chmod +x "$EXISTING_CODEX_SIGNAL_STUBS/mkdir"
+rc=0
+env HOME="$TEST_HOME" SIGNAL_CODEX_SKILLS_DIR="$TEST_HOME/.codex/skills" \
+    PATH="$EXISTING_CODEX_SIGNAL_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill >/dev/null 2>&1 || rc=$?
+assert_eq "130" "$rc" \
+    "INT during existing-Codex validation preserves the conventional status"
+assert_true "$([ -L "$CODEX_SKILL" ] && [ ! -L "$CLAUDE_SKILL" ] && echo 0 || echo 1)" \
+    "existing-Codex cancellation performs no later Claude publication"
+assert_no_skill_install_residue \
+    "existing-Codex cancellation creates no private ownership reference"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill --runtime codex >/dev/null
 assert_true "$([ ! -e "$CLAUDE_SKILL" ] && echo 0 || echo 1)" \
     "the uninstaller removes the Claude registration"
 assert_true "$([ ! -e "$CODEX_SKILL" ] && echo 0 || echo 1)" \
     "the uninstaller removes the Codex registration"
+
+# Dotfile-managed homes commonly symlink each runtime's skills directory.
+SYMLINK_HOME="$TEST_OUTPUT_DIR/symlink-home"
+mkdir -p "$SYMLINK_HOME/.codex" "$SYMLINK_HOME/.claude" \
+    "$SYMLINK_HOME/real-codex-skills" "$SYMLINK_HOME/real-claude-skills"
+ln -s "$SYMLINK_HOME/real-codex-skills" "$SYMLINK_HOME/.codex/skills"
+ln -s "$SYMLINK_HOME/real-claude-skills" "$SYMLINK_HOME/.claude/skills"
+HOME="$SYMLINK_HOME" "$GH_PR_ENRICH" install-skill >/dev/null
+assert_true "$([ -L "$SYMLINK_HOME/real-codex-skills/gh-pr-enrich" ] && echo 0 || echo 1)" \
+    "Codex installation supports a symlinked skills directory"
+assert_true "$([ -L "$SYMLINK_HOME/real-claude-skills/gh-pr-enrich" ] && echo 0 || echo 1)" \
+    "Claude installation supports a symlinked skills directory"
+HOME="$SYMLINK_HOME" "$GH_PR_ENRICH" uninstall-skill >/dev/null
+assert_true "$([ ! -L "$SYMLINK_HOME/real-codex-skills/gh-pr-enrich" ] && \
+    [ ! -L "$SYMLINK_HOME/real-claude-skills/gh-pr-enrich" ] && echo 0 || echo 1)" \
+    "symlinked skills directories uninstall both registrations"
 
 # Default uninstall preflights both registrations before removing either. An
 # operator-owned Claude path must not leave the Codex half uninstalled.
@@ -263,6 +331,502 @@ assert_true "$([ ! -e "$CODEX_SKILL" ] && echo 0 || echo 1)" \
 assert_eq "operator-owned" "$(cat "$CLAUDE_SKILL")" \
     "a failed two-runtime install preserves the conflicting target"
 rm "$CLAUDE_SKILL"
+
+# A non-symlink target created after preflight must make publication fail
+# without being nested into or displaced from the public registration path.
+INSTALL_COLLISION_STUBS="$TEST_OUTPUT_DIR/install-collision-stubs"
+mkdir -p "$INSTALL_COLLISION_STUBS"
+cat > "$INSTALL_COLLISION_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+source_index=$(( $# - 1 ))
+source_path="${!source_index}"
+published_path="$target/$(basename "$source_path")"
+if [ "$published_path" = "$COLLISION_CODEX_TARGET" ]; then
+    case "$source_path" in
+        */.gh-pr-enrich-install.*/claim/gh-pr-enrich)
+            exec /bin/ln "$@"
+            ;;
+    esac
+    case "$COLLISION_KIND" in
+        file) printf '%s\n' 'operator-owned-file' > "$published_path" ;;
+        directory)
+            /bin/mkdir "$published_path" || exit 74
+            printf '%s\n' 'operator-owned-directory' > "$published_path/owner"
+            ;;
+    esac
+fi
+exec /bin/ln "$@"
+STUB
+chmod +x "$INSTALL_COLLISION_STUBS/ln"
+
+rc=0
+env HOME="$TEST_HOME" COLLISION_CODEX_TARGET="$CODEX_SKILL" \
+    COLLISION_KIND=file PATH="$INSTALL_COLLISION_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a concurrent regular-file registration fails installation"
+assert_eq "operator-owned-file" "$(cat "$CODEX_SKILL")" \
+    "regular-file collision remains unchanged at the public path"
+assert_no_skill_install_residue \
+    "regular-file collision leaves no private transaction residue"
+rm "$CODEX_SKILL"
+
+rc=0
+env HOME="$TEST_HOME" COLLISION_CODEX_TARGET="$CODEX_SKILL" \
+    COLLISION_KIND=directory PATH="$INSTALL_COLLISION_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a concurrent directory registration fails installation"
+assert_eq "operator-owned-directory" "$(cat "$CODEX_SKILL/owner")" \
+    "directory collision remains unchanged at the public path"
+assert_true "$([ ! -e "$CODEX_SKILL/gh-pr-enrich" ] && \
+    [ ! -L "$CODEX_SKILL/gh-pr-enrich" ] && echo 0 || echo 1)" \
+    "directory collision never receives a nested registration"
+assert_no_skill_install_residue \
+    "directory collision leaves no private transaction residue"
+rm "$CODEX_SKILL/owner"
+rmdir "$CODEX_SKILL"
+
+# A successful second-runtime publication is not the transaction commit. Both
+# public registrations must still match the sources validated by the installer.
+COMMIT_REVALIDATION_STUBS="$TEST_OUTPUT_DIR/commit-revalidation-stubs"
+CONCURRENT_COMMIT_SOURCE="$TEST_OUTPUT_DIR/concurrent-commit-source"
+mkdir -p "$COMMIT_REVALIDATION_STUBS" "$CONCURRENT_COMMIT_SOURCE"
+cat > "$COMMIT_REVALIDATION_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+source_index=$(( $# - 1 ))
+source_path="${!source_index}"
+published_path="$target/$(basename "$source_path")"
+if [ "$published_path" = "$COMMIT_REVALIDATION_CLAUDE_TARGET" ]; then
+    /bin/ln "$@" || exit $?
+    /bin/rm "$COMMIT_REVALIDATION_CODEX_TARGET" || exit 74
+    /bin/ln -s "$CONCURRENT_COMMIT_SOURCE" \
+        "$COMMIT_REVALIDATION_CODEX_TARGET" || exit 75
+    exit 0
+fi
+exec /bin/ln "$@"
+STUB
+chmod +x "$COMMIT_REVALIDATION_STUBS/ln"
+rc=0
+COMMIT_REVALIDATION_OUTPUT=$(env HOME="$TEST_HOME" \
+    COMMIT_REVALIDATION_CODEX_TARGET="$CODEX_SKILL" \
+    COMMIT_REVALIDATION_CLAUDE_TARGET="$CLAUDE_SKILL" \
+    CONCURRENT_COMMIT_SOURCE="$CONCURRENT_COMMIT_SOURCE" \
+    PATH="$COMMIT_REVALIDATION_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "commit revalidation rejects a concurrently replaced Codex registration"
+assert_eq "$CONCURRENT_COMMIT_SOURCE" "$(readlink "$CODEX_SKILL")" \
+    "failed commit revalidation preserves the concurrent Codex registration"
+assert_true "$([ ! -L "$CLAUDE_SKILL" ] && echo 0 || echo 1)" \
+    "failed commit revalidation rolls back the owned Claude registration"
+assert_contains "$COMMIT_REVALIDATION_OUTPUT" \
+    "Codex registration changed before install commit" \
+    "commit revalidation reports the inconsistent runtime"
+assert_no_skill_install_residue \
+    "commit revalidation leaves no private transaction residue"
+rm "$CODEX_SKILL"
+
+# If the second runtime fails after another installer replaces the Codex
+# registration, rollback must not remove the concurrent installer's symlink.
+CONCURRENT_INSTALL_STUBS="$TEST_OUTPUT_DIR/concurrent-install-stubs"
+mkdir -p "$CONCURRENT_INSTALL_STUBS"
+cat > "$CONCURRENT_INSTALL_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+source_index=$(( $# - 1 ))
+source_path="${!source_index}"
+published_path="$target/$(basename "$source_path")"
+if [ "$published_path" = "$CONCURRENT_CODEX_TARGET" ]; then
+    /bin/ln "$@" || exit $?
+    payload=$(/usr/bin/readlink "$CONCURRENT_CODEX_TARGET") || exit 74
+    replacement="$CONCURRENT_CODEX_TARGET.concurrent"
+    /bin/ln -s "$payload" "$replacement" || exit 75
+    /bin/rm "$CONCURRENT_CODEX_TARGET" || exit 76
+    /bin/mv "$replacement" "$CONCURRENT_CODEX_TARGET" || exit 77
+    exit 0
+fi
+if [ "$published_path" = "$FAIL_CLAUDE_INSTALL_TARGET" ]; then
+    exit 73
+fi
+exec /bin/ln "$@"
+STUB
+chmod +x "$CONCURRENT_INSTALL_STUBS/ln"
+rc=0
+env HOME="$TEST_HOME" FAIL_CLAUDE_INSTALL_TARGET="$CLAUDE_SKILL" \
+    CONCURRENT_CODEX_TARGET="$CODEX_SKILL" \
+    PATH="$CONCURRENT_INSTALL_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a second-runtime install failure fails the transactional install"
+assert_true "$([ -L "$CODEX_SKILL" ] && echo 0 || echo 1)" \
+    "install rollback preserves a concurrently replaced Codex registration"
+assert_eq "$(dirname "$CANONICAL_SKILL")" "$(readlink "$CODEX_SKILL")" \
+    "the preserved concurrent registration retains its symlink payload"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill --runtime codex >/dev/null
+
+# Replacement immediately before rollback's atomic claim is also preserved.
+ROLLBACK_CLAIM_STUBS="$TEST_OUTPUT_DIR/rollback-claim-stubs"
+mkdir -p "$ROLLBACK_CLAIM_STUBS"
+cat > "$ROLLBACK_CLAIM_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+source_index=$(( $# - 1 ))
+source_path="${!source_index}"
+published_path="$target/$(basename "$source_path")"
+if [ "$published_path" = "$FAIL_CLAUDE_INSTALL_TARGET" ]; then
+    exit 73
+fi
+exec /bin/ln "$@"
+STUB
+cat > "$ROLLBACK_CLAIM_STUBS/mv" << 'STUB'
+#!/bin/bash
+if [ "$1" = "$CONCURRENT_CODEX_TARGET" ]; then
+    payload=$(/usr/bin/readlink "$CONCURRENT_CODEX_TARGET") || exit 74
+    replacement="$CONCURRENT_CODEX_TARGET.concurrent"
+    /bin/ln -s "$payload" "$replacement" || exit 75
+    /bin/rm "$CONCURRENT_CODEX_TARGET" || exit 76
+    /bin/mv "$replacement" "$CONCURRENT_CODEX_TARGET" || exit 77
+fi
+exec /bin/mv "$@"
+STUB
+chmod +x "$ROLLBACK_CLAIM_STUBS/ln" "$ROLLBACK_CLAIM_STUBS/mv"
+rc=0
+env HOME="$TEST_HOME" FAIL_CLAUDE_INSTALL_TARGET="$CLAUDE_SKILL" \
+    CONCURRENT_CODEX_TARGET="$CODEX_SKILL" \
+    PATH="$ROLLBACK_CLAIM_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a rollback-boundary replacement still fails the two-runtime install"
+assert_true "$([ -L "$CODEX_SKILL" ] && echo 0 || echo 1)" \
+    "atomic rollback claim restores a concurrently replaced Codex registration"
+assert_eq "$(dirname "$CANONICAL_SKILL")" "$(readlink "$CODEX_SKILL")" \
+    "rollback-boundary restoration preserves the concurrent symlink payload"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill --runtime codex >/dev/null
+
+# A move wrapper can report failure after the atomic rename already completed.
+# Rollback must detect and finish processing that detached claim.
+POST_CLAIM_FAILURE_STUBS="$TEST_OUTPUT_DIR/post-claim-failure-stubs"
+mkdir -p "$POST_CLAIM_FAILURE_STUBS"
+cat > "$POST_CLAIM_FAILURE_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+source_index=$(( $# - 1 ))
+source_path="${!source_index}"
+published_path="$target/$(basename "$source_path")"
+if [ "$published_path" = "$FAIL_CLAUDE_INSTALL_TARGET" ]; then
+    exit 73
+fi
+exec /bin/ln "$@"
+STUB
+cat > "$POST_CLAIM_FAILURE_STUBS/mv" << 'STUB'
+#!/bin/bash
+if [ "$1" = "$POST_CLAIM_CODEX_TARGET" ]; then
+    /bin/mv "$@" || exit $?
+    kill -TERM "$PPID"
+    exit 73
+fi
+exec /bin/mv "$@"
+STUB
+chmod +x "$POST_CLAIM_FAILURE_STUBS/ln" "$POST_CLAIM_FAILURE_STUBS/mv"
+rc=0
+POST_CLAIM_FAILURE_OUTPUT=$(env HOME="$TEST_HOME" \
+    FAIL_CLAUDE_INSTALL_TARGET="$CLAUDE_SKILL" \
+    POST_CLAIM_CODEX_TARGET="$CODEX_SKILL" \
+    PATH="$POST_CLAIM_FAILURE_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill 2>&1) || rc=$?
+assert_eq "1" "$rc" \
+    "repeated cleanup TERM preserves the original install failure status"
+assert_true "$([ ! -L "$CODEX_SKILL" ] && [ ! -L "$CLAUDE_SKILL" ] && echo 0 || echo 1)" \
+    "post-rename claim failure completes the owned rollback"
+assert_contains "$POST_CLAIM_FAILURE_OUTPUT" \
+    "reported failure after detaching" \
+    "post-rename claim failure is distinguished from an untouched target"
+assert_no_skill_install_residue \
+    "a repeated cleanup signal cannot strand private claim residue"
+
+# If rollback cannot identify a detached symlink, it must not republish an
+# indeterminate object as if it were a concurrent registration.
+CLAIM_METADATA_STUBS="$TEST_OUTPUT_DIR/claim-metadata-stubs"
+mkdir -p "$CLAIM_METADATA_STUBS"
+cat > "$CLAIM_METADATA_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+source_index=$(( $# - 1 ))
+source_path="${!source_index}"
+published_path="$target/$(basename "$source_path")"
+if [ "$published_path" = "$FAIL_CLAUDE_INSTALL_TARGET" ]; then
+    exit 73
+fi
+exec /bin/ln "$@"
+STUB
+cat > "$CLAIM_METADATA_STUBS/stat" << 'STUB'
+#!/bin/bash
+target="${!#}"
+case "$target" in
+    */.gh-pr-enrich-install.*/claim/gh-pr-enrich) exit 73 ;;
+esac
+exec /usr/bin/stat "$@"
+STUB
+chmod +x "$CLAIM_METADATA_STUBS/ln" "$CLAIM_METADATA_STUBS/stat"
+rc=0
+CLAIM_METADATA_OUTPUT=$(env HOME="$TEST_HOME" \
+    FAIL_CLAUDE_INSTALL_TARGET="$CLAUDE_SKILL" \
+    PATH="$CLAIM_METADATA_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill 2>&1) || rc=$?
+CLAIM_METADATA_PATH=$(find "$TEST_HOME/.codex/skills" \
+    -path '*/.gh-pr-enrich-install.*/claim/gh-pr-enrich' \
+    -type l -print -quit)
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "rollback metadata failure fails the two-runtime install"
+assert_true "$([ ! -L "$CODEX_SKILL" ] && [ -L "$CLAIM_METADATA_PATH" ] && echo 0 || echo 1)" \
+    "indeterminate claimed registration stays private and recoverable"
+assert_contains "$CLAIM_METADATA_OUTPUT" "preserved at" \
+    "rollback metadata failure reports the recovery path"
+rm "$CLAIM_METADATA_PATH"
+rmdir "$(dirname "$CLAIM_METADATA_PATH")"
+rmdir "$(dirname "$(dirname "$CLAIM_METADATA_PATH")")"
+
+# A directory replacement in the narrow window after the directory pre-check
+# cannot be atomically restored. It must remain recoverable and be reported.
+DIRECTORY_CLAIM_STUBS="$TEST_OUTPUT_DIR/directory-claim-stubs"
+mkdir -p "$DIRECTORY_CLAIM_STUBS"
+cat > "$DIRECTORY_CLAIM_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+source_index=$(( $# - 1 ))
+source_path="${!source_index}"
+published_path="$target/$(basename "$source_path")"
+if [ "$published_path" = "$FAIL_CLAUDE_INSTALL_TARGET" ]; then
+    exit 73
+fi
+exec /bin/ln "$@"
+STUB
+cat > "$DIRECTORY_CLAIM_STUBS/mv" << 'STUB'
+#!/bin/bash
+if [ "$1" = "$CONCURRENT_CODEX_TARGET" ]; then
+    /bin/rm "$CONCURRENT_CODEX_TARGET" || exit 74
+    /bin/mkdir "$CONCURRENT_CODEX_TARGET" || exit 75
+    printf '%s\n' 'concurrent-directory' > "$CONCURRENT_CODEX_TARGET/owner"
+fi
+exec /bin/mv "$@"
+STUB
+chmod +x "$DIRECTORY_CLAIM_STUBS/ln" "$DIRECTORY_CLAIM_STUBS/mv"
+rc=0
+DIRECTORY_CLAIM_OUTPUT=$(env HOME="$TEST_HOME" \
+    FAIL_CLAUDE_INSTALL_TARGET="$CLAUDE_SKILL" \
+    CONCURRENT_CODEX_TARGET="$CODEX_SKILL" \
+    PATH="$DIRECTORY_CLAIM_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill 2>&1) || rc=$?
+DIRECTORY_CLAIMED=$(find "$TEST_HOME/.codex/skills" \
+    -path '*/.gh-pr-enrich-install.*/claim/gh-pr-enrich' \
+    -type d -print -quit)
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a claim-boundary directory replacement fails the install"
+assert_eq "concurrent-directory" "$(cat "$DIRECTORY_CLAIMED/owner")" \
+    "a claimed concurrent directory remains recoverable with its contents"
+assert_contains "$DIRECTORY_CLAIM_OUTPUT" "preserved at" \
+    "directory claim collision reports the recovery path"
+rm "$DIRECTORY_CLAIMED/owner"
+rmdir "$DIRECTORY_CLAIMED"
+rmdir "$(dirname "$DIRECTORY_CLAIMED")"
+rmdir "$(dirname "$(dirname "$DIRECTORY_CLAIMED")")"
+
+# If a newer registration appears after rollback claims a concurrent one,
+# restoration must not overwrite it and the claimed link must stay recoverable.
+RESTORE_RACE_STUBS="$TEST_OUTPUT_DIR/restore-race-stubs"
+NEWER_REGISTRATION_SOURCE="$TEST_OUTPUT_DIR/newer-registration-source"
+mkdir -p "$RESTORE_RACE_STUBS" "$NEWER_REGISTRATION_SOURCE"
+cat > "$RESTORE_RACE_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+source_index=$(( $# - 1 ))
+source_path="${!source_index}"
+published_path="$target/$(basename "$source_path")"
+if [ "$published_path" = "$CONCURRENT_CODEX_TARGET" ]; then
+    case "$source_path" in
+        */.gh-pr-enrich-install.*/claim/gh-pr-enrich)
+            /bin/ln -s "$NEWER_REGISTRATION_SOURCE" \
+                "$CONCURRENT_CODEX_TARGET" || exit 78
+            exec /bin/ln "$@"
+            ;;
+    esac
+    /bin/ln "$@" || exit $?
+    payload=$(/usr/bin/readlink "$CONCURRENT_CODEX_TARGET") || exit 74
+    replacement="$CONCURRENT_CODEX_TARGET.concurrent"
+    /bin/ln -s "$payload" "$replacement" || exit 75
+    /bin/rm "$CONCURRENT_CODEX_TARGET" || exit 76
+    /bin/mv "$replacement" "$CONCURRENT_CODEX_TARGET" || exit 77
+    exit 0
+fi
+if [ "$published_path" = "$FAIL_CLAUDE_INSTALL_TARGET" ]; then
+    exit 73
+fi
+exec /bin/ln "$@"
+STUB
+chmod +x "$RESTORE_RACE_STUBS/ln"
+rc=0
+RESTORE_RACE_OUTPUT=$(env HOME="$TEST_HOME" \
+    FAIL_CLAUDE_INSTALL_TARGET="$CLAUDE_SKILL" \
+    CONCURRENT_CODEX_TARGET="$CODEX_SKILL" \
+    NEWER_REGISTRATION_SOURCE="$NEWER_REGISTRATION_SOURCE" \
+    PATH="$RESTORE_RACE_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill 2>&1) || rc=$?
+RESTORE_RACE_CLAIMED=$(find "$TEST_HOME/.codex/skills" \
+    -path '*/.gh-pr-enrich-install.*/claim/gh-pr-enrich' \
+    -type l -print -quit)
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a restore-boundary replacement fails the transactional install"
+assert_eq "$NEWER_REGISTRATION_SOURCE" "$(readlink "$CODEX_SKILL")" \
+    "restore rollback never overwrites a newer public Codex registration"
+assert_true "$([ -L "$RESTORE_RACE_CLAIMED" ] && echo 0 || echo 1)" \
+    "the displaced concurrent registration remains recoverable"
+assert_eq "$(dirname "$CANONICAL_SKILL")" \
+    "$(readlink "$RESTORE_RACE_CLAIMED")" \
+    "the recoverable claim retains the displaced registration payload"
+assert_contains "$RESTORE_RACE_OUTPUT" "preserved at" \
+    "restore collision reports the recoverable registration path"
+rm "$CODEX_SKILL" "$RESTORE_RACE_CLAIMED"
+rmdir "$(dirname "$RESTORE_RACE_CLAIMED")"
+rmdir "$(dirname "$(dirname "$RESTORE_RACE_CLAIMED")")"
+
+# Transaction-scoped signal handling cleans private references and never
+# leaves only one runtime registered.
+PRIVATE_SIGNAL_STUBS="$TEST_OUTPUT_DIR/private-signal-stubs"
+mkdir -p "$PRIVATE_SIGNAL_STUBS"
+cat > "$PRIVATE_SIGNAL_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+case "$target" in
+    */.gh-pr-enrich-install.*/gh-pr-enrich)
+        /bin/ln "$@" || exit $?
+        kill -INT "$PPID"
+        exit 73
+        ;;
+esac
+exec /bin/ln "$@"
+STUB
+chmod +x "$PRIVATE_SIGNAL_STUBS/ln"
+rc=0
+env HOME="$TEST_HOME" PATH="$PRIVATE_SIGNAL_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill >/dev/null 2>&1 || rc=$?
+assert_eq "130" "$rc" \
+    "INT after private reference creation preserves the conventional status"
+assert_true "$([ ! -L "$CODEX_SKILL" ] && [ ! -L "$CLAUDE_SKILL" ] && echo 0 || echo 1)" \
+    "private-reference cancellation leaves no partial runtime registration"
+assert_no_skill_install_residue \
+    "private-reference cancellation removes its ownership reference"
+
+PUBLISHED_SIGNAL_STUBS="$TEST_OUTPUT_DIR/published-signal-stubs"
+mkdir -p "$PUBLISHED_SIGNAL_STUBS"
+cat > "$PUBLISHED_SIGNAL_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+source_index=$(( $# - 1 ))
+source_path="${!source_index}"
+published_path="$target/$(basename "$source_path")"
+if [ "$published_path" = "$SIGNAL_CODEX_TARGET" ]; then
+    /bin/ln "$@" || exit $?
+    kill -TERM "$PPID"
+    exit 73
+fi
+exec /bin/ln "$@"
+STUB
+chmod +x "$PUBLISHED_SIGNAL_STUBS/ln"
+rc=0
+env HOME="$TEST_HOME" SIGNAL_CODEX_TARGET="$CODEX_SKILL" \
+    PATH="$PUBLISHED_SIGNAL_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill >/dev/null 2>&1 || rc=$?
+assert_eq "143" "$rc" \
+    "TERM after Codex publication preserves the conventional status"
+assert_true "$([ ! -L "$CODEX_SKILL" ] && [ ! -L "$CLAUDE_SKILL" ] && echo 0 || echo 1)" \
+    "post-publication cancellation rolls back the partial registration"
+assert_no_skill_install_residue \
+    "post-publication cancellation removes its ownership reference"
+
+CLAUDE_SIGNAL_STUBS="$TEST_OUTPUT_DIR/claude-signal-stubs"
+mkdir -p "$CLAUDE_SIGNAL_STUBS"
+cat > "$CLAUDE_SIGNAL_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+source_index=$(( $# - 1 ))
+source_path="${!source_index}"
+published_path="$target/$(basename "$source_path")"
+if [ "$published_path" = "$SIGNAL_CLAUDE_TARGET" ]; then
+    /bin/ln "$@" || exit $?
+    kill -INT "$PPID"
+    exit 73
+fi
+exec /bin/ln "$@"
+STUB
+chmod +x "$CLAUDE_SIGNAL_STUBS/ln"
+rc=0
+env HOME="$TEST_HOME" SIGNAL_CLAUDE_TARGET="$CLAUDE_SKILL" \
+    PATH="$CLAUDE_SIGNAL_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill >/dev/null 2>&1 || rc=$?
+assert_eq "130" "$rc" \
+    "INT during Claude installation preserves the conventional status"
+assert_true "$([ ! -L "$CODEX_SKILL" ] && [ ! -L "$CLAUDE_SKILL" ] && echo 0 || echo 1)" \
+    "Claude-install cancellation rolls back the partial registration"
+assert_no_skill_install_residue \
+    "Claude-install cancellation removes its ownership reference"
+
+CLAUDE_PRECOMMIT_SIGNAL_STUBS="$TEST_OUTPUT_DIR/claude-precommit-signal-stubs"
+mkdir -p "$CLAUDE_PRECOMMIT_SIGNAL_STUBS"
+cat > "$CLAUDE_PRECOMMIT_SIGNAL_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+source_index=$(( $# - 1 ))
+source_path="${!source_index}"
+published_path="$target/$(basename "$source_path")"
+if [ "$published_path" = "$SIGNAL_CLAUDE_TARGET" ]; then
+    /bin/ln "$@" || exit $?
+    kill -TERM "$PPID"
+    exit 0
+fi
+exec /bin/ln "$@"
+STUB
+chmod +x "$CLAUDE_PRECOMMIT_SIGNAL_STUBS/ln"
+rc=0
+env HOME="$TEST_HOME" SIGNAL_CLAUDE_TARGET="$CLAUDE_SKILL" \
+    PATH="$CLAUDE_PRECOMMIT_SIGNAL_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill >/dev/null 2>&1 || rc=$?
+assert_eq "143" "$rc" \
+    "TERM after both publications preserves the conventional status"
+assert_true "$([ ! -L "$CODEX_SKILL" ] && [ ! -L "$CLAUDE_SKILL" ] && echo 0 || echo 1)" \
+    "pre-commit cancellation rolls back both runtime registrations"
+assert_no_skill_install_residue \
+    "pre-commit cancellation removes both ownership references"
+
+# Once both public registrations pass commit revalidation, cancellation during
+# private-reference cleanup preserves the coherent pair and removes residue.
+POST_COMMIT_SIGNAL_STUBS="$TEST_OUTPUT_DIR/post-commit-signal-stubs"
+mkdir -p "$POST_COMMIT_SIGNAL_STUBS"
+cat > "$POST_COMMIT_SIGNAL_STUBS/rm" << 'STUB'
+#!/bin/bash
+target="${!#}"
+case "$target" in
+    */.gh-pr-enrich-install.*/gh-pr-enrich)
+        /bin/rm "$@" || exit $?
+        kill -TERM "$PPID"
+        exit 0
+        ;;
+esac
+exec /bin/rm "$@"
+STUB
+chmod +x "$POST_COMMIT_SIGNAL_STUBS/rm"
+rc=0
+env HOME="$TEST_HOME" PATH="$POST_COMMIT_SIGNAL_STUBS:$PATH" \
+    "$GH_PR_ENRICH" install-skill >/dev/null 2>&1 || rc=$?
+assert_eq "143" "$rc" \
+    "TERM after commit revalidation preserves the conventional status"
+assert_true "$([ -L "$CODEX_SKILL" ] && [ -L "$CLAUDE_SKILL" ] && echo 0 || echo 1)" \
+    "post-commit cancellation preserves the coherent two-runtime install"
+assert_no_skill_install_residue \
+    "post-commit cancellation removes both ownership references"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill >/dev/null
 
 # ---------------------------------------------------------------------------
 # End-to-end stubs
@@ -1941,6 +2505,7 @@ QUARANTINE_IDENTITY_OUT=$(cd "$SELECTION_REPO" && \
     QUARANTINE_IDENTITY_MKDIR="$(command -v mkdir)" \
     "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
         "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+: "$QUARANTINE_IDENTITY_OUT"
 assert_true "$([ "$rc" -ne 0 ] && [ -e "$QUARANTINE_IDENTITY_MARKER" ] && echo 0 || echo 1)" \
     "selection rejects a replacement-set change during quarantine"
 assert_selection_views_match "$SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
@@ -2012,6 +2577,7 @@ LINK_IDENTITY_OUT=$(cd "$SELECTION_REPO" && \
     LINK_IDENTITY_REAL_MKDIR="$(command -v mkdir)" \
     "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
         "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+: "$LINK_IDENTITY_OUT"
 assert_true "$([ "$rc" -ne 0 ] && [ -e "$LINK_IDENTITY_MARKER" ] && echo 0 || echo 1)" \
     "selection rejects replacement bytes changed after the first link"
 assert_selection_views_match "$SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \

@@ -633,7 +633,7 @@ cleanup_code_access_snapshot() {
 create_code_access_snapshot() {
     local ignored_output_dir="$1"
     local expected_fingerprint="$2"
-    local repo_root manifest manifest_digest kind header_value origin relative mode expected_hash
+    local repo_root manifest manifest_digest kind origin relative mode expected_hash
     local destination destination_hash destination_mode
     cleanup_code_access_snapshot
     repo_root="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
@@ -653,7 +653,7 @@ create_code_access_snapshot() {
     while IFS= read -r -d '' kind <&3; do
         case "$kind" in
             head|index)
-                IFS= read -r -d '' header_value <&3 || {
+                IFS= read -r -d '' _ <&3 || {
                     rm -f "$manifest"
                     cleanup_code_access_snapshot
                     return 1
@@ -760,7 +760,7 @@ report_run_is_owner_shell() {
 }
 
 run_report_command() {
-    local command_pid command_rc=0 timeout_seconds watchdog_tick
+    local command_pid command_rc=0 timeout_seconds
     local command_group_owned=false
     if ! report_run_is_owner_shell; then
         "$@"
@@ -794,7 +794,7 @@ run_report_command() {
     (
         watchdog_fired=false
         trap '[ "$watchdog_fired" = true ] || exit 0' TERM INT
-        for watchdog_tick in $(seq 1 $((timeout_seconds * 5))); do
+        for _ in $(seq 1 $((timeout_seconds * 5))); do
             sleep 0.2
         done
         watchdog_fired=true
@@ -847,7 +847,6 @@ stop_report_run_watchdog() {
 terminate_report_run_child() {
     local command_pid="$REPORT_RUN_CHILD_PID"
     local command_group_owned="$REPORT_RUN_CHILD_GROUP_OWNED"
-    local attempt
     stop_report_run_watchdog
     if [ -z "$command_pid" ]; then
         return 0
@@ -857,7 +856,7 @@ terminate_report_run_child() {
     else
         kill -TERM "$command_pid" 2>/dev/null || true
     fi
-    for attempt in $(seq 1 20); do
+    for _ in $(seq 1 20); do
         if [ "$command_group_owned" = true ]; then
             kill -0 -- "-$command_pid" 2>/dev/null || break
         else
@@ -1396,7 +1395,7 @@ publish_selected_analysis_transaction() (
     trap 'transaction_signal=TERM; transaction_failed=true' TERM
 
     rollback_selected_publication() {
-        local rollback_name rollback_destination rollback_replacement
+        local rollback_name rollback_destination
         local rollback_quarantine rollback_published rollback_reference
         local index
         for ((index=${#names[@]}-1; index>=0; index--)); do
@@ -1406,7 +1405,6 @@ publish_selected_analysis_transaction() (
                 *) continue ;;
             esac
             rollback_destination="$report_dir/$rollback_name"
-            rollback_replacement="$replacement_dir/$rollback_name"
             rollback_reference="$quarantine_dir/.replacement-$rollback_name"
             if [ -e "$rollback_destination" ]; then
                 rollback_published="$quarantine_dir/.published-$rollback_name"
@@ -1954,8 +1952,9 @@ run_analysis_snapshot_janitor() {
 }
 
 stop_analysis_snapshot_janitor() {
-    local snapshot_path="$1" sidecar_path="$snapshot_path.janitor"
-    local token janitor_pid state attempt cancel_tmp
+    local snapshot_path="$1"
+    local sidecar_path="$snapshot_path.janitor"
+    local token janitor_pid state cancel_tmp
     if ! analysis_snapshot_sidecar_matches "$snapshot_path" "$sidecar_path"; then
         rm -f "$sidecar_path" 2>/dev/null || true
         return 0
@@ -1967,7 +1966,7 @@ stop_analysis_snapshot_janitor() {
         rm -f "$cancel_tmp"
         return 1
     fi
-    for attempt in $(seq 1 300); do
+    for _ in $(seq 1 300); do
         [ ! -e "$sidecar_path" ] && return 0
         sleep 0.01
     done
@@ -1976,7 +1975,7 @@ stop_analysis_snapshot_janitor() {
 
 start_analysis_snapshot_janitor() {
     local snapshot_path="$1" ttl_seconds="$2"
-    local cleanup_command sidecar_path token_file token janitor_pid attempt
+    local cleanup_command sidecar_path token_file token janitor_pid
     local recorded_token recorded_pid state ready=false
     is_private_code_snapshot_path "$snapshot_path" || return 1
     [[ "$ttl_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
@@ -1989,7 +1988,7 @@ start_analysis_snapshot_janitor() {
     "$cleanup_command" __snapshot-janitor "$snapshot_path" "$sidecar_path" \
         "$token" "$ttl_seconds" </dev/null >/dev/null 2>&1 &
     janitor_pid=$!
-    for attempt in $(seq 1 300); do
+    for _ in $(seq 1 300); do
         if analysis_snapshot_sidecar_matches "$snapshot_path" "$sidecar_path" \
                 "$token" active; then
             IFS=$'\t' read -r recorded_token recorded_pid state \
@@ -2635,7 +2634,7 @@ fi
 run_standalone_analysis_selection() {
     local report_dir="$1" source_file="$2"
     local selection_pid="" selection_rc=0 selection_signal=""
-    local selection_group_owned=false attempt
+    local selection_group_owned=false
 
     forward_selection_signal() {
         [ -n "$selection_signal" ] || selection_signal="$1"
@@ -2665,7 +2664,7 @@ run_standalone_analysis_selection() {
     # the lock owner. Wait for that worker to finish its signal-aware cleanup
     # before the public command returns the conventional signal status.
     if [ -n "$selection_signal" ] && [ "$selection_group_owned" = true ]; then
-        for attempt in $(seq 1 200); do
+        for _ in $(seq 1 200); do
             kill -0 -- "-$selection_pid" 2>/dev/null || break
             sleep 0.05
         done
@@ -2742,7 +2741,7 @@ if [ "$1" = "install-skill" ]; then
         fi
         if [ -L "$skill_target" ]; then
             if [ "$(canonicalize_path "$skill_target")" = "$(canonicalize_path "$SKILL_SOURCE")" ]; then
-                echo "✅ $runtime_label skill already installed at $skill_target"
+                echo "✅ $runtime_label skill already installed at $skill_target" || true
                 return 0
             fi
             echo "Error: $skill_target points to another skill source; leaving it untouched."
@@ -2752,7 +2751,8 @@ if [ "$1" = "install-skill" ]; then
             echo "Error: Could not create symlink at $skill_target"
             return 1
         }
-        echo "✅ $runtime_label skill installed at $skill_target"
+        echo "✅ $runtime_label skill installed at $skill_target" || true
+        return 0
     }
 
     preflight_skill_for_runtime() {
@@ -2774,35 +2774,342 @@ if [ "$1" = "install-skill" ]; then
         fi
     }
 
+    skill_symlink_identity() {
+        local skill_target="$1"
+        [ -L "$skill_target" ] || return 1
+        stat -c '%d:%i' "$skill_target" 2>/dev/null || \
+            stat -f '%d:%i' "$skill_target" 2>/dev/null
+    }
+
+    cleanup_skill_install_reference() {
+        local reference_path="$1" reference_dir="$2"
+        [ -n "$reference_path" ] && [ -n "$reference_dir" ] || return 0
+        [ ! -e "$reference_path" ] && [ ! -L "$reference_path" ] || \
+            rm "$reference_path" 2>/dev/null || return 1
+        [ ! -d "$reference_dir" ] || \
+        rmdir "$reference_dir" 2>/dev/null
+    }
+
+    install_skill_with_reference() {
+        local runtime_label="$1" skills_dir="$2" skill_target="$3"
+        local reference_dir reference_path created_payload created_identity
+
+        mkdir -p "$skills_dir" 2>/dev/null || {
+            echo "Error: Could not create directory $skills_dir"
+            return 1
+        }
+        reference_dir="$(mktemp -d \
+            "$skills_dir/.gh-pr-enrich-install.XXXXXX")" || {
+            echo "Error: Could not create a private $runtime_label install reference"
+            return 1
+        }
+        # Match the public basename so linking into skills_dir atomically
+        # targets exactly skills_dir/gh-pr-enrich. This fails without writing
+        # inside a concurrently created directory at that public path.
+        reference_path="$reference_dir/gh-pr-enrich"
+        case "$runtime_label" in
+            Codex)
+                CODEX_INSTALL_REFERENCE_DIR="$reference_dir"
+                CODEX_INSTALL_REFERENCE="$reference_path"
+                ;;
+            Claude)
+                CLAUDE_INSTALL_REFERENCE_DIR="$reference_dir"
+                CLAUDE_INSTALL_REFERENCE="$reference_path"
+                ;;
+        esac
+        ln -s "$SKILL_SOURCE" "$reference_path" 2>/dev/null || {
+            echo "Error: Could not create a private $runtime_label install reference"
+            rmdir "$reference_dir" 2>/dev/null || true
+            return 1
+        }
+        created_payload="$(readlink "$reference_path")" || {
+            cleanup_skill_install_reference "$reference_path" \
+                "$reference_dir" || true
+            return 1
+        }
+        created_identity="$(skill_symlink_identity "$reference_path")" || {
+            cleanup_skill_install_reference "$reference_path" \
+                "$reference_dir" || true
+            return 1
+        }
+        case "$runtime_label" in
+            Codex)
+                CODEX_CREATED_PAYLOAD="$created_payload"
+                CODEX_CREATED_IDENTITY="$created_identity"
+                CODEX_INSTALL_ATTEMPTED=true
+                ;;
+            Claude)
+                CLAUDE_CREATED_PAYLOAD="$created_payload"
+                CLAUDE_CREATED_IDENTITY="$created_identity"
+                CLAUDE_INSTALL_ATTEMPTED=true
+                ;;
+        esac
+
+        # Publish a hard link to the prepared symlink inode. The retained
+        # private name is a stable ownership reference even if another
+        # installer replaces the public registration before this call returns.
+        if ! ln -P "$reference_path" "$skills_dir" 2>/dev/null; then
+            echo "Error: Could not create symlink at $skill_target"
+            return 1
+        fi
+        echo "✅ $runtime_label skill installed at $skill_target" || true
+        return 0
+    }
+
+    validate_skill_install_commit() {
+        local runtime_label="$1" skill_target="$2" install_attempted="$3"
+        local expected_payload="$4" expected_identity="$5"
+        local actual_payload actual_identity actual_source canonical_source
+
+        if [ "$install_attempted" = true ]; then
+            actual_payload="$(readlink "$skill_target" 2>/dev/null)" || {
+                echo "Error: $runtime_label registration changed before install commit"
+                return 1
+            }
+            actual_identity="$(skill_symlink_identity "$skill_target")" || {
+                echo "Error: $runtime_label registration changed before install commit"
+                return 1
+            }
+            if [ "$actual_payload" != "$expected_payload" ] || \
+               [ "$actual_identity" != "$expected_identity" ]; then
+                echo "Error: $runtime_label registration changed before install commit"
+                return 1
+            fi
+            return 0
+        fi
+
+        [ -L "$skill_target" ] || {
+            echo "Error: $runtime_label registration changed before install commit"
+            return 1
+        }
+        actual_source="$(canonicalize_path "$skill_target")" || {
+            echo "Error: $runtime_label registration changed before install commit"
+            return 1
+        }
+        canonical_source="$(canonicalize_path "$SKILL_SOURCE")" || return 1
+        if [ "$actual_source" != "$canonical_source" ]; then
+            echo "Error: $runtime_label registration changed before install commit"
+            return 1
+        fi
+    }
+
+    rollback_created_skill() {
+        local runtime_label="$1" skill_target="$2" expected_payload="$3"
+        local expected_identity="$4" reference_path="$5" reference_dir="$6"
+        local claim_dir="$reference_dir/claim"
+        local claimed_path="$claim_dir/gh-pr-enrich"
+        local skill_parent claimed_payload claimed_identity
+
+        # A directory cannot be restored with an atomic create-if-absent
+        # primitive. If one already won the public path, never detach it.
+        if [ -d "$skill_target" ] && [ ! -L "$skill_target" ]; then
+            echo "Error: $runtime_label registration was replaced concurrently by a directory; leaving it untouched"
+            cleanup_skill_install_reference "$reference_path" "$reference_dir" || true
+            return 1
+        fi
+
+        mkdir "$claim_dir" 2>/dev/null || {
+            echo "Error: Could not create a private $runtime_label rollback claim"
+            return 1
+        }
+
+        # Atomically detach the current public name before inspecting it. This
+        # closes the check-to-unlink race: later replacements at skill_target
+        # are never touched by this rollback.
+        if ! mv "$skill_target" "$claimed_path" 2>/dev/null; then
+            if [ ! -e "$claimed_path" ] && [ ! -L "$claimed_path" ]; then
+                echo "Error: $runtime_label registration changed before install rollback; leaving it untouched"
+                rmdir "$claim_dir" 2>/dev/null || true
+                cleanup_skill_install_reference "$reference_path" "$reference_dir" || true
+                return 1
+            fi
+            echo "Error: $runtime_label rollback claim reported failure after detaching the registration; recovering the claim"
+        fi
+        if [ -L "$claimed_path" ]; then
+            claimed_payload="$(readlink "$claimed_path")" || {
+                echo "Error: Could not inspect the claimed $runtime_label registration; preserved at $claimed_path"
+                rm "$reference_path" 2>/dev/null || true
+                return 1
+            }
+            claimed_identity="$(skill_symlink_identity "$claimed_path")" || {
+                echo "Error: Could not identify the claimed $runtime_label registration; preserved at $claimed_path"
+                rm "$reference_path" 2>/dev/null || true
+                return 1
+            }
+        else
+            claimed_payload=""
+            claimed_identity=""
+        fi
+
+        if [ "$claimed_payload" = "$expected_payload" ] && \
+           [ "$claimed_identity" = "$expected_identity" ]; then
+            rm "$claimed_path" 2>/dev/null || {
+                echo "Error: Could not remove the claimed $runtime_label registration"
+                return 1
+            }
+        else
+            # The claim captured another installer's object. Symlinks and
+            # regular files can be restored atomically with an exact-basename
+            # hard link into the parent. A directory caught in the narrow race
+            # after the pre-claim check remains recoverable at claimed_path.
+            skill_parent="$(dirname "$skill_target")"
+            if { [ -L "$claimed_path" ] || [ -f "$claimed_path" ]; } && \
+               ln -P "$claimed_path" "$skill_parent" 2>/dev/null; then
+                rm "$claimed_path" 2>/dev/null || return 1
+                echo "Error: $runtime_label registration was replaced concurrently; restored it unchanged"
+            else
+                echo "Error: $runtime_label registration was replaced concurrently; preserved at $claimed_path"
+                rm "$reference_path" 2>/dev/null || true
+                return 1
+            fi
+        fi
+        rmdir "$claim_dir" 2>/dev/null || return 1
+        cleanup_skill_install_reference "$reference_path" "$reference_dir"
+    }
+
+    record_install_signal() {
+        case "$1" in
+            INT) INSTALL_TRANSACTION_SIGNAL_STATUS=130 ;;
+            TERM) INSTALL_TRANSACTION_SIGNAL_STATUS=143 ;;
+        esac
+    }
+
+    exit_if_install_signaled() {
+        [ -z "$INSTALL_TRANSACTION_SIGNAL_STATUS" ] || \
+            exit "$INSTALL_TRANSACTION_SIGNAL_STATUS"
+    }
+
+    cleanup_install_transaction_on_exit() {
+        local exit_status="$1"
+        # Rollback temporarily detaches public registrations. Ignore repeated
+        # cancellation while cleanup owns those private claims; the original
+        # signal status is already captured in exit_status.
+        trap - EXIT
+        trap '' INT TERM
+        if [ "$INSTALL_TRANSACTION_ACTIVE" = true ]; then
+            if [ "$INSTALL_TRANSACTION_BOTH_INSTALLED" = true ]; then
+                cleanup_skill_install_reference "$CLAUDE_INSTALL_REFERENCE" \
+                    "$CLAUDE_INSTALL_REFERENCE_DIR" || true
+                cleanup_skill_install_reference "$CODEX_INSTALL_REFERENCE" \
+                    "$CODEX_INSTALL_REFERENCE_DIR" || true
+            else
+                if [ "$CLAUDE_INSTALL_ATTEMPTED" = true ]; then
+                    rollback_created_skill "Claude" "$CLAUDE_SKILL_TARGET" \
+                        "$CLAUDE_CREATED_PAYLOAD" \
+                        "$CLAUDE_CREATED_IDENTITY" \
+                        "$CLAUDE_INSTALL_REFERENCE" \
+                        "$CLAUDE_INSTALL_REFERENCE_DIR" || true
+                else
+                    cleanup_skill_install_reference \
+                        "$CLAUDE_INSTALL_REFERENCE" \
+                        "$CLAUDE_INSTALL_REFERENCE_DIR" || true
+                fi
+                if [ "$CODEX_INSTALL_ATTEMPTED" = true ]; then
+                    rollback_created_skill "Codex" "$CODEX_SKILL_TARGET" \
+                        "$CODEX_CREATED_PAYLOAD" "$CODEX_CREATED_IDENTITY" \
+                        "$CODEX_INSTALL_REFERENCE" \
+                        "$CODEX_INSTALL_REFERENCE_DIR" || true
+                else
+                    cleanup_skill_install_reference "$CODEX_INSTALL_REFERENCE" \
+                        "$CODEX_INSTALL_REFERENCE_DIR" || true
+                fi
+            fi
+        fi
+        exit "$exit_status"
+    }
+
     CODEX_SKILLS_DIR="$HOME/.codex/skills"
     CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
     CODEX_SKILL_TARGET="$CODEX_SKILLS_DIR/gh-pr-enrich"
+    CLAUDE_SKILL_TARGET="$CLAUDE_SKILLS_DIR/gh-pr-enrich"
 
     if [ "$SKILL_RUNTIME" = "both" ]; then
-        preflight_skill_for_runtime "Codex" "$CODEX_SKILLS_DIR"
-        preflight_skill_for_runtime "Claude" "$CLAUDE_SKILLS_DIR"
+        preflight_skill_for_runtime "Codex" "$CODEX_SKILLS_DIR" || exit 1
+        preflight_skill_for_runtime "Claude" "$CLAUDE_SKILLS_DIR" || exit 1
 
         CODEX_ALREADY_INSTALLED=false
         [ ! -L "$CODEX_SKILL_TARGET" ] || CODEX_ALREADY_INSTALLED=true
-        if ! install_skill_for_runtime "Codex" "$CODEX_SKILLS_DIR"; then
+        CLAUDE_ALREADY_INSTALLED=false
+        [ ! -L "$CLAUDE_SKILL_TARGET" ] || CLAUDE_ALREADY_INSTALLED=true
+        CODEX_INSTALL_REFERENCE_DIR=""
+        CODEX_INSTALL_REFERENCE=""
+        CODEX_CREATED_PAYLOAD=""
+        CODEX_CREATED_IDENTITY=""
+        CODEX_INSTALL_ATTEMPTED=false
+        CLAUDE_INSTALL_REFERENCE_DIR=""
+        CLAUDE_INSTALL_REFERENCE=""
+        CLAUDE_CREATED_PAYLOAD=""
+        CLAUDE_CREATED_IDENTITY=""
+        CLAUDE_INSTALL_ATTEMPTED=false
+        INSTALL_TRANSACTION_ACTIVE=false
+        INSTALL_TRANSACTION_BOTH_INSTALLED=false
+        INSTALL_TRANSACTION_SIGNAL_STATUS=""
+        if [ "$CODEX_ALREADY_INSTALLED" = false ] || \
+           [ "$CLAUDE_ALREADY_INSTALLED" = false ]; then
+            INSTALL_TRANSACTION_ACTIVE=true
+            trap 'record_install_signal INT' INT
+            trap 'record_install_signal TERM' TERM
+            trap 'cleanup_install_transaction_on_exit $?' EXIT
+        fi
+        if [ "$CODEX_ALREADY_INSTALLED" = true ]; then
+            install_skill_for_runtime "Codex" "$CODEX_SKILLS_DIR" || exit 1
+        else
+            if ! install_skill_with_reference "Codex" "$CODEX_SKILLS_DIR" \
+                    "$CODEX_SKILL_TARGET"; then
+                exit_if_install_signaled
+                exit 1
+            fi
+        fi
+        exit_if_install_signaled
+        if [ "$CLAUDE_ALREADY_INSTALLED" = true ]; then
+            install_skill_for_runtime "Claude" "$CLAUDE_SKILLS_DIR" || exit 1
+        else
+            if ! install_skill_with_reference "Claude" "$CLAUDE_SKILLS_DIR" \
+                    "$CLAUDE_SKILL_TARGET"; then
+                exit_if_install_signaled
+                exit 1
+            fi
+        fi
+        if ! validate_skill_install_commit "Codex" "$CODEX_SKILL_TARGET" \
+                "$CODEX_INSTALL_ATTEMPTED" "$CODEX_CREATED_PAYLOAD" \
+                "$CODEX_CREATED_IDENTITY"; then
+            exit_if_install_signaled
             exit 1
         fi
-        if ! install_skill_for_runtime "Claude" "$CLAUDE_SKILLS_DIR"; then
-            if [ "$CODEX_ALREADY_INSTALLED" = false ] && [ -L "$CODEX_SKILL_TARGET" ]; then
-                rm "$CODEX_SKILL_TARGET"
-            fi
+        if ! validate_skill_install_commit "Claude" "$CLAUDE_SKILL_TARGET" \
+                "$CLAUDE_INSTALL_ATTEMPTED" "$CLAUDE_CREATED_PAYLOAD" \
+                "$CLAUDE_CREATED_IDENTITY"; then
+            exit_if_install_signaled
             exit 1
+        fi
+        exit_if_install_signaled
+        if [ "$INSTALL_TRANSACTION_ACTIVE" = true ]; then
+            INSTALL_TRANSACTION_BOTH_INSTALLED=true
+            exit_if_install_signaled
+            cleanup_skill_install_reference "$CLAUDE_INSTALL_REFERENCE" \
+                "$CLAUDE_INSTALL_REFERENCE_DIR" || {
+                echo "Error: Could not clean the private Claude install reference"
+                exit 1
+            }
+            cleanup_skill_install_reference "$CODEX_INSTALL_REFERENCE" \
+                "$CODEX_INSTALL_REFERENCE_DIR" || {
+                echo "Error: Could not clean the private Codex install reference"
+                exit 1
+            }
+            INSTALL_TRANSACTION_ACTIVE=false
+            trap - EXIT INT TERM
+            exit_if_install_signaled
         fi
     elif [ "$SKILL_RUNTIME" = "codex" ]; then
-        preflight_skill_for_runtime "Codex" "$CODEX_SKILLS_DIR"
+        preflight_skill_for_runtime "Codex" "$CODEX_SKILLS_DIR" || exit 1
         install_skill_for_runtime "Codex" "$CODEX_SKILLS_DIR"
     else
-        preflight_skill_for_runtime "Claude" "$CLAUDE_SKILLS_DIR"
+        preflight_skill_for_runtime "Claude" "$CLAUDE_SKILLS_DIR" || exit 1
         install_skill_for_runtime "Claude" "$CLAUDE_SKILLS_DIR"
     fi
-    echo "   Canonical source: $SKILL_SOURCE"
-    echo ""
-    echo "The skill will auto-update when you run: gh extension upgrade pr-enrich"
+    echo "   Canonical source: $SKILL_SOURCE" || true
+    echo "" || true
+    echo "The skill will auto-update when you run: gh extension upgrade pr-enrich" || true
     exit 0
 fi
 
@@ -3066,7 +3373,8 @@ RETRO_HELP
 
             local analysis_file
             analysis_file="$(select_analysis_file "$pr_dir" 2>/dev/null || true)"
-            local summary_file="$(dirname "$analysis_file")/pr-summary.json"
+            local summary_file
+            summary_file="$(dirname "$analysis_file")/pr-summary.json"
 
             if [ -z "$analysis_file" ] || [ ! -f "$analysis_file" ]; then
                 ((skipped_no_analysis++)) || true
