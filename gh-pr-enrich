@@ -2649,25 +2649,99 @@ if [ "$1" = "uninstall-skill" ]; then
     [ $# -eq 0 ] || { echo "Error: Unknown uninstall-skill option: $1"; exit 1; }
     case "$SKILL_RUNTIME" in codex|claude|both) ;; *) echo "Error: Invalid runtime '$SKILL_RUNTIME'"; exit 1 ;; esac
 
-    uninstall_skill_for_runtime() {
-        local runtime_label="$1"
-        local skill_target="$2/gh-pr-enrich"
+    capture_skill_uninstall() {
+        local skill_target="$1"
+        CAPTURED_UNINSTALL_PRESENT=false
+        CAPTURED_UNINSTALL_PAYLOAD=""
         if [ -L "$skill_target" ]; then
-            rm "$skill_target" 2>/dev/null || { echo "Error: Could not remove $skill_target"; return 1; }
-            echo "✅ $runtime_label skill uninstalled"
+            CAPTURED_UNINSTALL_PAYLOAD="$(readlink "$skill_target")" || {
+                echo "Error: Could not inspect symlink $skill_target"
+                return 1
+            }
+            CAPTURED_UNINSTALL_PRESENT=true
         elif [ -e "$skill_target" ]; then
-            echo "⚠️  $skill_target is not a symlink; leaving it untouched"
+            echo "⚠️  $skill_target is not a symlink; leaving all requested registrations untouched"
             return 1
-        else
-            echo "ℹ️  $runtime_label skill not installed at $skill_target"
         fi
     }
 
+    remove_captured_skill() {
+        local runtime_label="$1" skill_target="$2" was_present="$3" payload="$4"
+        local current_payload
+        if [ "$was_present" != true ]; then
+            echo "ℹ️  $runtime_label skill not installed at $skill_target"
+            return 0
+        fi
+        if [ ! -L "$skill_target" ]; then
+            echo "Error: $skill_target changed after uninstall preflight; leaving it untouched"
+            return 1
+        fi
+        current_payload="$(readlink "$skill_target")" || {
+            echo "Error: Could not re-check symlink $skill_target"
+            return 1
+        }
+        if [ "$current_payload" != "$payload" ]; then
+            echo "Error: $skill_target changed after uninstall preflight; leaving it untouched"
+            return 1
+        fi
+        rm "$skill_target" 2>/dev/null || {
+            echo "Error: Could not remove $skill_target"
+            return 1
+        }
+        echo "✅ $runtime_label skill uninstalled"
+    }
+
+    restore_removed_skill() {
+        local runtime_label="$1" skill_target="$2" payload="$3"
+        if [ -e "$skill_target" ] || [ -L "$skill_target" ]; then
+            echo "Error: Could not restore $runtime_label registration because $skill_target was replaced concurrently"
+            return 1
+        fi
+        if ! ln -s "$payload" "$skill_target" 2>/dev/null; then
+            echo "Error: Could not restore $runtime_label registration at $skill_target"
+            return 1
+        fi
+        echo "↩️  Restored $runtime_label skill registration after uninstall failure"
+    }
+
+    CODEX_SKILL_TARGET="$HOME/.codex/skills/gh-pr-enrich"
+    CLAUDE_SKILL_TARGET="$HOME/.claude/skills/gh-pr-enrich"
+    CODEX_UNINSTALL_PRESENT=false
+    CODEX_UNINSTALL_PAYLOAD=""
+    CLAUDE_UNINSTALL_PRESENT=false
+    CLAUDE_UNINSTALL_PAYLOAD=""
+
+    # Capture both selected registrations before removing either. Any symlink,
+    # including a stale or broken one, remains removable; non-symlink entries
+    # fail the whole requested operation before it mutates either runtime.
     if [ "$SKILL_RUNTIME" = "codex" ] || [ "$SKILL_RUNTIME" = "both" ]; then
-        uninstall_skill_for_runtime "Codex" "$HOME/.codex/skills"
+        capture_skill_uninstall "$CODEX_SKILL_TARGET" || exit 1
+        CODEX_UNINSTALL_PRESENT="$CAPTURED_UNINSTALL_PRESENT"
+        CODEX_UNINSTALL_PAYLOAD="$CAPTURED_UNINSTALL_PAYLOAD"
     fi
     if [ "$SKILL_RUNTIME" = "claude" ] || [ "$SKILL_RUNTIME" = "both" ]; then
-        uninstall_skill_for_runtime "Claude" "$HOME/.claude/skills"
+        capture_skill_uninstall "$CLAUDE_SKILL_TARGET" || exit 1
+        CLAUDE_UNINSTALL_PRESENT="$CAPTURED_UNINSTALL_PRESENT"
+        CLAUDE_UNINSTALL_PAYLOAD="$CAPTURED_UNINSTALL_PAYLOAD"
+    fi
+
+    CODEX_UNINSTALL_REMOVED=false
+    if [ "$SKILL_RUNTIME" = "codex" ] || [ "$SKILL_RUNTIME" = "both" ]; then
+        if ! remove_captured_skill "Codex" "$CODEX_SKILL_TARGET" \
+            "$CODEX_UNINSTALL_PRESENT" "$CODEX_UNINSTALL_PAYLOAD"; then
+            exit 1
+        fi
+        [ "$CODEX_UNINSTALL_PRESENT" != true ] || CODEX_UNINSTALL_REMOVED=true
+    fi
+    if [ "$SKILL_RUNTIME" = "claude" ] || [ "$SKILL_RUNTIME" = "both" ]; then
+        if ! remove_captured_skill "Claude" "$CLAUDE_SKILL_TARGET" \
+            "$CLAUDE_UNINSTALL_PRESENT" "$CLAUDE_UNINSTALL_PAYLOAD"; then
+            if [ "$CODEX_UNINSTALL_REMOVED" = true ]; then
+                restore_removed_skill "Codex" "$CODEX_SKILL_TARGET" \
+                    "$CODEX_UNINSTALL_PAYLOAD" || true
+            fi
+            exit 1
+        fi
     fi
     exit 0
 fi
@@ -3382,9 +3456,9 @@ ENVIRONMENT VARIABLES:
   GH_PR_ENRICH_PROMPT          Path to custom prompt file for Claude analysis
   GH_PR_ENRICH_MODEL           Model for the analysis (default: sonnet)
   GH_PR_ENRICH_CODE_ACCESS     'false' to run without repository read access
-  GH_PR_ENRICH_TRUNCATE_CHARS  Per-comment/diff truncation limit (default: 5000)
+  GH_PR_ENRICH_TRUNCATE_CHARS  Per-comment/diff truncation limit (1-100000; default: 5000)
   GH_PR_ENRICH_SEMGREP_CONFIG  semgrep --config value for --sast (default: auto)
-  GH_PR_ENRICH_SEMGREP_TIMEOUT Seconds allowed for the semgrep pre-pass (default: 180)
+  GH_PR_ENRICH_SEMGREP_TIMEOUT Seconds allowed for the semgrep pre-pass (1-86400; default: 180)
   CLAUDE_TIMEOUT               Seconds allowed for the analysis (default: 600)
 
 DEPENDENCIES:
@@ -3903,7 +3977,17 @@ build_analysis_context() {
     else
         include_sast=false
     fi
-    local truncate_at="${GH_PR_ENRICH_TRUNCATE_CHARS:-5000}"
+    local truncate_at
+    if [ -n "${GH_PR_ENRICH_TRUNCATE_CHARS:-}" ]; then
+        truncate_at="$(positive_integer_or_default \
+            "$GH_PR_ENRICH_TRUNCATE_CHARS" "" 100000)"
+        if [ -z "$truncate_at" ]; then
+            echo "Error: GH_PR_ENRICH_TRUNCATE_CHARS must be an integer from 1 to 100000." >&2
+            return 1
+        fi
+    else
+        truncate_at=5000
+    fi
 
     # Missing optional inputs degrade to empty, never to a hard failure.
     if [ ! -f "$output_dir/issue-comments.json" ]; then
@@ -4368,10 +4452,169 @@ build_claude_context() {
 # Semgrep is deterministic where the model is not: its findings enter the context
 # as ground truth the analyzer can confirm or refute, rather than as another
 # opinion. A missing semgrep is a warning, never a failed run.
+# Run Semgrep with an owned watchdog instead of depending on GNU timeout, which
+# is absent on stock macOS. The wrapper owns, terminates, and reaps both direct
+# children on completion or interruption.
+run_semgrep_with_watchdog() {
+    local timeout_secs="$1" raw_file="$2" stderr_file="$3" config="$4"
+    shift 4
+    local -a targets=("$@")
+    local semgrep_pid="" watchdog_pid="" semgrep_rc=0 semgrep_group_owned=false
+    local launch_attempts=0
+    local semgrep_launch_dir="" watchdog_launch_dir=""
+    cleanup_semgrep_launch() {
+        [ -n "$semgrep_launch_dir" ] || return 0
+        rm -f "$semgrep_launch_dir/ready" "$semgrep_launch_dir/go" 2>/dev/null || true
+        rmdir "$semgrep_launch_dir" 2>/dev/null || true
+        semgrep_launch_dir=""
+    }
+    cleanup_semgrep_watchdog_launch() {
+        [ -n "$watchdog_launch_dir" ] || return 0
+        rm -f "$watchdog_launch_dir/ready" "$watchdog_launch_dir/go" \
+            "$watchdog_launch_dir/started" 2>/dev/null || true
+        rmdir "$watchdog_launch_dir" 2>/dev/null || true
+        watchdog_launch_dir=""
+    }
+    stop_semgrep_watchdog() {
+        if [ -n "$watchdog_pid" ]; then
+            kill -TERM "$watchdog_pid" 2>/dev/null || true
+            wait "$watchdog_pid" 2>/dev/null || true
+            watchdog_pid=""
+        fi
+        cleanup_semgrep_watchdog_launch
+    }
+    stop_semgrep_group() {
+        [ -n "$semgrep_pid" ] || return 0
+        # Job control gives the scanner an isolated process group on Bash 3.2,
+        # including stock macOS where setsid is unavailable. Terminate every
+        # descendant in that group, then reap the direct scanner child.
+        if [ "$semgrep_group_owned" = true ]; then
+            kill -TERM -- "-$semgrep_pid" 2>/dev/null || true
+            kill -KILL -- "-$semgrep_pid" 2>/dev/null || true
+        else
+            kill -TERM "$semgrep_pid" 2>/dev/null || true
+            kill -KILL "$semgrep_pid" 2>/dev/null || true
+        fi
+        wait "$semgrep_pid" 2>/dev/null || true
+        semgrep_pid=""
+        cleanup_semgrep_launch
+    }
+    stop_semgrep_wrapper() {
+        local signal_exit="$1"
+        stop_semgrep_watchdog
+        stop_semgrep_group
+        exit "$signal_exit"
+    }
+    trap 'stop_semgrep_wrapper 143' TERM
+    trap 'stop_semgrep_wrapper 130' INT
+
+    # Keep the direct child behind a private launch gate while the wrapper proves
+    # that Bash put it in the expected isolated process group. Never use a
+    # negative PID until that proof succeeds: a failed job-control assumption
+    # must not target the caller's process group.
+    semgrep_launch_dir="$(mktemp -d "${TMPDIR:-/tmp}/gh-pr-enrich-semgrep-launch.XXXXXX")" || return 125
+    set -m
+    GH_PR_ENRICH_SEMGREP_TIMEOUT_SECONDS="$timeout_secs" \
+        /bin/sh -c '
+            launch_dir="$1"
+            shift
+            : > "$launch_dir/ready"
+            while [ ! -f "$launch_dir/go" ]; do :; done
+            exec "$@"
+        ' sh "$semgrep_launch_dir" semgrep --config "$config" --json --quiet -- "${targets[@]}" \
+        > "$raw_file" 2> "$stderr_file" &
+    semgrep_pid=$!
+    launch_attempts=0
+    while [ ! -f "$semgrep_launch_dir/ready" ] && [ "$launch_attempts" -lt 100 ]; do
+        kill -0 "$semgrep_pid" 2>/dev/null || break
+        /bin/sleep 0.01
+        launch_attempts=$((launch_attempts + 1))
+    done
+    if [ -f "$semgrep_launch_dir/ready" ] && \
+       kill -0 -- "-$semgrep_pid" 2>/dev/null; then
+        semgrep_group_owned=true
+        : > "$semgrep_launch_dir/go"
+    else
+        set +m
+        stop_semgrep_group
+        echo "Error: Could not isolate the Semgrep process group." >&2
+        return 125
+    fi
+    set +m
+    watchdog_launch_dir="$(mktemp -d "${TMPDIR:-/tmp}/gh-pr-enrich-semgrep-watchdog.XXXXXX")" || {
+        stop_semgrep_group
+        return 125
+    }
+    (
+        watchdog_sleep_pid=""
+        trap '[ -z "$watchdog_sleep_pid" ] || kill "$watchdog_sleep_pid" 2>/dev/null; [ -z "$watchdog_sleep_pid" ] || wait "$watchdog_sleep_pid" 2>/dev/null; exit 0' TERM INT
+        : > "$watchdog_launch_dir/ready"
+        while [ ! -f "$watchdog_launch_dir/go" ]; do :; done
+        sleep "$timeout_secs" &
+        watchdog_sleep_pid=$!
+        : > "$watchdog_launch_dir/started"
+        if ! wait "$watchdog_sleep_pid" 2>/dev/null; then
+            watchdog_sleep_pid=""
+            [ "$semgrep_group_owned" != true ] || \
+                kill -TERM -- "-$semgrep_pid" 2>/dev/null || true
+            [ "$semgrep_group_owned" != true ] || \
+                kill -KILL -- "-$semgrep_pid" 2>/dev/null || true
+            exit 1
+        fi
+        watchdog_sleep_pid=""
+        [ "$semgrep_group_owned" != true ] || \
+            kill -TERM -- "-$semgrep_pid" 2>/dev/null || true
+        [ "$semgrep_group_owned" != true ] || \
+            kill -KILL -- "-$semgrep_pid" 2>/dev/null || true
+    ) &
+    watchdog_pid=$!
+    launch_attempts=0
+    while [ ! -f "$watchdog_launch_dir/ready" ] && [ "$launch_attempts" -lt 100 ]; do
+        kill -0 "$watchdog_pid" 2>/dev/null || break
+        /bin/sleep 0.01
+        launch_attempts=$((launch_attempts + 1))
+    done
+    if [ ! -f "$watchdog_launch_dir/ready" ]; then
+        stop_semgrep_watchdog
+        stop_semgrep_group
+        echo "Error: Could not initialize the Semgrep timeout watcher." >&2
+        return 125
+    fi
+    : > "$watchdog_launch_dir/go"
+    launch_attempts=0
+    while [ ! -f "$watchdog_launch_dir/started" ] && [ "$launch_attempts" -lt 100 ]; do
+        kill -0 "$watchdog_pid" 2>/dev/null || break
+        /bin/sleep 0.01
+        launch_attempts=$((launch_attempts + 1))
+    done
+    if [ ! -f "$watchdog_launch_dir/started" ]; then
+        stop_semgrep_watchdog
+        stop_semgrep_group
+        echo "Error: Could not start the Semgrep timeout watcher." >&2
+        return 125
+    fi
+
+    wait "$semgrep_pid" || semgrep_rc=$?
+    semgrep_pid=""
+    cleanup_semgrep_launch
+    stop_semgrep_watchdog
+    return "$semgrep_rc"
+}
+
 collect_sast_findings() {
     local output_dir="$1"
     local config="${GH_PR_ENRICH_SEMGREP_CONFIG:-auto}"
-    local timeout_secs="${GH_PR_ENRICH_SEMGREP_TIMEOUT:-180}"
+    local timeout_secs requested_timeout="${GH_PR_ENRICH_SEMGREP_TIMEOUT:-}"
+    if [ -n "$requested_timeout" ]; then
+        timeout_secs="$(positive_integer_or_default \
+            "$requested_timeout" "" 86400)"
+        if [ -z "$timeout_secs" ]; then
+            echo "⚠️  GH_PR_ENRICH_SEMGREP_TIMEOUT must be an integer from 1 to 86400; using 180 seconds." >&2
+            timeout_secs=180
+        fi
+    else
+        timeout_secs=180
+    fi
     local output_file="$output_dir/sast-findings.json"
     local status_file="$output_dir/sast-status.json"
 
@@ -4422,15 +4665,29 @@ collect_sast_findings() {
     fi
 
     local raw_file="$output_dir/semgrep-raw.json"
-    local rc=0
-    if command -v timeout > /dev/null 2>&1; then
-        timeout --signal=KILL --foreground "$timeout_secs" \
-            semgrep --config "$config" --json --quiet -- "${targets[@]}" \
-            > "$raw_file" 2> "$output_dir/semgrep-stderr.log" || rc=$?
-    else
-        semgrep --config "$config" --json --quiet -- "${targets[@]}" \
-            > "$raw_file" 2> "$output_dir/semgrep-stderr.log" || rc=$?
-    fi
+    local rc=0 semgrep_wrapper_pid="" semgrep_signal=""
+    local previous_term_trap previous_int_trap
+    previous_term_trap="$(trap -p TERM)"
+    previous_int_trap="$(trap -p INT)"
+    stop_owned_semgrep_wrapper() {
+        [ -n "$semgrep_wrapper_pid" ] || return 0
+        kill -TERM "$semgrep_wrapper_pid" 2>/dev/null || true
+        wait "$semgrep_wrapper_pid" 2>/dev/null || true
+        semgrep_wrapper_pid=""
+    }
+    trap 'semgrep_signal=TERM; stop_owned_semgrep_wrapper' TERM
+    trap 'semgrep_signal=INT; stop_owned_semgrep_wrapper' INT
+    run_semgrep_with_watchdog "$timeout_secs" "$raw_file" \
+        "$output_dir/semgrep-stderr.log" "$config" "${targets[@]}" &
+    semgrep_wrapper_pid=$!
+    wait "$semgrep_wrapper_pid" || rc=$?
+    semgrep_wrapper_pid=""
+    if [ -n "$previous_term_trap" ]; then eval "$previous_term_trap"; else trap - TERM; fi
+    if [ -n "$previous_int_trap" ]; then eval "$previous_int_trap"; else trap - INT; fi
+    case "$semgrep_signal" in
+        TERM) return 143 ;;
+        INT) return 130 ;;
+    esac
 
     if [ "$rc" -ne 0 ] && [ ! -s "$raw_file" ]; then
         echo "⚠️  semgrep failed (exit $rc). See $output_dir/semgrep-stderr.log" >&2
@@ -5072,7 +5329,7 @@ _select_analysis_artifact() {
     fi
 
     if [ -f "$report_dir/comprehensive-report.md" ]; then
-        if ! awk '/<!-- BEGIN SELECTED ANALYSIS -->/{exit} {print}' \
+        if ! awk '$0 == "<!-- BEGIN SELECTED ANALYSIS -->" {exit} {print}' \
             "$report_dir/comprehensive-report.md" > "$comprehensive_base"; then
             cleanup_selection_temps
             return 1

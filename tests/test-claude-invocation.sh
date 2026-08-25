@@ -78,6 +78,7 @@ chmod +x "$STUB_DIR/ps"
 cat > "$STUB_DIR/sleep" << 'STUB'
 #!/bin/bash
 [ -z "${SLEEP_INTERVAL_LOG:-}" ] || printf '%s\n' "$1" >> "$SLEEP_INTERVAL_LOG"
+[ -z "${SLEEP_PID_LOG:-}" ] || printf '%s\n' "$$" > "$SLEEP_PID_LOG"
 [ "${SLEEP_FAIL_INTERVAL:-}" != "$1" ] || exit 64
 exec /bin/sleep "$@"
 STUB
@@ -888,6 +889,181 @@ assert_jq "$SAST_FILE" '.[0].line == 12' "finding carries its line"
 assert_jq "$SAST_FILE" '.[0].severity == "ERROR"' "finding carries its severity"
 assert_jq "$SAST_FILE" '.[0].check_id | contains("unsafe-exec")' "finding carries its rule id"
 assert_jq "$SAST_FILE" '.[0].message | contains("unsafe exec")' "finding carries its message"
+
+# Stock macOS has no GNU timeout. The portable owned watchdog must terminate and
+# reap a stalled scanner without invoking any timeout binary on PATH.
+WATCHDOG_REPORTS="$WORKSPACE/watchdog-reports"
+WATCHDOG_STUBS="$TEST_OUTPUT_DIR/semgrep-watchdog-stubs"
+WATCHDOG_PID_LOG="$TEST_OUTPUT_DIR/semgrep-watchdog.pid"
+WATCHDOG_CHILD_PID_LOG="$TEST_OUTPUT_DIR/semgrep-watchdog-child.pid"
+WATCHDOG_TIMEOUT_LOG="$TEST_OUTPUT_DIR/semgrep-timeout-command.log"
+mkdir -p "$WATCHDOG_REPORTS" "$WATCHDOG_STUBS"
+cp "$SAST_DIR/pr-summary.json" "$WATCHDOG_REPORTS/pr-summary.json"
+: > "$WATCHDOG_TIMEOUT_LOG"
+cat > "$WATCHDOG_STUBS/semgrep" << 'STUB'
+#!/bin/bash
+printf '%s\n' "$$" > "$SEMGREP_PID_LOG"
+trap '' TERM INT
+"$SEMGREP_CHILD_STUB" &
+child_pid=$!
+printf '%s\n' "$child_pid" > "$SEMGREP_CHILD_PID_LOG"
+wait "$child_pid"
+STUB
+chmod +x "$WATCHDOG_STUBS/semgrep"
+cat > "$WATCHDOG_STUBS/semgrep-child" << 'STUB'
+#!/bin/bash
+trap '' TERM INT
+while :; do :; done
+STUB
+chmod +x "$WATCHDOG_STUBS/semgrep-child"
+cat > "$WATCHDOG_STUBS/timeout" << 'STUB'
+#!/bin/bash
+printf 'invoked\n' >> "$SEMGREP_GNU_TIMEOUT_LOG"
+exit 99
+STUB
+chmod +x "$WATCHDOG_STUBS/timeout"
+
+SECONDS=0
+WATCHDOG_OUT=$( (cd "$WORKSPACE" && env \
+    PATH="$WATCHDOG_STUBS:$STUB_DIR:$PATH" \
+    GH_PR_ENRICH_CODE_ACCESS=true GH_PR_ENRICH_SEMGREP_TIMEOUT=1 \
+    SEMGREP_PID_LOG="$WATCHDOG_PID_LOG" \
+    SEMGREP_CHILD_PID_LOG="$WATCHDOG_CHILD_PID_LOG" \
+    SEMGREP_CHILD_STUB="$WATCHDOG_STUBS/semgrep-child" \
+    SEMGREP_GNU_TIMEOUT_LOG="$WATCHDOG_TIMEOUT_LOG" \
+    "$GH_PR_ENRICH" --test-call collect_sast_findings \
+    "watchdog-reports" 2>&1) || true)
+WATCHDOG_ELAPSED=$SECONDS
+assert_true "$([ "$WATCHDOG_ELAPSED" -ge 1 ] && [ "$WATCHDOG_ELAPSED" -lt 8 ] && echo 0 || echo 1)" \
+    "the portable Semgrep watchdog enforces the configured timeout without spinning"
+assert_true "$([ ! -s "$WATCHDOG_TIMEOUT_LOG" ] && echo 0 || echo 1)" \
+    "the portable Semgrep watchdog does not invoke GNU timeout even when one is present"
+assert_jq "$WATCHDOG_REPORTS/sast-status.json" '.status == "failed"' \
+    "a watchdog-terminated Semgrep scan is recorded as failed coverage"
+WATCHDOG_SEMGREP_PID=$(cat "$WATCHDOG_PID_LOG" 2>/dev/null || echo "")
+WATCHDOG_CHILD_PID=$(cat "$WATCHDOG_CHILD_PID_LOG" 2>/dev/null || echo "")
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    scanner_alive=false
+    child_alive=false
+    [ -z "$WATCHDOG_SEMGREP_PID" ] || ! kill -0 "$WATCHDOG_SEMGREP_PID" 2>/dev/null || scanner_alive=true
+    [ -z "$WATCHDOG_CHILD_PID" ] || ! kill -0 "$WATCHDOG_CHILD_PID" 2>/dev/null || child_alive=true
+    [ "$scanner_alive" = true ] || [ "$child_alive" = true ] || break
+    /bin/sleep 0.05
+done
+assert_true "$([ -n "$WATCHDOG_SEMGREP_PID" ] && [ "$scanner_alive" = false ] && echo 0 || echo 1)" \
+    "the portable Semgrep watchdog reaps the stalled scanner"
+assert_true "$([ -n "$WATCHDOG_CHILD_PID" ] && [ "$child_alive" = false ] && echo 0 || echo 1)" \
+    "the portable Semgrep watchdog terminates scanner descendants"
+assert_contains "$WATCHDOG_OUT" "semgrep failed" \
+    "a watchdog timeout is reported as a failed Semgrep pre-pass"
+
+# Sending TERM only to the top-level CLI must propagate through the owned
+# wrapper and scanner process group instead of leaving a long-timeout orphan.
+CANCEL_REPORTS="$WORKSPACE/cancel-reports"
+CANCEL_SCANNER_PID_LOG="$TEST_OUTPUT_DIR/semgrep-cancel.pid"
+CANCEL_CHILD_PID_LOG="$TEST_OUTPUT_DIR/semgrep-cancel-child.pid"
+mkdir -p "$CANCEL_REPORTS"
+cp "$SAST_DIR/pr-summary.json" "$CANCEL_REPORTS/pr-summary.json"
+(
+    cd "$WORKSPACE"
+    exec env PATH="$WATCHDOG_STUBS:$STUB_DIR:$PATH" \
+        GH_PR_ENRICH_CODE_ACCESS=true GH_PR_ENRICH_SEMGREP_TIMEOUT=3600 \
+        SEMGREP_PID_LOG="$CANCEL_SCANNER_PID_LOG" \
+        SEMGREP_CHILD_PID_LOG="$CANCEL_CHILD_PID_LOG" \
+        SEMGREP_CHILD_STUB="$WATCHDOG_STUBS/semgrep-child" \
+        SEMGREP_GNU_TIMEOUT_LOG="$WATCHDOG_TIMEOUT_LOG" \
+        "$GH_PR_ENRICH" --test-call collect_sast_findings "cancel-reports"
+) > "$TEST_OUTPUT_DIR/semgrep-cancel.out" 2>&1 &
+CANCEL_CLI_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ ! -s "$CANCEL_SCANNER_PID_LOG" ] || [ ! -s "$CANCEL_CHILD_PID_LOG" ] || break
+    /bin/sleep 0.05
+done
+assert_true "$([ -s "$CANCEL_SCANNER_PID_LOG" ] && [ -s "$CANCEL_CHILD_PID_LOG" ] && echo 0 || echo 1)" \
+    "the cancellation fixture starts a scanner and descendant"
+SECONDS=0
+kill -TERM "$CANCEL_CLI_PID"
+CANCEL_RC=0
+wait "$CANCEL_CLI_PID" || CANCEL_RC=$?
+CANCEL_ELAPSED=$SECONDS
+CANCEL_SCANNER_PID=$(cat "$CANCEL_SCANNER_PID_LOG" 2>/dev/null || echo "")
+CANCEL_CHILD_PID=$(cat "$CANCEL_CHILD_PID_LOG" 2>/dev/null || echo "")
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    cancel_scanner_alive=false
+    cancel_child_alive=false
+    [ -z "$CANCEL_SCANNER_PID" ] || ! kill -0 "$CANCEL_SCANNER_PID" 2>/dev/null || cancel_scanner_alive=true
+    [ -z "$CANCEL_CHILD_PID" ] || ! kill -0 "$CANCEL_CHILD_PID" 2>/dev/null || cancel_child_alive=true
+    [ "$cancel_scanner_alive" = true ] || [ "$cancel_child_alive" = true ] || break
+    /bin/sleep 0.05
+done
+assert_true "$([ "$CANCEL_RC" -ne 0 ] && [ "$CANCEL_ELAPSED" -lt 8 ] && echo 0 || echo 1)" \
+    "TERM sent only to the CLI promptly cancels the long Semgrep run"
+assert_true "$([ -n "$CANCEL_SCANNER_PID" ] && [ "$cancel_scanner_alive" = false ] && echo 0 || echo 1)" \
+    "CLI cancellation reaps the owned Semgrep scanner"
+assert_true "$([ -n "$CANCEL_CHILD_PID" ] && [ "$cancel_child_alive" = false ] && echo 0 || echo 1)" \
+    "CLI cancellation terminates Semgrep descendants"
+
+# Timeout input is bounded before it reaches sleep. Invalid explicit values use
+# the documented safe default, while the upper boundary remains accepted.
+TIMEOUT_REPORTS="$WORKSPACE/timeout-reports"
+TIMEOUT_STUBS="$TEST_OUTPUT_DIR/semgrep-timeout-stubs"
+TIMEOUT_VALUE_LOG="$TEST_OUTPUT_DIR/semgrep-timeout-values.log"
+mkdir -p "$TIMEOUT_REPORTS" "$TIMEOUT_STUBS"
+cp "$SAST_DIR/pr-summary.json" "$TIMEOUT_REPORTS/pr-summary.json"
+: > "$TIMEOUT_VALUE_LOG"
+cat > "$TIMEOUT_STUBS/semgrep" << 'STUB'
+#!/bin/bash
+if [ -n "${WAIT_FOR_WATCHDOG_PID_LOG:-}" ]; then
+    attempts=0
+    while [ ! -s "$WAIT_FOR_WATCHDOG_PID_LOG" ] && [ "$attempts" -lt 100 ]; do
+        /bin/sleep 0.01
+        attempts=$((attempts + 1))
+    done
+fi
+printf '%s\n' "$GH_PR_ENRICH_SEMGREP_TIMEOUT_SECONDS" >> "$SEMGREP_TIMEOUT_VALUE_LOG"
+echo '{"results": [], "errors": []}'
+STUB
+chmod +x "$TIMEOUT_STUBS/semgrep"
+
+for INVALID_TIMEOUT in nope 0 -1 86401 999999999999999999999999999999; do
+    TIMEOUT_OUT=$( (cd "$WORKSPACE" && env \
+        PATH="$TIMEOUT_STUBS:$STUB_DIR:$PATH" \
+        GH_PR_ENRICH_CODE_ACCESS=true \
+        GH_PR_ENRICH_SEMGREP_TIMEOUT="$INVALID_TIMEOUT" \
+        SEMGREP_TIMEOUT_VALUE_LOG="$TIMEOUT_VALUE_LOG" \
+        "$GH_PR_ENRICH" --test-call collect_sast_findings \
+        "timeout-reports" 2>&1) || true)
+    assert_eq "180" "$(tail -n 1 "$TIMEOUT_VALUE_LOG")" \
+        "invalid Semgrep timeout '$INVALID_TIMEOUT' uses the safe default"
+    assert_contains "$TIMEOUT_OUT" "GH_PR_ENRICH_SEMGREP_TIMEOUT" \
+        "invalid Semgrep timeout '$INVALID_TIMEOUT' is reported by name"
+done
+
+(cd "$WORKSPACE" && env PATH="$TIMEOUT_STUBS:$STUB_DIR:$PATH" \
+    GH_PR_ENRICH_CODE_ACCESS=true GH_PR_ENRICH_SEMGREP_TIMEOUT=86400 \
+    SEMGREP_TIMEOUT_VALUE_LOG="$TIMEOUT_VALUE_LOG" \
+    "$GH_PR_ENRICH" --test-call collect_sast_findings \
+    "timeout-reports" >/dev/null 2>&1)
+assert_eq "86400" "$(tail -n 1 "$TIMEOUT_VALUE_LOG")" \
+    "the maximum supported Semgrep timeout reaches the owned watchdog unchanged"
+
+FAST_WATCHDOG_PID_LOG="$TEST_OUTPUT_DIR/fast-semgrep-watchdog.pid"
+(cd "$WORKSPACE" && env PATH="$TIMEOUT_STUBS:$STUB_DIR:$PATH" \
+    GH_PR_ENRICH_CODE_ACCESS=true GH_PR_ENRICH_SEMGREP_TIMEOUT=5 \
+    SEMGREP_TIMEOUT_VALUE_LOG="$TIMEOUT_VALUE_LOG" \
+    SLEEP_PID_LOG="$FAST_WATCHDOG_PID_LOG" \
+    WAIT_FOR_WATCHDOG_PID_LOG="$FAST_WATCHDOG_PID_LOG" \
+    "$GH_PR_ENRICH" --test-call collect_sast_findings \
+    "timeout-reports" >/dev/null 2>&1)
+FAST_WATCHDOG_PID=$(cat "$FAST_WATCHDOG_PID_LOG" 2>/dev/null || echo "")
+assert_true "$([ -n "$FAST_WATCHDOG_PID" ] && echo 0 || echo 1)" \
+    "a fast Semgrep run starts an owned timeout watcher"
+if [ -n "$FAST_WATCHDOG_PID" ] && kill -0 "$FAST_WATCHDOG_PID" 2>/dev/null; then
+    fail "a fast Semgrep run cancels and reaps its timeout watcher" \
+        "watcher sleep process $FAST_WATCHDOG_PID is still alive"
+else
+    pass "a fast Semgrep run cancels and reaps its timeout watcher"
+fi
 
 # The SAST pass reads the working tree, so it is governed by the same revision
 # rule as the analyzer. Scanning `main` while analyzing someone else's PR yields

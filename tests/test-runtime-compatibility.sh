@@ -97,6 +97,58 @@ assert_true "$([ ! -e "$CLAUDE_SKILL" ] && echo 0 || echo 1)" \
 assert_true "$([ ! -e "$CODEX_SKILL" ] && echo 0 || echo 1)" \
     "the uninstaller removes the Codex registration"
 
+# Default uninstall preflights both registrations before removing either. An
+# operator-owned Claude path must not leave the Codex half uninstalled.
+HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill >/dev/null
+rm "$CLAUDE_SKILL"
+echo "operator-owned" > "$CLAUDE_SKILL"
+rc=0
+HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "an unsafe Claude target fails the default uninstall preflight"
+assert_true "$([ -L "$CODEX_SKILL" ] && echo 0 || echo 1)" \
+    "a failed two-runtime uninstall preserves the Codex registration"
+assert_eq "operator-owned" "$(cat "$CLAUDE_SKILL")" \
+    "a failed two-runtime uninstall preserves the unsafe Claude target"
+rm "$CLAUDE_SKILL"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill --runtime codex >/dev/null
+
+# A failure while removing the second runtime rolls the first registration back
+# from its captured payload. The rollback uses ln's no-overwrite behavior, so a
+# concurrent replacement is never clobbered.
+HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill >/dev/null
+CODEX_PAYLOAD_BEFORE=$(readlink "$CODEX_SKILL")
+CLAUDE_PAYLOAD_BEFORE=$(readlink "$CLAUDE_SKILL")
+FAIL_RM_STUBS="$TEST_OUTPUT_DIR/failing-uninstall-rm"
+mkdir -p "$FAIL_RM_STUBS"
+cat > "$FAIL_RM_STUBS/rm" << 'STUB'
+#!/bin/bash
+if [ "$1" = "$FAIL_RM_TARGET" ]; then
+    exit 73
+fi
+exec /bin/rm "$@"
+STUB
+chmod +x "$FAIL_RM_STUBS/rm"
+rc=0
+env HOME="$TEST_HOME" FAIL_RM_TARGET="$CLAUDE_SKILL" \
+    PATH="$FAIL_RM_STUBS:$PATH" \
+    "$GH_PR_ENRICH" uninstall-skill >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a second-runtime removal failure fails the transactional uninstall"
+assert_eq "$CODEX_PAYLOAD_BEFORE" "$(readlink "$CODEX_SKILL")" \
+    "a second-runtime removal failure restores the Codex symlink payload"
+assert_eq "$CLAUDE_PAYLOAD_BEFORE" "$(readlink "$CLAUDE_SKILL")" \
+    "a failed Claude removal preserves its captured symlink payload"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill >/dev/null
+
+# Uninstall has historically removed any symlink registration, including stale
+# and broken links. Atomic preflight must not tighten that public behavior.
+mkdir -p "$TEST_HOME/.claude/skills"
+ln -s "$TEST_OUTPUT_DIR/nonexistent-skill-source" "$CLAUDE_SKILL"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill --runtime claude >/dev/null
+assert_true "$([ ! -L "$CLAUDE_SKILL" ] && echo 0 || echo 1)" \
+    "uninstall still removes a broken symlink registration"
+
 HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill --runtime codex >/dev/null
 assert_true "$([ -L "$CODEX_SKILL" ] && echo 0 || echo 1)" \
     "--runtime codex installs only the Codex registration"
@@ -382,10 +434,28 @@ jq '.task_list = [{
 # Selection performs its own hosted-state check, so all selector calls use the
 # deterministic GitHub stub rather than the developer's live checkout.
 export PATH="$STUB_DIR:$PATH"
+
+# Untrusted PR prose may contain the marker substring. Only a complete marker
+# line inserted by the renderer is allowed to delimit the generated section.
+NEAR_MARKER='PR title mentions <!-- BEGIN SELECTED ANALYSIS --> without being a marker'
+{
+    printf '%s\n' "$NEAR_MARKER"
+    cat "$AUTHORIZED_DIR/comprehensive-report.md"
+} > "$AUTHORIZED_DIR/comprehensive-report.with-near-marker.md"
+mv "$AUTHORIZED_DIR/comprehensive-report.with-near-marker.md" \
+    "$AUTHORIZED_DIR/comprehensive-report.md"
 "$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$HYBRID_SOURCE" >/dev/null
 
 assert_jq "$AUTHORIZED_DIR/analysis.json" '._metadata.provider == "hybrid"' \
     "select-analysis promotes a root-verified hybrid artifact"
+assert_contains "$(cat "$AUTHORIZED_DIR/comprehensive-report.md")" "$NEAR_MARKER" \
+    "a marker substring in untrusted report prose does not truncate the report"
+assert_eq "1" "$(grep -c '^<!-- BEGIN SELECTED ANALYSIS -->$' \
+    "$AUTHORIZED_DIR/comprehensive-report.md")" \
+    "selection publishes exactly one complete selected-analysis begin marker"
+assert_eq "1" "$(grep -c '^<!-- END SELECTED ANALYSIS -->$' \
+    "$AUTHORIZED_DIR/comprehensive-report.md")" \
+    "selection publishes exactly one complete selected-analysis end marker"
 assert_contains "$(cat "$AUTHORIZED_DIR/analysis.md")" "Hybrid-selected task" \
     "select-analysis regenerates the selected Markdown report"
 assert_jq "$AUTHORIZED_DIR/combined-data.json" \

@@ -427,6 +427,57 @@ assert_jq "$CUSTOM_DIR/claude-context.json" \
     '.coverage.unresolved_threads.truncated == ["thread-at-limit", "thread-over-limit"]' \
     "thread coverage follows the configured truncation limit"
 
+# Explicit invalid limits fail by name before the builder creates or mutates
+# context artifacts. This prevents non-numeric and oversized values from
+# reaching jq --argjson as cryptic parser errors.
+INVALID_LIMITS=(nope 0 -1 100001 999999999999999999999999999999 \
+    1.5 01 " 1" "1 " null true)
+INVALID_LIMIT_INDEX=0
+for INVALID_LIMIT in "${INVALID_LIMITS[@]}"; do
+    INVALID_LIMIT_INDEX=$((INVALID_LIMIT_INDEX + 1))
+    INVALID_LIMIT_DIR="$TEST_OUTPUT_DIR/invalid-limit-$INVALID_LIMIT_INDEX"
+    mkdir -p "$INVALID_LIMIT_DIR"
+    cp "$BOUNDARY_DIR/pr-summary.json" "$INVALID_LIMIT_DIR/pr-summary.json"
+    cp "$BOUNDARY_DIR/issue-comments.json" "$INVALID_LIMIT_DIR/issue-comments.json"
+    cp "$BOUNDARY_DIR/unresolved-threads.json" "$INVALID_LIMIT_DIR/unresolved-threads.json"
+    rc=0
+    INVALID_LIMIT_OUT=$(env GH_PR_ENRICH_TRUNCATE_CHARS="$INVALID_LIMIT" \
+        "$GH_PR_ENRICH" --test-call build_claude_context \
+        "$INVALID_LIMIT_DIR" false 2>&1) || rc=$?
+    assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+        "invalid truncation limit '$INVALID_LIMIT' is rejected"
+    assert_contains "$INVALID_LIMIT_OUT" "GH_PR_ENRICH_TRUNCATE_CHARS" \
+        "invalid truncation limit '$INVALID_LIMIT' names the environment variable"
+    assert_not_contains "$INVALID_LIMIT_OUT" "invalid JSON text passed to --argjson" \
+        "invalid truncation limit '$INVALID_LIMIT' does not leak a jq parser error"
+    assert_true "$([ ! -e "$INVALID_LIMIT_DIR/claude-context.json" ] && echo 0 || echo 1)" \
+        "invalid truncation limit '$INVALID_LIMIT' does not publish a context artifact"
+done
+
+for VALID_LIMIT in 1 100000; do
+    VALID_LIMIT_DIR="$TEST_OUTPUT_DIR/valid-limit-$VALID_LIMIT"
+    mkdir -p "$VALID_LIMIT_DIR"
+    cp "$BOUNDARY_DIR/pr-summary.json" "$VALID_LIMIT_DIR/pr-summary.json"
+    cp "$BOUNDARY_DIR/issue-comments.json" "$VALID_LIMIT_DIR/issue-comments.json"
+    cp "$BOUNDARY_DIR/unresolved-threads.json" "$VALID_LIMIT_DIR/unresolved-threads.json"
+    GH_PR_ENRICH_TRUNCATE_CHARS="$VALID_LIMIT" "$GH_PR_ENRICH" --test-call \
+        build_claude_context "$VALID_LIMIT_DIR" false >/dev/null
+    assert_jq_eq "$VALID_LIMIT_DIR/claude-context.json" \
+        '.coverage.truncation_limit_chars' "$VALID_LIMIT" \
+        "truncation limit boundary '$VALID_LIMIT' is accepted"
+done
+
+EMPTY_LIMIT_DIR="$TEST_OUTPUT_DIR/empty-limit"
+mkdir -p "$EMPTY_LIMIT_DIR"
+cp "$BOUNDARY_DIR/pr-summary.json" "$EMPTY_LIMIT_DIR/pr-summary.json"
+cp "$BOUNDARY_DIR/issue-comments.json" "$EMPTY_LIMIT_DIR/issue-comments.json"
+cp "$BOUNDARY_DIR/unresolved-threads.json" "$EMPTY_LIMIT_DIR/unresolved-threads.json"
+GH_PR_ENRICH_TRUNCATE_CHARS= "$GH_PR_ENRICH" --test-call \
+    build_claude_context "$EMPTY_LIMIT_DIR" false >/dev/null
+assert_jq_eq "$EMPTY_LIMIT_DIR/claude-context.json" \
+    '.coverage.truncation_limit_chars' "5000" \
+    "an explicitly empty truncation limit uses the documented default"
+
 # ---------------------------------------------------------------------------
 # Coverage is rendered for humans, not just stored
 # ---------------------------------------------------------------------------
