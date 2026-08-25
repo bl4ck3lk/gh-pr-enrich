@@ -107,6 +107,13 @@ assert_eq "$(printf '%s\n' "$schema_cats" | wc -l | tr -d ' ')" \
           "$(printf '%s\n' "$prompt_cats" | wc -l | tr -d ' ')" \
           "prompt and schema list the same number of categories"
 assert_not_contains "$PROMPT_TEXT" "etc.)" "prompt category list is closed (no open-ended 'etc.')"
+assert_contains "$PROMPT_TEXT" \
+    "evidence cannot certify a clean axis" \
+    "prompt forbids clean coverage verdicts when analysis evidence was truncated"
+assert_contains "$PROMPT_TEXT" "neither repository code access nor a complete included diff" \
+    "prompt forbids clean coverage when no code evidence was supplied"
+assert_contains "$PROMPT_TEXT" "truncated PR description" \
+    "prompt applies the truncation contract to the PR description"
 
 # ---------------------------------------------------------------------------
 # 3. Severity decoupled from category

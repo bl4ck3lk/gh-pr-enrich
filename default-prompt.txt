@@ -106,6 +106,13 @@ Return one category_coverage entry for every category above, with verdict:
 A missing category entry reads as an unswept category. Never report
 "reviewed_none_found" for a category you did not actually check.
 
+If coverage lists any truncated PR description, comment, thread reply, commit
+body, linked issue body, or file diff, do not return a clean or not-applicable
+verdict for categories without findings. The same applies when you received
+neither repository code access nor a complete included diff. Mark every such category
+"not_reviewable" and name the missing evidence in its note. A result with omitted
+evidence cannot certify a clean axis.
+
 ## Rule 3 — severity is impact times likelihood, never category
 
 A style comment can be critical and a security comment can be low. Rate each

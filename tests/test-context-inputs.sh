@@ -141,6 +141,86 @@ PATH="$ERROR_STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call fetch_linked_issues \
 assert_eq "1" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)" \
     "an HTTP-200 GraphQL error fails the linked-issue fetch"
 
+# Linked issue intent is complete across the full GraphQL connection. A
+# successful page one must not conceal issue 101 or publish an ambiguous cap.
+LINKED_PAGES_STUB_DIR="$TEST_OUTPUT_DIR/linked-pages-gh"
+mkdir -p "$LINKED_PAGES_STUB_DIR"
+cat > "$LINKED_PAGES_STUB_DIR/gh" << 'STUB'
+#!/bin/bash
+printf '%s\n' "$*" > "$LINKED_ARGS_LOG"
+jq -nc '{data:{repository:{pullRequest:{closingIssuesReferences:{
+    totalCount:101,pageInfo:{hasNextPage:true,endCursor:"cursor-100"},
+    nodes:[range(1;101) | {id:("ISSUE_" + tostring),number:.,title:("issue " + tostring),body:"body",url:("u" + tostring)}]
+}}}}}'
+jq -nc '{data:{repository:{pullRequest:{closingIssuesReferences:{
+    totalCount:101,pageInfo:{hasNextPage:false,endCursor:null},
+    nodes:[{id:"ISSUE_101",number:101,title:"issue 101",body:"body",url:"u101"}]
+}}}}}'
+STUB
+chmod +x "$LINKED_PAGES_STUB_DIR/gh"
+LINKED_PAGES_OUT="$TEST_OUTPUT_DIR/linked-pages.json"
+LINKED_ARGS_LOG="$TEST_OUTPUT_DIR/linked-pages-args.txt"
+env PATH="$LINKED_PAGES_STUB_DIR:$PATH" LINKED_ARGS_LOG="$LINKED_ARGS_LOG" \
+    "$GH_PR_ENRICH" --test-call fetch_linked_issues \
+    owner repo 1 "$LINKED_PAGES_OUT" >/dev/null 2>&1
+LINKED_ARGS=$(cat "$LINKED_ARGS_LOG")
+assert_contains "$LINKED_ARGS" "--paginate" \
+    "the linked-issue fetch asks gh to follow every page"
+assert_contains "$LINKED_ARGS" 'after: $endCursor' \
+    "the linked-issue query binds the pagination cursor"
+assert_contains "$LINKED_ARGS" "totalCount" \
+    "the linked-issue query requests a completeness proof"
+assert_jq_eq "$LINKED_PAGES_OUT" 'length' "101" \
+    "linked issues from every page are merged"
+assert_jq "$LINKED_PAGES_OUT" 'any(.[]; .id == "ISSUE_101")' \
+    "the linked issue after the first 100 is retained"
+
+# A transport that stops early or repeats an opaque node identity fails closed
+# and retains the valid-empty failure artifact expected by context builders.
+INCOMPLETE_LINKED_STUB_DIR="$TEST_OUTPUT_DIR/incomplete-linked-gh"
+mkdir -p "$INCOMPLETE_LINKED_STUB_DIR"
+cat > "$INCOMPLETE_LINKED_STUB_DIR/gh" << 'STUB'
+#!/bin/bash
+jq -nc '{data:{repository:{pullRequest:{closingIssuesReferences:{
+    totalCount:2,pageInfo:{hasNextPage:false,endCursor:null},
+    nodes:[{id:"ISSUE_1",number:1,title:"one",body:"body",url:"u1"}]
+}}}}}'
+STUB
+chmod +x "$INCOMPLETE_LINKED_STUB_DIR/gh"
+INCOMPLETE_LINKED_OUT="$TEST_OUTPUT_DIR/incomplete-linked.json"
+rc=0
+PATH="$INCOMPLETE_LINKED_STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call \
+    fetch_linked_issues owner repo 1 "$INCOMPLETE_LINKED_OUT" \
+    >/dev/null 2>&1 || rc=$?
+assert_eq "1" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)" \
+    "an incomplete linked-issue connection fails coverage"
+assert_jq "$INCOMPLETE_LINKED_OUT" 'type == "array" and length == 0' \
+    "an incomplete linked-issue connection publishes no partial intent"
+
+DUPLICATE_LINKED_STUB_DIR="$TEST_OUTPUT_DIR/duplicate-linked-gh"
+mkdir -p "$DUPLICATE_LINKED_STUB_DIR"
+cat > "$DUPLICATE_LINKED_STUB_DIR/gh" << 'STUB'
+#!/bin/bash
+jq -nc '{data:{repository:{pullRequest:{closingIssuesReferences:{
+    totalCount:2,pageInfo:{hasNextPage:true,endCursor:"cursor-1"},
+    nodes:[{id:"ISSUE_1",number:1,title:"one",body:"body",url:"u1"}]
+}}}}}'
+jq -nc '{data:{repository:{pullRequest:{closingIssuesReferences:{
+    totalCount:2,pageInfo:{hasNextPage:false,endCursor:null},
+    nodes:[{id:"ISSUE_1",number:1,title:"one",body:"body",url:"u1"}]
+}}}}}'
+STUB
+chmod +x "$DUPLICATE_LINKED_STUB_DIR/gh"
+DUPLICATE_LINKED_OUT="$TEST_OUTPUT_DIR/duplicate-linked.json"
+rc=0
+PATH="$DUPLICATE_LINKED_STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call \
+    fetch_linked_issues owner repo 1 "$DUPLICATE_LINKED_OUT" \
+    >/dev/null 2>&1 || rc=$?
+assert_eq "1" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)" \
+    "duplicate linked-issue identities fail pagination validation"
+assert_jq "$DUPLICATE_LINKED_OUT" 'type == "array" and length == 0' \
+    "duplicate linked-issue pages publish no ambiguous intent"
+
 EMPTY_SUCCESS_STUB_DIR="$TEST_OUTPUT_DIR/graphql-empty-gh"
 mkdir -p "$EMPTY_SUCCESS_STUB_DIR"
 cat > "$EMPTY_SUCCESS_STUB_DIR/gh" << 'STUB'
@@ -385,6 +465,9 @@ assert_jq_eq "$CAP_CTX" '.coverage.unresolved_threads.comments_per_thread_limit'
     "coverage states the per-thread comment limit"
 assert_jq_eq "$CAP_CTX" '.coverage.unresolved_threads.threads_at_comment_limit' "1" \
     "coverage counts threads whose replies may have been cut off"
+assert_jq "$CAP_CTX" \
+    '.coverage.unresolved_threads.incomplete_comment_threads == ["PRRT_full"]' \
+    "coverage identifies the exact thread whose later replies were omitted"
 
 # ---------------------------------------------------------------------------
 # Truncation: the marker, the boundary, and the configured limit
@@ -439,6 +522,69 @@ BOUNDARY_COV_MD="$BOUNDARY_DIR/coverage.md"
 assert_contains "$(cat "$BOUNDARY_COV_MD" 2>/dev/null || echo "")" \
     "nested comments truncated: 1" \
     "rendered thread coverage counts truncated nested comments"
+
+# Commit and linked-issue bodies use the same explicit truncation contract as
+# comments and diffs; otherwise omitted intent could still certify a clean PR.
+INTENT_DIR="$TEST_OUTPUT_DIR/intent-truncation"
+mkdir -p "$INTENT_DIR"
+cp "$BOUNDARY_DIR/issue-comments.json" "$INTENT_DIR/issue-comments.json"
+cp "$BOUNDARY_DIR/unresolved-threads.json" "$INTENT_DIR/unresolved-threads.json"
+jq '.body = "PR description beyond five"
+    | .commits[0].messageBody = "commit body beyond five"' \
+    "$CTX_DIR/pr-summary.json" > "$INTENT_DIR/pr-summary.json"
+printf '%s\n' \
+    '[{"number":42,"title":"intent","body":"linked issue body beyond five","url":"https://gh/42"}]' \
+    > "$INTENT_DIR/linked-issues.json"
+GH_PR_ENRICH_TRUNCATE_CHARS=5 "$GH_PR_ENRICH" --test-call \
+    build_claude_context "$INTENT_DIR" false >/dev/null 2>&1
+INTENT_CTX="$INTENT_DIR/analysis-context.json"
+assert_jq "$INTENT_CTX" \
+    '(.pr.body | contains("(truncated)")) and
+     (.coverage.pr_description.truncated == ["PR description"])' \
+    "truncated PR intent is marked in content and coverage"
+assert_jq "$INTENT_CTX" \
+    '(.pr.commits[0].message | contains("(truncated)")) and
+     (.coverage.commits.truncated == ["abc123d"])' \
+    "truncated commit intent is marked in content and coverage"
+assert_jq "$INTENT_CTX" \
+    '.pr.linked_issues[0].body | contains("(truncated)")' \
+    "truncated linked-issue intent carries an inline marker"
+assert_jq "$INTENT_CTX" \
+    '.coverage.linked_issues.truncated == ["https://gh/42"]' \
+    "coverage identifies the linked issue whose body was truncated"
+
+FAILED_LINKED_COVERAGE_CTX="$INTENT_DIR/failed-linked-context.json"
+jq '.coverage.sources.linked_issues = {
+        requested:true,status:"failed",reason:"fixture pagination failure"
+    }' "$INTENT_CTX" > "$FAILED_LINKED_COVERAGE_CTX"
+FAILED_LINKED_COVERAGE_MD="$INTENT_DIR/failed-linked-coverage.md"
+"$GH_PR_ENRICH" --test-call generate_coverage_section \
+    "$FAILED_LINKED_COVERAGE_CTX" "$FAILED_LINKED_COVERAGE_MD" >/dev/null 2>&1
+FAILED_LINKED_COVERAGE_TEXT=$(cat "$FAILED_LINKED_COVERAGE_MD")
+assert_contains "$FAILED_LINKED_COVERAGE_TEXT" \
+    "| PR description | 1 | 1 body truncated |" \
+    "human coverage reports a truncated PR description"
+assert_contains "$FAILED_LINKED_COVERAGE_TEXT" \
+    "per PR description, comment, thread reply, commit body, linked issue body and file diff" \
+    "coverage documents every text input governed by the truncation limit"
+assert_contains "$FAILED_LINKED_COVERAGE_TEXT" \
+    "fetch failed: fixture pagination failure" \
+    "linked-issue coverage renders its failed source status"
+assert_not_contains "$FAILED_LINKED_COVERAGE_TEXT" "all pages fetched" \
+    "failed linked-issue coverage never claims pagination completed"
+
+INTENT_BOUNDARY_DIR="$TEST_OUTPUT_DIR/intent-boundary"
+mkdir -p "$INTENT_BOUNDARY_DIR"
+echo '[]' > "$INTENT_BOUNDARY_DIR/issue-comments.json"
+echo '[]' > "$INTENT_BOUNDARY_DIR/unresolved-threads.json"
+jq '.body = "abcde" | .commits = []' "$CTX_DIR/pr-summary.json" \
+    > "$INTENT_BOUNDARY_DIR/pr-summary.json"
+echo '[]' > "$INTENT_BOUNDARY_DIR/linked-issues.json"
+GH_PR_ENRICH_TRUNCATE_CHARS=5 "$GH_PR_ENRICH" --test-call \
+    build_claude_context "$INTENT_BOUNDARY_DIR" false >/dev/null 2>&1
+assert_jq "$INTENT_BOUNDARY_DIR/analysis-context.json" \
+    '.pr.body == "abcde" and .coverage.pr_description.truncated == []' \
+    "a PR description exactly at the configured limit is complete"
 
 # The limit is configurable, and the coverage block reports the configured value.
 CUSTOM_DIR="$TEST_OUTPUT_DIR/custom-limit"

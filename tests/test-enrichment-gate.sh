@@ -40,11 +40,14 @@ case "$1 $2" in
         ;;
     "pr view")     cat "$FIXTURE_DIR/pr-summary.json"; exit 0 ;;
     "pr checks")   echo '[]'; exit 0 ;;
-    "pr diff")     echo ""; exit 0 ;;
+    "pr diff")
+        printf 'diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -0,0 +1 @@\n+const x = 1;\n'
+        exit 0
+        ;;
 esac
 if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
     case "$*" in
-        *closingIssuesReferences*) echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[]}}}}}' ;;
+        *closingIssuesReferences*) echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' ;;
         *) cat "$FIXTURE_DIR/threads.json" ;;
     esac
     exit 0
@@ -112,7 +115,7 @@ EOF
 
     env FIXTURE_DIR="$fixtures" CLAUDE_INVOKED_LOG="$TEST_OUTPUT_DIR/$name/claude-invoked.txt" \
         PATH="$STUB_DIR:$PATH" \
-        "$GH_PR_ENRICH" 1 --enrich --output-dir "$out" 2>&1 || true
+        "$GH_PR_ENRICH" 1 --enrich --diff --output-dir "$out" 2>&1 || true
 }
 
 claude_ran() {
@@ -195,12 +198,15 @@ case "$1 $2" in
         exit 0
         ;;
     "pr checks") echo '[]'; exit 0 ;;
-    "pr diff") echo ''; exit 0 ;;
+    "pr diff")
+        printf 'diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -0,0 +1 @@\n+const x = 1;\n'
+        exit 0
+        ;;
 esac
 if [ "$1 $2" = "api graphql" ]; then
     case "$*" in
         *closingIssuesReferences*)
-            echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[]}}}}}'
+            echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
             ;;
         *WatchThreadComments*)
             [ -z "${WATCH_GRAPHQL_LOG:-}" ] || printf '%s\n' "$*" >> "$WATCH_GRAPHQL_LOG"

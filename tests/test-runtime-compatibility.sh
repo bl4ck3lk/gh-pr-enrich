@@ -212,7 +212,7 @@ JSON
 esac
 if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
     case "$*" in
-        *closingIssuesReferences*) echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[]}}}}}' ;;
+        *closingIssuesReferences*) echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' ;;
         *) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PRRT_open","isResolved":false,"isOutdated":false,"path":"a.js","line":1,"comments":{"nodes":[{"id":"c","databaseId":1,"body":"check this","author":{"login":"rev"},"createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/1#discussion_r1"}]}}]}}}}}' ;;
     esac
     exit 0
@@ -390,7 +390,8 @@ done
 AUTHORIZED_DIR="$TEST_OUTPUT_DIR/private-authorized"
 env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PRIVATE GH_PR_ENRICH_CODE_ACCESS=false \
     CLAUDE_INVOKED_LOG="$CLAUDE_LOG" \
-    "$GH_PR_ENRICH" 1 --enrich --allow-external --output-dir "$AUTHORIZED_DIR" >/dev/null 2>&1
+    "$GH_PR_ENRICH" 1 --enrich --allow-external --diff \
+    --output-dir "$AUTHORIZED_DIR" >/dev/null 2>&1
 
 assert_true "$([ -s "$CLAUDE_LOG" ] && echo 0 || echo 1)" \
     "--allow-external authorizes Claude for a private repository"
@@ -1062,6 +1063,162 @@ rc=0
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "missing GitHub source coverage cannot pass selection vacuously"
 mv "$AUTHORIZED_DIR/context-before-source-failure.json" "$AUTHORIZED_DIR/analysis-context.json"
+
+# Known omissions cannot be promoted as clean category coverage. The context
+# does not attribute omitted bytes to individual categories, so every category
+# without a finding must remain explicitly not_reviewable.
+TRUNCATION_CASE_ROOT="$TEST_OUTPUT_DIR/truncated-selection"
+mkdir -p "$TRUNCATION_CASE_ROOT"
+for TRUNCATION_CASE in pr_body issue review inline thread_body thread_replies diff commit linked_issue; do
+    TRUNCATION_CASE_DIR="$TRUNCATION_CASE_ROOT/$TRUNCATION_CASE"
+    mkdir -p "$TRUNCATION_CASE_DIR"
+    cp "$AUTHORIZED_DIR/pr-summary.json" "$TRUNCATION_CASE_DIR/pr-summary.json"
+    cp "$AUTHORIZED_DIR/analysis.json" "$TRUNCATION_CASE_DIR/analysis.json"
+    cp "$AUTHORIZED_DIR/analysis.md" "$TRUNCATION_CASE_DIR/analysis.md"
+    cp "$AUTHORIZED_DIR/context-coverage.md" "$TRUNCATION_CASE_DIR/context-coverage.md"
+    cp "$AUTHORIZED_DIR/combined-data.json" "$TRUNCATION_CASE_DIR/combined-data.json"
+    cp "$AUTHORIZED_DIR/comprehensive-report.md" \
+        "$TRUNCATION_CASE_DIR/comprehensive-report.md"
+    case "$TRUNCATION_CASE" in
+        pr_body) TRUNCATION_FILTER='.coverage.pr_description.truncated = ["PR description"]' ;;
+        issue) TRUNCATION_FILTER='.coverage.issue_comments.truncated = ["issue-u"]' ;;
+        review) TRUNCATION_FILTER='.coverage.review_comments.truncated = ["review-u"]' ;;
+        inline) TRUNCATION_FILTER='.coverage.inline_comments.truncated = ["inline-u"]' ;;
+        thread_body) TRUNCATION_FILTER='.coverage.unresolved_threads.truncated = ["thread-u"]' ;;
+        thread_replies) TRUNCATION_FILTER='.coverage.unresolved_threads.incomplete_comment_threads = ["PRRT_more"]' ;;
+        diff) TRUNCATION_FILTER='.coverage.diff.files_truncated = ["a.js"]' ;;
+        commit) TRUNCATION_FILTER='.coverage.commits.truncated = ["abc1234"]' ;;
+        linked_issue) TRUNCATION_FILTER='.coverage.linked_issues.truncated = ["issue-u"]' ;;
+    esac
+    jq "del(.coverage.context_fingerprint) | $TRUNCATION_FILTER" \
+        "$AUTHORIZED_DIR/analysis-context.json" \
+        > "$TRUNCATION_CASE_DIR/context.tmp.json"
+    TRUNCATION_FINGERPRINT=$(
+        "$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+            "$TRUNCATION_CASE_DIR/context.tmp.json"
+    )
+    jq --arg fingerprint "$TRUNCATION_FINGERPRINT" \
+        '.coverage.context_fingerprint = $fingerprint' \
+        "$TRUNCATION_CASE_DIR/context.tmp.json" \
+        > "$TRUNCATION_CASE_DIR/analysis-context.json"
+    jq --arg fingerprint "$TRUNCATION_FINGERPRINT" \
+        '._metadata.context_fingerprint = $fingerprint' \
+        "$HYBRID_SOURCE" > "$TRUNCATION_CASE_DIR/candidate.json"
+    cp "$TRUNCATION_CASE_DIR/analysis.json" \
+        "$TRUNCATION_CASE_DIR/analysis.before.json"
+    rc=0
+    TRUNCATION_OUT=$("$GH_PR_ENRICH" select-analysis \
+        "$TRUNCATION_CASE_DIR" "$TRUNCATION_CASE_DIR/candidate.json" 2>&1) || rc=$?
+    assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+        "$TRUNCATION_CASE truncation rejects clean category verdicts"
+    assert_contains "$TRUNCATION_OUT" "analysis inputs require" \
+        "$TRUNCATION_CASE rejection identifies the incomplete-evidence contract"
+    assert_true "$(cmp -s "$TRUNCATION_CASE_DIR/analysis.json" \
+        "$TRUNCATION_CASE_DIR/analysis.before.json"; echo $?)" \
+        "$TRUNCATION_CASE rejection preserves the prior selected artifact"
+done
+
+NO_CODE_OR_DIFF_DIR="$TEST_OUTPUT_DIR/no-code-or-diff-selection"
+mkdir -p "$NO_CODE_OR_DIFF_DIR"
+cp "$AUTHORIZED_DIR/pr-summary.json" "$NO_CODE_OR_DIFF_DIR/pr-summary.json"
+jq 'del(.coverage.context_fingerprint)
+    | .coverage.code_access.state = "disabled"
+    | .coverage.diff.included = false
+    | .coverage.diff.requested = false
+    | .coverage.diff.status = "not_requested"
+    | .coverage.diff.files_truncated = []' \
+    "$AUTHORIZED_DIR/analysis-context.json" \
+    > "$NO_CODE_OR_DIFF_DIR/context.tmp.json"
+NO_CODE_OR_DIFF_FINGERPRINT=$(
+    "$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+        "$NO_CODE_OR_DIFF_DIR/context.tmp.json"
+)
+jq --arg fingerprint "$NO_CODE_OR_DIFF_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$NO_CODE_OR_DIFF_DIR/context.tmp.json" \
+    > "$NO_CODE_OR_DIFF_DIR/analysis-context.json"
+jq --arg fingerprint "$NO_CODE_OR_DIFF_FINGERPRINT" \
+    '._metadata.context_fingerprint = $fingerprint' \
+    "$HYBRID_SOURCE" > "$NO_CODE_OR_DIFF_DIR/candidate.json"
+rc=0
+NO_CODE_OR_DIFF_OUT=$("$GH_PR_ENRICH" select-analysis \
+    "$NO_CODE_OR_DIFF_DIR" "$NO_CODE_OR_DIFF_DIR/candidate.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "clean category verdicts require either repository code access or an included diff"
+assert_contains "$NO_CODE_OR_DIFF_OUT" "Incomplete or truncated analysis inputs" \
+    "the no-code/no-diff rejection identifies the missing-evidence contract"
+jq '.category_coverage |= map(.verdict = "not_reviewable")' \
+    "$NO_CODE_OR_DIFF_DIR/candidate.json" \
+    > "$NO_CODE_OR_DIFF_DIR/not-reviewable.json"
+"$GH_PR_ENRICH" select-analysis "$NO_CODE_OR_DIFF_DIR" \
+    "$NO_CODE_OR_DIFF_DIR/not-reviewable.json" >/dev/null
+assert_jq "$NO_CODE_OR_DIFF_DIR/analysis.json" \
+    'all(.category_coverage[]; .verdict == "not_reviewable")' \
+    "a no-code/no-diff analysis remains selectable when it reports every gap"
+
+PARTIAL_DIFF_DIR="$TEST_OUTPUT_DIR/partial-diff-selection"
+mkdir -p "$PARTIAL_DIFF_DIR"
+cp "$AUTHORIZED_DIR/pr-summary.json" "$PARTIAL_DIFF_DIR/pr-summary.json"
+jq 'del(.coverage.context_fingerprint)
+    | .coverage.code_access.state = "disabled"
+    | .coverage.diff.included = true
+    | .coverage.diff.requested = true
+    | .coverage.diff.status = "partial"
+    | .coverage.diff.files_included = 1
+    | .coverage.diff.files_total = 1
+    | .coverage.diff.files_truncated = []' \
+    "$AUTHORIZED_DIR/analysis-context.json" \
+    > "$PARTIAL_DIFF_DIR/context.tmp.json"
+PARTIAL_DIFF_FINGERPRINT=$(
+    "$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+        "$PARTIAL_DIFF_DIR/context.tmp.json"
+)
+jq --arg fingerprint "$PARTIAL_DIFF_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$PARTIAL_DIFF_DIR/context.tmp.json" \
+    > "$PARTIAL_DIFF_DIR/analysis-context.json"
+jq --arg fingerprint "$PARTIAL_DIFF_FINGERPRINT" \
+    '._metadata.context_fingerprint = $fingerprint' \
+    "$HYBRID_SOURCE" > "$PARTIAL_DIFF_DIR/candidate.json"
+rc=0
+PARTIAL_DIFF_OUT=$("$GH_PR_ENRICH" select-analysis \
+    "$PARTIAL_DIFF_DIR" "$PARTIAL_DIFF_DIR/candidate.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a partial diff cannot certify clean categories without repository code access"
+assert_contains "$PARTIAL_DIFF_OUT" "Incomplete or truncated analysis inputs" \
+    "the partial-diff rejection identifies the missing-evidence contract"
+
+TRUNCATION_POSITIVE_DIR="$TRUNCATION_CASE_ROOT/explicit-not-reviewable"
+cp -R "$TRUNCATION_CASE_ROOT/linked_issue" "$TRUNCATION_POSITIVE_DIR"
+rm -f "$TRUNCATION_POSITIVE_DIR/.selected-analysis-"* \
+    "$TRUNCATION_POSITIVE_DIR/analysis.before.json"
+jq '.category_coverage |= map(.verdict = "not_reviewable")' \
+    "$TRUNCATION_POSITIVE_DIR/candidate.json" \
+    > "$TRUNCATION_POSITIVE_DIR/not-reviewable.json"
+"$GH_PR_ENRICH" select-analysis "$TRUNCATION_POSITIVE_DIR" \
+    "$TRUNCATION_POSITIVE_DIR/not-reviewable.json" >/dev/null
+assert_jq "$TRUNCATION_POSITIVE_DIR/analysis.json" \
+    'all(.category_coverage[]; .verdict == "not_reviewable")' \
+    "explicit not_reviewable coverage can be selected with truncated evidence"
+
+jq '.issue_categories = [{
+        name:"Visible defect",category:"logic_error",severity:"high",
+        impact:"moderate",likelihood:"likely",severity_rationale:"fixture",
+        verdict:"plausible",confidence:"medium",description:"fixture",
+        evidence:[{file:"a.js",line:1,detail:"fixture"}],thread_ids:[],
+        sources:["codex:orchestrator"]
+    }]
+    | .category_coverage |= map(
+        if .category == "logic_error" then .verdict = "findings_reported"
+        else .verdict = "not_reviewable" end)' \
+    "$TRUNCATION_POSITIVE_DIR/candidate.json" \
+    > "$TRUNCATION_POSITIVE_DIR/mixed.json"
+"$GH_PR_ENRICH" select-analysis "$TRUNCATION_POSITIVE_DIR" \
+    "$TRUNCATION_POSITIVE_DIR/mixed.json" >/dev/null
+assert_jq "$TRUNCATION_POSITIVE_DIR/analysis.json" \
+    '(.category_coverage[] | select(.category == "logic_error").verdict) == "findings_reported" and
+     all(.category_coverage[]; .category == "logic_error" or .verdict == "not_reviewable")' \
+    "findings remain selectable when every omitted clean axis is not_reviewable"
 
 # A current Claude provider source is not a legacy fallback when selection has
 # rejected or omitted analysis.json.

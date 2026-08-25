@@ -3836,7 +3836,7 @@ if [ "$1" = "watch" ]; then
                 BEFORE_ANALYSIS_IDENTITY="$(watch_selected_analysis_identity \
                     "$WATCH_REPORT_DIR" "$REPO" "$WATCH_PR" 2>/dev/null || echo "")"
                 ENRICH_EXIT=0
-                "$0" "$WATCH_PR" --enrich "${WATCH_EXTERNAL_ARGS[@]}" \
+                "$0" "$WATCH_PR" --enrich --diff "${WATCH_EXTERNAL_ARGS[@]}" \
                     --output-dir "$WATCH_REPORT_DIR" > /dev/null 2>&1 || ENRICH_EXIT=$?
                 AFTER_ANALYSIS_IDENTITY="$(watch_selected_analysis_identity \
                     "$WATCH_REPORT_DIR" "$REPO" "$WATCH_PR" 2>/dev/null || echo "")"
@@ -3847,7 +3847,7 @@ if [ "$1" = "watch" ]; then
                 else
                     ADVANCE_WATCH_BASELINE=false
                     echo "   ❌ Analysis did not publish a fresh selected artifact; retaining the prior watch state for retry."
-                    echo "      Check manually with: gh pr-enrich $WATCH_PR --enrich"
+                    echo "      Check manually with: gh pr-enrich $WATCH_PR --enrich --diff"
                 fi
             fi
 
@@ -4339,7 +4339,7 @@ ENVIRONMENT VARIABLES:
   GH_PR_ENRICH_PROMPT          Path to custom prompt file for Claude analysis
   GH_PR_ENRICH_MODEL           Model for the analysis (default: sonnet)
   GH_PR_ENRICH_CODE_ACCESS     'false' to run without repository read access
-  GH_PR_ENRICH_TRUNCATE_CHARS  Per-comment/diff truncation limit (1-100000; default: 5000)
+  GH_PR_ENRICH_TRUNCATE_CHARS  Per-text-input truncation limit (1-100000; default: 5000)
   GH_PR_ENRICH_SEMGREP_CONFIG  semgrep --config value for --sast (default: auto)
   GH_PR_ENRICH_SEMGREP_TIMEOUT Seconds allowed for the semgrep pre-pass (1-86400; default: 180)
   CLAUDE_TIMEOUT               Seconds allowed for the analysis (default: 600)
@@ -4592,10 +4592,11 @@ create_comments_with_graphql_ids() {
 # not exist as far as the analysis is concerned. gh --paginate walks the cursor
 # and emits one JSON document per page; the pages are merged back into the single
 # document shape the rest of the pipeline reads.
-# Per-thread reply cap used by the GraphQL fetch. Coverage reports how many
-# threads hit it, since a thread at the cap has replies the analyzer never saw.
+# Per-thread reply page used by the GraphQL fetch. The nested connection's
+# pageInfo records exactly which threads have later replies the analyzer did
+# not receive.
 THREAD_COMMENT_LIMIT=20
-LINKED_ISSUE_LIMIT=10
+LINKED_ISSUE_PAGE_SIZE=100
 
 fetch_review_threads() {
     local owner="$1"
@@ -4670,53 +4671,85 @@ fetch_review_threads() {
 }
 
 # Fetch the issues this PR closes, for the intent the diff cannot show.
-fetch_linked_issues() {
+fetch_linked_issues() (
     local owner="$1"
     local repo_name="$2"
     local pr_number="$3"
     local output_file="$4"
 
     local query='
-    query($owner: String!, $name: String!, $prNumber: Int!) {
+    query($owner: String!, $name: String!, $prNumber: Int!, $pageSize: Int!, $endCursor: String) {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $prNumber) {
-          closingIssuesReferences(first: '"$LINKED_ISSUE_LIMIT"') {
-            nodes { number title body url }
+          closingIssuesReferences(first: $pageSize, after: $endCursor) {
+            totalCount
+            pageInfo { hasNextPage endCursor }
+            nodes { id number title body url }
           }
         }
       }
     }'
 
-    # Fetch first, then transform. Piping gh straight into jq would report jq's
-    # exit status: a failed gh leaves jq reading an empty stream, exiting 0, and
-    # the caller believing it wrote a valid file when the file is zero bytes.
-    local raw_file="${output_file}.raw"
-    if ! gh api graphql -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
-            -f query="$query" > "$raw_file" 2>/dev/null; then
-        rm -f "$raw_file"
-        echo '[]' > "$output_file"
+    # gh emits one JSON document per page. Keep the transport private and
+    # validate the full connection before publishing any issue intent: a
+    # partial issue list must remain failed coverage, never a clean input.
+    local pages_file normalized_file
+    pages_file="$(mktemp "${output_file}.pages.XXXXXX")" || return 1
+    normalized_file="$(mktemp "${output_file}.normalized.XXXXXX")" || {
+        rm -f "$pages_file"
+        return 1
+    }
+    trap 'rm -f "$pages_file" "$normalized_file"' EXIT INT TERM
+    chmod 600 "$pages_file" "$normalized_file" || return 1
+
+    if ! gh api graphql --paginate \
+            -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
+            -F pageSize="$LINKED_ISSUE_PAGE_SIZE" -f query="$query" \
+            > "$pages_file" 2>/dev/null; then
+        printf '[]\n' > "$output_file"
         return 1
     fi
 
-    if [ ! -s "$raw_file" ] || ! jq -e '
-        (((.errors // []) | length) == 0) and
-         ((.data.repository.pullRequest.closingIssuesReferences.nodes | type) == "array")
-    ' "$raw_file" > /dev/null 2>&1; then
-        rm -f "$raw_file"
-        echo '[]' > "$output_file"
+    if [ ! -s "$pages_file" ] || ! jq -s -e '
+        def connection:
+            .data.repository.pullRequest.closingIssuesReferences;
+        . as $pages
+        | [$pages[] | connection.nodes[]] as $nodes
+        | ($pages[0] | connection.totalCount) as $total
+        | (
+            (($pages | length) > 0) and
+            (all($pages[];
+              (((.errors // []) | length) == 0) and
+              ((connection.nodes | type) == "array") and
+              ((connection.totalCount | type) == "number") and
+              (connection.totalCount >= 0) and
+              (connection.totalCount == (connection.totalCount | floor)) and
+              ((connection.pageInfo | type) == "object") and
+              ((connection.pageInfo.hasNextPage | type) == "boolean"))) and
+            (all($pages[]; (. | connection.totalCount) == $total)) and
+            ($pages | to_entries | all(
+              . as $entry
+              | ($entry.value | connection) as $connection
+              | if $entry.key < (($pages | length) - 1)
+                then ($connection.pageInfo.hasNextPage == true and
+                      ($connection.pageInfo.endCursor | type) == "string" and
+                      ($connection.pageInfo.endCursor | length) > 0)
+                else $connection.pageInfo.hasNextPage == false
+                end)) and
+            (($nodes | length) == $total) and
+            (all($nodes[];
+              ((.id | type) == "string") and (.id | length) > 0 and
+              ((.number | type) == "number") and
+              (.number == (.number | floor)))) and
+            (([$nodes[].id] | unique | length) == ($nodes | length))
+          ) as $valid
+        | if $valid then $nodes else error("incomplete linked-issue connection") end
+    ' "$pages_file" > "$normalized_file" 2>/dev/null; then
+        printf '[]\n' > "$output_file"
         return 1
     fi
-
-    if ! jq '[.data.repository.pullRequest.closingIssuesReferences.nodes[]?]' \
-            "$raw_file" > "$output_file" 2>/dev/null; then
-        rm -f "$raw_file"
-        echo '[]' > "$output_file"
-        return 1
-    fi
-
-    rm -f "$raw_file"
-    return 0
-}
+    mv "$normalized_file" "$output_file"
+)
 
 extract_unresolved_threads() {
     local threads_file="$1"
@@ -5106,7 +5139,6 @@ build_analysis_context() (
         --arg workspace_fingerprint "$workspace_fingerprint" \
         --arg repository "$repository" \
         --argjson thread_comment_limit "$THREAD_COMMENT_LIMIT" \
-        --argjson linked_issue_limit "$LINKED_ISSUE_LIMIT" \
         '
         def trunc($text): if (($text // "") | length) > $limit
             then (($text // "")[0:$limit] + "\n... (truncated)")
@@ -5132,13 +5164,14 @@ build_analysis_context() (
                 repository: $repository,
                 number: ($pr.number // null),
                 title: $pr.title,
-                body: ($pr.body // "No description"),
+                body: trunc($pr.body // "No description"),
                 author: ($pr.author.login // "unknown"),
                 files_changed: [($pr.files // [])[].path],
                 commits: [($pr.commits // [])[] | {
                     sha: ((.oid // "") | .[0:7]),
                     message: ((.messageHeadline // "") +
-                        (if ((.messageBody // "") | length) > 0 then "\n" + (.messageBody | .[0:1000]) else "" end))
+                        (if ((.messageBody // "") | length) > 0
+                         then "\n" + trunc(.messageBody) else "" end))
                 }],
                 linked_issues: [($linked // [])[] | {
                     number: .number,
@@ -5208,6 +5241,11 @@ build_analysis_context() (
                     outdated: ([$thread_list[] | select(.is_outdated == true)] | length),
                     truncated: [$thread_list[] | (.comments // [])[]
                         | select(was_truncated(.body)) | .url],
+                    incomplete_comment_threads: [$thread_list[]
+                        | select((.comments_complete == false) or
+                            ((has("comments_complete") | not) and
+                             ((.comments // []) | length) >= $thread_comment_limit))
+                        | .thread_id],
                     comments_per_thread_limit: $thread_comment_limit,
                     threads_at_comment_limit: ([$thread_list[]
                         | select((.comments // []) | length >= $thread_comment_limit)] | length)
@@ -5229,6 +5267,21 @@ build_analysis_context() (
                     reason: ($sast_status.reason // ""),
                     findings: (($sast // []) | length)
                 },
+                commits: {
+                    total: (($pr.commits // []) | length),
+                    truncated: [($pr.commits // [])[]
+                        | select(was_truncated(.messageBody))
+                        | ((.oid // "") | .[0:7])]
+                },
+                linked_issues: {
+                    total: (($linked // []) | length),
+                    truncated: [($linked // [])[]
+                        | select(was_truncated(.body)) | (.url // (.number | tostring))]
+                },
+                pr_description: {
+                    truncated: (if was_truncated($pr.body // "")
+                        then ["PR description"] else [] end)
+                },
                 sources: {
                     issue_comments: ($issue_comments_status_doc[0] // {}),
                     review_comments: ($review_comments_status_doc[0] // {}),
@@ -5240,7 +5293,6 @@ build_analysis_context() (
                 inputs: {
                     commits: (($pr.commits // []) | length),
                     linked_issues: (($linked // []) | length),
-                    linked_issues_limit: $linked_issue_limit,
                     failing_checks: ([($checks // [])[] | select(.bucket == "fail")] | length),
                     sast_findings: (($sast // []) | length)
                 }
@@ -6403,6 +6455,43 @@ _select_analysis_artifact() (
         echo "Error: Selected analysis is missing required findings or provenance: $source_file" >&2
         return 1
     fi
+    # A definitive clean verdict is impossible when evidence was shortened or
+    # omitted. Because the schema does not map each omitted byte to individual
+    # categories, every category without a finding must be explicitly marked
+    # not_reviewable until the analyzer receives complete inputs.
+    if ! jq -e --slurpfile analysis "$source_file" '
+        (.coverage // {}) as $coverage
+        | [
+            $coverage.issue_comments.truncated,
+            $coverage.review_comments.truncated,
+            $coverage.inline_comments.truncated,
+            $coverage.unresolved_threads.truncated,
+            $coverage.unresolved_threads.incomplete_comment_threads,
+            $coverage.diff.files_truncated,
+            $coverage.commits.truncated,
+            $coverage.linked_issues.truncated,
+            $coverage.pr_description.truncated
+          ] as $omissions
+        | ($analysis[0] // {}) as $result
+        | ([$result.issue_categories[].category] | unique) as $finding_categories
+        | (($coverage.diff.included // false) == true and
+           ($coverage.diff.status // "unknown") == "completed" and
+           ($coverage.diff.files_included // -1) ==
+             ($coverage.diff.files_total // -2)) as $complete_diff
+        | (($coverage.code_access.state // "disabled") != "enabled" and
+           ($complete_diff | not)) as $code_unavailable
+        | all($omissions[]; type == "array") and
+          ((([$omissions[] | length] | add) == 0 and ($code_unavailable | not)) or
+           all($result.category_coverage[];
+             . as $category_coverage
+             | if ($finding_categories | index($category_coverage.category)) != null
+             then $category_coverage.verdict == "findings_reported"
+             else $category_coverage.verdict == "not_reviewable"
+             end))
+    ' "$context_file" > /dev/null 2>&1; then
+        echo "Error: Incomplete or truncated analysis inputs require every category without findings to be marked not_reviewable." >&2
+        return 1
+    fi
 
     local context_head source_head context_fingerprint embedded_fingerprint source_fingerprint
     local context_pr_number context_repository source_pr_number source_repository
@@ -6597,8 +6686,8 @@ generate_coverage_section() {
       "| Review threads | " + (($c.unresolved_threads.total // 0) | tostring) + " unresolved (all pages) | " +
         (($c.unresolved_threads.outdated // 0) | tostring) + " outdated; " +
         "nested comments truncated: " + ((($c.unresolved_threads.truncated // []) | length) | tostring) + "; " +
-        (($c.unresolved_threads.threads_at_comment_limit // 0) | tostring) + " at the " +
-        (($c.unresolved_threads.comments_per_thread_limit // 0) | tostring) + "-reply fetch limit (later replies not analyzed) |\n" +
+        ((($c.unresolved_threads.incomplete_comment_threads // []) | length) | tostring) + " with replies beyond the " +
+        (($c.unresolved_threads.comments_per_thread_limit // 0) | tostring) + "-reply page (later replies not analyzed) |\n" +
       "| Issue comments | " + (($c.issue_comments.included // 0) | tostring) + " of " + (($c.issue_comments.total // 0) | tostring) + " | " +
         (($c.issue_comments.superseded_bot_duplicates // 0) | tostring) + " superseded bot reposts dropped; " +
         ((($c.issue_comments.truncated // []) | length) | tostring) + " truncated |\n" +
@@ -6606,13 +6695,22 @@ generate_coverage_section() {
         ((($c.review_comments.truncated // []) | length) | tostring) + " truncated |\n" +
       "| Inline comments | " + (($c.inline_comments.total // 0) | tostring) + " | " +
         ((($c.inline_comments.truncated // []) | length) | tostring) + " truncated |\n" +
+      "| PR description | 1 | " +
+        ((($c.pr_description.truncated // []) | length) | tostring) + " body truncated |\n" +
       "| Diff | " + (if ($c.diff.included // false) then (($c.diff.files_included // 0) | tostring) + " of " + (($c.diff.files_total // 0) | tostring) + " files" elif ($c.diff.requested // false) then "requested, " + ($c.diff.status // "unknown") else "not requested (run with --diff)" end) + " | " +
         (if (($c.diff.files_truncated // []) | length) > 0
             then "truncated: " + (($c.diff.files_truncated // []) | join(", "))
             elif (($c.diff.reason // "") | length) > 0 then ($c.diff.reason | gsub("\\|"; "\\\\|"))
             else "no files truncated" end) + " |\n" +
-      "| Commits | " + (($c.inputs.commits // 0) | tostring) + " | commit messages supplied as intent |\n" +
-      "| Linked issues | " + (($c.inputs.linked_issues // 0) | tostring) + " | issue bodies supplied as intent (fetch limit " + (($c.inputs.linked_issues_limit // 0) | tostring) + ") |\n" +
+      "| Commits | " + (($c.inputs.commits // 0) | tostring) + " | commit messages supplied as intent; " +
+        ((($c.commits.truncated // []) | length) | tostring) + " bodies truncated |\n" +
+      "| Linked issues | " + (($c.inputs.linked_issues // 0) | tostring) + " | " +
+        (if (($c.sources.linked_issues.status // "unknown") == "completed")
+         then "all pages fetched; " + ((($c.linked_issues.truncated // []) | length) | tostring) + " bodies truncated"
+         else "fetch " + ($c.sources.linked_issues.status // "unknown") +
+              (if (($c.sources.linked_issues.reason // "") | length) > 0
+               then ": " + ($c.sources.linked_issues.reason | gsub("\\|"; "\\\\|")) else "" end)
+         end) + " |\n" +
       "| Failing checks | " + (($c.inputs.failing_checks // 0) | tostring) + " | CI failures supplied as evidence |\n" +
       "| SAST findings | " + (($c.inputs.sast_findings // 0) | tostring) + " | " +
         (if ($c.sast.requested // false) then ($c.sast.status // "unknown") +
@@ -6626,7 +6724,7 @@ generate_coverage_section() {
       (if ($c.code_access.state // "enabled") == "disabled"
        then "**The analyzer could not read the repository**, so no finding was verified against code: " + ($c.code_access.reason // "") + "\n\n"
        else "" end) +
-      "_Truncation limit: " + (($c.truncation_limit_chars // 0) | tostring) + " characters per comment, issue body and file diff._\n"
+      "_Truncation limit: " + (($c.truncation_limit_chars // 0) | tostring) + " characters per PR description, comment, thread reply, commit body, linked issue body and file diff._\n"
     ' "$context_file" > "$output_file" 2>/dev/null || echo "" > "$output_file"
 }
 

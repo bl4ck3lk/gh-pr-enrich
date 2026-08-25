@@ -103,7 +103,7 @@ Analyzing PR #123 from `main` without this check produced confident verdicts and
 | `GH_PR_ENRICH_PROMPT` | Path to custom prompt file for Claude analysis |
 | `GH_PR_ENRICH_MODEL` | Model for the analysis (default: `sonnet`) |
 | `GH_PR_ENRICH_CODE_ACCESS` | `false` disables repository read access; `true` forces it on a revision mismatch |
-| `GH_PR_ENRICH_TRUNCATE_CHARS` | Per-comment / per-diff truncation limit (default: 5000) |
+| `GH_PR_ENRICH_TRUNCATE_CHARS` | Per-text-input truncation limit for comments, intent bodies and diffs (default: 5000) |
 | `GH_PR_ENRICH_SEMGREP_CONFIG` | `semgrep --config` value for `--sast` (default: `auto`) |
 | `GH_PR_ENRICH_SEMGREP_TIMEOUT` | Seconds allowed for the semgrep pre-pass (default: 180) |
 | `GH_PR_ENRICH_HEARTBEAT_SECONDS` | Seconds between "still analyzing" progress lines (default: 60) |

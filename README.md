@@ -200,6 +200,12 @@ The result is a verification pass, not a summary:
 
 Severity is derived from **impact × likelihood**, never from the category — a bug raised inside a style nit still ranks as a bug.
 
+Linked issues are fetched across the complete GraphQL connection. If any PR
+description, comment, thread reply, commit body, linked issue body, or file diff
+is truncated, categories without findings must remain `not_reviewable`; omitted
+evidence can never produce a clean selected verdict. The same rule applies when
+the analyzer has neither repository code access nor a complete included diff.
+
 The analysis runs when the PR has unresolved threads, review summaries, issue
 comments, or inline comments; if it has none, enrichment is skipped.
 
@@ -282,7 +288,7 @@ export GH_PR_ENRICH_MODEL=opus
 # Run the analysis without repository read access (sandboxed/offline)
 export GH_PR_ENRICH_CODE_ACCESS=false
 
-# Per-comment and per-file-diff truncation limit (default: 5000 characters)
+# Per-text-input truncation limit (comments, intent bodies and file diffs; default: 5000 characters)
 export GH_PR_ENRICH_TRUNCATE_CHARS=8000
 
 # Seconds between "still analyzing" progress lines during a long analysis
