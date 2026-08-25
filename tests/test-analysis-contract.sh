@@ -57,12 +57,24 @@ assert_jq "$SCHEMA_FILE" "$IC.properties.evidence.minItems == 1" \
     "finding evidence requires at least one code anchor"
 assert_jq "$SCHEMA_FILE" "$IC.required | index(\"verdict\") != null and index(\"confidence\") != null and index(\"evidence\") != null" \
     "verdict, confidence and evidence are required on every finding"
+assert_jq "$SCHEMA_FILE" "$IC.required | index(\"finding_id\") != null" \
+    "every finding requires an explicit linkage ID"
+assert_jq "$SCHEMA_FILE" "$IC.properties.finding_id.minLength == 1" \
+    "finding linkage IDs cannot be empty"
 assert_jq "$SCHEMA_FILE" '.properties.disputed_comments.type == "array"' \
     "schema has a disputed_comments section"
 assert_jq "$SCHEMA_FILE" '.required | index("disputed_comments") != null' \
     "disputed_comments is required (silence is not a valid answer)"
+assert_contains "$(jq -r '.properties.disputed_comments.items.properties.thread_id.description' "$SCHEMA_FILE")" \
+    "non-thread comment URL" \
+    "disputed comment references include exact captured non-thread URLs"
+assert_jq "$SCHEMA_FILE" \
+    '.properties.disputed_comments.items.properties.thread_id.minLength == 1' \
+    "disputed comment references cannot be empty"
 assert_contains "$PROMPT_TEXT" "verify" "prompt instructs verification against the code"
 assert_contains "$PROMPT_TEXT" "refuted" "prompt allows refuting a reviewer claim"
+assert_contains "$PROMPT_TEXT" "exact URL supplied in the context" \
+    "prompt identifies non-thread disputes with captured URLs"
 
 # ---------------------------------------------------------------------------
 # 2. Closed taxonomy + forced coverage
@@ -155,10 +167,18 @@ done
 # 4. Tasks anchored to code
 # ---------------------------------------------------------------------------
 TL='.properties.task_list.items'
-for field in file line suggested_fix verification; do
+for field in finding_ids file line suggested_fix verification; do
     assert_jq "$SCHEMA_FILE" "$TL.properties.$field != null" "task carries '$field'"
     assert_jq "$SCHEMA_FILE" "$TL.required | index(\"$field\") != null" "task requires '$field'"
 done
+assert_jq "$SCHEMA_FILE" "$TL.properties.finding_ids.minItems == 1 and $TL.properties.finding_ids.uniqueItems == true" \
+    "task linkage requires one or more unique finding IDs"
+assert_jq "$SCHEMA_FILE" "$TL.properties.finding_ids.items.minLength == 1" \
+    "task linkage IDs cannot be empty"
+assert_contains "$PROMPT_TEXT" "Never create a task for a plausible or refuted claim" \
+    "prompt limits remediation tasks to confirmed findings"
+assert_contains "$PROMPT_TEXT" "Every task thread_id" \
+    "prompt ties task thread mutations to mapped confirmed findings"
 
 # ---------------------------------------------------------------------------
 # 5. Renderer surfaces the new contract
@@ -168,6 +188,7 @@ cat > "$ANALYSIS" << 'EOF'
 {
   "issue_categories": [
     {
+      "finding_id": "unchecked-array-index",
       "name": "Unchecked array index",
       "category": "boundary_condition",
       "severity": "critical",
@@ -199,6 +220,7 @@ cat > "$ANALYSIS" << 'EOF'
     {
       "priority": "critical",
       "task": "Guard tokens[0] with a length check",
+      "finding_ids": ["unchecked-array-index"],
       "thread_ids": ["PRRT_aaa"],
       "file": "src/parse.js",
       "line": 42,
@@ -216,6 +238,8 @@ REPORT="$TEST_OUTPUT_DIR/analysis.md"
 REPORT_TEXT=$(cat "$REPORT" 2>/dev/null || echo "")
 
 assert_contains "$REPORT_TEXT" "confirmed" "report renders the finding verdict"
+assert_contains "$REPORT_TEXT" 'Finding ID:** `unchecked-array-index`' \
+    "report renders the finding ID used by tasks"
 assert_contains "$REPORT_TEXT" "boundary_condition" "report renders the finding category"
 assert_contains "$REPORT_TEXT" "src/parse.js:42" "report renders the evidence anchor"
 assert_contains "$REPORT_TEXT" "severe" "report renders impact"

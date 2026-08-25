@@ -20,6 +20,7 @@ Each finding is verified, categorized, rated and anchored:
 {
   "issue_categories": [
     {
+      "finding_id": "retry-counter-reset",
       "name": "Retry loop never terminates on 429",
       "category": "logic_error",
       "verdict": "confirmed",
@@ -71,6 +72,10 @@ Reviewer or bot claims that were checked and found incorrect:
   ]
 }
 ```
+
+`thread_id` is a captured comment reference: use the exact `PRRT_*` ID for an
+unresolved review thread, or the exact context URL for an issue comment, review
+summary, or standalone inline comment. Selection rejects invented references.
 
 **Use these to:** avoid treating a disputed claim as a confirmed code task. In
 explicitly authorized remediation mode, follow `remediation.md` before replying
@@ -147,6 +152,7 @@ Prioritized actions, each anchored to code and provable:
     {
       "priority": "critical",
       "task": "Move the attempt counter reset outside the catch block",
+      "finding_ids": ["retry-counter-reset"],
       "thread_ids": ["PRRT_xxx"],
       "file": "src/retry.js",
       "line": 42,
@@ -165,6 +171,9 @@ Prioritized actions, each anchored to code and provable:
   remediation, derive trusted commands from repository test conventions.
 
 Tasks with no single code site use `file: "n/a"` and `line: 0`.
+Every task names one or more confirmed findings by their unique `finding_id`;
+plausible and refuted claims cannot become remediation work. Task thread IDs
+must belong to those mapped confirmed findings.
 
 #### 5. Process Improvements
 

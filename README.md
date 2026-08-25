@@ -189,12 +189,12 @@ passes the access gate, reads the repository itself to check claims against code
 
 The result is a verification pass, not a summary:
 
-- **Issue Categories**: Each finding carries a `verdict` (`confirmed` / `plausible` / `refuted`), a `confidence`, and `evidence` naming the file and line that was inspected
-- **Disputed Comments**: Reviewer or bot claims that were checked and found wrong, with the reason
+- **Issue Categories**: Each finding carries a unique `finding_id`, a `verdict` (`confirmed` / `plausible` / `refuted`), a `confidence`, and `evidence` naming the file and line that was inspected
+- **Disputed Comments**: Reviewer or bot claims that were checked and found wrong, identified by an exact captured thread ID or comment URL
 - **Category Coverage**: An explicit verdict for each of the 16 categories, so "not checked" never looks like "clean"
 - **Systemic Issues**: Patterns behind several findings, with the evidence that links them
 - **Adjacent Problems**: Related areas, flagged with whether the analyzer actually searched them
-- **Task List**: Prioritized actions, each with `file`, `line`, `suggested_fix` and a `verification` command
+- **Task List**: Prioritized actions mapped by `finding_ids` only to confirmed findings, each with `file`, `line`, `suggested_fix` and a `verification` command
 - **Process Improvements**: Automation, documentation, and review-process suggestions to prevent recurrence
 - **PR Template Suggestions**: Checklist items that would catch these issues before review
 

@@ -1,6 +1,7 @@
 {
   "issue_categories": [
     {
+      "finding_id": "swallowed-sync-exception",
       "name": "Swallowed exception in the sync worker",
       "category": "error_handling",
       "verdict": "confirmed",
@@ -54,6 +55,9 @@
     {
       "priority": "medium",
       "task": "Log and rethrow in syncAll()",
+      "finding_ids": [
+        "swallowed-sync-exception"
+      ],
       "thread_ids": [
         "PRRT_test2"
       ],

@@ -129,26 +129,67 @@ write_current_selection() {
     local thread_id="${3:-}"
     local report_dir="$ws/.reports/pr-reviews/pr-999"
     local context_file="$report_dir/analysis-context.json"
-    local context_fingerprint
+    local context_fingerprint workspace_fingerprint inspected_sha thread_ids existing_root
 
-    jq -n --arg tid "$thread_id" '{
+    existing_root=$(git -C "$ws" rev-parse --show-toplevel 2>/dev/null || echo "")
+    if [ "$existing_root" != "$ws" ]; then
+        (cd "$ws" && git init -q . && git config user.email t@t && \
+            git config user.name t && \
+            git -c commit.gpgsign=false commit -qm fixture --allow-empty)
+    fi
+    inspected_sha=$(git -C "$ws" rev-parse HEAD)
+
+    # Address is a strict mutation consumer: every displayed task must map to
+    # a confirmed finding, and confirmed findings require a current code-access
+    # fingerprint. Normalize terse test inputs into that production contract.
+    jq '
+        . as $analysis
+        | (($analysis.task_list // []) | to_entries) as $tasks
+        | .task_list = [$tasks[] | .key as $index | .value + {
+            finding_ids: ["address-task-" + ($index | tostring)]
+          }]
+        | .issue_categories = [$tasks[] | .key as $index | .value as $task | {
+            finding_id: ("address-task-" + ($index | tostring)),
+            name: "Address fixture finding", category: "logic_error",
+            severity: "high", impact: "moderate", likelihood: "likely",
+            severity_rationale: "fixture", verdict: "confirmed", confidence: "high",
+            description: "fixture",
+            evidence: [{file:($task.file // "n/a"),line:($task.line // 0),detail:"fixture"}],
+            thread_ids: ($task.thread_ids // [])
+          }]
+    ' "$source_file" > "$report_dir/analysis.json"
+    rm -f "$source_file"
+    thread_ids=$(jq -c --arg tid "$thread_id" '
+        [(.task_list // [])[].thread_ids[]?, $tid]
+        | map(select(type == "string" and test("^PRRT_[A-Za-z0-9_-]+$")))
+        | unique
+    ' "$report_dir/analysis.json")
+
+    jq -n --argjson tids "$thread_ids" --arg inspected_sha "$inspected_sha" '{
         pr: {repository:"o/r", number:999},
-        unresolved_threads: (if ($tid | test("^PRRT_[A-Za-z0-9_-]+$"))
-            then [{thread_id:$tid,comments_complete:true,comment_identity:[]}]
-            else [] end),
-        coverage: {code_access:{state:"disabled", pr_head_sha:"captured-head"}}
+        unresolved_threads: [$tids[] | {thread_id:.,comments_complete:true,comment_identity:[]}],
+        coverage: {code_access:{state:"enabled", pr_head_sha:"captured-head",
+            inspected_sha:$inspected_sha, revision_matches:false}}
     }' > "$context_file"
+    workspace_fingerprint=$(cd "$ws" && "$GH_PR_ENRICH" --test-call \
+        code_access_workspace_fingerprint "$report_dir")
+    jq --arg workspace_fingerprint "$workspace_fingerprint" \
+        '.coverage.code_access.workspace_fingerprint = $workspace_fingerprint' \
+        "$context_file" > "$context_file.tmp"
+    mv "$context_file.tmp" "$context_file"
     context_fingerprint=$("$GH_PR_ENRICH" --test-call \
         analysis_context_fingerprint "$context_file")
     jq --arg fingerprint "$context_fingerprint" \
         '.coverage.context_fingerprint = $fingerprint' "$context_file" \
         > "$context_file.tmp"
     mv "$context_file.tmp" "$context_file"
-    jq --arg fingerprint "$context_fingerprint" '. + {_metadata:{
+    jq --arg fingerprint "$context_fingerprint" \
+        --arg workspace_fingerprint "$workspace_fingerprint" '. + {_metadata:{
         provider:"claude", repository:"o/r", pr_number:999,
-        pr_head_sha:"captured-head", context_fingerprint:$fingerprint
-    }}' "$source_file" > "$report_dir/analysis.json"
-    rm -f "$source_file"
+        pr_head_sha:"captured-head", context_fingerprint:$fingerprint,
+        workspace_fingerprint:$workspace_fingerprint
+    }}' "$report_dir/analysis.json" > "$report_dir/analysis.json.tmp"
+    mv "$report_dir/analysis.json.tmp" "$report_dir/analysis.json"
 }
 
 # Build a workspace with a hostile analysis file and run `address` in it.
@@ -281,6 +322,39 @@ fi
 
 assert_contains "$TERM_OUT" "FAKE PROMPT" "the task text itself is still shown to the user"
 
+# A current, provenance-valid selected artifact must still satisfy the task to
+# confirmed-finding relationship at consumption time. Local replacement of a
+# generated analysis file cannot revive an unlinked or unverified task.
+STRICT_LINK_WS="$TEST_OUTPUT_DIR/ws-strict-link"
+STRICT_LINK_REPORT="$STRICT_LINK_WS/.reports/pr-reviews/pr-999"
+STRICT_LINK_SOURCE="$STRICT_LINK_REPORT/claude-analysis.json"
+mkdir -p "$STRICT_LINK_REPORT"
+jq -n '{
+    issue_categories: [], category_coverage: [], disputed_comments: [],
+    systemic_issues: [], adjacent_problems: [],
+    task_list: [{priority:"high",task:"STRICT LINK TASK",thread_ids:[],
+        file:"a.js",line:1,suggested_fix:"fix",verification:"test"}],
+    process_improvements: [], pr_template_suggestions: []
+}' > "$STRICT_LINK_SOURCE"
+write_current_selection "$STRICT_LINK_WS" "$STRICT_LINK_SOURCE"
+cp "$STRICT_LINK_REPORT/analysis.json" "$TEST_OUTPUT_DIR/strict-link-valid.json"
+jq 'del(.task_list[0].finding_ids)' "$TEST_OUTPUT_DIR/strict-link-valid.json" \
+    > "$STRICT_LINK_REPORT/analysis.json"
+STRICT_UNLINKED_OUT=$( (cd "$STRICT_LINK_WS" && \
+    "$GH_PR_ENRICH" address 999 2>&1) || true)
+assert_contains "$STRICT_UNLINKED_OUT" "Analysis not found" \
+    "address rejects a provenance-valid task without finding linkage"
+assert_not_contains "$STRICT_UNLINKED_OUT" "STRICT LINK TASK" \
+    "address never displays an unlinked current task"
+jq '.issue_categories[0].verdict = "plausible"' \
+    "$TEST_OUTPUT_DIR/strict-link-valid.json" > "$STRICT_LINK_REPORT/analysis.json"
+STRICT_PLAUSIBLE_OUT=$( (cd "$STRICT_LINK_WS" && \
+    "$GH_PR_ENRICH" address 999 2>&1) || true)
+assert_contains "$STRICT_PLAUSIBLE_OUT" "Analysis not found" \
+    "address rejects a task mapped only to a plausible finding"
+assert_not_contains "$STRICT_PLAUSIBLE_OUT" "STRICT LINK TASK" \
+    "address never displays a plausible-only current task"
+
 # A current provider source can remain on disk after selection rejects it. The
 # address workflow must not consume it through the pre-v2.1 legacy fallback.
 CURRENT_SOURCE_WS="$TEST_OUTPUT_DIR/ws-current-source"
@@ -347,26 +421,23 @@ assert_contains "$SYMLINK_LEGACY_OUT" "Analysis not found" \
 # cannot resolve threads after the PR advances to head B.
 STALE_MUTATION_WS="$TEST_OUTPUT_DIR/ws-stale-mutation"
 STALE_MUTATION_REPORT="$STALE_MUTATION_WS/.reports/pr-reviews/pr-999"
-MUTATION_LOG="$STALE_MUTATION_WS/mutations.log"
+MUTATION_LOG="$TEST_OUTPUT_DIR/stale-mutations.log"
 mkdir -p "$STALE_MUTATION_REPORT"
-jq -n '{pr:{repository:"o/r",number:999},
-    unresolved_threads:[
-        {thread_id:"PRRT_stale",comments_complete:true,comment_identity:[]},
-        {thread_id:"PRRT_first",comments_complete:true,comment_identity:[]},
-        {thread_id:"PRRT_second",comments_complete:true,comment_identity:[]}],
-    coverage:{code_access:{pr_head_sha:"captured-head"}}}' \
-    > "$STALE_MUTATION_REPORT/analysis-context.tmp.json"
-STALE_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
-    "$STALE_MUTATION_REPORT/analysis-context.tmp.json")
-jq --arg fingerprint "$STALE_FINGERPRINT" '.coverage.context_fingerprint = $fingerprint' \
-    "$STALE_MUTATION_REPORT/analysis-context.tmp.json" \
-    > "$STALE_MUTATION_REPORT/analysis-context.json"
-jq -n --arg fingerprint "$STALE_FINGERPRINT" '{
-    task_list:[{priority:"high",task:"STALE TASK",thread_ids:["PRRT_stale"],
+jq -n '{
+    issue_categories:[], category_coverage:[], disputed_comments:[],
+    systemic_issues:[], adjacent_problems:[],
+    task_list:[{priority:"high",task:"STALE TASK",
+        thread_ids:["PRRT_stale","PRRT_first","PRRT_second"],
         file:"a.js",line:1,suggested_fix:"fix",verification:"test"}],
-    _metadata:{provider:"codex",repository:"o/r",pr_number:999,
-        pr_head_sha:"captured-head",context_fingerprint:$fingerprint}
-}' > "$STALE_MUTATION_REPORT/analysis.json"
+    process_improvements:[], pr_template_suggestions:[]
+}' > "$STALE_MUTATION_REPORT/claude-analysis.json"
+write_current_selection "$STALE_MUTATION_WS" \
+    "$STALE_MUTATION_REPORT/claude-analysis.json"
+jq '.task_list[0].thread_ids = ["PRRT_stale"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
 STALE_BATCH_TEMPLATE="$TEST_OUTPUT_DIR/stale-batch-analysis.json"
 cp "$STALE_MUTATION_REPORT/analysis.json" "$STALE_BATCH_TEMPLATE"
 : > "$MUTATION_LOG"
@@ -390,13 +461,9 @@ assert_eq "" "$(cat "$MUTATION_LOG")" \
 assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
     "a stale address run invalidates the selected artifact"
 
-jq -n --arg fingerprint "$STALE_FINGERPRINT" '{
-    task_list:[{priority:"high",task:"BATCH TASK",
-        thread_ids:["PRRT_first","PRRT_second"],file:"a.js",line:1,
-        suggested_fix:"fix",verification:"test"}],
-    _metadata:{provider:"codex",repository:"o/r",pr_number:999,
-        pr_head_sha:"captured-head",context_fingerprint:$fingerprint}
-}' > "$STALE_MUTATION_REPORT/analysis.json"
+jq '.task_list[0].task = "BATCH TASK"
+    | .task_list[0].thread_ids = ["PRRT_first","PRRT_second"]' \
+    "$STALE_BATCH_TEMPLATE" > "$STALE_MUTATION_REPORT/analysis.json"
 : > "$MUTATION_LOG"
 BATCH_MUTATION_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
     env GH_HEAD_MODE=advance_after_mutation GH_MUTATIONS_LOG="$MUTATION_LOG" \
@@ -440,9 +507,10 @@ jq --arg fingerprint "$LOCAL_CONTEXT_FINGERPRINT" \
     "$LOCAL_MUTATION_CONTEXT_TMP" > "$LOCAL_MUTATION_REPORT/analysis-context.json"
 jq -n --arg fingerprint "$LOCAL_CONTEXT_FINGERPRINT" \
     --arg workspace_fingerprint "$LOCAL_WORKSPACE_FINGERPRINT" '{
-    issue_categories:[{name:"correctness",severity:"high",verdict:"plausible"}],
+    issue_categories:[{finding_id:"local-mutation",name:"correctness",
+        severity:"high",verdict:"confirmed",thread_ids:["PRRT_local"]}],
     task_list:[{priority:"high",task:"LOCAL MUTATION TASK",
-        thread_ids:["PRRT_local"],file:"base.txt",line:1,
+        finding_ids:["local-mutation"],thread_ids:["PRRT_local"],file:"base.txt",line:1,
         suggested_fix:"fix",verification:"test"}],
     _metadata:{provider:"codex",repository:"o/r",pr_number:999,
         pr_head_sha:"captured-head",context_fingerprint:$fingerprint,
@@ -470,7 +538,7 @@ PRESTART_WORKSPACE_OUT=$(printf 'q' | (cd "$LOCAL_MUTATION_WS" && \
     env GH_HEAD_MODE=captured GH_MUTATIONS_LOG="$LOCAL_MUTATION_LOG" \
     PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" address 999 2>&1) || true)
 assert_contains "$PRESTART_WORKSPACE_OUT" "Analysis not found" \
-    "address rejects an enabled plausible selection after pre-start workspace drift"
+    "address rejects an enabled confirmed selection after pre-start workspace drift"
 assert_eq "" "$(cat "$LOCAL_MUTATION_LOG")" \
     "pre-start workspace drift sends no hosted mutation"
 assert_true "$([ ! -e "$LOCAL_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
@@ -1302,11 +1370,16 @@ cp "$ROLLBACK_INVALIDATION_DIR/combined-data.json" \
 echo '{"selected":"original"}' > "$ROLLBACK_BOUNDARY_DIR/analysis.json"
 cat > "$ROLLBACK_BOUNDARY_STUBS/ln" << 'STUB'
 #!/bin/bash
-count=0
-[ ! -f "$ROLLBACK_LN_COUNT" ] || read -r count < "$ROLLBACK_LN_COUNT"
-count=$((count + 1))
-printf '%s\n' "$count" > "$ROLLBACK_LN_COUNT"
-[ "$count" -ne 2 ] || exit 76
+case "$2" in
+    "$ROLLBACK_BOUNDARY_REPORT"/combined-data.json|\
+    "$ROLLBACK_BOUNDARY_REPORT"/comprehensive-report.md)
+        count=0
+        [ ! -f "$ROLLBACK_LN_COUNT" ] || read -r count < "$ROLLBACK_LN_COUNT"
+        count=$((count + 1))
+        printf '%s\n' "$count" > "$ROLLBACK_LN_COUNT"
+        [ "$count" -ne 2 ] || exit 76
+        ;;
+esac
 exec "$REAL_LN" "$@"
 STUB
 cat > "$ROLLBACK_BOUNDARY_STUBS/mv" << 'STUB'
@@ -1327,6 +1400,7 @@ rc=0
 env PATH="$ROLLBACK_BOUNDARY_STUBS:$PATH" \
     REAL_LN="$(command -v ln)" REAL_MV="$(command -v mv)" \
     ROLLBACK_LN_COUNT="$ROLLBACK_BOUNDARY_LN_COUNT" \
+    ROLLBACK_BOUNDARY_REPORT="$ROLLBACK_BOUNDARY_DIR" \
     ROLLBACK_BOUNDARY_MARKER="$ROLLBACK_BOUNDARY_MARKER" \
     ROLLBACK_BOUNDARY_TARGET="$ROLLBACK_BOUNDARY_DIR/combined-data.json" \
     "$GH_PR_ENRICH" --test-call invalidate_selected_analysis \

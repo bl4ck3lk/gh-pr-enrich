@@ -59,6 +59,10 @@ Put every refuted claim in disputed_comments with the specific reason it is wron
 (the guard that already exists, the caller that cannot pass null, the defer that
 closes the handle). Refuting a reviewer with evidence is a successful analysis,
 not a failure — a task list that fixes a non-bug wastes more time than it saves.
+For an unresolved review thread, identify the dispute with its exact PRRT
+thread_id. For an issue comment, review summary, or standalone inline comment,
+put the exact URL supplied in the context in disputed_comments[].thread_id. Never
+invent an identifier or URL.
 
 Every finding needs at least one evidence entry naming a file and line you
 actually inspected. A finding you cannot anchor to code is a "plausible" at best.
@@ -147,6 +151,10 @@ file, line or thread that shows it. "Best practice" is not a rationale.
 
 Each task_list entry must carry:
 
+- finding_ids: one or more exact finding_id values from confirmed
+  issue_categories findings. Give every finding a unique non-empty finding_id.
+  Never create a task for a plausible or refuted claim. Every task thread_id
+  must also belong to one of its mapped confirmed findings.
 - file and line: where the change goes. Use the real path from the repository.
   For a task with no single site (a decision, a discussion, a follow-up), use
   file "n/a" and line 0.

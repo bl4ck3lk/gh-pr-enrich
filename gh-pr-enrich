@@ -372,7 +372,9 @@ workspace_file_mode() {
 build_code_access_workspace_manifest() {
     local ignored_output_dir="${1:-}"
     local manifest="$2"
+    local ignored_transaction_dir="${3:-}"
     local repo_root output_abs="" output_rel="" output_is_repo_root=false
+    local transaction_abs="" transaction_rel="" transaction_name="" lock_abs=""
     local records index_state head index_digest record metadata index_mode index_stage
     local relative origin file_hash file_mode artifact_relative
     repo_root="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
@@ -384,6 +386,27 @@ build_code_access_workspace_manifest() {
             "$repo_root") output_is_repo_root=true ;;
             "$repo_root"/*) output_rel="${output_abs#"$repo_root/"}" ;;
         esac
+    fi
+    if [ -n "$SELECTED_ANALYSIS_LOCK_DIR" ] && \
+       [ -d "$SELECTED_ANALYSIS_LOCK_DIR" ] && \
+       [ ! -L "$SELECTED_ANALYSIS_LOCK_DIR" ] && \
+       ! path_has_symlink_component "$SELECTED_ANALYSIS_LOCK_DIR"; then
+        lock_abs="$(canonicalize_path "$SELECTED_ANALYSIS_LOCK_DIR")"
+    fi
+    if [ -n "$ignored_transaction_dir" ] && [ -n "$output_abs" ] && \
+       [ "$lock_abs" = "$output_abs/.selected-analysis.lock" ] && \
+       [ -n "$SELECTED_ANALYSIS_LOCK_TOKEN" ] && \
+       [ -f "$SELECTED_ANALYSIS_LOCK_DIR/owner" ] && \
+       [ ! -L "$SELECTED_ANALYSIS_LOCK_DIR/owner" ] && \
+       [ "$(cat "$SELECTED_ANALYSIS_LOCK_DIR/owner" 2>/dev/null || echo "")" = \
+         "$SELECTED_ANALYSIS_LOCK_TOKEN" ]; then
+        transaction_abs="$(canonicalize_path "$ignored_transaction_dir")"
+        transaction_name="$(basename "$transaction_abs")"
+        if [[ "$transaction_name" =~ ^\.selected-analysis-replacements\.[A-Za-z0-9]{6}$ ]] && \
+           [ "$transaction_abs" = "$output_abs/$transaction_name" ] && \
+           [ -d "$transaction_abs" ] && [ ! -L "$transaction_abs" ]; then
+            transaction_rel="${transaction_abs#"$repo_root/"}"
+        fi
     fi
 
     records="$(mktemp "/tmp/gh-pr-enrich-workspace-records.XXXXXX")" || return 1
@@ -448,6 +471,11 @@ build_code_access_workspace_manifest() {
                 }
         fi
         while IFS= read -r -d '' relative; do
+            if [ -n "$transaction_rel" ]; then
+                case "$relative" in
+                    "$transaction_rel"/*) continue ;;
+                esac
+            fi
             if path_has_symlink_component "$repo_root/$relative" || \
                [ ! -f "$repo_root/$relative" ]; then
                 # Includes nested repositories, which Git reports as directory
@@ -482,9 +510,10 @@ build_code_access_workspace_manifest() {
 # Bind repository tools to one exact local workspace. Generated report
 # artifacts are excluded individually; every other visible path is manifested.
 code_access_workspace_fingerprint() {
-    local manifest digest
+    local manifest digest ignored_transaction_dir="${2:-}"
     manifest="$(mktemp "/tmp/gh-pr-enrich-workspace.XXXXXX")" || return 1
-    if ! build_code_access_workspace_manifest "${1:-}" "$manifest" || \
+    if ! build_code_access_workspace_manifest "${1:-}" "$manifest" \
+            "$ignored_transaction_dir" || \
        ! digest="$(sha256_file "$manifest")"; then
         rm -f "$manifest"
         return 1
@@ -717,8 +746,11 @@ write_input_status() {
 # child, preserving the existing fetch and normalization contracts.
 REPORT_RUN_CHILD_PID=""
 REPORT_RUN_CHILD_STARTING=false
+REPORT_RUN_CHILD_GROUP_OWNED=false
 REPORT_RUN_MANAGED=false
 REPORT_RUN_OWNER_PID=""
+REPORT_RUN_WATCHDOG_PID=""
+REPORT_RUN_WATCHDOG_STATUS=0
 
 report_run_is_owner_shell() {
     [ "$REPORT_RUN_MANAGED" = true ] && [ -n "$REPORT_RUN_OWNER_PID" ] || \
@@ -728,41 +760,123 @@ report_run_is_owner_shell() {
 }
 
 run_report_command() {
-    local command_pid command_rc=0
+    local command_pid command_rc=0 timeout_seconds watchdog_tick
+    local command_group_owned=false
     if ! report_run_is_owner_shell; then
         "$@"
         return $?
     fi
     REPORT_RUN_CHILD_STARTING=true
+    set -m
     "$@" &
     command_pid=$!
+    if kill -0 -- "-$command_pid" 2>/dev/null; then
+        command_group_owned=true
+    fi
+    set +m
     REPORT_RUN_CHILD_PID="$command_pid"
+    REPORT_RUN_CHILD_GROUP_OWNED="$command_group_owned"
     REPORT_RUN_CHILD_STARTING=false
+    if [ -n "${selected_writer_signal:-}" ]; then
+        terminate_report_run_child
+        case "$selected_writer_signal" in
+            INT) return 130 ;;
+            TERM) return 143 ;;
+        esac
+    fi
     if [ -n "${RUN_LOCK_PENDING_SIGNAL:-}" ]; then
         handle_report_run_signal "$RUN_LOCK_PENDING_SIGNAL" \
             "$RUN_LOCK_PENDING_EXIT_CODE"
     fi
+    timeout_seconds="$(positive_integer_or_default \
+        "${GH_PR_ENRICH_GITHUB_TIMEOUT:-}" 60 3600)"
+    REPORT_RUN_WATCHDOG_STATUS=0
+    (
+        watchdog_fired=false
+        trap '[ "$watchdog_fired" = true ] || exit 0' TERM INT
+        for watchdog_tick in $(seq 1 $((timeout_seconds * 5))); do
+            sleep 0.2
+        done
+        watchdog_fired=true
+        if [ "$command_group_owned" = true ]; then
+            kill -TERM -- "-$command_pid" 2>/dev/null || true
+        else
+            kill -TERM "$command_pid" 2>/dev/null || true
+        fi
+        sleep 1 || true
+        if [ "$command_group_owned" = true ]; then
+            kill -KILL -- "-$command_pid" 2>/dev/null || true
+        else
+            kill -KILL "$command_pid" 2>/dev/null || true
+        fi
+        exit 124
+    ) &
+    REPORT_RUN_WATCHDOG_PID=$!
     wait "$command_pid" || command_rc=$?
+    stop_report_run_watchdog
+    if [ "$REPORT_RUN_WATCHDOG_STATUS" -eq 124 ]; then
+        if [ "$REPORT_RUN_CHILD_PID" = "$command_pid" ]; then
+            REPORT_RUN_CHILD_PID=""
+            REPORT_RUN_CHILD_GROUP_OWNED=false
+        fi
+        REPORT_RUN_WATCHDOG_STATUS=0
+        return 124
+    fi
+    if [ "$REPORT_RUN_WATCHDOG_STATUS" -ne 0 ]; then
+        terminate_report_run_child
+        REPORT_RUN_WATCHDOG_STATUS=0
+        return 125
+    fi
     if [ "$REPORT_RUN_CHILD_PID" = "$command_pid" ]; then
         REPORT_RUN_CHILD_PID=""
+        REPORT_RUN_CHILD_GROUP_OWNED=false
     fi
     return "$command_rc"
 }
 
+stop_report_run_watchdog() {
+    local watchdog_rc=0
+    if [ -n "$REPORT_RUN_WATCHDOG_PID" ]; then
+        kill -TERM "$REPORT_RUN_WATCHDOG_PID" 2>/dev/null || true
+        wait "$REPORT_RUN_WATCHDOG_PID" 2>/dev/null || watchdog_rc=$?
+        REPORT_RUN_WATCHDOG_STATUS="$watchdog_rc"
+        REPORT_RUN_WATCHDOG_PID=""
+    fi
+}
+
 terminate_report_run_child() {
     local command_pid="$REPORT_RUN_CHILD_PID"
+    local command_group_owned="$REPORT_RUN_CHILD_GROUP_OWNED"
     local attempt
-    [ -n "$command_pid" ] || return 0
-    kill -TERM "$command_pid" 2>/dev/null || true
+    stop_report_run_watchdog
+    if [ -z "$command_pid" ]; then
+        return 0
+    fi
+    if [ "$command_group_owned" = true ]; then
+        kill -TERM -- "-$command_pid" 2>/dev/null || true
+    else
+        kill -TERM "$command_pid" 2>/dev/null || true
+    fi
     for attempt in $(seq 1 20); do
-        kill -0 "$command_pid" 2>/dev/null || break
+        if [ "$command_group_owned" = true ]; then
+            kill -0 -- "-$command_pid" 2>/dev/null || break
+        else
+            kill -0 "$command_pid" 2>/dev/null || break
+        fi
         sleep 0.05
     done
-    if kill -0 "$command_pid" 2>/dev/null; then
-        kill -KILL "$command_pid" 2>/dev/null || true
+    if [ "$command_group_owned" = true ]; then
+        if kill -0 -- "-$command_pid" 2>/dev/null; then
+            kill -KILL -- "-$command_pid" 2>/dev/null || true
+        fi
+    else
+        if kill -0 "$command_pid" 2>/dev/null; then
+            kill -KILL "$command_pid" 2>/dev/null || true
+        fi
     fi
     wait "$command_pid" 2>/dev/null || true
     REPORT_RUN_CHILD_PID=""
+    REPORT_RUN_CHILD_GROUP_OWNED=false
 }
 
 cleanup_report_run_temp_files() {
@@ -781,10 +895,12 @@ cleanup_report_run_temp_files() {
 }
 
 CURRENT_HOSTED_HEAD=""
+HOSTED_HEAD_VERIFICATION_STATUS="unavailable"
 verify_pr_head_unchanged() {
     local pr_number="$1" expected_head="$2" repository="${3:-}" head_json
     local head_json_file
     CURRENT_HOSTED_HEAD=""
+    HOSTED_HEAD_VERIFICATION_STATUS="unavailable"
     head_json_file="$(mktemp "/tmp/gh-pr-enrich-hosted-head.XXXXXX")" || return 1
     if [ -n "$repository" ]; then
         if ! run_report_command gh pr view "$pr_number" --repo "$repository" \
@@ -803,7 +919,19 @@ verify_pr_head_unchanged() {
     fi
     rm -f "$head_json_file"
     CURRENT_HOSTED_HEAD="$(printf '%s' "$head_json" | jq -r '.headRefOid // ""' 2>/dev/null || echo "")"
-    [ -n "$expected_head" ] && [ "$CURRENT_HOSTED_HEAD" = "$expected_head" ]
+    [ -n "$expected_head" ] && [ -n "$CURRENT_HOSTED_HEAD" ] || return 1
+    if [ "$CURRENT_HOSTED_HEAD" = "$expected_head" ]; then
+        HOSTED_HEAD_VERIFICATION_STATUS="unchanged"
+        return 0
+    fi
+    HOSTED_HEAD_VERIFICATION_STATUS="mismatch"
+    return 1
+}
+
+invalidate_on_confirmed_hosted_head_mismatch() {
+    local report_dir="$1"
+    [ "$HOSTED_HEAD_VERIFICATION_STATUS" != "mismatch" ] || \
+        invalidate_selected_analysis "$report_dir"
 }
 
 fetch_live_review_thread() {
@@ -1207,19 +1335,61 @@ release_selected_analysis_lock() {
     fi
 }
 
+# Return an exact identity for the fixed selected-analysis replacement set.
+# Any extra entry, symlink, directory, mode change, or byte change fails closed.
+selected_analysis_replacement_identity() (
+    local replacement_dir="$1" entry name digest mode
+    local -a names=(
+        analysis.json analysis.md context-coverage.md
+        combined-data.json comprehensive-report.md
+    )
+    [ -d "$replacement_dir" ] && [ ! -L "$replacement_dir" ] && \
+        ! path_has_symlink_component "$replacement_dir" || return 1
+    while IFS= read -r -d '' entry; do
+        name="$(basename "$entry")"
+        case "$name" in
+            analysis.json|analysis.md|context-coverage.md|\
+            combined-data.json|comprehensive-report.md) ;;
+            *) return 1 ;;
+        esac
+        [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
+    done < <(find "$replacement_dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    for name in "${names[@]}"; do
+        entry="$replacement_dir/$name"
+        if [ -e "$entry" ] || [ -L "$entry" ]; then
+            [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
+            digest="$(sha256_file "$entry" 2>/dev/null || echo "")"
+            mode="$(workspace_file_mode "$entry" 2>/dev/null || echo "")"
+            [ -n "$digest" ] && [ -n "$mode" ] || return 1
+            printf '%s\tfile\t%s\t%s\n' "$name" "$mode" "$digest"
+        else
+            printf '%s\tabsent\n' "$name"
+        fi
+    done
+)
+
 # Replace or delete the five selected-analysis views as one recoverable
 # transaction. Live originals are atomically quarantined and verified against
 # the caller's capture. Hard-link publication and restoration fail rather than
 # clobbering a pathname that reappears at a boundary.
 publish_selected_analysis_transaction() (
     local report_dir="$1" expected_dir="$2" replacement_dir="$3"
+    local expected_replacement_identity="$4" current_replacement_identity=""
     local quarantine_dir name destination expected replacement quarantine
+    local published_reference
     local expected_digest quarantine_digest expected_mode quarantine_mode
     local transaction_failed=false rollback_failed=false transaction_signal=""
+    local quarantined_names=" " published_names=" "
     local -a names=(
         analysis.json analysis.md context-coverage.md
         combined-data.json comprehensive-report.md
     )
+    current_replacement_identity="$(selected_analysis_replacement_identity \
+        "$replacement_dir" 2>/dev/null || echo "")"
+    if [ -z "$expected_replacement_identity" ] || \
+       [ "$current_replacement_identity" != "$expected_replacement_identity" ]; then
+        return 1
+    fi
     quarantine_dir="$(mktemp -d \
         "$report_dir/.selected-analysis-quarantine.XXXXXX")" || return 1
     trap 'transaction_signal=INT; transaction_failed=true' INT
@@ -1227,19 +1397,25 @@ publish_selected_analysis_transaction() (
 
     rollback_selected_publication() {
         local rollback_name rollback_destination rollback_replacement
-        local rollback_quarantine rollback_published
+        local rollback_quarantine rollback_published rollback_reference
         local index
         for ((index=${#names[@]}-1; index>=0; index--)); do
             rollback_name="${names[$index]}"
+            case "$published_names" in
+                *" $rollback_name "*) ;;
+                *) continue ;;
+            esac
             rollback_destination="$report_dir/$rollback_name"
             rollback_replacement="$replacement_dir/$rollback_name"
-            if [ -f "$rollback_replacement" ] && \
-               [ -e "$rollback_destination" ]; then
+            rollback_reference="$quarantine_dir/.replacement-$rollback_name"
+            if [ -e "$rollback_destination" ]; then
                 rollback_published="$quarantine_dir/.published-$rollback_name"
                 if [ -e "$rollback_published" ] || [ -L "$rollback_published" ] || \
                    ! mv "$rollback_destination" "$rollback_published"; then
                     rollback_failed=true
-                elif [ "$rollback_published" -ef "$rollback_replacement" ]; then
+                elif [ -f "$rollback_reference" ] && \
+                     [ ! -L "$rollback_reference" ] && \
+                     [ "$rollback_published" -ef "$rollback_reference" ]; then
                     : # Owned publication is now safely quarantined for discard.
                 else
                     # The destination changed before rollback could claim it.
@@ -1255,6 +1431,10 @@ publish_selected_analysis_transaction() (
             fi
         done
         for rollback_name in "${names[@]}"; do
+            case "$quarantined_names" in
+                *" $rollback_name "*) ;;
+                *) continue ;;
+            esac
             rollback_destination="$report_dir/$rollback_name"
             rollback_quarantine="$quarantine_dir/$rollback_name"
             [ -f "$rollback_quarantine" ] || continue
@@ -1275,6 +1455,13 @@ publish_selected_analysis_transaction() (
     }
 
     for name in "${names[@]}"; do
+        current_replacement_identity="$(selected_analysis_replacement_identity \
+            "$replacement_dir" 2>/dev/null || echo "")"
+        if [ "$current_replacement_identity" != \
+             "$expected_replacement_identity" ]; then
+            transaction_failed=true
+            break
+        fi
         destination="$report_dir/$name"
         expected="$expected_dir/$name"
         quarantine="$quarantine_dir/$name"
@@ -1284,6 +1471,7 @@ publish_selected_analysis_transaction() (
                 transaction_failed=true
                 break
             fi
+            quarantined_names+="$name "
             expected_digest="$(sha256_file "$expected" 2>/dev/null || echo "")"
             quarantine_digest="$(sha256_file "$quarantine" 2>/dev/null || echo "")"
             expected_mode="$(workspace_file_mode "$expected" 2>/dev/null || echo "")"
@@ -1318,11 +1506,18 @@ publish_selected_analysis_transaction() (
         destination="$report_dir/$name"
         replacement="$replacement_dir/$name"
         if [ -f "$replacement" ]; then
+            published_reference="$quarantine_dir/.replacement-$name"
+            if [ -e "$published_reference" ] || [ -L "$published_reference" ] || \
+               ! ln "$replacement" "$published_reference"; then
+                transaction_failed=true
+                break
+            fi
             if [ -e "$destination" ] || [ -L "$destination" ] || \
                ! ln "$replacement" "$destination"; then
                 transaction_failed=true
                 break
             fi
+            published_names+="$name "
         elif [ -e "$destination" ] || [ -L "$destination" ]; then
             transaction_failed=true
             break
@@ -1332,6 +1527,12 @@ publish_selected_analysis_transaction() (
             break
         fi
     done
+    if [ "$transaction_failed" = false ]; then
+        current_replacement_identity="$(selected_analysis_replacement_identity \
+            "$replacement_dir" 2>/dev/null || echo "")"
+        [ "$current_replacement_identity" = "$expected_replacement_identity" ] || \
+            transaction_failed=true
+    fi
     if [ "$transaction_failed" = false ]; then
         for name in "${names[@]}"; do
             destination="$report_dir/$name"
@@ -1378,6 +1579,7 @@ invalidate_selected_analysis() (
     local selected_lock_dir="" selected_lock_token="" selected_lock_owned=false
     local selected_writer_signal=""
     local publication_rc=0
+    local replacement_identity=""
     local artifact backup_file backup_digest source_digest source_mode
     local -a invalidation_artifacts=(
         "$report_dir/analysis.json"
@@ -1504,8 +1706,12 @@ invalidate_selected_analysis() (
             TERM) return 143 ;;
         esac
     fi
+    replacement_identity="$(selected_analysis_replacement_identity \
+        "$replacement_dir" 2>/dev/null || echo "")"
+    [ -n "$replacement_identity" ] || return 1
     publish_selected_analysis_transaction \
-        "$report_dir" "$invalidation_backup_dir" "$replacement_dir" || \
+        "$report_dir" "$invalidation_backup_dir" "$replacement_dir" \
+        "$replacement_identity" || \
         publication_rc=$?
     if [ "$publication_rc" -ne 0 ]; then
         echo "Error: Selected-analysis invalidation could not be published safely." >&2
@@ -1666,6 +1872,7 @@ sanitize_for_terminal() {
 validate_code_access_grant() {
     local context_file="$1"
     local report_dir="$2"
+    local ignored_transaction_dir="${3:-}"
     local expected_fingerprint current_fingerprint
     if [ "${GH_PR_ENRICH_CODE_ACCESS:-}" = "false" ]; then
         echo "Error: Repository code access was revoked by --no-code-access." >&2
@@ -1680,7 +1887,7 @@ validate_code_access_grant() {
         '.coverage.code_access.workspace_fingerprint // ""' \
         "$context_file" 2>/dev/null || echo "")"
     current_fingerprint="$(code_access_workspace_fingerprint \
-        "$report_dir" 2>/dev/null || echo "")"
+        "$report_dir" "$ignored_transaction_dir" 2>/dev/null || echo "")"
     if [ -z "$expected_fingerprint" ] || \
        [ "$current_fingerprint" != "$expected_fingerprint" ]; then
         echo "Error: Current local code access no longer matches the fingerprinted context." >&2
@@ -1895,14 +2102,62 @@ validate_analysis_thread_ids() {
     jq -e --slurpfile analysis "$analysis_file" '
         [(.unresolved_threads // [])[] | .thread_id
             | select(type == "string" and test("^PRRT_[A-Za-z0-9_-]+$"))] as $allowed
+        | [(.issue_comments // [])[]?.url,
+           (.review_comments // [])[]?.url,
+           (.inline_comments // [])[]?.url
+           | select(type == "string" and length > 0)] as $comment_urls
         | ($analysis[0]) as $a
         | def known_thread:
             type == "string" and test("^PRRT_[A-Za-z0-9_-]+$") and
             (. as $id | $allowed | index($id) != null);
+          def known_comment_reference:
+            type == "string" and length > 0 and
+            ((known_thread) or
+             (. as $url | $comment_urls | index($url) != null));
           all($a.task_list[]?.thread_ids[]?; known_thread) and
           all($a.issue_categories[]?.thread_ids[]?; known_thread) and
-          all($a.disputed_comments[]?.thread_id; known_thread)
+          all($a.disputed_comments[]?.thread_id; known_comment_reference)
     ' "$context_file" > /dev/null 2>&1
+}
+
+# Tasks are actionable only when every one maps to an exact confirmed finding
+# in the same immutable result. Mutation-bearing thread IDs must be inherited
+# from those findings rather than introduced independently by a task.
+validate_analysis_task_links() {
+    local analysis_file="$1"
+    [ -f "$analysis_file" ] || return 1
+    jq -e '
+        if ((.issue_categories | type) != "array" or
+            (.task_list | type) != "array") then false
+        else
+          . as $analysis
+          | ([.issue_categories[].finding_id]) as $finding_ids
+          | (all(.issue_categories[];
+                (.finding_id | type == "string" and length > 0) and
+                (.verdict | IN("confirmed", "plausible", "refuted")) and
+                (.thread_ids | type == "array") and
+                all(.thread_ids[]; type == "string"))) and
+             (($finding_ids | unique | length) == ($finding_ids | length)) and
+             all(.task_list[]; . as $task |
+                if ((.finding_ids | type) != "array" or
+                    (.thread_ids | type) != "array") then false
+                else
+                  [$analysis.issue_categories[] |
+                    select(.finding_id as $finding_id |
+                      $task.finding_ids | index($finding_id) != null)] as $mapped
+                  | ([$mapped[] | .thread_ids[]] | unique) as $confirmed_threads
+                  | (.finding_ids | length > 0) and
+                    ((.finding_ids | unique | length) == (.finding_ids | length)) and
+                    all(.finding_ids[]; type == "string" and length > 0) and
+                    all(.thread_ids[]; type == "string") and
+                    (($mapped | map(.finding_id) | unique) ==
+                      (.finding_ids | unique)) and
+                    all($mapped[]; .verdict == "confirmed") and
+                    all(.thread_ids[]; . as $thread_id |
+                      $confirmed_threads | index($thread_id) != null)
+                end)
+        end
+    ' "$analysis_file" > /dev/null 2>&1
 }
 
 validate_selected_provenance() {
@@ -1948,19 +2203,22 @@ validate_selected_provenance() {
          [ "$analysis_workspace_fingerprint" != "$expected_workspace_fingerprint" ]; }; then
         return 1
     fi
-    validate_analysis_thread_ids "$context_file" "$analysis_file"
+    validate_analysis_thread_ids "$context_file" "$analysis_file" &&
+        validate_analysis_task_links "$analysis_file"
 }
 
 validate_selected_workspace() {
     local report_dir="$1"
     local analysis_file="$2"
     local context_file="${3:-$report_dir/analysis-context.json}"
+    local ignored_transaction_dir="${4:-}"
     validate_selected_provenance "$report_dir" "$analysis_file" "$context_file" || return 1
     if [ "$(jq -r '.coverage.code_access.state // "disabled"' \
             "$context_file" 2>/dev/null || echo disabled)" = "enabled" ] || \
        jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
             "$analysis_file" > /dev/null 2>&1; then
-        validate_code_access_grant "$context_file" "$report_dir"
+        validate_code_access_grant "$context_file" "$report_dir" \
+            "$ignored_transaction_dir"
     fi
 }
 
@@ -2374,6 +2632,55 @@ if [ "$1" = "cleanup-analysis-snapshot" ]; then
     exit $?
 fi
 
+run_standalone_analysis_selection() {
+    local report_dir="$1" source_file="$2"
+    local selection_pid="" selection_rc=0 selection_signal=""
+    local selection_group_owned=false attempt
+
+    forward_selection_signal() {
+        [ -n "$selection_signal" ] || selection_signal="$1"
+        [ -n "$selection_pid" ] || return 0
+        if [ "$selection_group_owned" = true ]; then
+            kill -"$1" -- "-$selection_pid" 2>/dev/null || true
+        else
+            kill -"$1" "$selection_pid" 2>/dev/null || true
+        fi
+    }
+
+    trap 'forward_selection_signal INT' INT
+    trap 'forward_selection_signal TERM' TERM
+    set -m
+    "$0" --test-call select_analysis_artifact "$report_dir" "$source_file" &
+    selection_pid=$!
+    if kill -0 -- "-$selection_pid" 2>/dev/null; then
+        selection_group_owned=true
+    fi
+    set +m
+    if [ -n "$selection_signal" ]; then
+        forward_selection_signal "$selection_signal"
+    fi
+    wait "$selection_pid" || selection_rc=$?
+
+    # The dispatcher is the process-group leader, but the selection worker is
+    # the lock owner. Wait for that worker to finish its signal-aware cleanup
+    # before the public command returns the conventional signal status.
+    if [ -n "$selection_signal" ] && [ "$selection_group_owned" = true ]; then
+        for attempt in $(seq 1 200); do
+            kill -0 -- "-$selection_pid" 2>/dev/null || break
+            sleep 0.05
+        done
+        if kill -0 -- "-$selection_pid" 2>/dev/null; then
+            kill -KILL -- "-$selection_pid" 2>/dev/null || true
+        fi
+    fi
+    trap - INT TERM
+    case "$selection_signal" in
+        INT) return 130 ;;
+        TERM) return 143 ;;
+    esac
+    return "$selection_rc"
+}
+
 if [ "$1" = "select-analysis" ]; then
     shift
     if [ "${1:-}" = "--help" ] || [ $# -ne 2 ]; then
@@ -2382,7 +2689,8 @@ if [ "$1" = "select-analysis" ]; then
         [ "${1:-}" = "--help" ] && exit 0
         exit 1
     fi
-    exec "$0" --test-call select_analysis_artifact "$1" "$2"
+    run_standalone_analysis_selection "$1" "$2"
+    exit $?
 fi
 
 # Handle install-skill subcommand
@@ -4178,8 +4486,13 @@ if [ "$1" = "address" ]; then
                             # already succeeded against the captured context.
                             if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
                                     "$ADDRESS_CONTEXT_HEAD" "$ADDRESS_CONTEXT_REPOSITORY"; then
-                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
-                                echo "  ❌ Hosted PR head changed since analysis (expected $ADDRESS_CONTEXT_HEAD, found ${CURRENT_HOSTED_HEAD:-unknown}). Re-run before resolving threads."
+                                invalidate_on_confirmed_hosted_head_mismatch \
+                                    "$ANALYSIS_DIR" || true
+                                if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
+                                    echo "  ❌ Hosted PR head changed since analysis (expected $ADDRESS_CONTEXT_HEAD, found $CURRENT_HOSTED_HEAD). Re-run before resolving threads."
+                                else
+                                    echo "  ❌ Hosted PR head could not be revalidated; no thread mutation was sent and the selected analysis was preserved."
+                                fi
                                 exit 1
                             fi
                             RESULT=""
@@ -4252,10 +4565,12 @@ if [ "$1" = "address" ]; then
                             rm -f "$POST_LIVE_FILE"
 
                             POST_HEAD_VALID=true
+                            POST_HEAD_STATUS="unchanged"
                             if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
                                     "$ADDRESS_CONTEXT_HEAD" \
                                     "$ADDRESS_CONTEXT_REPOSITORY"; then
                                 POST_HEAD_VALID=false
+                                POST_HEAD_STATUS="$HOSTED_HEAD_VERIFICATION_STATUS"
                             fi
 
                             if [ "$POST_THREAD_IDENTITY_VALID" != true ]; then
@@ -4272,10 +4587,18 @@ if [ "$1" = "address" ]; then
                                [ "$POST_HEAD_VALID" != true ]; then
                                 if unresolve_review_thread_and_verify \
                                         "$ADDRESS_CONTEXT_FILE" "$TID"; then
-                                    invalidate_selected_analysis "$ANALYSIS_DIR" || true
-                                    echo "  ❌ State changed during resolution; reopened $TID and invalidated the analysis."
+                                    if [ "$POST_LOCAL_VALID" != true ] || \
+                                       [ "$POST_HEAD_STATUS" = "mismatch" ]; then
+                                        invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                        echo "  ❌ State changed during resolution; reopened $TID and invalidated the analysis."
+                                    else
+                                        echo "  ❌ Hosted PR head could not be revalidated after resolution; reopened $TID and preserved the selected analysis."
+                                    fi
                                 else
-                                    invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                    if [ "$POST_LOCAL_VALID" != true ] || \
+                                       [ "$POST_HEAD_STATUS" = "mismatch" ]; then
+                                        invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                    fi
                                     echo "  ❌ State changed during resolution and $TID could not be verified reopened. Manual intervention is required."
                                 fi
                                 exit 1
@@ -4434,6 +4757,7 @@ ENVIRONMENT VARIABLES:
   GH_PR_ENRICH_TRUNCATE_CHARS  Per-text-input truncation limit (1-100000; default: 5000)
   GH_PR_ENRICH_SEMGREP_CONFIG  semgrep --config value for --sast (default: auto)
   GH_PR_ENRICH_SEMGREP_TIMEOUT Seconds allowed for the semgrep pre-pass (1-86400; default: 180)
+  GH_PR_ENRICH_GITHUB_TIMEOUT  Seconds allowed for a managed GitHub request (1-3600; default: 60)
   CLAUDE_TIMEOUT               Seconds allowed for the analysis (default: 600)
 
 DEPENDENCIES:
@@ -5462,6 +5786,7 @@ ANALYSIS_SCHEMA='{
       "items": {
         "type": "object",
         "properties": {
+          "finding_id": { "type": "string", "minLength": 1 },
           "name": { "type": "string" },
           "category": { "enum": '"$ANALYSIS_CATEGORIES"' },
           "severity": { "enum": ["critical", "high", "medium", "low"] },
@@ -5487,7 +5812,7 @@ ANALYSIS_SCHEMA='{
           "thread_ids": { "type": "array", "items": { "type": "string" } },
           "sources": { "type": "array", "items": { "type": "string" } }
         },
-        "required": ["name", "category", "severity", "impact", "likelihood", "severity_rationale", "verdict", "confidence", "description", "evidence", "thread_ids"]
+        "required": ["finding_id", "name", "category", "severity", "impact", "likelihood", "severity_rationale", "verdict", "confidence", "description", "evidence", "thread_ids"]
       }
     },
     "category_coverage": {
@@ -5507,7 +5832,7 @@ ANALYSIS_SCHEMA='{
       "items": {
         "type": "object",
         "properties": {
-          "thread_id": { "type": "string" },
+          "thread_id": { "type": "string", "minLength": 1, "description": "Exact captured PRRT thread ID or non-thread comment URL" },
           "claim": { "type": "string" },
           "why_incorrect": { "type": "string" },
           "confidence": { "enum": ["high", "medium", "low"] }
@@ -5547,13 +5872,19 @@ ANALYSIS_SCHEMA='{
         "properties": {
           "priority": { "enum": ["critical", "high", "medium", "low"] },
           "task": { "type": "string" },
+          "finding_ids": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1 }
+          },
           "thread_ids": { "type": "array", "items": { "type": "string" } },
           "file": { "type": "string" },
           "line": { "type": "integer" },
           "suggested_fix": { "type": "string" },
           "verification": { "type": "string" }
         },
-        "required": ["priority", "task", "thread_ids", "file", "line", "suggested_fix", "verification"]
+        "required": ["priority", "task", "finding_ids", "thread_ids", "file", "line", "suggested_fix", "verification"]
       }
     },
     "process_improvements": {
@@ -6407,7 +6738,11 @@ _select_analysis_artifact() (
     local selected_lock_dir="" selected_lock_token="" selected_lock_owned=false
     local selected_writer_signal=""
     local publication_rc=0
+    local replacement_identity="" current_replacement_identity=""
     cleanup_selection_transaction() {
+        terminate_report_run_child
+        REPORT_RUN_MANAGED=false
+        REPORT_RUN_OWNER_PID=""
         [ -z "$selection_backup_dir" ] || \
             rm -rf "$selection_backup_dir" 2>/dev/null || true
         [ -z "$replacement_dir" ] || \
@@ -6419,9 +6754,20 @@ _select_analysis_artifact() (
             fi
         fi
     }
+    handle_selection_signal() {
+        selected_writer_signal="$1"
+        terminate_report_run_child
+    }
     trap cleanup_selection_transaction EXIT
-    trap 'selected_writer_signal=INT' INT
-    trap 'selected_writer_signal=TERM' TERM
+    trap 'handle_selection_signal INT' INT
+    trap 'handle_selection_signal TERM' TERM
+
+    # Bound both hosted-head checks, including the initial pre-lock request.
+    # Child ownership belongs to this selection worker; lock ownership is a
+    # separate concern acquired only immediately before publication staging.
+    selected_analysis_worker_pid || return 1
+    REPORT_RUN_OWNER_PID="$SELECTED_ANALYSIS_WORKER_PID"
+    REPORT_RUN_MANAGED=true
 
     if path_has_symlink_component "$report_dir"; then
         echo "Error: Analysis report path contains a symbolic-link component: $report_dir" >&2
@@ -6510,8 +6856,7 @@ _select_analysis_artifact() (
         (.task_list | type == "array") and
         (all(.task_list[];
             (.priority | IN("critical", "high", "medium", "low")) and
-            (.task | type == "string") and (.thread_ids | type == "array") and
-            (all(.thread_ids[]; type == "string")) and (.file | type == "string") and
+            (.task | type == "string") and (.file | type == "string") and
             (.line | (type == "number" and . == floor)) and (.suggested_fix | type == "string") and
             (.verification | type == "string"))) and
         (.process_improvements | type == "array") and
@@ -6552,6 +6897,10 @@ _select_analysis_artifact() (
                 (.sources | type == "array") and (.sources | length > 0) and
                 (all(.sources[]; type == "string" and (. as $source | $analyzer_ids | index($source) != null))))))
     ' "$source_file" > /dev/null 2>&1; then
+        echo "Error: Selected analysis is missing required findings or provenance: $source_file" >&2
+        return 1
+    fi
+    if ! validate_analysis_task_links "$source_file"; then
         echo "Error: Selected analysis is missing required findings or provenance: $source_file" >&2
         return 1
     fi
@@ -6625,8 +6974,12 @@ _select_analysis_artifact() (
         return 1
     fi
     if ! verify_pr_head_unchanged "$context_pr_number" "$context_head" "$context_repository"; then
-        invalidate_selected_analysis "$report_dir" || return 1
-        echo "Error: Hosted PR head changed before selection (expected $context_head, found ${CURRENT_HOSTED_HEAD:-unknown}). Rebuild the analysis context." >&2
+        invalidate_on_confirmed_hosted_head_mismatch "$report_dir" || return 1
+        if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
+            echo "Error: Hosted PR head changed before selection (expected $context_head, found $CURRENT_HOSTED_HEAD). Rebuild the analysis context." >&2
+        else
+            echo "Error: Hosted PR head could not be revalidated before selection; prior selected artifacts were preserved." >&2
+        fi
         return 1
     fi
     if ! validate_selected_workspace "$report_dir" "$source_file" "$context_file"; then
@@ -6638,6 +6991,7 @@ _select_analysis_artifact() (
     selected_lock_dir="$SELECTED_ANALYSIS_LOCK_DIR"
     selected_lock_token="$SELECTED_ANALYSIS_LOCK_TOKEN"
     selected_lock_owned="$SELECTED_ANALYSIS_LOCK_OWNED"
+    REPORT_RUN_OWNER_PID="${selected_lock_token%%.*}"
     selection_backup_dir="$(mktemp -d \
         "/tmp/gh-pr-enrich-selection.XXXXXX")" || return 1
     replacement_dir="$(mktemp -d \
@@ -6739,6 +7093,50 @@ _select_analysis_artifact() (
     fi
 
     rm -f "$comprehensive_base"
+    replacement_identity="$(selected_analysis_replacement_identity \
+        "$replacement_dir" 2>/dev/null || echo "")"
+    [ -n "$replacement_identity" ] || return 1
+    if ! validate_selected_workspace "$report_dir" "$source_file" "$context_file" \
+            "$replacement_dir"; then
+        echo "Error: Local workspace changed during selection; no selected artifacts were published. Rebuild the analysis context." >&2
+        return 1
+    fi
+    if ! verify_pr_head_unchanged "$context_pr_number" "$context_head" \
+            "$context_repository"; then
+        case "$selected_writer_signal" in
+            INT) return 130 ;;
+            TERM) return 143 ;;
+        esac
+        invalidate_on_confirmed_hosted_head_mismatch "$report_dir" || return 1
+        if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
+            echo "Error: Hosted PR head changed during selection; no selected artifacts were published (expected $context_head, found $CURRENT_HOSTED_HEAD). Rebuild the analysis context." >&2
+        else
+            echo "Error: Hosted PR head could not be revalidated during selection; prior selected artifacts were preserved." >&2
+        fi
+        return 1
+    fi
+    live_context_fingerprint="$(analysis_context_fingerprint \
+        "$live_context_file" 2>/dev/null || echo "")"
+    live_embedded_fingerprint="$(jq -r '.coverage.context_fingerprint // ""' \
+        "$live_context_file" 2>/dev/null || echo "")"
+    if [ -L "$live_context_file" ] || path_is_git_tracked "$live_context_file" || \
+       [ -z "$captured_context_fingerprint" ] || \
+       [ "$live_context_fingerprint" != "$captured_context_fingerprint" ] || \
+       [ "$live_embedded_fingerprint" != "$captured_context_fingerprint" ]; then
+        echo "Error: Analysis context changed during the final hosted-head check; no selected artifacts were published." >&2
+        return 1
+    fi
+    if ! validate_selected_workspace "$report_dir" "$source_file" "$context_file" \
+            "$replacement_dir"; then
+        echo "Error: Local workspace changed during the final hosted-head check; no selected artifacts were published. Rebuild the analysis context." >&2
+        return 1
+    fi
+    current_replacement_identity="$(selected_analysis_replacement_identity \
+        "$replacement_dir" 2>/dev/null || echo "")"
+    if [ "$current_replacement_identity" != "$replacement_identity" ]; then
+        echo "Error: Staged selected-analysis views changed before publication; prior selected artifacts were preserved." >&2
+        return 1
+    fi
     if [ -n "$selected_writer_signal" ]; then
         echo "Error: Selected-analysis publication was cancelled before commit." >&2
         case "$selected_writer_signal" in
@@ -6747,7 +7145,8 @@ _select_analysis_artifact() (
         esac
     fi
     publish_selected_analysis_transaction \
-        "$report_dir" "$selection_backup_dir" "$replacement_dir" || \
+        "$report_dir" "$selection_backup_dir" "$replacement_dir" \
+        "$replacement_identity" || \
         publication_rc=$?
     if [ "$publication_rc" -ne 0 ]; then
         echo "Error: Selected analysis could not be published safely." >&2
@@ -6851,6 +7250,7 @@ generate_analysis_report() {
     else
         (.issue_categories | map(
             "### " + .name + "\n\n" +
+            "**Finding ID:** `" + (.finding_id // "") + "`\n\n" +
             "**Verdict:** " + verdict_mark(.verdict // "plausible") +
             " · **Confidence:** " + (.confidence // "unknown") +
             " · **Severity:** " + (.severity // "unknown") +
@@ -6870,7 +7270,7 @@ generate_analysis_report() {
         "_No claims were refuted._\n"
     else
         ((.disputed_comments // []) | map(
-            "- **" + (.thread_id // "unknown thread") + "** (confidence: " + (.confidence // "unknown") + ")\n" +
+            "- **" + (.thread_id // "unknown comment") + "** (confidence: " + (.confidence // "unknown") + ")\n" +
             "  - Claim: " + (.claim // "") + "\n" +
             "  - Why it is incorrect: " + (.why_incorrect // "")
         ) | join("\n"))
@@ -6910,6 +7310,7 @@ generate_analysis_report() {
     else
         ((.task_list // []) | map(
             "### [" + (.priority // "?") + "] " + (.task // "") + "\n" +
+            "- **Confirmed findings:** " + ((.finding_ids // []) | join(", ")) + "\n" +
             (if anchor(.) == "" then "" else "- **Location:** `" + anchor(.) + "`\n" end) +
             (if (.suggested_fix // "") != "" then "- **Suggested fix:** " + .suggested_fix + "\n" else "" end) +
             (if (.verification // "") != "" then "- **Verify with:** `" + .verification + "`\n" else "" end) +
@@ -7391,8 +7792,12 @@ if [ -n "$BASE_WRITER_SIGNAL" ]; then
         TERM) exit 143 ;;
     esac
 fi
+BASE_REPLACEMENT_IDENTITY="$(selected_analysis_replacement_identity \
+    "$BASE_REPLACEMENT_DIR" 2>/dev/null || echo "")"
+[ -n "$BASE_REPLACEMENT_IDENTITY" ] || exit 1
 publish_selected_analysis_transaction \
-    "$OUTPUT_DIR" "$BASE_BACKUP_DIR" "$BASE_REPLACEMENT_DIR" || \
+    "$OUTPUT_DIR" "$BASE_BACKUP_DIR" "$BASE_REPLACEMENT_DIR" \
+    "$BASE_REPLACEMENT_IDENTITY" || \
     BASE_PUBLICATION_RC=$?
 if [ "$BASE_PUBLICATION_RC" -ne 0 ]; then
     echo "Error: Base report views could not be published safely." >&2
@@ -7438,7 +7843,7 @@ if [ "$REFRESH_EXISTING_ANALYSIS" = true ] || [ "$PREPARE_ANALYSIS" = true ] || 
     fi
     CAPTURED_PR_HEAD=$(jq -r '.headRefOid // ""' "$OUTPUT_DIR/pr-summary.json")
     if ! verify_pr_head_unchanged "$PR_NUMBER" "$CAPTURED_PR_HEAD"; then
-        invalidate_selected_analysis "$OUTPUT_DIR"
+        invalidate_on_confirmed_hosted_head_mismatch "$OUTPUT_DIR"
         echo "Error: PR head changed or could not be revalidated while analysis inputs were collected." >&2
         [ -z "$CURRENT_HOSTED_HEAD" ] || \
             echo "Expected $CAPTURED_PR_HEAD, now $CURRENT_HOSTED_HEAD. Re-run to collect one coherent snapshot." >&2
@@ -7460,7 +7865,7 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
             CAPTURED_PR_HEAD=$(jq -r '.coverage.code_access.pr_head_sha // ""' \
                 "$OUTPUT_DIR/analysis-context.json")
             if ! verify_pr_head_unchanged "$PR_NUMBER" "$CAPTURED_PR_HEAD"; then
-                invalidate_selected_analysis "$OUTPUT_DIR"
+                invalidate_on_confirmed_hosted_head_mismatch "$OUTPUT_DIR"
                 echo "⚠️  PR head changed or could not be revalidated during Claude analysis; the response was not published." >&2
                 [ -z "$CURRENT_HOSTED_HEAD" ] || \
                     echo "   Expected $CAPTURED_PR_HEAD, now $CURRENT_HOSTED_HEAD. Re-run the analysis." >&2
@@ -7541,9 +7946,13 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                         TERM) exit 143 ;;
                     esac
                 fi
+                PROVIDER_REPLACEMENT_IDENTITY="$(selected_analysis_replacement_identity \
+                    "$PROVIDER_REPLACEMENT_DIR" 2>/dev/null || echo "")"
+                [ -n "$PROVIDER_REPLACEMENT_IDENTITY" ] || exit 1
                 publish_selected_analysis_transaction \
                     "$OUTPUT_DIR" "$PROVIDER_BACKUP_DIR" \
-                    "$PROVIDER_REPLACEMENT_DIR" || PROVIDER_PUBLICATION_RC=$?
+                    "$PROVIDER_REPLACEMENT_DIR" \
+                    "$PROVIDER_REPLACEMENT_IDENTITY" || PROVIDER_PUBLICATION_RC=$?
                 if [ "$PROVIDER_PUBLICATION_RC" -ne 0 ]; then
                     echo "Error: Provider combined update could not be published safely." >&2
                     exit "$PROVIDER_PUBLICATION_RC"

@@ -11,12 +11,15 @@ GH_PR_ENRICH="$PROJECT_DIR/gh-pr-enrich"
 TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output/runtime-compatibility"
 STUB_DIR="$TEST_OUTPUT_DIR/stubs"
 TMP_ALIAS_OUTPUT="/tmp/gh-pr-enrich-runtime-$$"
+TMP_ALIAS_SELECTION="/tmp/gh-pr-enrich-selection-$$"
 RUNTIME_BACKGROUND_PID=""
 COLLECTION_LOCK_RELEASE=""
 COLLECTION_ACQUIRE_RELEASE=""
 COLLECTION_SIGNAL_RM_RELEASE=""
 LINKED_CONCURRENT_RELEASE=""
 CHILD_START_PID_FILE=""
+BLOCKED_HEAD_CHILD_PID_FILE=""
+BLOCKED_HEAD_DESCENDANT_PID_FILE=""
 
 # shellcheck source=lib/assert.sh
 source "$SCRIPT_DIR/lib/assert.sh"
@@ -49,13 +52,69 @@ cleanup() {
             kill -KILL "$cleanup_child_pid" 2>/dev/null || true
         fi
     fi
-    rm -rf "$TEST_OUTPUT_DIR" "$TMP_ALIAS_OUTPUT"
+    for cleanup_pid_file in "$BLOCKED_HEAD_CHILD_PID_FILE" \
+            "$BLOCKED_HEAD_DESCENDANT_PID_FILE" \
+            "${PRELOCK_HEAD_CHILD_PID:-}" \
+            "${PRELOCK_HEAD_DESCENDANT_PID:-}"; do
+        [ -n "$cleanup_pid_file" ] && [ -f "$cleanup_pid_file" ] || continue
+        cleanup_child_pid=$(cat "$cleanup_pid_file" 2>/dev/null || echo "")
+        if [ -n "$cleanup_child_pid" ] && \
+           kill -0 "$cleanup_child_pid" 2>/dev/null; then
+            kill -KILL "$cleanup_child_pid" 2>/dev/null || true
+        fi
+    done
+    rm -rf "$TEST_OUTPUT_DIR" "$TMP_ALIAS_OUTPUT" "$TMP_ALIAS_SELECTION"
 }
 trap cleanup EXIT
 cleanup
 mkdir -p "$STUB_DIR"
 
 suite_start "gh pr-enrich runtime compatibility suite"
+
+assert_no_selection_transaction_residue() {
+    local report_dir="$1"
+    local description="$2"
+    local residue
+    residue=$(find "$report_dir" -maxdepth 1 \
+        \( -name '.selected-analysis.lock' -o \
+           -name '.selected-analysis-replacements.*' -o \
+           -name '.selected-analysis-quarantine.*' -o \
+           -name '.selected-analysis-release.*' -o \
+           -name '.selected-analysis-stale.*' \) -print -quit)
+    assert_true "$([ -z "$residue" ] && echo 0 || echo 1)" "$description" \
+        "residue: ${residue:-none}"
+}
+
+assert_selection_views_match() {
+    local report_dir="$1"
+    local backup_dir="$2"
+    local description="$3"
+    local view matches=true
+    for view in analysis.json analysis.md context-coverage.md \
+            combined-data.json comprehensive-report.md; do
+        if [ -f "$backup_dir/$view" ]; then
+            cmp -s "$report_dir/$view" "$backup_dir/$view" || matches=false
+        elif [ -e "$report_dir/$view" ]; then
+            matches=false
+        fi
+    done
+    assert_true "$([ "$matches" = true ] && echo 0 || echo 1)" "$description"
+}
+
+assert_process_reaped() {
+    local pid="$1" description="$2" reaped=true attempt
+    if [ -n "$pid" ]; then
+        for attempt in $(seq 1 40); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.05
+        done
+    fi
+    if [ -z "$pid" ] || kill -0 "$pid" 2>/dev/null; then
+        reaped=false
+        [ -z "$pid" ] || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    assert_true "$([ "$reaped" = true ] && echo 0 || echo 1)" "$description"
+}
 
 # GNU stat accepts -c while BSD stat accepts -f. Probe GNU first and never
 # mistake a failed probe's diagnostic text for a permission mode.
@@ -221,7 +280,7 @@ case "$1 $2" in
         ;;
     "pr view")
         if [ -n "${MUTATE_ANALYSIS_SOURCE:-}" ] && [ -f "$MUTATE_ANALYSIS_SOURCE" ]; then
-            jq '.task_list[0].task = "mutated after selector freeze"' \
+            jq '.process_improvements[0].suggestion = "mutated after selector freeze"' \
                 "$MUTATE_ANALYSIS_SOURCE" > "$MUTATE_ANALYSIS_SOURCE.tmp"
             mv "$MUTATE_ANALYSIS_SOURCE.tmp" "$MUTATE_ANALYSIS_SOURCE"
         fi
@@ -346,7 +405,8 @@ rc=0
 wait "$RUNTIME_BACKGROUND_PID" || rc=$?
 RUNTIME_BACKGROUND_PID=""
 assert_true "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" \
-    "the lock owner completes after the concurrent run is rejected"
+    "the lock owner completes after the concurrent run is rejected" \
+    "$(tail -20 "$COLLECTION_LOCK_FIRST_OUT" 2>/dev/null || true)"
 assert_true "$([ ! -e "$COLLECTION_LOCK_REPORT/.selected-analysis.lock" ] && echo 0 || echo 1)" \
     "the report lifecycle lock is released after successful completion"
 
@@ -408,7 +468,7 @@ for _ in $(seq 1 200); do
 done
 assert_true "$([ -e "$COLLECTION_ACQUIRE_READY" ] && echo 0 || echo 1)" \
     "the acquisition fixture reaches the owner-publication window"
-kill -TERM "$RUNTIME_BACKGROUND_PID"
+kill -TERM "$RUNTIME_BACKGROUND_PID" 2>/dev/null || true
 : > "$COLLECTION_ACQUIRE_RELEASE"
 rc=0
 wait "$RUNTIME_BACKGROUND_PID" || rc=$?
@@ -1062,9 +1122,10 @@ assert_contains "$PROVENANCE_RACE_OUT" "context fingerprint" \
     "the post-verification context race fails at immutable identity validation"
 
 HYBRID_SOURCE="$AUTHORIZED_DIR/hybrid-analysis.json"
-jq '.task_list = [{
-        priority: "high", task: "Hybrid-selected task", thread_ids: [],
-        file: "a.js", line: 1, suggested_fix: "fix it", verification: "test it"
+jq '.task_list = []
+    | .process_improvements = [{
+        category: "testing", suggestion: "Hybrid-selected improvement",
+        rationale: "fixture"
     }]
     | ._metadata.provider = "hybrid"
     | ._metadata.analyzers = [
@@ -1097,10 +1158,10 @@ assert_eq "1" "$(grep -c '^<!-- BEGIN SELECTED ANALYSIS -->$' \
 assert_eq "1" "$(grep -c '^<!-- END SELECTED ANALYSIS -->$' \
     "$AUTHORIZED_DIR/comprehensive-report.md")" \
     "selection publishes exactly one complete selected-analysis end marker"
-assert_contains "$(cat "$AUTHORIZED_DIR/analysis.md")" "Hybrid-selected task" \
+assert_contains "$(cat "$AUTHORIZED_DIR/analysis.md")" "No tasks generated" \
     "select-analysis regenerates the selected Markdown report"
 assert_jq "$AUTHORIZED_DIR/combined-data.json" \
-    '.analysis._metadata.provider == "hybrid" and .analysis.task_list[0].task == "Hybrid-selected task"' \
+    '.analysis._metadata.provider == "hybrid" and (.analysis.task_list | length) == 0' \
     "select-analysis refreshes the combined-data selected view"
 
 # Selection also treats writer-lock release as part of success. The first
@@ -1160,6 +1221,7 @@ jq '
       {impact:"minor", likelihood:"possible", severity:"low"},
       {impact:"minor", likelihood:"unlikely", severity:"low"}
     ] | to_entries | map(.value + {
+      finding_id:("matrix-" + (.key | tostring)),
       name:("Matrix tuple " + (.key | tostring)), category:"logic_error",
       severity_rationale:"matrix fixture", verdict:"plausible", confidence:"medium",
       description:"matrix fixture", evidence:[{file:"a.js",line:1,detail:"fixture"}],
@@ -1185,14 +1247,14 @@ assert_contains "$INVALID_SEVERITY_OUT" "missing required findings or provenance
 "$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$HYBRID_SOURCE" >/dev/null
 
 FROZEN_SOURCE="$AUTHORIZED_DIR/freeze-race-analysis.json"
-jq '.task_list[0].task = "frozen before hosted verification"' \
+jq '.process_improvements[0].suggestion = "frozen before hosted verification"' \
     "$HYBRID_SOURCE" > "$FROZEN_SOURCE"
 TMPDIR="$AUTHORIZED_DIR" MUTATE_ANALYSIS_SOURCE="$FROZEN_SOURCE" \
     "$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$FROZEN_SOURCE" >/dev/null
 assert_jq "$AUTHORIZED_DIR/analysis.json" \
-    '.task_list[0].task == "frozen before hosted verification"' \
+    '.process_improvements[0].suggestion == "frozen before hosted verification"' \
     "selection publishes the private frozen source when the original changes mid-validation"
-assert_jq "$FROZEN_SOURCE" '.task_list[0].task == "mutated after selector freeze"' \
+assert_jq "$FROZEN_SOURCE" '.process_improvements[0].suggestion == "mutated after selector freeze"' \
     "the GitHub revalidation stub deterministically mutates the original source"
 
 CONTEXT_RACE_ORIGINAL="$TEST_OUTPUT_DIR/context-race-original.json"
@@ -1208,7 +1270,7 @@ CONTEXT_RACE_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerpr
 jq --arg fingerprint "$CONTEXT_RACE_FINGERPRINT" \
     '.coverage.context_fingerprint = $fingerprint' \
     "$CONTEXT_RACE_TMP" > "$CONTEXT_RACE_REPLACEMENT"
-jq '.task_list[0].task = "must not publish refreshed-context race"' \
+jq '.process_improvements[0].suggestion = "must not publish refreshed-context race"' \
     "$HYBRID_SOURCE" > "$CONTEXT_RACE_SOURCE"
 rc=0
 CONTEXT_SELECTION_RACE_OUT=$(MUTATE_ANALYSIS_CONTEXT="$AUTHORIZED_DIR/analysis-context.json" \
@@ -1219,31 +1281,105 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
 assert_contains "$CONTEXT_SELECTION_RACE_OUT" "context changed during selection" \
     "the selector reports the live-context publication race"
 assert_jq "$AUTHORIZED_DIR/analysis.json" \
-    '.task_list[0].task == "frozen before hosted verification"' \
+    '.process_improvements[0].suggestion == "frozen before hosted verification"' \
     "a context refresh race preserves the previously selected analysis"
 cp "$CONTEXT_RACE_ORIGINAL" "$AUTHORIZED_DIR/analysis-context.json"
 
-UNKNOWN_THREAD_SOURCE="$AUTHORIZED_DIR/unknown-thread-analysis.json"
-jq '.task_list[0].thread_ids = ["PRRT_from_another_pr"]' \
-    "$HYBRID_SOURCE" > "$UNKNOWN_THREAD_SOURCE"
+# Disputes are informational, so their reference may be either a captured
+# PRRT ID or the exact URL of a non-thread comment. Mutation-bearing finding
+# and task thread IDs remain PRRT-only.
+DISPUTE_CONTEXT_ORIGINAL="$TEST_OUTPUT_DIR/dispute-context-original.json"
+DISPUTE_CONTEXT_TMP="$TEST_OUTPUT_DIR/dispute-context.tmp.json"
+DISPUTE_SOURCE="$AUTHORIZED_DIR/disputed-comments-analysis.json"
+UNKNOWN_DISPUTE_SOURCE="$AUTHORIZED_DIR/unknown-dispute-analysis.json"
+FINDING_URL_SOURCE="$AUTHORIZED_DIR/finding-url-analysis.json"
+TASK_URL_SOURCE="$AUTHORIZED_DIR/task-url-analysis.json"
+cp "$AUTHORIZED_DIR/analysis-context.json" "$DISPUTE_CONTEXT_ORIGINAL"
+jq 'del(.coverage.context_fingerprint)
+    | .issue_comments += [{user:"u",body:"issue claim",
+        url:"https://github.com/o/r/pull/1#issuecomment-10",created_at:"t"}]
+    | .review_comments += [{user:"u",body:"review claim",state:"COMMENTED",
+        url:"https://github.com/o/r/pull/1#pullrequestreview-20",submitted_at:"t"}]
+    | .inline_comments += [{user:"u",body:"inline claim",path:"a.js",line:1,
+        url:"https://github.com/o/r/pull/1#discussion_r30",created_at:"t"}]' \
+    "$DISPUTE_CONTEXT_ORIGINAL" > "$DISPUTE_CONTEXT_TMP"
+DISPUTE_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+    "$DISPUTE_CONTEXT_TMP")
+jq --arg fingerprint "$DISPUTE_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$DISPUTE_CONTEXT_TMP" > "$AUTHORIZED_DIR/analysis-context.json"
+jq --arg fingerprint "$DISPUTE_FINGERPRINT" '
+    ._metadata.context_fingerprint = $fingerprint
+    | .disputed_comments = [
+        {thread_id:"PRRT_open",claim:"thread",why_incorrect:"fixture",confidence:"high"},
+        {thread_id:"https://github.com/o/r/pull/1#issuecomment-10",claim:"issue",why_incorrect:"fixture",confidence:"high"},
+        {thread_id:"https://github.com/o/r/pull/1#pullrequestreview-20",claim:"review",why_incorrect:"fixture",confidence:"high"},
+        {thread_id:"https://github.com/o/r/pull/1#discussion_r30",claim:"inline",why_incorrect:"fixture",confidence:"high"}
+    ]' "$HYBRID_SOURCE" > "$DISPUTE_SOURCE"
+"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$DISPUTE_SOURCE" >/dev/null
+assert_jq "$AUTHORIZED_DIR/analysis.json" \
+    '(.disputed_comments | length) == 4' \
+    "selection accepts captured PRRT and non-thread comment references"
+jq '.disputed_comments[1].thread_id = "https://github.com/o/r/pull/1#issuecomment-invented"' \
+    "$DISPUTE_SOURCE" > "$UNKNOWN_DISPUTE_SOURCE"
+DISPUTE_SELECTED_BEFORE=$(jq -c . "$AUTHORIZED_DIR/analysis.json")
 rc=0
-UNKNOWN_THREAD_OUT=$("$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
-    "$UNKNOWN_THREAD_SOURCE" 2>&1) || rc=$?
+UNKNOWN_DISPUTE_OUT=$("$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+    "$UNKNOWN_DISPUTE_SOURCE" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
-    "selection rejects task thread IDs absent from the PR context"
-assert_contains "$UNKNOWN_THREAD_OUT" "fingerprinted context" \
-    "the unknown-thread rejection is attributed to selected-analysis provenance"
+    "selection rejects dispute URLs absent from the fingerprinted context"
+assert_contains "$UNKNOWN_DISPUTE_OUT" "fingerprinted context" \
+    "unknown dispute references fail provenance validation"
+assert_eq "$DISPUTE_SELECTED_BEFORE" "$(jq -c . "$AUTHORIZED_DIR/analysis.json")" \
+    "an unknown dispute reference preserves the selected analysis"
+jq '.issue_categories = [{
+        finding_id:"captured-url-finding",name:"Captured URL finding",
+        category:"logic_error",severity:"high",impact:"moderate",likelihood:"likely",
+        severity_rationale:"fixture",verdict:"plausible",confidence:"high",
+        description:"fixture",evidence:[{file:"a.js",line:1,detail:"fixture"}],
+        thread_ids:["https://github.com/o/r/pull/1#issuecomment-10"],
+        sources:["codex:orchestrator"]
+    }]
+    | .category_coverage |= map(if .category == "logic_error"
+        then .verdict = "findings_reported" else . end)' \
+    "$DISPUTE_SOURCE" > "$FINDING_URL_SOURCE"
+rc=0
+"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+    "$FINDING_URL_SOURCE" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "captured comment URLs remain invalid as finding thread IDs"
+jq '.issue_categories[0].verdict = "confirmed"
+    | .task_list = [{priority:"high",task:"URL-bearing task",
+        finding_ids:["captured-url-finding"],
+        thread_ids:["https://github.com/o/r/pull/1#issuecomment-10"],
+        file:"a.js",line:1,suggested_fix:"fix",verification:"test"}]' \
+    "$FINDING_URL_SOURCE" > "$TASK_URL_SOURCE"
+rc=0
+"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+    "$TASK_URL_SOURCE" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "captured comment URLs remain invalid as task thread IDs"
+assert_eq "$DISPUTE_SELECTED_BEFORE" "$(jq -c . "$AUTHORIZED_DIR/analysis.json")" \
+    "mutation-bearing captured URLs preserve the selected analysis"
+cp "$DISPUTE_CONTEXT_ORIGINAL" "$AUTHORIZED_DIR/analysis-context.json"
+"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$HYBRID_SOURCE" >/dev/null
 
 assert_jq "$AUTHORIZED_DIR/analysis-context.json" \
     '.coverage.code_access.state == "disabled"' \
     "the selection fixture records disabled repository code access"
 NO_CODE_CONFIRMED_SOURCE="$AUTHORIZED_DIR/no-code-confirmed.json"
 jq '.issue_categories = [{
-        name: "Unverified finding", category: "logic_error", severity: "high",
+        finding_id: "unverified-finding", name: "Unverified finding",
+        category: "logic_error", severity: "high",
         impact: "moderate", likelihood: "likely", severity_rationale: "fixture",
         verdict: "confirmed", confidence: "high", description: "fixture",
-        evidence: [{file:"a.js",line:1,detail:"fixture"}], thread_ids: [],
+        evidence: [{file:"a.js",line:1,detail:"fixture"}], thread_ids: ["PRRT_open"],
         sources: ["codex:orchestrator"]
+    }]
+    | .task_list = [{
+        priority: "high", task: "Fix the verified defect",
+        finding_ids: ["unverified-finding"], thread_ids: ["PRRT_open"],
+        file: "a.js", line: 1, suggested_fix: "fix it", verification: "test it"
     }]
     | .category_coverage |= map(if .category == "logic_error"
         then .verdict = "findings_reported" else . end)' \
@@ -1281,6 +1417,8 @@ jq --arg inspected_sha "$SELECTION_HEAD" --arg workspace_fingerprint "$SELECTION
     | .coverage.code_access.inspected_sha = $inspected_sha
     | .coverage.code_access.revision_matches = false
     | .coverage.code_access.workspace_fingerprint = $workspace_fingerprint
+    | .unresolved_threads += [{thread_id:"PRRT_other",comments_complete:true,
+        comment_identity:[]}]
 ' "$SELECTION_CONTEXT_BASE" > "$SELECTION_CONTEXT_TMP"
 SELECTION_CONTEXT_FINGERPRINT=$(
     "$GH_PR_ENRICH" --test-call analysis_context_fingerprint "$SELECTION_CONTEXT_TMP"
@@ -1312,6 +1450,791 @@ assert_jq "$SELECTION_REPORT/analysis.json" \
 assert_jq_eq "$SELECTION_REPORT/analysis.json" \
     '._metadata.workspace_fingerprint' "$SELECTION_WORKSPACE_FINGERPRINT" \
     "confirmed native analysis binds the materialized workspace fingerprint"
+assert_jq "$SELECTION_REPORT/analysis.json" \
+    '.task_list[0].finding_ids == ["unverified-finding"]' \
+    "a task mapped to a confirmed finding is selectable"
+
+FRACTIONAL_LINE_SOURCE="$SELECTION_REPORT/fractional-lines.json"
+jq '.task_list[0].line = 1.5' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$FRACTIONAL_LINE_SOURCE"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$FRACTIONAL_LINE_SOURCE" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selector line validation matches the schema integer contract"
+rm -f "$FRACTIONAL_LINE_SOURCE"
+
+for RELATIVE_REPORT in report ./report report/../report report/; do
+    (cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis \
+        "$RELATIVE_REPORT" "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null)
+    assert_true "0" \
+        "stable selection accepts report path spelling '$RELATIVE_REPORT'"
+done
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "normalized relative selections leave no transaction residue"
+
+# macOS exposes /tmp through the /private/tmp root alias. The held writer lock
+# must be compared by its physical path so the selector can exclude only its
+# own private replacement directory during final workspace revalidation.
+mkdir -p "$TMP_ALIAS_SELECTION/report"
+(cd "$TMP_ALIAS_SELECTION" && git init -q . && git config user.email t@t && \
+    git config user.name t && echo stable > tracked.txt && git add tracked.txt && \
+    git -c commit.gpgsign=false commit -qm init)
+TMP_ALIAS_HEAD=$(git -C "$TMP_ALIAS_SELECTION" rev-parse HEAD)
+cp "$AUTHORIZED_DIR/pr-summary.json" "$TMP_ALIAS_SELECTION/report/pr-summary.json"
+TMP_ALIAS_WORKSPACE_FINGERPRINT=$(cd "$TMP_ALIAS_SELECTION" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint \
+        "$TMP_ALIAS_SELECTION/report")
+jq --arg inspected_sha "$TMP_ALIAS_HEAD" \
+    --arg workspace_fingerprint "$TMP_ALIAS_WORKSPACE_FINGERPRINT" '
+    del(.coverage.context_fingerprint)
+    | .coverage.code_access.state = "enabled"
+    | .coverage.code_access.reason = "root-alias fixture"
+    | .coverage.code_access.inspected_sha = $inspected_sha
+    | .coverage.code_access.revision_matches = false
+    | .coverage.code_access.workspace_fingerprint = $workspace_fingerprint
+' "$SELECTION_CONTEXT_BASE" > "$TMP_ALIAS_SELECTION/report/context.tmp.json"
+TMP_ALIAS_CONTEXT_FINGERPRINT=$(
+    "$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+        "$TMP_ALIAS_SELECTION/report/context.tmp.json"
+)
+jq --arg fingerprint "$TMP_ALIAS_CONTEXT_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$TMP_ALIAS_SELECTION/report/context.tmp.json" \
+    > "$TMP_ALIAS_SELECTION/report/analysis-context.json"
+rm -f "$TMP_ALIAS_SELECTION/report/context.tmp.json"
+jq --arg fingerprint "$TMP_ALIAS_CONTEXT_FINGERPRINT" \
+    --arg workspace_fingerprint "$TMP_ALIAS_WORKSPACE_FINGERPRINT" '
+    ._metadata.context_fingerprint = $fingerprint
+    | ._metadata.workspace_fingerprint = $workspace_fingerprint
+' "$SELECTION_SOURCE_BASE" > "$TMP_ALIAS_SELECTION/report/hybrid-analysis.json"
+(cd "$TMP_ALIAS_SELECTION" && "$GH_PR_ENRICH" select-analysis \
+    "$TMP_ALIAS_SELECTION/report" \
+    "$TMP_ALIAS_SELECTION/report/hybrid-analysis.json" >/dev/null)
+assert_true "$([ -f "$TMP_ALIAS_SELECTION/report/analysis.json" ] && echo 0 || echo 1)" \
+    "stable selection accepts a platform root-alias report path"
+assert_no_selection_transaction_residue "$TMP_ALIAS_SELECTION/report" \
+    "root-alias selection leaves no transaction residue"
+
+MISSING_TASK_LINK="$SELECTION_REPORT/missing-task-link.json"
+jq 'del(.task_list[0].finding_ids)' "$SELECTION_REPORT/hybrid-analysis.json" \
+    > "$MISSING_TASK_LINK"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$MISSING_TASK_LINK" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects remediation tasks without finding linkage"
+
+UNKNOWN_TASK_LINK="$SELECTION_REPORT/unknown-task-link.json"
+jq '.task_list[0].finding_ids = ["invented-finding"]' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$UNKNOWN_TASK_LINK"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$UNKNOWN_TASK_LINK" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects remediation tasks mapped to unknown findings"
+
+DUPLICATE_FINDING_ID="$SELECTION_REPORT/duplicate-finding-id.json"
+jq '.issue_categories += [.issue_categories[0]]' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$DUPLICATE_FINDING_ID"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$DUPLICATE_FINDING_ID" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects duplicate finding linkage IDs"
+
+EMPTY_FINDING_ID="$SELECTION_REPORT/empty-finding-id.json"
+jq '.issue_categories[0].finding_id = "" | .task_list = []' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$EMPTY_FINDING_ID"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$EMPTY_FINDING_ID" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects an empty finding linkage ID"
+
+DUPLICATE_TASK_LINK="$SELECTION_REPORT/duplicate-task-link.json"
+jq '.task_list[0].finding_ids += [.task_list[0].finding_ids[0]]' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$DUPLICATE_TASK_LINK"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$DUPLICATE_TASK_LINK" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects duplicate task finding IDs"
+
+EMPTY_TASK_LINK="$SELECTION_REPORT/empty-task-link.json"
+jq '.task_list[0].finding_ids = [""]' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$EMPTY_TASK_LINK"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$EMPTY_TASK_LINK" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects empty task finding IDs"
+
+for UNVERIFIED_TASK_VERDICT in plausible refuted; do
+    UNVERIFIED_TASK_SOURCE="$SELECTION_REPORT/$UNVERIFIED_TASK_VERDICT-task.json"
+    jq --arg verdict "$UNVERIFIED_TASK_VERDICT" \
+        '.issue_categories[0].verdict = $verdict' \
+        "$SELECTION_REPORT/hybrid-analysis.json" > "$UNVERIFIED_TASK_SOURCE"
+    rc=0
+    (cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$UNVERIFIED_TASK_SOURCE" >/dev/null 2>&1) || rc=$?
+    assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+        "selection rejects tasks mapped to $UNVERIFIED_TASK_VERDICT findings"
+done
+
+MISMATCHED_TASK_THREAD="$SELECTION_REPORT/mismatched-task-thread.json"
+jq '.task_list[0].thread_ids = ["PRRT_other"]' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$MISMATCHED_TASK_THREAD"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$MISMATCHED_TASK_THREAD" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects task threads outside the mapped confirmed findings"
+
+UNKNOWN_TASK_THREAD="$SELECTION_REPORT/unknown-task-thread.json"
+jq '.task_list[0].thread_ids = ["PRRT_from_another_pr"]' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$UNKNOWN_TASK_THREAD"
+rc=0
+UNKNOWN_TASK_THREAD_OUT=$(cd "$SELECTION_REPO" && \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$UNKNOWN_TASK_THREAD" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection keeps mutation-bearing task IDs restricted to captured PRRT threads"
+assert_contains "$UNKNOWN_TASK_THREAD_OUT" "missing required findings or provenance" \
+    "an unknown mutation-bearing thread fails selected-analysis validation"
+rm -f "$MISSING_TASK_LINK" "$UNKNOWN_TASK_LINK" \
+    "$DUPLICATE_FINDING_ID" "$EMPTY_FINDING_ID" \
+    "$DUPLICATE_TASK_LINK" "$EMPTY_TASK_LINK" \
+    "$SELECTION_REPORT/plausible-task.json" \
+    "$SELECTION_REPORT/refuted-task.json" \
+    "$MISMATCHED_TASK_THREAD" "$UNKNOWN_TASK_THREAD"
+
+# Rendering can outlive the initial head/workspace checks. Mutate the tracked
+# workspace exactly when the frozen candidate is copied into its private
+# replacement directory; the final prepublication check must preserve every
+# previously selected view.
+LATE_WORKSPACE_STUBS="$TEST_OUTPUT_DIR/late-workspace-stubs"
+LATE_WORKSPACE_MARKER="$TEST_OUTPUT_DIR/late-workspace-fired"
+LATE_WORKSPACE_BACKUP="$TEST_OUTPUT_DIR/late-workspace-backup"
+mkdir -p "$LATE_WORKSPACE_STUBS" "$LATE_WORKSPACE_BACKUP"
+for LATE_VIEW in analysis.json analysis.md context-coverage.md \
+        combined-data.json comprehensive-report.md; do
+    [ ! -f "$SELECTION_REPORT/$LATE_VIEW" ] || \
+        cp "$SELECTION_REPORT/$LATE_VIEW" "$LATE_WORKSPACE_BACKUP/$LATE_VIEW"
+done
+cat > "$LATE_WORKSPACE_STUBS/cp" << 'STUB'
+#!/bin/bash
+destination=""
+for argument in "$@"; do destination="$argument"; done
+case "$destination" in
+    "$LATE_WORKSPACE_REPORT"/.selected-analysis-replacements.*/analysis.json)
+        if [ ! -e "$LATE_WORKSPACE_MARKER" ]; then
+            : > "$LATE_WORKSPACE_MARKER"
+            printf '%s\n' late-selection-change >> "$LATE_WORKSPACE_TRACKED_FILE"
+        fi
+        ;;
+esac
+exec "$LATE_WORKSPACE_REAL_CP" "$@"
+STUB
+chmod +x "$LATE_WORKSPACE_STUBS/cp"
+rc=0
+LATE_WORKSPACE_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$LATE_WORKSPACE_STUBS:$PATH" \
+    LATE_WORKSPACE_REPORT="$SELECTION_REPORT" \
+    LATE_WORKSPACE_MARKER="$LATE_WORKSPACE_MARKER" \
+    LATE_WORKSPACE_TRACKED_FILE="$SELECTION_REPO/tracked.txt" \
+    LATE_WORKSPACE_REAL_CP="$(command -v cp)" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$LATE_WORKSPACE_MARKER" ] && echo 0 || echo 1)" \
+    "selection detects workspace drift introduced after rendering begins" \
+    "$LATE_WORKSPACE_OUT"
+assert_contains "$LATE_WORKSPACE_OUT" "Local workspace changed during selection" \
+    "late workspace rejection identifies the prepublication boundary"
+LATE_WORKSPACE_VIEWS_PRESERVED=true
+for LATE_VIEW in analysis.json analysis.md context-coverage.md \
+        combined-data.json comprehensive-report.md; do
+    if [ -f "$LATE_WORKSPACE_BACKUP/$LATE_VIEW" ]; then
+        cmp -s "$SELECTION_REPORT/$LATE_VIEW" \
+            "$LATE_WORKSPACE_BACKUP/$LATE_VIEW" || \
+            LATE_WORKSPACE_VIEWS_PRESERVED=false
+    elif [ -e "$SELECTION_REPORT/$LATE_VIEW" ]; then
+        LATE_WORKSPACE_VIEWS_PRESERVED=false
+    fi
+done
+assert_true "$([ "$LATE_WORKSPACE_VIEWS_PRESERVED" = true ] && echo 0 || echo 1)" \
+    "late workspace drift preserves every prior selected view"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "late workspace rejection leaves no selection transaction residue"
+git -C "$SELECTION_REPO" checkout -- tracked.txt
+
+# Advance the hosted head only after private replacement staging. The second
+# hosted check must invalidate the now-stale selected views and publish none of
+# the staged candidate.
+LATE_HEAD_STUBS="$TEST_OUTPUT_DIR/late-head-stubs"
+LATE_HEAD_MARKER="$TEST_OUTPUT_DIR/late-head-fired"
+LATE_HEAD_LOG="$TEST_OUTPUT_DIR/late-head-views.log"
+mkdir -p "$LATE_HEAD_STUBS"
+cat > "$LATE_HEAD_STUBS/cp" << 'STUB'
+#!/bin/bash
+destination=""
+for argument in "$@"; do destination="$argument"; done
+case "$destination" in
+    "$LATE_HEAD_REPORT"/.selected-analysis-replacements.*/analysis.json)
+        : > "$LATE_HEAD_MARKER"
+        ;;
+esac
+exec "$LATE_HEAD_REAL_CP" "$@"
+STUB
+cat > "$LATE_HEAD_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ]; then
+    if [ -e "$LATE_HEAD_MARKER" ]; then
+        printf '%s\n' new-hosted-head >> "$LATE_HEAD_LOG"
+        PR_HEAD_OID=new-hosted-head exec "$LATE_HEAD_BASE_GH" "$@"
+    fi
+    printf '%s\n' abc123 >> "$LATE_HEAD_LOG"
+fi
+exec "$LATE_HEAD_BASE_GH" "$@"
+STUB
+chmod +x "$LATE_HEAD_STUBS/cp" "$LATE_HEAD_STUBS/gh"
+rc=0
+LATE_HEAD_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$LATE_HEAD_STUBS:$PATH" \
+    LATE_HEAD_REPORT="$SELECTION_REPORT" \
+    LATE_HEAD_MARKER="$LATE_HEAD_MARKER" LATE_HEAD_LOG="$LATE_HEAD_LOG" \
+    LATE_HEAD_REAL_CP="$(command -v cp)" LATE_HEAD_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$LATE_HEAD_MARKER" ] && echo 0 || echo 1)" \
+    "selection detects a hosted head advance after rendering begins" \
+    "$LATE_HEAD_OUT"
+assert_eq $'abc123\nnew-hosted-head' "$(cat "$LATE_HEAD_LOG")" \
+    "selection checks the hosted head before and immediately after staging"
+assert_contains "$LATE_HEAD_OUT" "Hosted PR head changed during selection" \
+    "late hosted-head rejection identifies the prepublication boundary"
+assert_true "$([ ! -e "$SELECTION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "late hosted-head drift invalidates stale selected artifacts"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "late hosted-head rejection leaves no selection transaction residue"
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null)
+
+FINAL_BOUNDARY_BACKUP="$TEST_OUTPUT_DIR/final-boundary-backup"
+mkdir -p "$FINAL_BOUNDARY_BACKUP"
+for FINAL_VIEW in analysis.json analysis.md context-coverage.md \
+        combined-data.json comprehensive-report.md; do
+    [ ! -f "$SELECTION_REPORT/$FINAL_VIEW" ] || \
+        cp "$SELECTION_REPORT/$FINAL_VIEW" "$FINAL_BOUNDARY_BACKUP/$FINAL_VIEW"
+done
+
+# The final hosted request sits between two local-state validations. Mutations
+# made while that request is in flight must be detected after the unchanged
+# hosted head returns and before any selected view is published.
+FINAL_LOCAL_RACE_STUBS="$TEST_OUTPUT_DIR/final-local-race-stubs"
+FINAL_LOCAL_RACE_COUNT="$TEST_OUTPUT_DIR/final-local-race-count"
+FINAL_CONTEXT_BACKUP="$TEST_OUTPUT_DIR/final-context-backup.json"
+mkdir -p "$FINAL_LOCAL_RACE_STUBS"
+cat > "$FINAL_LOCAL_RACE_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ]; then
+    count=$(cat "$FINAL_LOCAL_RACE_COUNT" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FINAL_LOCAL_RACE_COUNT"
+    if [ "$count" -eq 2 ]; then
+        case "$FINAL_LOCAL_RACE_KIND" in
+            workspace)
+                printf '%s\n' changed-during-hosted-check >> \
+                    "$FINAL_LOCAL_RACE_TRACKED"
+                ;;
+            context)
+                "$FINAL_LOCAL_RACE_JQ" \
+                    '.pr.title = ((.pr.title // "") + " changed")' \
+                    "$FINAL_LOCAL_RACE_CONTEXT" \
+                    > "$FINAL_LOCAL_RACE_CONTEXT.tmp"
+                "$FINAL_LOCAL_RACE_MV" "$FINAL_LOCAL_RACE_CONTEXT.tmp" \
+                    "$FINAL_LOCAL_RACE_CONTEXT"
+                ;;
+        esac
+    fi
+fi
+exec "$FINAL_LOCAL_RACE_BASE_GH" "$@"
+STUB
+chmod +x "$FINAL_LOCAL_RACE_STUBS/gh"
+
+rc=0
+FINAL_WORKSPACE_RACE_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$FINAL_LOCAL_RACE_STUBS:$PATH" \
+    FINAL_LOCAL_RACE_KIND=workspace \
+    FINAL_LOCAL_RACE_COUNT="$FINAL_LOCAL_RACE_COUNT" \
+    FINAL_LOCAL_RACE_TRACKED="$SELECTION_REPO/tracked.txt" \
+    FINAL_LOCAL_RACE_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ "$(cat "$FINAL_LOCAL_RACE_COUNT")" = 2 ] && echo 0 || echo 1)" \
+    "selection rejects workspace drift during the final hosted-head lookup"
+assert_contains "$FINAL_WORKSPACE_RACE_OUT" \
+    "Local workspace changed during the final hosted-head check" \
+    "final hosted-head workspace drift names the stale boundary"
+assert_selection_views_match "$SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
+    "final hosted-head workspace drift preserves prior selected views"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "final hosted-head workspace drift leaves no transaction residue"
+git -C "$SELECTION_REPO" checkout -- tracked.txt
+
+cp "$SELECTION_REPORT/analysis-context.json" "$FINAL_CONTEXT_BACKUP"
+rm -f "$FINAL_LOCAL_RACE_COUNT"
+rc=0
+FINAL_CONTEXT_RACE_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$FINAL_LOCAL_RACE_STUBS:$PATH" \
+    FINAL_LOCAL_RACE_KIND=context \
+    FINAL_LOCAL_RACE_COUNT="$FINAL_LOCAL_RACE_COUNT" \
+    FINAL_LOCAL_RACE_CONTEXT="$SELECTION_REPORT/analysis-context.json" \
+    FINAL_LOCAL_RACE_JQ="$(command -v jq)" \
+    FINAL_LOCAL_RACE_MV="$(command -v mv)" \
+    FINAL_LOCAL_RACE_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ "$(cat "$FINAL_LOCAL_RACE_COUNT")" = 2 ] && echo 0 || echo 1)" \
+    "selection rejects context drift during the final hosted-head lookup"
+assert_contains "$FINAL_CONTEXT_RACE_OUT" \
+    "Analysis context changed during the final hosted-head check" \
+    "final hosted-head context drift names the stale boundary"
+assert_selection_views_match "$SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
+    "final hosted-head context drift preserves prior selected views"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "final hosted-head context drift leaves no transaction residue"
+mv "$FINAL_CONTEXT_BACKUP" "$SELECTION_REPORT/analysis-context.json"
+
+# A transient failure of the final hosted-head lookup fails closed without
+# deleting the previously valid selected views.
+UNAVAILABLE_HEAD_STUBS="$TEST_OUTPUT_DIR/unavailable-head-stubs"
+UNAVAILABLE_HEAD_MARKER="$TEST_OUTPUT_DIR/unavailable-head-marker"
+mkdir -p "$UNAVAILABLE_HEAD_STUBS"
+cat > "$UNAVAILABLE_HEAD_STUBS/cp" << 'STUB'
+#!/bin/bash
+destination=""
+for argument in "$@"; do destination="$argument"; done
+case "$destination" in
+    "$UNAVAILABLE_HEAD_REPORT"/.selected-analysis-replacements.*/analysis.json)
+        : > "$UNAVAILABLE_HEAD_MARKER"
+        ;;
+esac
+exec "$UNAVAILABLE_HEAD_REAL_CP" "$@"
+STUB
+cat > "$UNAVAILABLE_HEAD_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ] && [ -e "$UNAVAILABLE_HEAD_MARKER" ]; then
+    exit 91
+fi
+exec "$UNAVAILABLE_HEAD_BASE_GH" "$@"
+STUB
+chmod +x "$UNAVAILABLE_HEAD_STUBS/cp" "$UNAVAILABLE_HEAD_STUBS/gh"
+rc=0
+UNAVAILABLE_HEAD_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$UNAVAILABLE_HEAD_STUBS:$PATH" \
+    UNAVAILABLE_HEAD_REPORT="$SELECTION_REPORT" \
+    UNAVAILABLE_HEAD_MARKER="$UNAVAILABLE_HEAD_MARKER" \
+    UNAVAILABLE_HEAD_REAL_CP="$(command -v cp)" \
+    UNAVAILABLE_HEAD_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$UNAVAILABLE_HEAD_MARKER" ] && echo 0 || echo 1)" \
+    "a final hosted-head lookup failure rejects selection"
+assert_contains "$UNAVAILABLE_HEAD_OUT" "could not be revalidated during selection" \
+    "hosted-head lookup failure is distinct from confirmed drift"
+assert_selection_views_match "$SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
+    "hosted-head lookup failure preserves every prior selected view"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "hosted-head lookup failure leaves no transaction residue"
+
+# Direct writes into the private staging directory are outside the cooperative
+# writer protocol. Bind every staged file by exact set, mode, and digest before
+# and inside publication so such a write cannot reach selected views.
+TAMPER_STAGED_STUBS="$TEST_OUTPUT_DIR/tamper-staged-stubs"
+TAMPER_STAGED_MARKER="$TEST_OUTPUT_DIR/tamper-staged-marker"
+mkdir -p "$TAMPER_STAGED_STUBS"
+cat > "$TAMPER_STAGED_STUBS/cp" << 'STUB'
+#!/bin/bash
+destination=""
+for argument in "$@"; do destination="$argument"; done
+case "$destination" in
+    "$TAMPER_STAGED_REPORT"/.selected-analysis-replacements.*/analysis.json)
+        : > "$TAMPER_STAGED_MARKER"
+        ;;
+esac
+exec "$TAMPER_STAGED_REAL_CP" "$@"
+STUB
+cat > "$TAMPER_STAGED_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ] && [ -e "$TAMPER_STAGED_MARKER" ]; then
+    for candidate in "$TAMPER_STAGED_REPORT"/.selected-analysis-replacements.*/analysis.json; do
+        [ -f "$candidate" ] || continue
+        printf '\n' >> "$candidate"
+    done
+fi
+exec "$TAMPER_STAGED_BASE_GH" "$@"
+STUB
+chmod +x "$TAMPER_STAGED_STUBS/cp" "$TAMPER_STAGED_STUBS/gh"
+rc=0
+TAMPER_STAGED_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$TAMPER_STAGED_STUBS:$PATH" \
+    TAMPER_STAGED_REPORT="$SELECTION_REPORT" \
+    TAMPER_STAGED_MARKER="$TAMPER_STAGED_MARKER" \
+    TAMPER_STAGED_REAL_CP="$(command -v cp)" \
+    TAMPER_STAGED_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$TAMPER_STAGED_MARKER" ] && echo 0 || echo 1)" \
+    "a staged replacement mutation rejects selection"
+assert_contains "$TAMPER_STAGED_OUT" "Staged selected-analysis views changed" \
+    "staged replacement mutation is reported at the publication boundary"
+assert_selection_views_match "$SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
+    "staged replacement mutation preserves every prior selected view"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "staged replacement mutation leaves no transaction residue"
+
+# The publication transaction rechecks the exact staged set between live-view
+# quarantine moves. A new entry after the first move must roll the transaction
+# back rather than publish from an untrusted replacement directory.
+QUARANTINE_IDENTITY_STUBS="$TEST_OUTPUT_DIR/quarantine-identity-stubs"
+QUARANTINE_IDENTITY_MARKER="$TEST_OUTPUT_DIR/quarantine-identity-marker"
+mkdir -p "$QUARANTINE_IDENTITY_STUBS"
+cat > "$QUARANTINE_IDENTITY_STUBS/mv" << 'STUB'
+#!/bin/bash
+"$QUARANTINE_IDENTITY_REAL_MV" "$@" || exit $?
+destination=""
+for argument in "$@"; do destination="$argument"; done
+case "$destination" in
+    "$QUARANTINE_IDENTITY_REPORT"/.selected-analysis-quarantine.*/analysis.json)
+        if [ ! -e "$QUARANTINE_IDENTITY_MARKER" ]; then
+            : > "$QUARANTINE_IDENTITY_MARKER"
+            for replacement in \
+                    "$QUARANTINE_IDENTITY_REPORT"/.selected-analysis-replacements.*; do
+                [ -d "$replacement" ] || continue
+                case "$QUARANTINE_IDENTITY_KIND" in
+                    unexpected) : > "$replacement/unexpected-entry" ;;
+                    mode) "$QUARANTINE_IDENTITY_CHMOD" 000 \
+                        "$replacement/analysis.md" ;;
+                    nonregular)
+                        "$QUARANTINE_IDENTITY_RM" -f \
+                            "$replacement/analysis.md"
+                        "$QUARANTINE_IDENTITY_MKDIR" \
+                            "$replacement/analysis.md"
+                        ;;
+                esac
+            done
+        fi
+        ;;
+esac
+STUB
+chmod +x "$QUARANTINE_IDENTITY_STUBS/mv"
+rc=0
+QUARANTINE_IDENTITY_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$QUARANTINE_IDENTITY_STUBS:$PATH" \
+    QUARANTINE_IDENTITY_KIND=unexpected \
+    QUARANTINE_IDENTITY_REPORT="$SELECTION_REPORT" \
+    QUARANTINE_IDENTITY_MARKER="$QUARANTINE_IDENTITY_MARKER" \
+    QUARANTINE_IDENTITY_REAL_MV="$(command -v mv)" \
+    QUARANTINE_IDENTITY_CHMOD="$(command -v chmod)" \
+    QUARANTINE_IDENTITY_RM="$(command -v rm)" \
+    QUARANTINE_IDENTITY_MKDIR="$(command -v mkdir)" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$QUARANTINE_IDENTITY_MARKER" ] && echo 0 || echo 1)" \
+    "selection rejects a replacement-set change during quarantine"
+assert_selection_views_match "$SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
+    "quarantine-time replacement mutation rolls back every selected view"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "quarantine-time replacement mutation leaves no transaction residue"
+
+for QUARANTINE_IDENTITY_KIND in mode nonregular; do
+    rm -f "$QUARANTINE_IDENTITY_MARKER"
+    rc=0
+    (cd "$SELECTION_REPO" && \
+        env PATH="$QUARANTINE_IDENTITY_STUBS:$PATH" \
+        QUARANTINE_IDENTITY_KIND="$QUARANTINE_IDENTITY_KIND" \
+        QUARANTINE_IDENTITY_REPORT="$SELECTION_REPORT" \
+        QUARANTINE_IDENTITY_MARKER="$QUARANTINE_IDENTITY_MARKER" \
+        QUARANTINE_IDENTITY_REAL_MV="$(command -v mv)" \
+        QUARANTINE_IDENTITY_CHMOD="$(command -v chmod)" \
+        QUARANTINE_IDENTITY_RM="$(command -v rm)" \
+        QUARANTINE_IDENTITY_MKDIR="$(command -v mkdir)" \
+        "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+            "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null 2>&1) || rc=$?
+    assert_true "$([ "$rc" -ne 0 ] && \
+        [ -e "$QUARANTINE_IDENTITY_MARKER" ] && echo 0 || echo 1)" \
+        "selection rejects a $QUARANTINE_IDENTITY_KIND staged replacement"
+    assert_selection_views_match "$SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
+        "$QUARANTINE_IDENTITY_KIND replacement rollback preserves selected views"
+    assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+        "$QUARANTINE_IDENTITY_KIND replacement rollback leaves no residue"
+done
+
+# A replacement can also change after its first hard link is published. The
+# final byte/mode identity check must detect that aliasing mutation and roll
+# every live view back to its prepublication bytes.
+LINK_IDENTITY_STUBS="$TEST_OUTPUT_DIR/link-identity-stubs"
+LINK_IDENTITY_MARKER="$TEST_OUTPUT_DIR/link-identity-marker"
+mkdir -p "$LINK_IDENTITY_STUBS"
+cat > "$LINK_IDENTITY_STUBS/ln" << 'STUB'
+#!/bin/bash
+"$LINK_IDENTITY_REAL_LN" "$@" || exit $?
+case "$1:$2" in
+    "$LINK_IDENTITY_REPORT"/.selected-analysis-replacements.*/analysis.json:"$LINK_IDENTITY_REPORT"/analysis.json)
+        if [ ! -e "$LINK_IDENTITY_MARKER" ]; then
+            : > "$LINK_IDENTITY_MARKER"
+            case "$LINK_IDENTITY_KIND" in
+                bytes) printf '\n' >> "$1" ;;
+                missing) "$LINK_IDENTITY_REAL_RM" -f "$1" ;;
+                nonregular)
+                    "$LINK_IDENTITY_REAL_RM" -f "$1"
+                    "$LINK_IDENTITY_REAL_MKDIR" "$1"
+                    ;;
+                symlink)
+                    "$LINK_IDENTITY_REAL_RM" -f "$1"
+                    "$LINK_IDENTITY_REAL_LN" -s "$2" "$1"
+                    ;;
+            esac
+        fi
+        ;;
+esac
+STUB
+chmod +x "$LINK_IDENTITY_STUBS/ln"
+rc=0
+LINK_IDENTITY_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$LINK_IDENTITY_STUBS:$PATH" \
+    LINK_IDENTITY_KIND=bytes \
+    LINK_IDENTITY_REPORT="$SELECTION_REPORT" \
+    LINK_IDENTITY_MARKER="$LINK_IDENTITY_MARKER" \
+    LINK_IDENTITY_REAL_LN="$(command -v ln)" \
+    LINK_IDENTITY_REAL_RM="$(command -v rm)" \
+    LINK_IDENTITY_REAL_MKDIR="$(command -v mkdir)" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$LINK_IDENTITY_MARKER" ] && echo 0 || echo 1)" \
+    "selection rejects replacement bytes changed after the first link"
+assert_selection_views_match "$SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
+    "link-time replacement mutation rolls back every selected view"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "link-time replacement mutation leaves no transaction residue"
+
+for LINK_IDENTITY_KIND in missing nonregular symlink; do
+    rm -f "$LINK_IDENTITY_MARKER"
+    rc=0
+    (cd "$SELECTION_REPO" && \
+        env PATH="$LINK_IDENTITY_STUBS:$PATH" \
+        LINK_IDENTITY_KIND="$LINK_IDENTITY_KIND" \
+        LINK_IDENTITY_REPORT="$SELECTION_REPORT" \
+        LINK_IDENTITY_MARKER="$LINK_IDENTITY_MARKER" \
+        LINK_IDENTITY_REAL_LN="$(command -v ln)" \
+        LINK_IDENTITY_REAL_RM="$(command -v rm)" \
+        LINK_IDENTITY_REAL_MKDIR="$(command -v mkdir)" \
+        "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+            "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null 2>&1) || rc=$?
+    assert_true "$([ "$rc" -ne 0 ] && \
+        [ -e "$LINK_IDENTITY_MARKER" ] && echo 0 || echo 1)" \
+        "selection rejects a post-link $LINK_IDENTITY_KIND replacement"
+    assert_selection_views_match "$SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
+        "post-link $LINK_IDENTITY_KIND rollback preserves selected views"
+    assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+        "post-link $LINK_IDENTITY_KIND rollback leaves no residue"
+done
+
+# The initial hosted-head verification runs before writer-lock acquisition, but
+# it is still an owned, bounded external command. A stalled lookup must time out
+# without creating a lock or leaving any process-group member behind.
+PRELOCK_HEAD_STUBS="$TEST_OUTPUT_DIR/prelock-head-stubs"
+PRELOCK_HEAD_READY="$TEST_OUTPUT_DIR/prelock-head-ready"
+PRELOCK_HEAD_CHILD_PID="$TEST_OUTPUT_DIR/prelock-head-child-pid"
+PRELOCK_HEAD_DESCENDANT_PID="$TEST_OUTPUT_DIR/prelock-head-descendant-pid"
+PRELOCK_SELECTION_REPO="$TEST_OUTPUT_DIR/prelock-selection-workspace"
+cp -R "$SELECTION_REPO" "$PRELOCK_SELECTION_REPO"
+PRELOCK_SELECTION_REPORT="$PRELOCK_SELECTION_REPO/report"
+mkdir -p "$PRELOCK_HEAD_STUBS"
+cat > "$PRELOCK_HEAD_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ]; then
+    printf '%s\n' "$$" > "$PRELOCK_HEAD_CHILD_PID"
+    (
+        trap '' TERM INT
+        while :; do sleep 1; done
+    ) &
+    printf '%s\n' "$!" > "$PRELOCK_HEAD_DESCENDANT_PID"
+    : > "$PRELOCK_HEAD_READY"
+    trap 'exit 0' TERM
+    while :; do sleep 1; done
+fi
+exec "$PRELOCK_HEAD_BASE_GH" "$@"
+STUB
+chmod +x "$PRELOCK_HEAD_STUBS/gh"
+BLOCKED_HEAD_CHILD_PID_FILE="$PRELOCK_HEAD_CHILD_PID"
+BLOCKED_HEAD_DESCENDANT_PID_FILE="$PRELOCK_HEAD_DESCENDANT_PID"
+rc=0
+PRELOCK_HEAD_OUT=$(cd "$PRELOCK_SELECTION_REPO" && \
+    env PATH="$PRELOCK_HEAD_STUBS:$PATH" GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
+    PRELOCK_HEAD_BASE_GH="$STUB_DIR/gh" \
+    PRELOCK_HEAD_READY="$PRELOCK_HEAD_READY" \
+    PRELOCK_HEAD_CHILD_PID="$PRELOCK_HEAD_CHILD_PID" \
+    PRELOCK_HEAD_DESCENDANT_PID="$PRELOCK_HEAD_DESCENDANT_PID" \
+    "$GH_PR_ENRICH" select-analysis "$PRELOCK_SELECTION_REPORT" \
+        "$PRELOCK_SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+PRELOCK_CHILD_PID=$(cat "$PRELOCK_HEAD_CHILD_PID" 2>/dev/null || echo "")
+PRELOCK_DESCENDANT_PID=$(cat \
+    "$PRELOCK_HEAD_DESCENDANT_PID" 2>/dev/null || echo "")
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$PRELOCK_HEAD_READY" ] && echo 0 || echo 1)" \
+    "the initial hosted-head lookup enforces its managed timeout"
+assert_contains "$PRELOCK_HEAD_OUT" "could not be revalidated before selection" \
+    "the pre-lock timeout preserves unavailable hosted-head semantics"
+assert_process_reaped "$PRELOCK_CHILD_PID" \
+    "the pre-lock timeout reaps its direct GitHub child"
+assert_process_reaped "$PRELOCK_DESCENDANT_PID" \
+    "the pre-lock timeout reaps TERM-ignoring descendants"
+assert_selection_views_match "$PRELOCK_SELECTION_REPORT" \
+    "$FINAL_BOUNDARY_BACKUP" \
+    "the pre-lock timeout preserves every prior selected view"
+assert_no_selection_transaction_residue "$PRELOCK_SELECTION_REPORT" \
+    "the pre-lock timeout creates no selection transaction residue"
+
+# The standalone selector owns and bounds its final GitHub child while holding
+# the writer lock. Cancellation terminates the child before releasing the lock.
+BLOCKED_HEAD_STUBS="$TEST_OUTPUT_DIR/blocked-head-stubs"
+BLOCKED_HEAD_MARKER="$TEST_OUTPUT_DIR/blocked-head-marker"
+BLOCKED_HEAD_READY="$TEST_OUTPUT_DIR/blocked-head-ready"
+BLOCKED_HEAD_CHILD_PID="$TEST_OUTPUT_DIR/blocked-head-child-pid"
+BLOCKED_HEAD_DESCENDANT_PID="$TEST_OUTPUT_DIR/blocked-head-descendant-pid"
+BLOCKED_HEAD_OUT="$TEST_OUTPUT_DIR/blocked-head.out"
+BLOCKED_HEAD_CHILD_PID_FILE="$BLOCKED_HEAD_CHILD_PID"
+BLOCKED_HEAD_DESCENDANT_PID_FILE="$BLOCKED_HEAD_DESCENDANT_PID"
+mkdir -p "$BLOCKED_HEAD_STUBS"
+cp "$UNAVAILABLE_HEAD_STUBS/cp" "$BLOCKED_HEAD_STUBS/cp"
+cat > "$BLOCKED_HEAD_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ] && [ -e "$UNAVAILABLE_HEAD_MARKER" ]; then
+    printf '%s\n' "$$" > "$BLOCKED_HEAD_CHILD_PID"
+    (
+        trap '' TERM INT
+        while :; do sleep 1; done
+    ) &
+    printf '%s\n' "$!" > "$BLOCKED_HEAD_DESCENDANT_PID"
+    : > "$BLOCKED_HEAD_READY"
+    trap 'exit 0' TERM
+    while :; do sleep 1; done
+fi
+exec "$UNAVAILABLE_HEAD_BASE_GH" "$@"
+STUB
+chmod +x "$BLOCKED_HEAD_STUBS/cp" "$BLOCKED_HEAD_STUBS/gh"
+TERM_SELECTION_REPO="$TEST_OUTPUT_DIR/term-selection-workspace"
+cp -R "$SELECTION_REPO" "$TERM_SELECTION_REPO"
+TERM_SELECTION_REPORT="$TERM_SELECTION_REPO/report"
+(cd "$TERM_SELECTION_REPO" && exec env PATH="$BLOCKED_HEAD_STUBS:$PATH" \
+    UNAVAILABLE_HEAD_REPORT="$TERM_SELECTION_REPORT" \
+    UNAVAILABLE_HEAD_MARKER="$BLOCKED_HEAD_MARKER" \
+    UNAVAILABLE_HEAD_REAL_CP="$(command -v cp)" \
+    UNAVAILABLE_HEAD_BASE_GH="$STUB_DIR/gh" \
+    BLOCKED_HEAD_READY="$BLOCKED_HEAD_READY" \
+    BLOCKED_HEAD_CHILD_PID="$BLOCKED_HEAD_CHILD_PID" \
+    BLOCKED_HEAD_DESCENDANT_PID="$BLOCKED_HEAD_DESCENDANT_PID" \
+    "$GH_PR_ENRICH" select-analysis "$TERM_SELECTION_REPORT" \
+        "$TERM_SELECTION_REPORT/hybrid-analysis.json") > "$BLOCKED_HEAD_OUT" 2>&1 &
+RUNTIME_BACKGROUND_PID=$!
+for _ in $(seq 1 200); do
+    [ -e "$BLOCKED_HEAD_READY" ] && break
+    sleep 0.05
+done
+assert_true "$([ -e "$BLOCKED_HEAD_READY" ] && echo 0 || echo 1)" \
+    "the final hosted-head cancellation fixture starts its GitHub child"
+BLOCKED_CHILD_PID=$(cat "$BLOCKED_HEAD_CHILD_PID" 2>/dev/null || echo "")
+BLOCKED_DESCENDANT_PID=$(cat "$BLOCKED_HEAD_DESCENDANT_PID" 2>/dev/null || echo "")
+kill -TERM "$RUNTIME_BACKGROUND_PID" 2>/dev/null || true
+rc=0
+wait "$RUNTIME_BACKGROUND_PID" || rc=$?
+RUNTIME_BACKGROUND_PID=""
+assert_eq "143" "$rc" \
+    "TERM during the final hosted-head lookup preserves the conventional status"
+assert_process_reaped "$BLOCKED_CHILD_PID" \
+    "final hosted-head cancellation terminates the owned GitHub child"
+assert_process_reaped "$BLOCKED_DESCENDANT_PID" \
+    "final hosted-head cancellation terminates TERM-ignoring descendants"
+assert_selection_views_match "$TERM_SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
+    "final hosted-head cancellation preserves every prior selected view"
+assert_no_selection_transaction_residue "$TERM_SELECTION_REPORT" \
+    "final hosted-head cancellation releases the writer lock"
+
+# The public wrapper forwards INT as well as TERM to the selection transaction.
+rm -f "$BLOCKED_HEAD_MARKER" "$BLOCKED_HEAD_READY" \
+    "$BLOCKED_HEAD_CHILD_PID" "$BLOCKED_HEAD_DESCENDANT_PID"
+INT_SELECTION_REPO="$TEST_OUTPUT_DIR/int-selection-workspace"
+cp -R "$SELECTION_REPO" "$INT_SELECTION_REPO"
+INT_SELECTION_REPORT="$INT_SELECTION_REPO/report"
+set -m
+(cd "$INT_SELECTION_REPO" && exec env PATH="$BLOCKED_HEAD_STUBS:$PATH" \
+    UNAVAILABLE_HEAD_REPORT="$INT_SELECTION_REPORT" \
+    UNAVAILABLE_HEAD_MARKER="$BLOCKED_HEAD_MARKER" \
+    UNAVAILABLE_HEAD_REAL_CP="$(command -v cp)" \
+    UNAVAILABLE_HEAD_BASE_GH="$STUB_DIR/gh" \
+    BLOCKED_HEAD_READY="$BLOCKED_HEAD_READY" \
+    BLOCKED_HEAD_CHILD_PID="$BLOCKED_HEAD_CHILD_PID" \
+    BLOCKED_HEAD_DESCENDANT_PID="$BLOCKED_HEAD_DESCENDANT_PID" \
+    "$GH_PR_ENRICH" select-analysis "$INT_SELECTION_REPORT" \
+        "$INT_SELECTION_REPORT/hybrid-analysis.json") >/dev/null 2>&1 &
+RUNTIME_BACKGROUND_PID=$!
+set +m
+for _ in $(seq 1 200); do
+    [ -e "$BLOCKED_HEAD_READY" ] && break
+    sleep 0.05
+done
+kill -INT "$RUNTIME_BACKGROUND_PID" 2>/dev/null || true
+rc=0
+wait "$RUNTIME_BACKGROUND_PID" || rc=$?
+RUNTIME_BACKGROUND_PID=""
+INT_BLOCKED_CHILD_PID=$(cat "$BLOCKED_HEAD_CHILD_PID" 2>/dev/null || echo "")
+INT_BLOCKED_DESCENDANT_PID=$(cat \
+    "$BLOCKED_HEAD_DESCENDANT_PID" 2>/dev/null || echo "")
+assert_eq "130" "$rc" \
+    "INT during the final hosted-head lookup preserves the conventional status"
+assert_process_reaped "$INT_BLOCKED_CHILD_PID" \
+    "INT cancellation reaps its direct GitHub child"
+assert_process_reaped "$INT_BLOCKED_DESCENDANT_PID" \
+    "INT cancellation reaps TERM-ignoring descendants"
+assert_selection_views_match "$INT_SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
+    "INT cancellation preserves every prior selected view"
+assert_no_selection_transaction_residue "$INT_SELECTION_REPORT" \
+    "INT cancellation releases the writer lock"
+
+# The same managed child has a portable deadline when no signal arrives.
+TIMEOUT_SELECTION_REPO="$TEST_OUTPUT_DIR/timeout-selection-workspace"
+cp -R "$SELECTION_REPO" "$TIMEOUT_SELECTION_REPO"
+TIMEOUT_SELECTION_REPORT="$TIMEOUT_SELECTION_REPO/report"
+rm -f "$BLOCKED_HEAD_MARKER" "$BLOCKED_HEAD_READY" \
+    "$BLOCKED_HEAD_CHILD_PID" "$BLOCKED_HEAD_DESCENDANT_PID"
+rc=0
+BOUNDED_HEAD_OUT=$(cd "$TIMEOUT_SELECTION_REPO" && \
+    env PATH="$BLOCKED_HEAD_STUBS:$PATH" GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
+    UNAVAILABLE_HEAD_REPORT="$TIMEOUT_SELECTION_REPORT" \
+    UNAVAILABLE_HEAD_MARKER="$BLOCKED_HEAD_MARKER" \
+    UNAVAILABLE_HEAD_REAL_CP="$(command -v cp)" \
+    UNAVAILABLE_HEAD_BASE_GH="$STUB_DIR/gh" \
+    BLOCKED_HEAD_READY="$BLOCKED_HEAD_READY" \
+    BLOCKED_HEAD_CHILD_PID="$BLOCKED_HEAD_CHILD_PID" \
+    BLOCKED_HEAD_DESCENDANT_PID="$BLOCKED_HEAD_DESCENDANT_PID" \
+    "$GH_PR_ENRICH" select-analysis "$TIMEOUT_SELECTION_REPORT" \
+        "$TIMEOUT_SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+BOUNDED_CHILD_PID=$(cat "$BLOCKED_HEAD_CHILD_PID" 2>/dev/null || echo "")
+BOUNDED_DESCENDANT_PID=$(cat \
+    "$BLOCKED_HEAD_DESCENDANT_PID" 2>/dev/null || echo "")
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$BLOCKED_HEAD_READY" ] && echo 0 || echo 1)" \
+    "the final hosted-head lookup enforces its managed timeout"
+assert_process_reaped "$BOUNDED_CHILD_PID" \
+    "the hosted-head timeout reaps its direct GitHub child"
+assert_process_reaped "$BOUNDED_DESCENDANT_PID" \
+    "the hosted-head timeout reaps TERM-ignoring descendants"
+assert_contains "$BOUNDED_HEAD_OUT" "could not be revalidated during selection" \
+    "the hosted-head timeout preserves the unavailable status"
+assert_selection_views_match "$TIMEOUT_SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
+    "the hosted-head timeout preserves every prior selected view"
+assert_no_selection_transaction_residue "$TIMEOUT_SELECTION_REPORT" \
+    "the hosted-head timeout releases the writer lock"
 
 rc=0
 CODE_ACCESS_VETO_OUT=$(cd "$SELECTION_REPO" && GH_PR_ENRICH_CODE_ACCESS=false \
@@ -1421,7 +2344,8 @@ assert_eq "$REPORT_BEFORE" "$(cat "$AUTHORIZED_DIR/analysis.md")" \
 
 UNATTRIBUTED_SOURCE="$AUTHORIZED_DIR/unattributed-hybrid.json"
 jq '.issue_categories = [{
-        name: "Unattributed finding", category: "logic_error", severity: "high",
+        finding_id: "unattributed", name: "Unattributed finding",
+        category: "logic_error", severity: "high",
         impact: "moderate", likelihood: "likely", severity_rationale: "fixture",
         verdict: "confirmed", confidence: "high", description: "fixture",
         evidence: [{file: "gh-pr-enrich", line: 1, detail: "fixture"}], thread_ids: []
@@ -1442,7 +2366,8 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
 
 NO_EVIDENCE_SOURCE="$AUTHORIZED_DIR/no-evidence.json"
 jq '.issue_categories = [{
-        name: "No anchor", category: "boundary_condition", severity: "high",
+        finding_id: "no-anchor", name: "No anchor",
+        category: "boundary_condition", severity: "high",
         impact: "moderate", likelihood: "likely", severity_rationale: "fixture",
         verdict: "confirmed", confidence: "high", description: "fixture",
         evidence: [], thread_ids: [], sources: ["codex:orchestrator"]
@@ -1457,7 +2382,8 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
 
 CONTRADICTORY_SOURCE="$AUTHORIZED_DIR/contradictory-coverage.json"
 jq '.issue_categories = [{
-        name: "Anchored", category: "boundary_condition", severity: "high",
+        finding_id: "anchored", name: "Anchored",
+        category: "boundary_condition", severity: "high",
         impact: "moderate", likelihood: "likely", severity_rationale: "fixture",
         verdict: "confirmed", confidence: "high", description: "fixture",
         evidence: [{file:"a.js",line:1,detail:"fixture"}], thread_ids: [],
@@ -1489,16 +2415,10 @@ rc=0
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "a Codex label cannot conceal an external Claude analyzer"
 
-FRACTIONAL_LINE_SOURCE="$AUTHORIZED_DIR/fractional-lines.json"
-jq '.task_list[0].line = 1.5' "$HYBRID_SOURCE" > "$FRACTIONAL_LINE_SOURCE"
-rc=0
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$FRACTIONAL_LINE_SOURCE" >/dev/null 2>&1 || rc=$?
-assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
-    "selector line validation matches the schema integer contract"
-
 INVENTED_SOURCE_ID="$AUTHORIZED_DIR/invented-source-id.json"
 jq '.issue_categories = [{
-        name: "Invented source", category: "boundary_condition", severity: "high",
+        finding_id: "invented-source", name: "Invented source",
+        category: "boundary_condition", severity: "high",
         impact: "moderate", likelihood: "likely", severity_rationale: "fixture",
         verdict: "confirmed", confidence: "high", description: "fixture",
         evidence: [{file:"a.js",line:1,detail:"fixture"}], thread_ids: [],
@@ -1682,7 +2602,7 @@ assert_jq "$TRUNCATION_POSITIVE_DIR/analysis.json" \
     "explicit not_reviewable coverage can be selected with truncated evidence"
 
 jq '.issue_categories = [{
-        name:"Visible defect",category:"logic_error",severity:"high",
+        finding_id:"visible-defect",name:"Visible defect",category:"logic_error",severity:"high",
         impact:"moderate",likelihood:"likely",severity_rationale:"fixture",
         verdict:"plausible",confidence:"medium",description:"fixture",
         evidence:[{file:"a.js",line:1,detail:"fixture"}],thread_ids:[],

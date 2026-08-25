@@ -1,6 +1,7 @@
 {
   "issue_categories": [
     {
+      "finding_id": "unbounded-report-query",
       "name": "Unbounded query in the report endpoint",
       "category": "performance",
       "verdict": "plausible",
@@ -50,19 +51,7 @@
     }
   ],
   "adjacent_problems": [],
-  "task_list": [
-    {
-      "priority": "medium",
-      "task": "Paginate listReports()",
-      "thread_ids": [
-        "PRRT_test3"
-      ],
-      "file": "src/reports.js",
-      "line": 14,
-      "suggested_fix": "Add limit/offset parameters with a default page size.",
-      "verification": "npm test -- reports.test.js"
-    }
-  ],
+  "task_list": [],
   "process_improvements": [],
   "pr_template_suggestions": [
     {

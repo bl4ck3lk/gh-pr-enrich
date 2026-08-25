@@ -67,10 +67,16 @@ For each candidate finding:
 6. keep the strongest supported severity, with a fresh rationale;
 7. produce one executable task and verification command.
 
+Give every finding a unique non-empty `finding_id`. Each task must set
+`finding_ids` to one or more IDs belonging only to confirmed findings, and its
+thread IDs must be a subset of those findings' thread IDs. Do not emit tasks for
+plausible or refuted claims.
+
 Example retained finding:
 
 ```json
 {
+  "finding_id": "retry-final-attempt",
   "name": "Retry counter skips final attempt",
   "category": "boundary_condition",
   "severity": "high",
