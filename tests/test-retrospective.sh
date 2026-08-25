@@ -129,6 +129,408 @@ test_basic_run() {
     fi
 }
 
+test_shared_snapshot_lease_lifecycle() {
+    local stubs="$TEST_OUTPUT_DIR/shared-lease-stubs"
+    local mktemp_log="$TEST_OUTPUT_DIR/shared-lease-mktemp.log"
+    local ready="$TEST_OUTPUT_DIR/shared-lease-ready"
+    local release="$TEST_OUTPUT_DIR/shared-lease-release"
+    local cp_pid_file="$TEST_OUTPUT_DIR/shared-lease-cp.pid"
+    local output="$TEST_OUTPUT_DIR/shared-lease-output"
+    local run_log="$TEST_OUTPUT_DIR/shared-lease-run.log"
+    local real_mktemp real_cp real_dirname run_pid root roots root_count child_count residue=""
+    real_mktemp=$(command -v mktemp)
+    real_cp=$(command -v cp)
+    real_dirname=$(command -v dirname)
+    mkdir -p "$stubs"
+    cat > "$stubs/mktemp" << 'EOF'
+#!/bin/bash
+result=$("$REAL_MKTEMP" "$@") || exit $?
+printf '%s\t%s\n' "$*" "$result" >> "$RETRO_MKTEMP_LOG"
+printf '%s\n' "$result"
+EOF
+    cat > "$stubs/cp" << 'EOF'
+#!/bin/bash
+trap '' TERM
+if [ "${RETRO_ASSERT_INHERITED_FDS:-false}" = true ]; then
+    printf 'fd8-preserved\n' >&8 || exit 91
+    printf 'fd9-preserved\n' >&9 || exit 92
+fi
+previous=""
+for argument in "$@"; do previous="$argument"; done
+case "$previous" in
+    */report.*/pr-2/*)
+        if [ -n "${RETRO_CP_PID_FILE:-}" ]; then
+            printf '%s\n' "$$" > "$RETRO_CP_PID_FILE"
+        fi
+        : > "$RETRO_CP_READY"
+        while [ ! -e "$RETRO_CP_RELEASE" ]; do sleep 0.01; done
+        ;;
+esac
+exec "$REAL_CP" "$@"
+EOF
+    chmod +x "$stubs/mktemp" "$stubs/cp"
+
+    env PATH="$stubs:$PATH" REAL_MKTEMP="$real_mktemp" REAL_CP="$real_cp" \
+        RETRO_MKTEMP_LOG="$mktemp_log" \
+        RETRO_CP_READY="$ready" RETRO_CP_RELEASE="$release" \
+        RETRO_CP_PID_FILE="$cp_pid_file" \
+        "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+            --output-dir "$output" --min-prs 1 >"$run_log" 2>&1 &
+    run_pid=$!
+    local wait_attempt=0
+    while [ "$wait_attempt" -lt 500 ] && [ ! -e "$ready" ]; do
+        kill -0 "$run_pid" 2>/dev/null || break
+        sleep 0.01
+        wait_attempt=$((wait_attempt + 1))
+    done
+
+    roots=$(awk -F '\t' '{print $2}' "$mktemp_log" 2>/dev/null | \
+        grep -E '^(/private)?/tmp/gh-pr-enrich-analysis-snapshot\.[A-Za-z0-9]+$' || true)
+    root_count=$(printf '%s\n' "$roots" | sed '/^$/d' | wc -l | tr -d ' ')
+    root=$(printf '%s\n' "$roots" | sed -n '1p')
+    child_count=$(find "$root" -mindepth 1 -maxdepth 1 -type d \
+        -name 'report.*' 2>/dev/null | wc -l | tr -d ' ')
+    if [ -e "$ready" ] && [ "$root_count" = "1" ] && \
+       [ "$child_count" = "2" ] && [ -d "$root" ] && \
+       [ -f "$root.janitor" ] && \
+       [ -z "$(find "$root" -name '*.janitor' -print -quit 2>/dev/null)" ]; then
+        pass "retrospective discovery uses one shared lease without child janitors"
+    else
+        fail "retrospective discovery uses one shared lease without child janitors" \
+            "ready=$([ -e "$ready" ] && echo yes || echo no) roots=$root_count children=$child_count root=$root"
+    fi
+
+    : > "$release"
+    wait "$run_pid"
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        if [ -e "$root" ] || [ -e "$root.janitor" ]; then
+            residue="$residue $root"
+        fi
+    done <<< "$roots"
+    if [ -z "$residue" ]; then
+        pass "successful retrospective cleanup removes the shared root and janitor"
+    else
+        fail "successful retrospective cleanup removes the shared root and janitor" \
+            "Residue:$residue"
+    fi
+
+    : > "$mktemp_log"
+    env PATH="$stubs:$PATH" REAL_MKTEMP="$real_mktemp" REAL_CP="$real_cp" \
+        RETRO_MKTEMP_LOG="$mktemp_log" \
+        RETRO_CP_READY="$ready" RETRO_CP_RELEASE="$release" \
+        RETRO_CP_PID_FILE="$cp_pid_file" \
+        "$GH_PR_ENRICH" retrospective \
+            --reports-dir "$TEST_OUTPUT_DIR/empty-reports" \
+            --output-dir "$TEST_OUTPUT_DIR/shared-lease-empty-output" \
+            --min-prs 1 >/dev/null 2>&1 || true
+    roots=$(awk -F '\t' '{print $2}' "$mktemp_log" 2>/dev/null | \
+        grep -E '^(/private)?/tmp/gh-pr-enrich-analysis-snapshot\.[A-Za-z0-9]+$' || true)
+    root_count=$(printf '%s\n' "$roots" | sed '/^$/d' | wc -l | tr -d ' ')
+    residue=""
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        if [ -e "$root" ] || [ -e "$root.janitor" ]; then
+            residue="$residue $root"
+        fi
+    done <<< "$roots"
+    if [ "$root_count" = "1" ] && [ -z "$residue" ]; then
+        pass "zero-selected retrospective cleanup removes its shared lease"
+    else
+        fail "zero-selected retrospective cleanup removes its shared lease" \
+            "roots=$root_count residue=$residue"
+    fi
+
+    local fail_stubs="$TEST_OUTPUT_DIR/shared-lease-failure-stubs"
+    local startup_rc=0
+    mkdir -p "$fail_stubs"
+    cat > "$fail_stubs/mkfifo" << 'EOF'
+#!/bin/bash
+exit 73
+EOF
+    chmod +x "$fail_stubs/mkfifo"
+    : > "$mktemp_log"
+    env PATH="$fail_stubs:$stubs:$PATH" REAL_MKTEMP="$real_mktemp" \
+        REAL_CP="$real_cp" RETRO_MKTEMP_LOG="$mktemp_log" \
+        RETRO_CP_READY="$ready" RETRO_CP_RELEASE="$release" \
+        RETRO_CP_PID_FILE="$cp_pid_file" \
+        "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+            --output-dir "$TEST_OUTPUT_DIR/shared-lease-startup-output" \
+            --min-prs 1 >"$run_log" 2>&1 || startup_rc=$?
+    roots=$(awk -F '\t' '{print $2}' "$mktemp_log" 2>/dev/null | \
+        grep -E '^(/private)?/tmp/gh-pr-enrich-analysis-snapshot\.[A-Za-z0-9]+$' || true)
+    root_count=$(printf '%s\n' "$roots" | sed '/^$/d' | wc -l | tr -d ' ')
+    residue=""
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        if [ -e "$root" ] || [ -e "$root.janitor" ]; then
+            residue="$residue $root"
+        fi
+    done <<< "$roots"
+    if [ "$startup_rc" -ne 0 ] && [ "$root_count" = "1" ] && \
+       [ -z "$residue" ] && \
+       grep -q "Could not start the retrospective snapshot lease" "$run_log"; then
+        pass "FIFO creation failure cleans the partially initialized lease"
+    else
+        fail "FIFO creation failure cleans the partially initialized lease" \
+            "status=$startup_rc roots=$root_count residue=$residue output=$(cat "$run_log")"
+    fi
+
+    local readiness_stubs="$TEST_OUTPUT_DIR/shared-lease-readiness-stubs"
+    local readiness_marker="$TEST_OUTPUT_DIR/shared-lease-readiness-killed"
+    local readiness_pid_file="$TEST_OUTPUT_DIR/shared-lease-readiness.pid"
+    local readiness_rc=0 readiness_pid=""
+    mkdir -p "$readiness_stubs"
+    cat > "$readiness_stubs/dirname" << 'EOF'
+#!/bin/bash
+case "${1:-}" in
+    /tmp/gh-pr-enrich-analysis-snapshot.*.janitor|\
+    /private/tmp/gh-pr-enrich-analysis-snapshot.*.janitor)
+        if [ ! -e "$RETRO_READINESS_MARKER" ] && [ -f "$1" ]; then
+            janitor_pid=$(awk -F '\t' 'NR == 1 {print $2}' "$1")
+            if [[ "$janitor_pid" =~ ^[1-9][0-9]*$ ]]; then
+                printf '%s\n' "$janitor_pid" > "$RETRO_READINESS_PID_FILE"
+                : > "$RETRO_READINESS_MARKER"
+                kill -KILL "$janitor_pid" 2>/dev/null || true
+            fi
+        fi
+        ;;
+esac
+exec "$REAL_DIRNAME" "$@"
+EOF
+    chmod +x "$readiness_stubs/dirname"
+    : > "$mktemp_log"
+    env PATH="$readiness_stubs:$stubs:$PATH" REAL_MKTEMP="$real_mktemp" \
+        REAL_CP="$real_cp" REAL_DIRNAME="$real_dirname" \
+        RETRO_MKTEMP_LOG="$mktemp_log" \
+        RETRO_CP_READY="$ready" RETRO_CP_RELEASE="$release" \
+        RETRO_CP_PID_FILE="$cp_pid_file" \
+        RETRO_READINESS_MARKER="$readiness_marker" \
+        RETRO_READINESS_PID_FILE="$readiness_pid_file" \
+        "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+            --output-dir "$TEST_OUTPUT_DIR/shared-lease-readiness-output" \
+            --min-prs 1 >"$run_log" 2>&1 || readiness_rc=$?
+    roots=$(awk -F '\t' '{print $2}' "$mktemp_log" 2>/dev/null | \
+        grep -E '^(/private)?/tmp/gh-pr-enrich-analysis-snapshot\.[A-Za-z0-9]+$' || true)
+    readiness_pid=$(sed -n '1p' "$readiness_pid_file" 2>/dev/null || true)
+    residue=""
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        if [ -e "$root" ] || [ -e "$root.janitor" ]; then
+            residue="$residue $root"
+        fi
+    done <<< "$roots"
+    if [ "$readiness_rc" -ne 0 ] && [ -n "$readiness_pid" ] && \
+       [ -z "$residue" ] && ! kill -0 "$readiness_pid" 2>/dev/null && \
+       grep -q "Could not start the retrospective snapshot lease" "$run_log"; then
+        pass "post-launch heartbeat failure reaps the janitor and lease"
+    else
+        fail "post-launch heartbeat failure reaps the janitor and lease" \
+            "status=$readiness_rc pid=$readiness_pid residue=$residue output=$(cat "$run_log")"
+    fi
+
+    local fd7="$TEST_OUTPUT_DIR/shared-lease-fd7"
+    local fd8="$TEST_OUTPUT_DIR/shared-lease-fd8"
+    local fd9="$TEST_OUTPUT_DIR/shared-lease-fd9"
+    local fallback_rc=0
+    printf 'fd8\n' > "$fd8"
+    printf 'fd9\n' > "$fd9"
+    : > "$mktemp_log"
+    (
+        exec 9>>"$fd9"
+        exec 8>>"$fd8"
+        env PATH="$stubs:$PATH" REAL_MKTEMP="$real_mktemp" REAL_CP="$real_cp" \
+            RETRO_MKTEMP_LOG="$mktemp_log" \
+            RETRO_CP_READY="$ready" RETRO_CP_RELEASE="$release" \
+            RETRO_CP_PID_FILE="$cp_pid_file" \
+            RETRO_ASSERT_INHERITED_FDS=true \
+            "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+                --output-dir "$TEST_OUTPUT_DIR/shared-lease-fallback-output" \
+                --min-prs 1 >/dev/null 2>&1
+    ) || fallback_rc=$?
+    roots=$(awk -F '\t' '{print $2}' "$mktemp_log" 2>/dev/null | \
+        grep -E '^(/private)?/tmp/gh-pr-enrich-analysis-snapshot\.[A-Za-z0-9]+$' || true)
+    residue=""
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        if [ -e "$root" ] || [ -e "$root.janitor" ]; then
+            residue="$residue $root"
+        fi
+    done <<< "$roots"
+    if [ "$fallback_rc" -eq 0 ] && [ -z "$residue" ] && \
+       grep -q '^fd8-preserved$' "$fd8" && \
+       grep -q '^fd9-preserved$' "$fd9"; then
+        pass "occupied high descriptors are preserved while the lease falls back"
+    else
+        fail "occupied high descriptors are preserved while the lease falls back" \
+            "status=$fallback_rc residue=$residue fd8=$(cat "$fd8") fd9=$(cat "$fd9")"
+    fi
+
+    local exhausted_rc=0
+    printf 'occupied\n' > "$fd7"
+    : > "$mktemp_log"
+    (
+        exec 9>>"$fd7"
+        exec 8>>"$fd7"
+        exec 7>>"$fd7"
+        exec 6>>"$fd7"
+        exec 5>>"$fd7"
+        env PATH="$stubs:$PATH" REAL_MKTEMP="$real_mktemp" REAL_CP="$real_cp" \
+            RETRO_MKTEMP_LOG="$mktemp_log" \
+            RETRO_CP_READY="$ready" RETRO_CP_RELEASE="$release" \
+            RETRO_CP_PID_FILE="$cp_pid_file" \
+            "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+                --output-dir "$TEST_OUTPUT_DIR/shared-lease-exhausted-output" \
+                --min-prs 1 >"$run_log" 2>&1
+    ) || exhausted_rc=$?
+    roots=$(awk -F '\t' '{print $2}' "$mktemp_log" 2>/dev/null | \
+        grep -E '^(/private)?/tmp/gh-pr-enrich-analysis-snapshot\.[A-Za-z0-9]+$' || true)
+    residue=""
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        if [ -e "$root" ] || [ -e "$root.janitor" ]; then
+            residue="$residue $root"
+        fi
+    done <<< "$roots"
+    if [ "$exhausted_rc" -ne 0 ] && [ -z "$residue" ] && \
+       grep -q "Could not start the retrospective snapshot lease" "$run_log"; then
+        pass "descriptor exhaustion fails startup without snapshot residue"
+    else
+        fail "descriptor exhaustion fails startup without snapshot residue" \
+            "status=$exhausted_rc residue=$residue output=$(cat "$run_log")"
+    fi
+
+    rm -f "$ready" "$release"
+    : > "$mktemp_log"
+    env PATH="$stubs:$PATH" REAL_MKTEMP="$real_mktemp" REAL_CP="$real_cp" \
+        RETRO_MKTEMP_LOG="$mktemp_log" \
+        RETRO_CP_READY="$ready" RETRO_CP_RELEASE="$release" \
+        RETRO_CP_PID_FILE="$cp_pid_file" \
+        "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+            --output-dir "$TEST_OUTPUT_DIR/shared-lease-dead-output" \
+            --min-prs 1 >"$run_log" 2>&1 &
+    run_pid=$!
+    wait_attempt=0
+    while [ "$wait_attempt" -lt 500 ] && [ ! -e "$ready" ]; do
+        kill -0 "$run_pid" 2>/dev/null || break
+        sleep 0.01
+        wait_attempt=$((wait_attempt + 1))
+    done
+    roots=$(awk -F '\t' '{print $2}' "$mktemp_log" 2>/dev/null | \
+        grep -E '^(/private)?/tmp/gh-pr-enrich-analysis-snapshot\.[A-Za-z0-9]+$' || true)
+    root=$(printf '%s\n' "$roots" | sed -n '1p')
+    local dead_janitor_pid=""
+    dead_janitor_pid=$(awk -F '\t' 'NR == 1 {print $2}' \
+        "$root.janitor" 2>/dev/null || true)
+    kill -KILL "$dead_janitor_pid" 2>/dev/null || true
+    wait "$dead_janitor_pid" 2>/dev/null || true
+    : > "$release"
+    local dead_rc=0
+    wait "$run_pid" || dead_rc=$?
+    residue=""
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        if [ -e "$root" ] || [ -e "$root.janitor" ]; then
+            residue="$residue $root"
+        fi
+    done <<< "$roots"
+    if [ "$dead_rc" -ne 0 ] && \
+       grep -q "snapshot lease was lost" "$run_log" && [ -z "$residue" ]; then
+        pass "retrospective fails closed and cleans up when its janitor dies"
+    else
+        fail "retrospective fails closed and cleans up when its janitor dies" \
+            "status=$dead_rc residue=$residue output=$(cat "$run_log")"
+    fi
+
+    rm -f "$ready" "$release"
+    : > "$mktemp_log"
+    env PATH="$stubs:$PATH" REAL_MKTEMP="$real_mktemp" REAL_CP="$real_cp" \
+        RETRO_MKTEMP_LOG="$mktemp_log" \
+        RETRO_CP_READY="$ready" RETRO_CP_RELEASE="$release" \
+        RETRO_CP_PID_FILE="$cp_pid_file" \
+        "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+            --output-dir "$TEST_OUTPUT_DIR/shared-lease-owner-crash-output" \
+            --min-prs 1 >"$run_log" 2>&1 &
+    run_pid=$!
+    wait_attempt=0
+    while [ "$wait_attempt" -lt 500 ] && [ ! -e "$ready" ]; do
+        kill -0 "$run_pid" 2>/dev/null || break
+        sleep 0.01
+        wait_attempt=$((wait_attempt + 1))
+    done
+    roots=$(awk -F '\t' '{print $2}' "$mktemp_log" 2>/dev/null | \
+        grep -E '^(/private)?/tmp/gh-pr-enrich-analysis-snapshot\.[A-Za-z0-9]+$' || true)
+    root=$(printf '%s\n' "$roots" | sed -n '1p')
+    local owner_crash_janitor_pid=""
+    owner_crash_janitor_pid=$(awk -F '\t' 'NR == 1 {print $2}' \
+        "$root.janitor" 2>/dev/null || true)
+    kill -KILL "$run_pid" 2>/dev/null || true
+    wait "$run_pid" 2>/dev/null || true
+    wait_attempt=0
+    while [ "$wait_attempt" -lt 500 ] && \
+          { [ -e "$root" ] || [ -e "$root.janitor" ] || \
+            kill -0 "$owner_crash_janitor_pid" 2>/dev/null; }; do
+        sleep 0.01
+        wait_attempt=$((wait_attempt + 1))
+    done
+    if [ -e "$ready" ] && [ ! -e "$root" ] && \
+       [ ! -e "$root.janitor" ] && \
+       ! kill -0 "$owner_crash_janitor_pid" 2>/dev/null; then
+        pass "owner crash closes the FIFO lease and reaps snapshots before blocked children exit"
+    else
+        fail "owner crash closes the FIFO lease and reaps snapshots before blocked children exit" \
+            "root=$root janitor=$owner_crash_janitor_pid"
+    fi
+    : > "$release"
+    sleep 0.1
+
+    rm -f "$ready" "$release" "$cp_pid_file"
+    : > "$mktemp_log"
+    env PATH="$stubs:$PATH" REAL_MKTEMP="$real_mktemp" REAL_CP="$real_cp" \
+        RETRO_MKTEMP_LOG="$mktemp_log" \
+        RETRO_CP_READY="$ready" RETRO_CP_RELEASE="$release" \
+        RETRO_CP_PID_FILE="$cp_pid_file" \
+        "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+            --output-dir "$TEST_OUTPUT_DIR/shared-lease-owner-term-output" \
+            --min-prs 1 >"$run_log" 2>&1 &
+    run_pid=$!
+    wait_attempt=0
+    while [ "$wait_attempt" -lt 500 ] && [ ! -e "$ready" ]; do
+        kill -0 "$run_pid" 2>/dev/null || break
+        sleep 0.01
+        wait_attempt=$((wait_attempt + 1))
+    done
+    roots=$(awk -F '\t' '{print $2}' "$mktemp_log" 2>/dev/null | \
+        grep -E '^(/private)?/tmp/gh-pr-enrich-analysis-snapshot\.[A-Za-z0-9]+$' || true)
+    root=$(printf '%s\n' "$roots" | sed -n '1p')
+    local blocked_cp_pid=""
+    blocked_cp_pid=$(sed -n '1p' "$cp_pid_file" 2>/dev/null || true)
+    kill -TERM "$run_pid" 2>/dev/null || true
+    wait_attempt=0
+    while [ "$wait_attempt" -lt 500 ] && kill -0 "$run_pid" 2>/dev/null; do
+        sleep 0.01
+        wait_attempt=$((wait_attempt + 1))
+    done
+    local term_still_running=false
+    kill -0 "$run_pid" 2>/dev/null && term_still_running=true
+    if [ "$term_still_running" = true ]; then
+        kill -KILL "$run_pid" 2>/dev/null || true
+    fi
+    local term_rc=0
+    wait "$run_pid" 2>/dev/null || term_rc=$?
+    if [ "$term_still_running" = false ] && [ ! -e "$root" ] && \
+       [ ! -e "$root.janitor" ] && [ "$term_rc" -eq 143 ] && \
+       [[ "$blocked_cp_pid" =~ ^[1-9][0-9]*$ ]] && \
+       ! kill -0 "$blocked_cp_pid" 2>/dev/null; then
+        pass "TERM cleanup is bounded while a snapshot child remains blocked"
+    else
+        fail "TERM cleanup is bounded while a snapshot child remains blocked" \
+            "still_running=$term_still_running status=$term_rc root=$root cp=$blocked_cp_pid"
+    fi
+    : > "$release"
+    sleep 0.1
+}
+
 test_aggregation() {
     "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" --output-dir "$TEST_OUTPUT_DIR/retro" --min-prs 1 >/dev/null 2>&1
 
@@ -528,6 +930,7 @@ test_no_reports_directory
 test_no_analysis_files
 test_minimum_prs_warning
 test_basic_run
+test_shared_snapshot_lease_lifecycle
 test_aggregation
 test_pattern_detection
 test_author_filter

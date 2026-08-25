@@ -2014,6 +2014,95 @@ start_analysis_snapshot_janitor() {
     disown "$janitor_pid" 2>/dev/null || true
 }
 
+RETROSPECTIVE_JANITOR_SNAPSHOT=""
+RETROSPECTIVE_JANITOR_SIDECAR=""
+RETROSPECTIVE_JANITOR_TOKEN=""
+cleanup_owned_retrospective_snapshot() {
+    local token janitor_pid state cleanup_attempt=0
+    [ -n "$RETROSPECTIVE_JANITOR_SNAPSHOT" ] && \
+        is_private_code_snapshot_path "$RETROSPECTIVE_JANITOR_SNAPSHOT" || return 0
+    [ "$RETROSPECTIVE_JANITOR_SIDECAR" = \
+        "$RETROSPECTIVE_JANITOR_SNAPSHOT.janitor" ] || return 0
+    [ -f "$RETROSPECTIVE_JANITOR_SIDECAR" ] && \
+        [ ! -L "$RETROSPECTIVE_JANITOR_SIDECAR" ] || return 0
+    IFS=$'\t' read -r token janitor_pid state \
+        < "$RETROSPECTIVE_JANITOR_SIDECAR" || return 0
+    [ "$token" = "$RETROSPECTIVE_JANITOR_TOKEN" ] && \
+        [ "$janitor_pid" = "$$" ] && [ "$state" = active ] || return 0
+    while [ "$cleanup_attempt" -lt 300 ] && \
+          [ -e "$RETROSPECTIVE_JANITOR_SNAPSHOT" ]; do
+        chmod -R u+w "$RETROSPECTIVE_JANITOR_SNAPSHOT" 2>/dev/null || true
+        rm -rf "$RETROSPECTIVE_JANITOR_SNAPSHOT" 2>/dev/null || true
+        [ ! -e "$RETROSPECTIVE_JANITOR_SNAPSHOT" ] || sleep 0.01
+        cleanup_attempt=$((cleanup_attempt + 1))
+    done
+    [ -e "$RETROSPECTIVE_JANITOR_SNAPSHOT" ] || \
+        rm -f "$RETROSPECTIVE_JANITOR_SIDECAR"
+}
+
+run_retrospective_snapshot_janitor() {
+    local snapshot_path="$1" sidecar_path="$2" token="$3" fifo_path="$4"
+    local inherited_lease_fd="$5" inherited_bootstrap_fd="$6"
+    local heartbeat
+    is_private_code_snapshot_path "$snapshot_path" || return 1
+    [ "$sidecar_path" = "$snapshot_path.janitor" ] || return 1
+    [ "$fifo_path" = "$snapshot_path/.owner" ] && \
+        [ -p "$fifo_path" ] && [ ! -L "$fifo_path" ] || return 1
+    case "$inherited_lease_fd" in
+        9) exec 9>&- ;;
+        8) exec 8>&- ;;
+        7) exec 7>&- ;;
+        6) exec 6>&- ;;
+        5) exec 5>&- ;;
+        *) return 1 ;;
+    esac
+    case "$inherited_bootstrap_fd" in
+        9) exec 9>&- ;;
+        8) exec 8>&- ;;
+        7) exec 7>&- ;;
+        6) exec 6>&- ;;
+        5) exec 5>&- ;;
+        *) return 1 ;;
+    esac
+    rm -f "$fifo_path" || return 1
+    if ! (umask 077; set -o noclobber; \
+            printf '%s\t%s\tactive\n' "$token" "$$" > "$sidecar_path") \
+            2>/dev/null; then
+        return 1
+    fi
+    RETROSPECTIVE_JANITOR_SNAPSHOT="$snapshot_path"
+    RETROSPECTIVE_JANITOR_SIDECAR="$sidecar_path"
+    RETROSPECTIVE_JANITOR_TOKEN="$token"
+    trap cleanup_owned_retrospective_snapshot EXIT
+    trap 'exit 0' HUP INT TERM
+    while IFS= read -r heartbeat; do
+        [ "$heartbeat" = "$token" ] || return 1
+    done
+}
+
+retrospective_snapshot_lease_active() {
+    local snapshot_root="$1" lease_fd="$2" token janitor_pid state
+    local previous_pipe_trap write_status=1
+    is_private_code_snapshot_path "$snapshot_root" || return 1
+    analysis_snapshot_sidecar_matches "$snapshot_root" \
+        "$snapshot_root.janitor" "" active || return 1
+    IFS=$'\t' read -r token janitor_pid state \
+        < "$snapshot_root.janitor" || return 1
+    previous_pipe_trap="$(trap -p PIPE)"
+    trap '' PIPE
+    case "$lease_fd" in
+        9) printf '%s\n' "$token" >&9 2>/dev/null; write_status=$? ;;
+        8) printf '%s\n' "$token" >&8 2>/dev/null; write_status=$? ;;
+        7) printf '%s\n' "$token" >&7 2>/dev/null; write_status=$? ;;
+        6) printf '%s\n' "$token" >&6 2>/dev/null; write_status=$? ;;
+        5) printf '%s\n' "$token" >&5 2>/dev/null; write_status=$? ;;
+        *) write_status=1 ;;
+    esac
+    trap - PIPE
+    [ -z "$previous_pipe_trap" ] || eval "$previous_pipe_trap"
+    [ "$write_status" -eq 0 ]
+}
+
 materialize_analysis_snapshot() {
     local report_dir="$1"
     local context_file="$report_dir/analysis-context.json"
@@ -2201,8 +2290,10 @@ validate_selected_provenance() {
        [ "$analysis_fingerprint" != "$context_fingerprint" ]; then
         return 1
     fi
-    if jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
-            "$analysis_file" > /dev/null 2>&1 && \
+    if { [ "$(jq -r '.coverage.code_access.state // "disabled"' \
+                    "$context_file" 2>/dev/null || echo disabled)" = "enabled" ] || \
+         jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
+            "$analysis_file" > /dev/null 2>&1; } && \
        { [ -z "$expected_workspace_fingerprint" ] || \
          [ "$analysis_workspace_fingerprint" != "$expected_workspace_fingerprint" ]; }; then
         return 1
@@ -2243,6 +2334,7 @@ validate_address_selection_pair() {
 select_analysis_file() (
     local report_dir="$1"
     local selection_mode="${2:-read-only}"
+    local managed_read_snapshot_root="${3:-}"
     local expected_head="" expected_fingerprint="" expected_repository=""
     local expected_pr_number="" has_current_context=false
     local selected_path="" reader_lock_dir="" reader_lock_token=""
@@ -2301,8 +2393,17 @@ select_analysis_file() (
             "$report_dir/analysis-context.json")" || return 1
         summary_identity="$(stable_read_identity \
             "$report_dir/pr-summary.json")" || return 1
-        read_snapshot_dir="$(mktemp -d \
-            "/tmp/gh-pr-enrich-analysis-snapshot.XXXXXX")" || return 1
+        if [ -n "$managed_read_snapshot_root" ]; then
+            is_private_code_snapshot_path "$managed_read_snapshot_root" && \
+                analysis_snapshot_sidecar_matches \
+                    "$managed_read_snapshot_root" \
+                    "$managed_read_snapshot_root.janitor" "" active || return 1
+            read_snapshot_dir="$(mktemp -d \
+                "$managed_read_snapshot_root/report.XXXXXX")" || return 1
+        else
+            read_snapshot_dir="$(mktemp -d \
+                "/tmp/gh-pr-enrich-analysis-snapshot.XXXXXX")" || return 1
+        fi
         read_snapshot_report="$read_snapshot_dir/$(basename "${report_dir%/}")"
         mkdir "$read_snapshot_report" || return 1
         local snapshot_name snapshot_identity
@@ -2411,10 +2512,16 @@ select_analysis_file() (
           "$context_identity" ] && \
         [ "$(stable_read_identity "$report_dir/pr-summary.json")" = \
           "$summary_identity" ] || return 1
-        snapshot_ttl_seconds="$(positive_integer_or_default \
-            "${GH_PR_ENRICH_SNAPSHOT_TTL_SECONDS:-3600}" 3600 86400)"
-        start_analysis_snapshot_janitor "$read_snapshot_dir" \
-            "$snapshot_ttl_seconds" || return 1
+        if [ -n "$managed_read_snapshot_root" ]; then
+            analysis_snapshot_sidecar_matches \
+                "$managed_read_snapshot_root" \
+                "$managed_read_snapshot_root.janitor" "" active || return 1
+        else
+            snapshot_ttl_seconds="$(positive_integer_or_default \
+                "${GH_PR_ENRICH_SNAPSHOT_TTL_SECONDS:-3600}" 3600 86400)"
+            start_analysis_snapshot_janitor "$read_snapshot_dir" \
+                "$snapshot_ttl_seconds" || return 1
+        fi
         read_snapshot_handed_off=true
     fi
     if [ "$reader_lock_owned" = true ]; then
@@ -2610,6 +2717,13 @@ if [ "$1" = "__snapshot-janitor" ]; then
     shift
     [ $# -eq 4 ] || exit 1
     run_analysis_snapshot_janitor "$1" "$2" "$3" "$4"
+    exit $?
+fi
+
+if [ "$1" = "__retrospective-snapshot-janitor" ]; then
+    shift
+    [ $# -eq 6 ] || exit 1
+    run_retrospective_snapshot_janitor "$1" "$2" "$3" "$4" "$5" "$6"
     exit $?
 fi
 
@@ -3134,14 +3248,157 @@ if [ "$1" = "retrospective" ]; then
     RETRO_FORMAT=""
     RETRO_OUTPUT_FORMAT="combined"
     PR_REPORTS=()
-    cleanup_retrospective_snapshots() {
-        local selected_file
-        for selected_file in "${PR_REPORTS[@]}"; do
-            cleanup_read_only_analysis_snapshot "$selected_file" \
-                2>/dev/null || true
+    RETRO_SNAPSHOT_ROOT=""
+    RETRO_SNAPSHOT_LEASE_FD=""
+    RETRO_SNAPSHOT_BOOTSTRAP_FD=""
+    RETRO_SNAPSHOT_JANITOR_PID=""
+    RETRO_SNAPSHOT_JANITOR_JOB=""
+    RETRO_SNAPSHOT_WORKER_PID=""
+    RETRO_SNAPSHOT_WORKER_GROUP_OWNED=false
+    RETRO_SNAPSHOT_WORKER_STARTING=false
+    RETRO_PENDING_SIGNAL_STATUS=""
+    close_retrospective_snapshot_lease() {
+        case "$RETRO_SNAPSHOT_LEASE_FD" in
+            9) exec 9>&- ;;
+            8) exec 8>&- ;;
+            7) exec 7>&- ;;
+            6) exec 6>&- ;;
+            5) exec 5>&- ;;
+            "") return 0 ;;
+            *) return 1 ;;
+        esac
+        RETRO_SNAPSHOT_LEASE_FD=""
+    }
+    close_retrospective_snapshot_bootstrap() {
+        case "$RETRO_SNAPSHOT_BOOTSTRAP_FD" in
+            9) exec 9>&- ;;
+            8) exec 8>&- ;;
+            7) exec 7>&- ;;
+            6) exec 6>&- ;;
+            5) exec 5>&- ;;
+            "") return 0 ;;
+            *) return 1 ;;
+        esac
+        RETRO_SNAPSHOT_BOOTSTRAP_FD=""
+    }
+    retrospective_snapshot_worker_alive() {
+        [ -n "$RETRO_SNAPSHOT_WORKER_PID" ] || return 1
+        if [ "$RETRO_SNAPSHOT_WORKER_GROUP_OWNED" = true ]; then
+            kill -0 -- "-$RETRO_SNAPSHOT_WORKER_PID" 2>/dev/null
+        else
+            kill -0 "$RETRO_SNAPSHOT_WORKER_PID" 2>/dev/null
+        fi
+    }
+    stop_retrospective_snapshot_worker() {
+        local wait_attempt=0
+        [ -n "$RETRO_SNAPSHOT_WORKER_PID" ] || return 0
+        if [ "$RETRO_SNAPSHOT_WORKER_GROUP_OWNED" = true ]; then
+            kill -TERM -- "-$RETRO_SNAPSHOT_WORKER_PID" 2>/dev/null || true
+        else
+            kill -TERM "$RETRO_SNAPSHOT_WORKER_PID" 2>/dev/null || true
+        fi
+        while [ "$wait_attempt" -lt 10 ] && \
+              retrospective_snapshot_worker_alive; do
+            sleep 0.01
+            wait_attempt=$((wait_attempt + 1))
         done
+        if retrospective_snapshot_worker_alive; then
+            if [ "$RETRO_SNAPSHOT_WORKER_GROUP_OWNED" = true ]; then
+                kill -KILL -- "-$RETRO_SNAPSHOT_WORKER_PID" 2>/dev/null || true
+            else
+                kill -KILL "$RETRO_SNAPSHOT_WORKER_PID" 2>/dev/null || true
+            fi
+        fi
+        wait "$RETRO_SNAPSHOT_WORKER_PID" 2>/dev/null || true
+        RETRO_SNAPSHOT_WORKER_PID=""
+        RETRO_SNAPSHOT_WORKER_GROUP_OWNED=false
+    }
+    cleanup_retrospective_snapshots() {
+        local snapshot_root="$RETRO_SNAPSHOT_ROOT"
+        local wait_attempt=0
+        [ -n "$RETRO_SNAPSHOT_ROOT" ] || return 0
+        stop_retrospective_snapshot_worker || true
+        close_retrospective_snapshot_lease || true
+        close_retrospective_snapshot_bootstrap || true
+        if [ -n "$RETRO_SNAPSHOT_JANITOR_PID" ]; then
+            while [ "$wait_attempt" -lt 100 ] && \
+                  { [ -e "$snapshot_root" ] || \
+                    [ -e "$snapshot_root.janitor" ]; } && \
+                  jobs -p "$RETRO_SNAPSHOT_JANITOR_JOB" \
+                    >/dev/null 2>&1; do
+                sleep 0.01
+                wait_attempt=$((wait_attempt + 1))
+            done
+            if jobs -p "$RETRO_SNAPSHOT_JANITOR_JOB" \
+                    >/dev/null 2>&1 && \
+               { [ -e "$snapshot_root" ] || \
+                 [ -e "$snapshot_root.janitor" ]; }; then
+                kill -TERM "$RETRO_SNAPSHOT_JANITOR_JOB" 2>/dev/null || true
+            fi
+            if [ -n "$RETRO_SNAPSHOT_JANITOR_JOB" ]; then
+                wait_attempt=0
+                while [ "$wait_attempt" -lt 100 ] && \
+                      jobs -p "$RETRO_SNAPSHOT_JANITOR_JOB" \
+                        >/dev/null 2>&1; do
+                    sleep 0.01
+                    wait_attempt=$((wait_attempt + 1))
+                done
+                if jobs -p "$RETRO_SNAPSHOT_JANITOR_JOB" \
+                        >/dev/null 2>&1; then
+                    kill -KILL "$RETRO_SNAPSHOT_JANITOR_JOB" 2>/dev/null || true
+                fi
+                wait "$RETRO_SNAPSHOT_JANITOR_PID" 2>/dev/null || true
+            fi
+            RETRO_SNAPSHOT_JANITOR_PID=""
+            RETRO_SNAPSHOT_JANITOR_JOB=""
+        fi
+        case "$snapshot_root" in
+            /tmp/gh-pr-enrich-analysis-snapshot.*|\
+            /private/tmp/gh-pr-enrich-analysis-snapshot.*)
+                chmod -R u+w "$snapshot_root" 2>/dev/null || true
+                rm -rf "$snapshot_root"
+                rm -f "$snapshot_root.janitor"
+                ;;
+            *) ;;
+        esac
+        if [ ! -e "$snapshot_root" ] && [ ! -e "$snapshot_root.janitor" ]; then
+            RETRO_SNAPSHOT_ROOT=""
+            return 0
+        fi
+        echo "Error: Retrospective snapshot cleanup is incomplete; recovery path retained: $snapshot_root" >&2
+        return 1
+    }
+    terminate_retrospective() {
+        local signal_status="$1"
+        if [ "$RETRO_SNAPSHOT_WORKER_STARTING" = true ]; then
+            [ -n "$RETRO_PENDING_SIGNAL_STATUS" ] || \
+                RETRO_PENDING_SIGNAL_STATUS="$signal_status"
+            return 0
+        fi
+        # An explicit signal trap interrupts Bash's synchronous wait for a
+        # snapshot-copy child. The child has already closed the lease writer,
+        # so cleanup can revoke the shared root without waiting for that copy.
+        cleanup_retrospective_snapshots || true
+        trap - EXIT HUP INT TERM
+        exit "$signal_status"
+    }
+    cleanup_retrospective_report_snapshot() {
+        local selected_file="$1" snapshot_dir snapshot_parent snapshot_name
+        [ -n "$RETRO_SNAPSHOT_ROOT" ] && [ -n "$selected_file" ] || return 1
+        snapshot_dir="$(dirname "$(dirname "$selected_file")")" || return 1
+        snapshot_parent="$(canonicalize_path "$(dirname "$snapshot_dir")")" || return 1
+        snapshot_name="$(basename "$snapshot_dir")"
+        [ "$snapshot_parent" = "$(canonicalize_path "$RETRO_SNAPSHOT_ROOT")" ] && \
+            [[ "$snapshot_name" =~ ^report\.[A-Za-z0-9]+$ ]] && \
+            [ -d "$snapshot_dir" ] && [ ! -L "$snapshot_dir" ] || return 1
+        chmod -R u+w "$snapshot_dir" 2>/dev/null || true
+        rm -rf "$snapshot_dir"
+        [ ! -e "$snapshot_dir" ]
     }
     trap cleanup_retrospective_snapshots EXIT
+    trap 'terminate_retrospective 129' HUP
+    trap 'terminate_retrospective 130' INT
+    trap 'terminate_retrospective 143' TERM
 
     # Show help
     if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
@@ -3306,6 +3563,103 @@ RETRO_HELP
         fi
     }
 
+    start_retrospective_snapshot_lease() {
+        local cleanup_command fifo_path token_file token janitor_pid
+        local recorded_token recorded_pid state ready=false wait_attempt=0
+        local candidate_fd janitor_job_number
+        RETRO_SNAPSHOT_ROOT="$(mktemp -d \
+            "/tmp/gh-pr-enrich-analysis-snapshot.XXXXXX")" || return 1
+        fifo_path="$RETRO_SNAPSHOT_ROOT/.owner"
+        token_file="$(mktemp "/tmp/gh-pr-enrich-retro-token.XXXXXX")" || {
+            cleanup_retrospective_snapshots || true
+            return 1
+        }
+        token="${token_file##*.}"
+        rm -f "$token_file"
+        if ! (umask 077; mkfifo "$fifo_path") 2>/dev/null; then
+            cleanup_retrospective_snapshots || true
+            return 1
+        fi
+        for candidate_fd in 9 8 7 6 5; do
+            case "$candidate_fd" in
+                9) { : >&9; } 2>/dev/null && continue ;;
+                8) { : >&8; } 2>/dev/null && continue ;;
+                7) { : >&7; } 2>/dev/null && continue ;;
+                6) { : >&6; } 2>/dev/null && continue ;;
+                5) { : >&5; } 2>/dev/null && continue ;;
+            esac
+            if [ -z "$RETRO_SNAPSHOT_LEASE_FD" ]; then
+                RETRO_SNAPSHOT_LEASE_FD="$candidate_fd"
+            else
+                RETRO_SNAPSHOT_BOOTSTRAP_FD="$candidate_fd"
+                break
+            fi
+        done
+        [ -n "$RETRO_SNAPSHOT_LEASE_FD" ] && \
+            [ -n "$RETRO_SNAPSHOT_BOOTSTRAP_FD" ] || {
+            cleanup_retrospective_snapshots || true
+            return 1
+        }
+        case "$RETRO_SNAPSHOT_BOOTSTRAP_FD" in
+            9) exec 9<>"$fifo_path" ;;
+            8) exec 8<>"$fifo_path" ;;
+            7) exec 7<>"$fifo_path" ;;
+            6) exec 6<>"$fifo_path" ;;
+            5) exec 5<>"$fifo_path" ;;
+        esac
+        # Open the durable writer while the bootstrap descriptor still keeps
+        # both FIFO ends available. The janitor may unlink the pathname once
+        # launched; neither side needs to reopen it after this point.
+        case "$RETRO_SNAPSHOT_LEASE_FD" in
+            9) exec 9>"$fifo_path" ;;
+            8) exec 8>"$fifo_path" ;;
+            7) exec 7>"$fifo_path" ;;
+            6) exec 6>"$fifo_path" ;;
+            5) exec 5>"$fifo_path" ;;
+        esac
+        cleanup_command="$(canonicalize_path "${BASH_SOURCE[0]}")"
+        "$cleanup_command" __retrospective-snapshot-janitor \
+            "$RETRO_SNAPSHOT_ROOT" "$RETRO_SNAPSHOT_ROOT.janitor" \
+            "$token" "$fifo_path" "$RETRO_SNAPSHOT_LEASE_FD" \
+            "$RETRO_SNAPSHOT_BOOTSTRAP_FD" < "$fifo_path" \
+            >/dev/null 2>&1 &
+        janitor_pid=$!
+        RETRO_SNAPSHOT_JANITOR_PID="$janitor_pid"
+        janitor_job_number="$(jobs -l | awk -v target="$janitor_pid" \
+            '$2 == target {job = $1; gsub(/[^0-9]/, "", job); print job; exit}')"
+        if ! [[ "$janitor_job_number" =~ ^[1-9][0-9]*$ ]]; then
+            cleanup_retrospective_snapshots || true
+            return 1
+        fi
+        RETRO_SNAPSHOT_JANITOR_JOB="%$janitor_job_number"
+        close_retrospective_snapshot_bootstrap || {
+            cleanup_retrospective_snapshots || true
+            return 1
+        }
+        while [ "$wait_attempt" -lt 300 ]; do
+            if analysis_snapshot_sidecar_matches "$RETRO_SNAPSHOT_ROOT" \
+                    "$RETRO_SNAPSHOT_ROOT.janitor" "$token" active; then
+                IFS=$'\t' read -r recorded_token recorded_pid state \
+                    < "$RETRO_SNAPSHOT_ROOT.janitor" || break
+                if [ "$recorded_pid" = "$janitor_pid" ]; then
+                    ready=true
+                    break
+                fi
+            fi
+            jobs -p "$RETRO_SNAPSHOT_JANITOR_JOB" >/dev/null 2>&1 || break
+            sleep 0.01
+            wait_attempt=$((wait_attempt + 1))
+        done
+        if [ "$ready" != true ] || \
+           ! retrospective_snapshot_lease_active "$RETRO_SNAPSHOT_ROOT" \
+                "$RETRO_SNAPSHOT_LEASE_FD"; then
+            close_retrospective_snapshot_lease || true
+            kill -TERM "$RETRO_SNAPSHOT_JANITOR_JOB" 2>/dev/null || true
+            cleanup_retrospective_snapshots || true
+            return 1
+        fi
+    }
+
     # ============================================================================
     # Retrospective Helper Functions
     # ============================================================================
@@ -3377,10 +3731,51 @@ RETRO_HELP
         for pr_dir in "$reports_dir"/pr-*/; do
             [ -d "$pr_dir" ] || continue
 
-            local analysis_file
-            analysis_file="$(select_analysis_file "$pr_dir" 2>/dev/null || true)"
+            if ! retrospective_snapshot_lease_active "$RETRO_SNAPSHOT_ROOT" \
+                    "$RETRO_SNAPSHOT_LEASE_FD"; then
+                echo "Error: Retrospective snapshot lease was lost during report discovery." >&2
+                return 1
+            fi
+
+            local analysis_file selection_output selection_status=0
+            selection_output="$(mktemp \
+                "$RETRO_SNAPSHOT_ROOT/.selection.XXXXXX")" || return 1
+            RETRO_SNAPSHOT_WORKER_STARTING=true
+            set -m
+            (
+                # Only the top-level retrospective owns the FIFO writer. A
+                # snapshot worker or tool child must not keep the lease
+                # alive after an ungraceful owner exit.
+                close_retrospective_snapshot_lease || exit 1
+                select_analysis_file "$pr_dir" read-only \
+                    "$RETRO_SNAPSHOT_ROOT" 2>/dev/null || true
+            ) > "$selection_output" &
+            RETRO_SNAPSHOT_WORKER_PID=$!
+            if kill -0 -- "-$RETRO_SNAPSHOT_WORKER_PID" 2>/dev/null; then
+                RETRO_SNAPSHOT_WORKER_GROUP_OWNED=true
+            fi
+            set +m
+            RETRO_SNAPSHOT_WORKER_STARTING=false
+            if [ -n "$RETRO_PENDING_SIGNAL_STATUS" ]; then
+                terminate_retrospective "$RETRO_PENDING_SIGNAL_STATUS"
+            fi
+            wait "$RETRO_SNAPSHOT_WORKER_PID" || selection_status=$?
+            RETRO_SNAPSHOT_WORKER_PID=""
+            RETRO_SNAPSHOT_WORKER_GROUP_OWNED=false
+            if [ "$selection_status" -ne 0 ]; then
+                rm -f "$selection_output"
+                return 1
+            fi
+            analysis_file="$(cat "$selection_output")"
+            rm -f "$selection_output"
             local summary_file
             summary_file="$(dirname "$analysis_file")/pr-summary.json"
+
+            if ! retrospective_snapshot_lease_active "$RETRO_SNAPSHOT_ROOT" \
+                    "$RETRO_SNAPSHOT_LEASE_FD"; then
+                echo "Error: Retrospective snapshot lease was lost while freezing a report." >&2
+                return 1
+            fi
 
             if [ -z "$analysis_file" ] || [ ! -f "$analysis_file" ]; then
                 ((skipped_no_analysis++)) || true
@@ -3392,7 +3787,7 @@ RETRO_HELP
                 local pr_date
                 pr_date=$(jq -r '.createdAt // .updatedAt // ""' "$summary_file" 2>/dev/null | cut -d'T' -f1)
                 if [ -n "$pr_date" ] && [[ "$pr_date" < "$since_date" ]]; then
-                    cleanup_read_only_analysis_snapshot "$analysis_file"
+                    cleanup_retrospective_report_snapshot "$analysis_file" || return 1
                     ((skipped_date++)) || true
                     continue
                 fi
@@ -3413,7 +3808,7 @@ RETRO_HELP
                     fi
                 done
                 if [ "$author_match" = false ]; then
-                    cleanup_read_only_analysis_snapshot "$analysis_file"
+                    cleanup_retrospective_report_snapshot "$analysis_file" || return 1
                     ((skipped_author++)) || true
                     continue
                 fi
@@ -3426,7 +3821,7 @@ RETRO_HELP
             if jq -e '(.issue_categories // []) | length > 0 and (map(has("category")) | any | not)' \
                     "$analysis_file" > /dev/null 2>&1; then
                 legacy_reports+=("$(basename "$pr_dir")")
-                cleanup_read_only_analysis_snapshot "$analysis_file"
+                cleanup_retrospective_report_snapshot "$analysis_file" || return 1
                 continue
             fi
 
@@ -4035,8 +4430,18 @@ CHECKLIST_HEADER
         retro_log "Filtering PRs since: $RETRO_SINCE"
     fi
 
+    # One bounded lease owns every immutable report snapshot in this run. This
+    # avoids a polling janitor per archived PR while preserving crash cleanup.
+    if ! start_retrospective_snapshot_lease; then
+        echo "Error: Could not start the retrospective snapshot lease." >&2
+        exit 1
+    fi
+
     # Discover PR reports
-    discover_pr_reports "$RETRO_REPORTS_DIR" "$RETRO_SINCE" "$RETRO_AUTHOR"
+    if ! discover_pr_reports "$RETRO_REPORTS_DIR" "$RETRO_SINCE" "$RETRO_AUTHOR"; then
+        echo "Error: Retrospective report discovery failed." >&2
+        exit 1
+    fi
 
     # Check minimum PRs requirement
     if [ ${#PR_REPORTS[@]} -eq 0 ]; then
@@ -4058,8 +4463,35 @@ CHECKLIST_HEADER
 
     # Aggregate data
     retro_log "Aggregating PR data..."
-    AGGREGATED=$(aggregate_pr_data)
-    cleanup_retrospective_snapshots
+    AGGREGATION_OUTPUT="$(mktemp \
+        "$RETRO_SNAPSHOT_ROOT/.aggregation.XXXXXX")" || exit 1
+    RETRO_SNAPSHOT_WORKER_STARTING=true
+    set -m
+    (
+        close_retrospective_snapshot_lease || exit 1
+        aggregate_pr_data
+    ) > "$AGGREGATION_OUTPUT" &
+    RETRO_SNAPSHOT_WORKER_PID=$!
+    if kill -0 -- "-$RETRO_SNAPSHOT_WORKER_PID" 2>/dev/null; then
+        RETRO_SNAPSHOT_WORKER_GROUP_OWNED=true
+    fi
+    set +m
+    RETRO_SNAPSHOT_WORKER_STARTING=false
+    if [ -n "$RETRO_PENDING_SIGNAL_STATUS" ]; then
+        terminate_retrospective "$RETRO_PENDING_SIGNAL_STATUS"
+    fi
+    if ! wait "$RETRO_SNAPSHOT_WORKER_PID"; then
+        RETRO_SNAPSHOT_WORKER_PID=""
+        RETRO_SNAPSHOT_WORKER_GROUP_OWNED=false
+        exit 1
+    fi
+    RETRO_SNAPSHOT_WORKER_PID=""
+    RETRO_SNAPSHOT_WORKER_GROUP_OWNED=false
+    AGGREGATED="$(cat "$AGGREGATION_OUTPUT")"
+    rm -f "$AGGREGATION_OUTPUT"
+    if ! cleanup_retrospective_snapshots; then
+        exit 1
+    fi
     PR_REPORTS=()
     echo "$AGGREGATED" > "$RETRO_OUTPUT_DIR/aggregated-data.json"
 

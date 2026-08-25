@@ -2221,6 +2221,45 @@ assert_jq "$SELECTION_REPORT/analysis.json" \
     '.task_list[0].finding_ids == ["unverified-finding"]' \
     "a task mapped to a confirmed finding is selectable"
 
+# A clean native result still claims that the immutable code snapshot was
+# reviewed. Bind that claim to the same workspace fingerprint as a finding.
+CLEAN_CODE_SOURCE="$SELECTION_REPORT/codex-analysis.json"
+CLEAN_CODE_SAVED="$SELECTION_REPORT/claude-code-analysis.json"
+jq '.issue_categories = []
+    | .task_list = []
+    | .disputed_comments = []
+    | .category_coverage |= map(.verdict = "reviewed_none_found")' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$CLEAN_CODE_SOURCE"
+cp "$CLEAN_CODE_SOURCE" "$CLEAN_CODE_SAVED"
+jq 'del(._metadata.workspace_fingerprint)' \
+    "$CLEAN_CODE_SAVED" > "$CLEAN_CODE_SOURCE"
+rc=0
+(cd "$SELECTION_REPO" && \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$CLEAN_CODE_SOURCE" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "clean native analysis without the snapshot fingerprint is rejected"
+jq '._metadata.workspace_fingerprint = "sha256:not-the-reviewed-workspace"' \
+    "$CLEAN_CODE_SAVED" > "$CLEAN_CODE_SOURCE"
+rc=0
+(cd "$SELECTION_REPO" && \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$CLEAN_CODE_SOURCE" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "clean native analysis with a mismatched snapshot fingerprint is rejected"
+mv "$CLEAN_CODE_SAVED" "$CLEAN_CODE_SOURCE"
+(cd "$SELECTION_REPO" && \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$CLEAN_CODE_SOURCE" >/dev/null)
+assert_jq "$SELECTION_REPORT/analysis.json" \
+    '(.issue_categories | length) == 0 and
+     all(.category_coverage[]; .verdict == "reviewed_none_found")' \
+    "clean native analysis binds its all-clear verdict to the reviewed snapshot"
+(cd "$SELECTION_REPO" && \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null)
+rm -f "$CLEAN_CODE_SOURCE"
+
 FRACTIONAL_LINE_SOURCE="$SELECTION_REPORT/fractional-lines.json"
 jq '.task_list[0].line = 1.5' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$FRACTIONAL_LINE_SOURCE"
@@ -3037,6 +3076,7 @@ READ_ONLY_SNAPSHOT_ROOT=$(dirname "$(dirname "$READ_ONLY_SELECTED")")
 "$GH_PR_ENRICH" cleanup-analysis-snapshot "$READ_ONLY_SNAPSHOT_ROOT"
 assert_true "$([ ! -e "$READ_ONLY_SNAPSHOT_ROOT" ] && echo 0 || echo 1)" \
     "read-only consumer explicitly cleans its private analysis snapshot"
+
 chmod 755 "$SELECTION_REPORT"
 
 rc=0
