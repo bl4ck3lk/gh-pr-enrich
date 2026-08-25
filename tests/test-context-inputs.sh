@@ -83,6 +83,126 @@ assert_jq_eq "$THREADS" '[.data.repository.pullRequest.reviewThreads.nodes[]] | 
 assert_jq "$THREADS" '[.data.repository.pullRequest.reviewThreads.nodes[].id] | index("PRRT_page2") != null' \
     "thread from the second page is not dropped"
 
+# `gh pr view --json files,commits` caps both connections at 100. A summary
+# that reaches either boundary must be completed from explicit paginated
+# GraphQL connections before it can feed SAST or analyzer intent.
+PR_CONNECTION_STUB_DIR="$TEST_OUTPUT_DIR/pr-connection-stubs"
+PR_CONNECTION_ARGS="$TEST_OUTPUT_DIR/pr-connection-args.log"
+PR_CONNECTION_SUMMARY="$TEST_OUTPUT_DIR/pr-connection-summary.json"
+mkdir -p "$PR_CONNECTION_STUB_DIR"
+cat > "$PR_CONNECTION_STUB_DIR/gh" << 'STUB'
+#!/bin/bash
+printf '%s\n' "$@" >> "$PR_CONNECTION_ARGS"
+query=""
+paginate=false
+for arg in "$@"; do
+    [ "$arg" != --paginate ] || paginate=true
+    case "$arg" in query=*) query="$arg" ;; esac
+done
+pageable=false
+if [ "$paginate" = true ]; then
+    has_page_info=false
+    has_cursor=false
+    applies_cursor=false
+    case "$query" in *pageInfo*) has_page_info=true ;; esac
+    case "$query" in *'$endCursor'*) has_cursor=true ;; esac
+    case "$query" in *'after: $endCursor'*) applies_cursor=true ;; esac
+    if [ "$has_page_info" = true ] && [ "$has_cursor" = true ] && \
+       [ "$applies_cursor" = true ]; then
+        pageable=true
+    fi
+fi
+case "$query" in
+    *'files(first:'*)
+        if [ "${PR_CONNECTION_MODE:-complete}" = partial-files ]; then
+            jq -cn '{data:{repository:{pullRequest:{headRefOid:"head-1",baseRefOid:"base-1",files:{totalCount:101,pageInfo:{hasNextPage:false,endCursor:null},nodes:[range(0;100)|{path:("src/file-"+(tostring)+".js"),additions:1,deletions:0}]}}}}}'
+            exit 0
+        fi
+        jq -cn '{data:{repository:{pullRequest:{headRefOid:"head-1",baseRefOid:"base-1",files:{totalCount:101,pageInfo:{hasNextPage:true,endCursor:"FILES-100"},nodes:[range(0;100)|{path:("src/file-"+(tostring)+".js"),additions:1,deletions:0}]}}}}}'
+        if [ "$pageable" = true ]; then
+            if [ "${PR_CONNECTION_MODE:-complete}" = head-drift ]; then
+                jq -cn '{data:{repository:{pullRequest:{headRefOid:"head-2",baseRefOid:"base-1",files:{totalCount:101,pageInfo:{hasNextPage:false,endCursor:null},nodes:[{path:"src/file-100.js",additions:2,deletions:1}]}}}}}'
+            else
+                jq -cn '{data:{repository:{pullRequest:{headRefOid:"head-1",baseRefOid:"base-1",files:{totalCount:101,pageInfo:{hasNextPage:false,endCursor:null},nodes:[{path:"src/file-100.js",additions:2,deletions:1}]}}}}}'
+            fi
+        fi
+        ;;
+    *'commits(first:'*)
+        if [ "${PR_CONNECTION_MODE:-complete}" = partial-commits ]; then
+            jq -cn '{data:{repository:{pullRequest:{headRefOid:"head-1",baseRefOid:"base-1",commits:{totalCount:101,pageInfo:{hasNextPage:false,endCursor:null},nodes:[range(0;100)|{commit:{oid:("oid-"+(tostring)),messageHeadline:("commit "+(tostring)),messageBody:"body"}}]}}}}}'
+            exit 0
+        fi
+        jq -cn '{data:{repository:{pullRequest:{headRefOid:"head-1",baseRefOid:"base-1",commits:{totalCount:101,pageInfo:{hasNextPage:true,endCursor:"COMMITS-100"},nodes:[range(0;100)|{commit:{oid:("oid-"+(tostring)),messageHeadline:("commit "+(tostring)),messageBody:"body"}}]}}}}}'
+        if [ "$pageable" = true ]; then
+            jq -cn '{data:{repository:{pullRequest:{headRefOid:"head-1",baseRefOid:"base-1",commits:{totalCount:101,pageInfo:{hasNextPage:false,endCursor:null},nodes:[{commit:{oid:"oid-100",messageHeadline:"commit 100",messageBody:"last body"}}]}}}}}'
+        fi
+        ;;
+    *) exit 1 ;;
+esac
+STUB
+chmod +x "$PR_CONNECTION_STUB_DIR/gh"
+jq -n '{
+    headRefOid: "head-1",
+    baseRefOid: "base-1",
+    changedFiles: 101,
+    files: [range(0;100) | {path:("src/file-"+(tostring)+".js"), additions:1, deletions:0}],
+    commits: [range(0;100) | {oid:("oid-"+(tostring)), messageHeadline:("commit "+(tostring)), messageBody:"body"}]
+}' > "$PR_CONNECTION_SUMMARY"
+env PR_CONNECTION_ARGS="$PR_CONNECTION_ARGS" PATH="$PR_CONNECTION_STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call complete_pr_summary_connections \
+        owner/owner 1 "$PR_CONNECTION_SUMMARY" >/dev/null 2>&1
+assert_jq "$PR_CONNECTION_SUMMARY" \
+    '.changedFiles == 101 and (.files | length) == 101 and .files[-1].path == "src/file-100.js"' \
+    "changed-file pagination completes the capped PR summary"
+assert_jq "$PR_CONNECTION_SUMMARY" \
+    '(.commits | length) == 101 and .commits[-1] == {oid:"oid-100",messageHeadline:"commit 100",messageBody:"last body"}' \
+    "commit pagination completes the capped PR summary"
+assert_true "$([ "$(grep -c -- '--paginate' "$PR_CONNECTION_ARGS")" -eq 2 ] && echo 0 || echo 1)" \
+    "changed files and commits both use explicit pagination"
+
+PR_CONNECTION_PARTIAL="$TEST_OUTPUT_DIR/pr-connection-partial.json"
+jq '.files = .files[0:100] | .commits = []' "$PR_CONNECTION_SUMMARY" \
+    > "$PR_CONNECTION_PARTIAL"
+cp "$PR_CONNECTION_PARTIAL" "$PR_CONNECTION_PARTIAL.before"
+rc=0
+env PR_CONNECTION_MODE=partial-files PR_CONNECTION_ARGS="$PR_CONNECTION_ARGS" \
+    PATH="$PR_CONNECTION_STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call complete_pr_summary_connections \
+        owner/repo 1 "$PR_CONNECTION_PARTIAL" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a terminal changed-file page short of totalCount fails closed"
+assert_true "$(cmp -s "$PR_CONNECTION_PARTIAL.before" "$PR_CONNECTION_PARTIAL"; echo $?)" \
+    "failed connection completion leaves the original summary unchanged"
+
+PR_CONNECTION_COMMIT_PARTIAL="$TEST_OUTPUT_DIR/pr-connection-commit-partial.json"
+jq '.commits = .commits[0:100]' "$PR_CONNECTION_SUMMARY" \
+    > "$PR_CONNECTION_COMMIT_PARTIAL"
+cp "$PR_CONNECTION_COMMIT_PARTIAL" "$PR_CONNECTION_COMMIT_PARTIAL.before"
+rc=0
+env PR_CONNECTION_MODE=partial-commits PR_CONNECTION_ARGS="$PR_CONNECTION_ARGS" \
+    PATH="$PR_CONNECTION_STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call complete_pr_summary_connections \
+        owner/repo 1 "$PR_CONNECTION_COMMIT_PARTIAL" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a terminal commit page short of totalCount fails closed"
+assert_true "$(cmp -s "$PR_CONNECTION_COMMIT_PARTIAL.before" \
+    "$PR_CONNECTION_COMMIT_PARTIAL"; echo $?)" \
+    "failed commit completion leaves the original summary unchanged"
+
+PR_CONNECTION_DRIFT="$TEST_OUTPUT_DIR/pr-connection-head-drift.json"
+jq '.files = .files[0:100] | .commits = []' "$PR_CONNECTION_SUMMARY" \
+    > "$PR_CONNECTION_DRIFT"
+cp "$PR_CONNECTION_DRIFT" "$PR_CONNECTION_DRIFT.before"
+rc=0
+env PR_CONNECTION_MODE=head-drift PR_CONNECTION_ARGS="$PR_CONNECTION_ARGS" \
+    PATH="$PR_CONNECTION_STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call complete_pr_summary_connections \
+        owner/repo 1 "$PR_CONNECTION_DRIFT" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "changed-file pagination rejects a head change between pages"
+assert_true "$(cmp -s "$PR_CONNECTION_DRIFT.before" "$PR_CONNECTION_DRIFT"; echo $?)" \
+    "head drift during pagination leaves the original summary unchanged"
+
 # One live discussion identity spans several API requests. Two consecutive
 # complete snapshots must agree before the hosted state is considered stable.
 STABILITY_STUB_DIR="$TEST_OUTPUT_DIR/discussion-stability"

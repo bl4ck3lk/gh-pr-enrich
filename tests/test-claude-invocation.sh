@@ -1024,6 +1024,7 @@ echo "const x = 1;" > "$WORKSPACE/src/retry.js"
 WORKSPACE_HEAD=$(git -C "$WORKSPACE" rev-parse HEAD)
 jq -n --arg sha "$WORKSPACE_HEAD" '{
     number: 1, title: "t", body: "", author: {login: "u"},
+    changedFiles: 2,
     files: [{path: "src/retry.js"}, {path: "src/deleted-by-this-pr.js"}],
     headRefOid: $sha
 }' > "$SAST_DIR/pr-summary.json"
@@ -1051,6 +1052,31 @@ assert_jq "$SAST_DIR/sast-status.json" \
     '.status == "completed" and .workspace_source == "immutable_snapshot" and
      (.workspace_fingerprint | startswith("sha256:"))' \
     "completed SAST provenance binds the immutable workspace fingerprint"
+
+SAST_PARTIAL_DIR="$WORKSPACE/partial-files-reports"
+SAST_PARTIAL_MARKER="$TEST_OUTPUT_DIR/partial-files-semgrep-invoked"
+SAST_PARTIAL_STUBS="$TEST_OUTPUT_DIR/partial-files-stubs"
+mkdir -p "$SAST_PARTIAL_DIR" "$SAST_PARTIAL_STUBS"
+jq '.changedFiles = ((.files | length) + 1)' \
+    "$SAST_DIR/pr-summary.json" > "$SAST_PARTIAL_DIR/pr-summary.json"
+cat > "$SAST_PARTIAL_STUBS/semgrep" << 'STUB'
+#!/bin/bash
+printf 'invoked\n' > "$SAST_PARTIAL_MARKER"
+exit 0
+STUB
+chmod +x "$SAST_PARTIAL_STUBS/semgrep"
+(cd "$WORKSPACE" && env PATH="$SAST_PARTIAL_STUBS:$STUB_DIR:$PATH" \
+    GH_PR_ENRICH_CODE_ACCESS=true \
+    SAST_PARTIAL_MARKER="$SAST_PARTIAL_MARKER" \
+    "$GH_PR_ENRICH" --test-call collect_sast_findings \
+    "partial-files-reports" >/dev/null 2>&1)
+assert_jq_eq "$SAST_PARTIAL_DIR/sast-findings.json" 'length' "0" \
+    "an incomplete changed-file summary cannot produce SAST findings"
+assert_jq "$SAST_PARTIAL_DIR/sast-status.json" \
+    '.status == "failed" and (.reason | contains("changed-file pagination"))' \
+    "incomplete changed-file pagination is explicit failed SAST coverage"
+assert_true "$([ ! -e "$SAST_PARTIAL_MARKER" ] && echo 0 || echo 1)" \
+    "semgrep is not invoked with a capped changed-file list"
 
 # A zero-exit scanner envelope is not automatically a clean result. Semgrep's
 # root must explicitly contain a results array before projection can complete.

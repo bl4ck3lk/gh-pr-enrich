@@ -1328,13 +1328,17 @@ STALE_LINKED_REPORT="$TEST_OUTPUT_DIR/stale-linked-report"
 mkdir -p "$STALE_LINKED_REPORT"
 printf 'partial\n' > "$STALE_LINKED_REPORT/linked-issues.json.pages.A1b2C3"
 printf 'partial\n' > "$STALE_LINKED_REPORT/linked-issues.json.normalized.Z9y8X7"
+mkdir "$STALE_LINKED_REPORT/.pr-summary-connections.Q1w2E3"
+printf '[]\n' > "$STALE_LINKED_REPORT/.pr-summary-connections.Q1w2E3/files.json"
+printf '{}\n' > "$STALE_LINKED_REPORT/.pr-summary-connections.Q1w2E3/pr-summary.json"
 env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" 1 \
     --output-dir "$STALE_LINKED_REPORT" >/dev/null 2>&1
-STALE_LINKED_RESIDUE=$(find "$STALE_LINKED_REPORT" -maxdepth 1 \
+STALE_LINKED_RESIDUE=$(find "$STALE_LINKED_REPORT" -maxdepth 2 \
     \( -name 'linked-issues.json.pages.*' -o \
-       -name 'linked-issues.json.normalized.*' \) -print -quit)
+       -name 'linked-issues.json.normalized.*' -o \
+       -name '.pr-summary-connections.*' \) -print -quit)
 assert_true "$([ -z "$STALE_LINKED_RESIDUE" ] && echo 0 || echo 1)" \
-    "a new lock owner recovers exact-name pagination staging from a crashed run"
+    "a new lock owner recovers linked and PR-summary pagination staging from a crashed run"
 
 PERSISTENT_RM_STUBS="$TEST_OUTPUT_DIR/persistent-pagination-rm-stubs"
 PERSISTENT_RM_REPORT="$TEST_OUTPUT_DIR/persistent-pagination-rm-report"

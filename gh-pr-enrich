@@ -904,16 +904,28 @@ terminate_report_run_child() {
 }
 
 cleanup_report_run_temp_files() {
-    local temp_file restore_nullglob=false cleanup_failed=false
-    local -a temp_files=()
+    local temp_file temp_dir temp_name temp_suffix restore_nullglob=false cleanup_failed=false
+    local -a temp_files=() temp_dirs=()
     shopt -q nullglob || { shopt -s nullglob; restore_nullglob=true; }
     temp_files=("$OUTPUT_DIR"/linked-issues.json.pages.* \
         "$OUTPUT_DIR"/linked-issues.json.normalized.*)
+    temp_dirs=("$OUTPUT_DIR"/.pr-summary-connections.??????)
     [ "$restore_nullglob" = false ] || shopt -u nullglob
     for temp_file in "${temp_files[@]}"; do
         [ -f "$temp_file" ] && [ ! -L "$temp_file" ] && \
             is_generated_report_artifact "$(basename "$temp_file")" || continue
         rm -f "$temp_file" || cleanup_failed=true
+    done
+    for temp_dir in "${temp_dirs[@]}"; do
+        [ -d "$temp_dir" ] && [ ! -L "$temp_dir" ] || continue
+        temp_name="$(basename "$temp_dir")"
+        temp_suffix="${temp_name##*.}"
+        [[ "$temp_suffix" =~ ^[A-Za-z0-9]{6}$ ]] || continue
+        rm -f "$temp_dir/files.json" "$temp_dir/files.json.pages" \
+            "$temp_dir/files.json.normalized" "$temp_dir/commits.json" \
+            "$temp_dir/commits.json.pages" "$temp_dir/commits.json.normalized" \
+            "$temp_dir/pr-summary.json" || cleanup_failed=true
+        rmdir "$temp_dir" 2>/dev/null || cleanup_failed=true
     done
     [ "$cleanup_failed" = false ]
 }
@@ -1796,10 +1808,22 @@ invalidate_selected_analysis() (
 )
 
 is_generated_report_artifact() {
-    local temp_suffix=""
+    local temp_suffix="" temp_dir=""
     case "$1" in
         linked-issues.json.pages.*|linked-issues.json.normalized.*)
             temp_suffix="${1##*.}"
+            [[ "$temp_suffix" =~ ^[A-Za-z0-9]{6}$ ]]
+            return $?
+            ;;
+        .pr-summary-connections.??????/files.json|\
+        .pr-summary-connections.??????/files.json.pages|\
+        .pr-summary-connections.??????/files.json.normalized|\
+        .pr-summary-connections.??????/commits.json|\
+        .pr-summary-connections.??????/commits.json.pages|\
+        .pr-summary-connections.??????/commits.json.normalized|\
+        .pr-summary-connections.??????/pr-summary.json)
+            temp_dir="${1%%/*}"
+            temp_suffix="${temp_dir##*.}"
             [[ "$temp_suffix" =~ ^[A-Za-z0-9]{6}$ ]]
             return $?
             ;;
@@ -4083,7 +4107,7 @@ RETRO_HELP
                 total_prs_analyzed: $agg.total_prs,
                 total_issues: [
                     $agg.prs[]
-                    | [(.issue_categories // [])[] | select(.verdict != "refuted")]
+                    | [(.issue_categories // [])[] | select(.verdict == "confirmed")]
                     | length
                 ] | add,
                 total_tasks: [$agg.prs[] | (.task_list // []) | length] | add,
@@ -4091,7 +4115,7 @@ RETRO_HELP
             },
             top_issue_categories: (
                 [$agg.prs[] | (.issue_categories // [])[]
-                    | select(.verdict != "refuted")] |
+                    | select(.verdict == "confirmed")] |
                 sort_by(.name) |
                 group_by(.name) |
                 map({name: .[0].name, count: length, severities: (sort_by(.severity) | group_by(.severity) | map({s: .[0].severity, c: length}))}) |
@@ -5822,6 +5846,7 @@ create_comments_with_graphql_ids() {
 # not receive.
 THREAD_COMMENT_LIMIT=20
 LINKED_ISSUE_PAGE_SIZE=100
+PR_CONNECTION_PAGE_SIZE=100
 
 fetch_review_threads() {
     local owner="$1"
@@ -6371,6 +6396,264 @@ fetch_linked_issues() {
     mv "$normalized_file" "$output_file" || publish_rc=$?
     rm -f "$pages_file" "$normalized_file"
     return "$publish_rc"
+}
+
+# `gh pr view --json files,commits` uses connections capped at 100 items.
+# Fetch either connection directly when the summary indicates that cap may have
+# hidden input. Each helper validates the complete GraphQL connection before it
+# publishes a normalized array; partial pages are never accepted as evidence.
+fetch_pr_files() {
+    local owner="$1" repo_name="$2" pr_number="$3"
+    local expected_head="$4" expected_base="$5" output_file="$6"
+    local pages_file="${output_file}.pages" normalized_file="${output_file}.normalized"
+    local query='
+    query($owner: String!, $name: String!, $prNumber: Int!, $pageSize: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $prNumber) {
+          headRefOid
+          baseRefOid
+          files(first: $pageSize, after: $endCursor) {
+            totalCount
+            pageInfo { hasNextPage endCursor }
+            nodes { path additions deletions }
+          }
+        }
+      }
+    }'
+
+    if ! run_report_command gh api graphql --paginate \
+            -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
+            -F pageSize="$PR_CONNECTION_PAGE_SIZE" -f query="$query" \
+            > "$pages_file" 2>/dev/null || \
+       [ ! -s "$pages_file" ] || ! jq -s -e \
+            --arg expected_head "$expected_head" --arg expected_base "$expected_base" '
+        def pr: .data.repository.pullRequest;
+        def connection: pr.files;
+        . as $pages
+        | [$pages[] | connection.nodes[]] as $nodes
+        | ($pages[0] | connection.totalCount) as $total
+        | (($pages | length) > 0 and
+           all($pages[];
+             (((.errors // []) | length) == 0) and
+             (pr.headRefOid == $expected_head) and
+             (pr.baseRefOid == $expected_base) and
+             ((connection.nodes | type) == "array") and
+             ((connection.totalCount | type) == "number") and
+             (connection.totalCount >= 0) and
+             (connection.totalCount == (connection.totalCount | floor)) and
+             ((connection.pageInfo.hasNextPage | type) == "boolean") and
+             (connection.pageInfo.endCursor == null or
+              (connection.pageInfo.endCursor | type) == "string")) and
+           all($pages[]; (. | connection.totalCount) == $total) and
+           ($pages | to_entries | all(
+             . as $entry | ($entry.value | connection) as $connection
+             | if $entry.key < (($pages | length) - 1)
+               then ($connection.pageInfo.hasNextPage == true and
+                     ($connection.pageInfo.endCursor | type) == "string" and
+                     ($connection.pageInfo.endCursor | length) > 0)
+               else $connection.pageInfo.hasNextPage == false end)) and
+           (($nodes | length) == $total) and
+           all($nodes[];
+             (.path | type) == "string" and (.path | length) > 0 and
+             ((.path | startswith("/")) | not) and
+             ((.path | split("/") | index("..")) == null) and
+             (.additions | type) == "number" and
+             (.deletions | type) == "number") and
+           (([$nodes[].path] | unique | length) == ($nodes | length))) as $valid
+        | if $valid then
+            $nodes | map({path, additions, deletions})
+          else error("incomplete changed-file connection") end
+    ' "$pages_file" > "$normalized_file" 2>/dev/null; then
+        rm -f "$pages_file" "$normalized_file" "$output_file"
+        return 1
+    fi
+    mv "$normalized_file" "$output_file" || {
+        rm -f "$pages_file" "$normalized_file" "$output_file"
+        return 1
+    }
+    rm -f "$pages_file"
+}
+
+fetch_pr_commits() {
+    local owner="$1" repo_name="$2" pr_number="$3"
+    local expected_head="$4" expected_base="$5" output_file="$6"
+    local pages_file="${output_file}.pages" normalized_file="${output_file}.normalized"
+    local query='
+    query($owner: String!, $name: String!, $prNumber: Int!, $pageSize: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $prNumber) {
+          headRefOid
+          baseRefOid
+          commits(first: $pageSize, after: $endCursor) {
+            totalCount
+            pageInfo { hasNextPage endCursor }
+            nodes { commit { oid messageHeadline messageBody } }
+          }
+        }
+      }
+    }'
+
+    if ! run_report_command gh api graphql --paginate \
+            -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
+            -F pageSize="$PR_CONNECTION_PAGE_SIZE" -f query="$query" \
+            > "$pages_file" 2>/dev/null || \
+       [ ! -s "$pages_file" ] || ! jq -s -e \
+            --arg expected_head "$expected_head" --arg expected_base "$expected_base" '
+        def pr: .data.repository.pullRequest;
+        def connection: pr.commits;
+        . as $pages
+        | [$pages[] | connection.nodes[]] as $nodes
+        | ($pages[0] | connection.totalCount) as $total
+        | (($pages | length) > 0 and
+           all($pages[];
+             (((.errors // []) | length) == 0) and
+             (pr.headRefOid == $expected_head) and
+             (pr.baseRefOid == $expected_base) and
+             ((connection.nodes | type) == "array") and
+             ((connection.totalCount | type) == "number") and
+             (connection.totalCount >= 0) and
+             (connection.totalCount == (connection.totalCount | floor)) and
+             ((connection.pageInfo.hasNextPage | type) == "boolean") and
+             (connection.pageInfo.endCursor == null or
+              (connection.pageInfo.endCursor | type) == "string")) and
+           all($pages[]; (. | connection.totalCount) == $total) and
+           ($pages | to_entries | all(
+             . as $entry | ($entry.value | connection) as $connection
+             | if $entry.key < (($pages | length) - 1)
+               then ($connection.pageInfo.hasNextPage == true and
+                     ($connection.pageInfo.endCursor | type) == "string" and
+                     ($connection.pageInfo.endCursor | length) > 0)
+               else $connection.pageInfo.hasNextPage == false end)) and
+           (($nodes | length) == $total) and
+           all($nodes[];
+             (.commit.oid | type) == "string" and
+             (.commit.oid | length) > 0 and
+             (.commit.messageHeadline | type) == "string" and
+             (.commit.messageBody | type) == "string") and
+           (([$nodes[].commit.oid] | unique | length) == ($nodes | length))) as $valid
+        | if $valid then
+            $nodes | map(.commit | {oid, messageHeadline, messageBody})
+          else error("incomplete commit connection") end
+    ' "$pages_file" > "$normalized_file" 2>/dev/null; then
+        rm -f "$pages_file" "$normalized_file" "$output_file"
+        return 1
+    fi
+    mv "$normalized_file" "$output_file" || {
+        rm -f "$pages_file" "$normalized_file" "$output_file"
+        return 1
+    }
+    rm -f "$pages_file"
+}
+
+PR_SUMMARY_CONNECTION_TEMP_DIR=""
+cleanup_pr_summary_connection_temps() {
+    local temp_dir="$PR_SUMMARY_CONNECTION_TEMP_DIR" cleanup_failed=false
+    case "$temp_dir" in
+        */.pr-summary-connections.??????)
+            if [ -d "$temp_dir" ] && [ ! -L "$temp_dir" ]; then
+                rm -f "$temp_dir/files.json" "$temp_dir/files.json.pages" \
+                    "$temp_dir/files.json.normalized" "$temp_dir/commits.json" \
+                    "$temp_dir/commits.json.pages" "$temp_dir/commits.json.normalized" \
+                    "$temp_dir/pr-summary.json" || cleanup_failed=true
+                rmdir "$temp_dir" 2>/dev/null || cleanup_failed=true
+            fi
+            ;;
+    esac
+    if [ "$cleanup_failed" = false ]; then
+        PR_SUMMARY_CONNECTION_TEMP_DIR=""
+        return 0
+    fi
+    return 1
+}
+
+complete_pr_summary_connections() {
+    local repository="$1" pr_number="$2" summary_file="$3"
+    local owner="${repository%%/*}" repo_name="${repository#*/}"
+    local changed_total files_count commits_count summary_mode replacement_file
+    local expected_head expected_base summary_dir
+    [ -f "$summary_file" ] && [ ! -L "$summary_file" ] || return 1
+    [ -n "$owner" ] && [ -n "$repo_name" ] && \
+        [ "${repo_name#*/}" = "$repo_name" ] || return 1
+    jq -e '
+        (.changedFiles | type) == "number" and .changedFiles >= 0 and
+        .changedFiles == (.changedFiles | floor) and
+        (.files | type) == "array" and
+        (.commits | type) == "array" and
+        all(.files[]; (.path | type) == "string" and (.path | length) > 0) and
+        all(.commits[];
+          (.oid | type) == "string" and
+          (.messageHeadline | type) == "string" and
+          (.messageBody | type) == "string")
+    ' "$summary_file" > /dev/null 2>&1 || return 1
+    changed_total="$(jq -r '.changedFiles' "$summary_file")"
+    files_count="$(jq -r '.files | length' "$summary_file")"
+    commits_count="$(jq -r '.commits | length' "$summary_file")"
+    if [ "$files_count" -eq "$changed_total" ] && \
+       [ "$commits_count" -lt "$PR_CONNECTION_PAGE_SIZE" ]; then
+        return 0
+    fi
+    jq -e '
+        (.headRefOid | type) == "string" and (.headRefOid | length) > 0 and
+        (.baseRefOid | type) == "string" and (.baseRefOid | length) > 0
+    ' "$summary_file" > /dev/null 2>&1 || return 1
+    expected_head="$(jq -r '.headRefOid' "$summary_file")"
+    expected_base="$(jq -r '.baseRefOid' "$summary_file")"
+
+    summary_dir="$(dirname "$summary_file")"
+    PR_SUMMARY_CONNECTION_TEMP_DIR="$(mktemp -d \
+        "$summary_dir/.pr-summary-connections.XXXXXX")" || return 1
+    chmod 700 "$PR_SUMMARY_CONNECTION_TEMP_DIR" || {
+        cleanup_pr_summary_connection_temps
+        return 1
+    }
+    jq '.files' "$summary_file" > "$PR_SUMMARY_CONNECTION_TEMP_DIR/files.json" || {
+        cleanup_pr_summary_connection_temps
+        return 1
+    }
+    jq '.commits' "$summary_file" > "$PR_SUMMARY_CONNECTION_TEMP_DIR/commits.json" || {
+        cleanup_pr_summary_connection_temps
+        return 1
+    }
+    if [ "$files_count" -ne "$changed_total" ] && \
+       ! fetch_pr_files "$owner" "$repo_name" "$pr_number" \
+            "$expected_head" "$expected_base" \
+            "$PR_SUMMARY_CONNECTION_TEMP_DIR/files.json"; then
+        cleanup_pr_summary_connection_temps
+        return 1
+    fi
+    if [ "$commits_count" -ge "$PR_CONNECTION_PAGE_SIZE" ] && \
+       ! fetch_pr_commits "$owner" "$repo_name" "$pr_number" \
+            "$expected_head" "$expected_base" \
+            "$PR_SUMMARY_CONNECTION_TEMP_DIR/commits.json"; then
+        cleanup_pr_summary_connection_temps
+        return 1
+    fi
+    replacement_file="$PR_SUMMARY_CONNECTION_TEMP_DIR/pr-summary.json"
+    if ! jq --slurpfile files "$PR_SUMMARY_CONNECTION_TEMP_DIR/files.json" \
+            --slurpfile commits "$PR_SUMMARY_CONNECTION_TEMP_DIR/commits.json" \
+            '.files = $files[0] | .commits = $commits[0]' \
+            "$summary_file" > "$replacement_file" || \
+       ! jq -e --arg expected_head "$expected_head" \
+            --arg expected_base "$expected_base" '
+            .headRefOid == $expected_head and
+            .baseRefOid == $expected_base and
+            (.files | length) == .changedFiles and
+            ([.files[].path] | unique | length) == (.files | length) and
+            ([.commits[].oid] | unique | length) == (.commits | length)
+       ' "$replacement_file" > /dev/null 2>&1; then
+        cleanup_pr_summary_connection_temps
+        return 1
+    fi
+    summary_mode="$(workspace_file_mode "$summary_file")" || {
+        cleanup_pr_summary_connection_temps
+        return 1
+    }
+    chmod "$summary_mode" "$replacement_file" && \
+        mv "$replacement_file" "$summary_file" || {
+        cleanup_pr_summary_connection_temps
+        return 1
+    }
+    cleanup_pr_summary_connection_temps || return 1
 }
 
 extract_unresolved_threads() {
@@ -7451,7 +7734,7 @@ collect_sast_findings() {
     # the analyzer. Scanning an unrelated revision produces findings with line
     # anchors for code the PR does not contain — and they enter the context
     # labelled as deterministic ground truth, which is worse than having none.
-    local pr_head_sha access_line
+    local pr_head_sha access_line declared_changed_files captured_changed_files
     # The SAST pass runs before analysis-context.json is built. Bind it directly
     # to the immutable GitHub snapshot that was fetched earlier in this run.
     pr_head_sha="$(jq -r '.headRefOid // ""' \
@@ -7460,6 +7743,24 @@ collect_sast_findings() {
     if [ "${access_line%%:*}" = "disabled" ]; then
         echo "⚠️  Skipping the semgrep pre-pass: ${access_line#*: }" >&2
         write_sast_status true "skipped" "${access_line#*: }"
+        restore_sast_signal_traps
+        return 0
+    fi
+
+    # `gh pr view` caps its changed-file connection at 100. The main collector
+    # replaces a capped array with a validated paginated connection; enforce
+    # that invariant again at the scan boundary so a partial summary can never
+    # produce deterministic-looking SAST coverage.
+    declared_changed_files="$(jq -r '.changedFiles // empty' \
+        "$output_dir/pr-summary.json" 2>/dev/null || echo "")"
+    captured_changed_files="$(jq -r '(.files // []) | length' \
+        "$output_dir/pr-summary.json" 2>/dev/null || echo "")"
+    if [ -n "$declared_changed_files" ] && \
+       { ! [[ "$declared_changed_files" =~ ^[0-9]+$ ]] || \
+         [ "$captured_changed_files" != "$declared_changed_files" ]; }; then
+        echo "⚠️  Changed-file collection is incomplete; refusing the semgrep pre-pass." >&2
+        write_sast_status true "failed" \
+            "complete changed-file pagination was not available"
         restore_sast_signal_traps
         return 0
     fi
@@ -7484,10 +7785,11 @@ collect_sast_findings() {
     # Scan only changed regular files represented by the captured manifest.
     local -a targets=()
     local path
-    while IFS= read -r path; do
+    while IFS= read -r -d '' path; do
         case "$path" in ""|/*|../*|*/../*|*/..) continue ;; esac
         [ -f "$sast_snapshot_path/$path" ] && targets+=("./$path")
-    done < <(jq -r '(.files // [])[].path' "$output_dir/pr-summary.json" 2>/dev/null)
+    done < <(jq -j '(.files // [])[] | .path, "\u0000"' \
+        "$output_dir/pr-summary.json" 2>/dev/null)
 
     if [ "${#targets[@]}" -eq 0 ]; then
         echo "ℹ️  No changed files present in the immutable workspace snapshot — skipping semgrep." >&2
@@ -8743,7 +9045,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues verify_pr_head_unchanged validate_output_directory_for_writes"
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in
@@ -8781,6 +9083,10 @@ RUN_LOCK_ACQUIRING=false
 RUN_LOCK_PENDING_SIGNAL=""
 RUN_LOCK_PENDING_EXIT_CODE=""
 cleanup_report_run_lock() {
+    if ! cleanup_pr_summary_connection_temps; then
+        echo "Error: PR-summary connection staging remains after cleanup." >&2
+        return 1
+    fi
     cleanup_live_analysis_discussion_temps
     if [ "$RUN_LOCK_OWNED" = true ]; then
         if ! cleanup_report_run_temp_files; then
@@ -8855,6 +9161,11 @@ run_report_command gh pr view "$PR_NUMBER" --json "$PR_SUMMARY_FIELDS" \
         echo "Error fetching PR summary. Ensure PR #$PR_NUMBER exists and you have access."
         exit 1
     }
+if ! complete_pr_summary_connections "$REPO" "$PR_NUMBER" \
+        "$OUTPUT_DIR/pr-summary.json"; then
+    echo "Error fetching complete PR changed-file or commit history; refusing a partial report." >&2
+    exit 1
+fi
 
 # 2. Fetch all comments
 echo "Fetching all comments..."

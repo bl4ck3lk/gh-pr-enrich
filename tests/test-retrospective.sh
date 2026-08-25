@@ -732,7 +732,7 @@ test_hotspots_group_by_taxonomy() {
     fi
 }
 
-test_refuted_findings_are_not_aggregated() {
+test_unconfirmed_findings_are_not_aggregated() {
     local reports_root="$TEST_OUTPUT_DIR/refuted-reports"
     local report_dir="$reports_root/pr-88"
     local output_dir="$TEST_OUTPUT_DIR/refuted-out"
@@ -759,11 +759,16 @@ EOF
     "$GH_PR_ENRICH" retrospective --reports-dir "$reports_root" \
         --output-dir "$output_dir" --min-prs 1 >/dev/null 2>&1
     assert_jq_eq "$output_dir/retrospective-data.json" \
-        '.summary.overview.total_issues' "2" \
-        "retrospective totals exclude refuted findings"
+        '.summary.overview.total_issues' "1" \
+        "retrospective totals count confirmed findings only"
     assert_jq "$output_dir/retrospective-data.json" \
-        '[.summary.top_issue_categories[].name] | index("Refuted issue") == null' \
-        "retrospective top categories exclude refuted findings"
+        '[.summary.top_issue_categories[] | select(.name == "Confirmed issue" and .count == 1)] | length == 1' \
+        "retrospective top categories retain confirmed findings"
+    assert_jq "$output_dir/retrospective-data.json" \
+        '[.summary.top_issue_categories[].name] |
+         (index("Plausible issue") == null and index("Refuted issue") == null and
+          index("Refuted-only issue") == null)' \
+        "retrospective top categories exclude unconfirmed findings"
     assert_jq_eq "$output_dir/retrospective-data.json" \
         '[.hotspots[] | select(.category == "error_handling") | .issue_count] | first' "1" \
         "retrospective hotspots count confirmed findings but not refuted claims"
@@ -779,6 +784,12 @@ EOF
     assert_jq_eq "$output_dir/retrospective-data.json" \
         '.summary.overview.total_tasks' "1" \
         "retrospective verdict filtering leaves task aggregation unchanged"
+    assert_contains "$(cat "$output_dir/retrospective-report.md")" \
+        "Total Issues Found:** 1" \
+        "retrospective report renders only confirmed issue totals"
+    assert_not_contains "$(cat "$output_dir/retrospective-report.md")" \
+        "Plausible issue" \
+        "retrospective report does not present plausible hypotheses as issues"
 }
 
 test_legacy_reports_are_reported_not_mixed_in() {
@@ -943,7 +954,7 @@ test_format_pr_template
 test_invalid_format
 test_guiding_questions
 test_hotspots_group_by_taxonomy
-test_refuted_findings_are_not_aggregated
+test_unconfirmed_findings_are_not_aggregated
 test_legacy_reports_are_reported_not_mixed_in
 test_improvement_tracking
 test_provider_neutral_analysis_is_discovered
