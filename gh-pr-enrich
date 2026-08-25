@@ -108,72 +108,209 @@ positive_integer_or_default() {
     fi
 }
 
-fetch_watch_state() {
+fetch_watch_state() (
     local owner="$1" repository="$2" pr_number="$3"
-    local issue_id_lines review_id_lines issue_comment_ids review_ids thread_state
-    issue_id_lines="$(gh api --paginate \
+    local watch_tmp_dir issue_lines_file review_lines_file
+    local issue_ids_file review_ids_file thread_pages_file threads_file
+    local thread_records_file overflow_threads_file overflow_thread
+    local thread_index thread_id is_resolved comment_total comment_pages_file
+    watch_tmp_dir="$(mktemp -d "/tmp/gh-pr-enrich-watch-state.XXXXXX")" || return 1
+    chmod 700 "$watch_tmp_dir" || {
+        rmdir "$watch_tmp_dir" 2>/dev/null || true
+        return 1
+    }
+    cleanup_watch_state() { rm -rf "$watch_tmp_dir"; }
+    trap cleanup_watch_state EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    issue_lines_file="$watch_tmp_dir/issue-comment-ids.txt"
+    review_lines_file="$watch_tmp_dir/review-ids.txt"
+    issue_ids_file="$watch_tmp_dir/issue-comment-ids.json"
+    review_ids_file="$watch_tmp_dir/review-ids.json"
+    thread_pages_file="$watch_tmp_dir/thread-pages.json"
+    threads_file="$watch_tmp_dir/threads.json"
+    thread_records_file="$watch_tmp_dir/thread-records.jsonl"
+    overflow_threads_file="$watch_tmp_dir/overflow-threads.jsonl"
+
+    gh api --paginate \
         "repos/$owner/$repository/issues/$pr_number/comments?per_page=100" \
         --jq '.[] | if .id == null then error("missing issue-comment id")
               else (.id | tostring) end' \
-        2>/dev/null)" || return 1
-    issue_comment_ids="$(printf '%s\n' "$issue_id_lines" | jq -Rsc '
+        > "$issue_lines_file" 2>/dev/null || return 1
+    jq -Rsc '
         (split("\n") | map(select(length > 0))) as $ids
         | if all($ids[]; test("^[1-9][0-9]*$")) then ($ids | unique | sort)
           else error("issue-comment pagination returned an invalid id") end
-    ')" || return 1
-    review_id_lines="$(gh api --paginate \
+    ' < "$issue_lines_file" > "$issue_ids_file" || return 1
+
+    gh api --paginate \
         "repos/$owner/$repository/pulls/$pr_number/reviews?per_page=100" \
         --jq '.[] | if .id == null then error("missing review id")
               else (.id | tostring) end' \
-        2>/dev/null)" || return 1
-    review_ids="$(printf '%s\n' "$review_id_lines" | jq -Rsc '
+        > "$review_lines_file" 2>/dev/null || return 1
+    jq -Rsc '
         (split("\n") | map(select(length > 0))) as $ids
         | if all($ids[]; test("^[1-9][0-9]*$")) then ($ids | unique | sort)
           else error("review pagination returned an invalid id") end
-    ')" || return 1
-    thread_state="$(gh api graphql \
+    ' < "$review_lines_file" > "$review_ids_file" || return 1
+
+    # gh follows the first pageInfo in a GraphQL query. Keep reviewThreads'
+    # pageInfo before nodes and omit nested comments.pageInfo so --paginate
+    # advances the thread connection rather than one thread's replies.
+    gh api graphql --paginate \
         -F owner="$owner" \
         -F name="$repository" \
         -F prNumber="$pr_number" \
-        -f query='query($owner: String!, $name: String!, $prNumber: Int!) {
+        -f query='query WatchReviewThreads(
+            $owner: String!, $name: String!, $prNumber: Int!, $endCursor: String
+        ) {
             repository(owner: $owner, name: $name) {
                 pullRequest(number: $prNumber) {
-                    reviewThreads(first: 100) {
+                    reviewThreads(first: 100, after: $endCursor) {
+                        pageInfo { hasNextPage endCursor }
                         totalCount
                         nodes {
+                            id
                             isResolved
                             comments(first: 100) { totalCount nodes { id } }
                         }
                     }
                 }
             }
-        }' 2>/dev/null)" || return 1
+        }' > "$thread_pages_file" 2>/dev/null || return 1
 
-    # Feed even the projected ID sets through stdin: a PR can accumulate an
-    # unbounded number of comments, so placing the complete arrays in argv
-    # would only move the ARG_MAX failure from bodies to very large ID sets.
-    printf '%s\n%s\n%s\n' "$issue_comment_ids" "$review_ids" "$thread_state" | \
-    jq -sec '
-        .[0] as $issue_comment_ids
-        | .[1] as $review_ids
-        | .[2] as $threads
-        | ($threads.data.repository.pullRequest.reviewThreads.nodes | arrays) as $thread_nodes
-        | select(($threads.data.repository.pullRequest.reviewThreads.totalCount | type) == "number")
-        | select($threads.data.repository.pullRequest.reviewThreads.totalCount == ($thread_nodes | length))
-        | select(all($thread_nodes[];
-            (.isResolved | type) == "boolean"
-            and (.comments.nodes | type) == "array"
-            and (.comments.totalCount | type) == "number"
-            and .comments.totalCount == (.comments.nodes | length)
-            and all(.comments.nodes[]; .id != null and ((.id | tostring) | length > 0))))
-        | {
-            issue_comment_ids: $issue_comment_ids,
-            review_ids: $review_ids,
-            inline_comment_ids: ([$thread_nodes[].comments.nodes[].id | tostring] | unique | sort),
-            unresolved: ([$thread_nodes[] | select(.isResolved == false)] | length)
+    jq -s -e '
+        def connection: .data.repository.pullRequest.reviewThreads;
+        map(connection.nodes[]) as $nodes
+        | ([.[] | connection.totalCount] | unique) as $totals
+        | if length == 0 or
+             any(.[]; ((.errors // []) | length) != 0) or
+             any(.[];
+                (.data.repository.pullRequest | type) != "object" or
+                (connection.pageInfo.hasNextPage | type) != "boolean" or
+                ((connection.pageInfo.endCursor == null or
+                  (connection.pageInfo.endCursor | type) == "string") | not) or
+                (connection.totalCount | type) != "number" or
+                connection.totalCount < 0 or
+                (connection.totalCount | floor) != connection.totalCount or
+                (connection.nodes | type) != "array") or
+             ($totals | length) != 1 or
+             (.[-1] | connection.pageInfo.hasNextPage) != false or
+             (length > 1 and any(.[0:-1][]; connection.pageInfo.hasNextPage != true)) or
+             $totals[0] != ($nodes | length) or
+             ([$nodes[].id] | length) != ([$nodes[].id] | unique | length) or
+             any($nodes[];
+                (.id | type) != "string" or (.id | length) == 0 or
+                (.isResolved | type) != "boolean" or
+                (.comments.totalCount | type) != "number" or
+                .comments.totalCount < 0 or
+                (.comments.totalCount | floor) != .comments.totalCount or
+                (.comments.nodes | type) != "array" or
+                (.comments.nodes | length) != ([.comments.totalCount, 100] | min) or
+                any(.comments.nodes[];
+                    (.id | type) != "string" or (.id | length) == 0) or
+                ([.comments.nodes[].id] | length) !=
+                    ([.comments.nodes[].id] | unique | length))
+          then error("review-thread pagination was incomplete or inconsistent")
+          else {
+            total_count: $totals[0],
+            threads: [$nodes[] | {
+                id, isResolved,
+                comment_total: .comments.totalCount,
+                initial_comment_ids: [.comments.nodes[].id]
+            }]
           }
+          end
+    ' "$thread_pages_file" > "$threads_file" || return 1
+
+    # Normalize the common case in bulk. Only threads whose reply connection
+    # overflowed the embedded first page need another API request or jq process.
+    jq -c '
+        .threads[]
+        | select(.comment_total <= (.initial_comment_ids | length))
+        | {id, isResolved, comment_ids:(.initial_comment_ids | unique | sort)}
+    ' "$threads_file" > "$thread_records_file" || return 1
+    jq -c '
+        .threads | to_entries[]
+        | select(.value.comment_total > (.value.initial_comment_ids | length))
+        | {index:.key, id:.value.id, isResolved:.value.isResolved,
+           comment_total:.value.comment_total}
+    ' "$threads_file" > "$overflow_threads_file" || return 1
+
+    while IFS= read -r overflow_thread; do
+        thread_index="$(printf '%s\n' "$overflow_thread" | jq -r '.index')" || return 1
+        thread_id="$(printf '%s\n' "$overflow_thread" | jq -r '.id')" || return 1
+        is_resolved="$(printf '%s\n' "$overflow_thread" | jq -r '.isResolved')" || return 1
+        comment_total="$(printf '%s\n' "$overflow_thread" | jq -r '.comment_total')" || return 1
+        [ -n "$thread_index" ] && [ -n "$thread_id" ] && \
+            [ -n "$is_resolved" ] && [ -n "$comment_total" ] || return 1
+        comment_pages_file="$watch_tmp_dir/comment-pages-$thread_index.json"
+        # This query contains only the comments pageInfo, so gh's automatic
+        # cursor advances the reply connection for this one overflow thread.
+        gh api graphql --paginate \
+            -F threadId="$thread_id" \
+            -f query='query WatchThreadComments(
+                $threadId: ID!, $endCursor: String
+            ) {
+                node(id: $threadId) {
+                    ... on PullRequestReviewThread {
+                        id
+                        isResolved
+                        comments(first: 100, after: $endCursor) {
+                            pageInfo { hasNextPage endCursor }
+                            totalCount
+                            nodes { id }
+                        }
+                    }
+                }
+            }' > "$comment_pages_file" 2>/dev/null || return 1
+        jq -c -s -e --arg thread_id "$thread_id" \
+            --argjson expected_total "$comment_total" \
+            --argjson expected_is_resolved "$is_resolved" \
+            --argjson thread_index "$thread_index" \
+            --slurpfile top_threads "$threads_file" '
+            map(.data.node.comments.nodes[]) as $comments
+            | ([.[] | .data.node.comments.totalCount] | unique) as $totals
+            | ($top_threads[0].threads[$thread_index].initial_comment_ids | sort) as $initial_ids
+            | if length == 0 or
+                 any(.[]; ((.errors // []) | length) != 0) or
+                 any(.[];
+                    .data.node.id != $thread_id or
+                    .data.node.isResolved != $expected_is_resolved or
+                    (.data.node.comments.pageInfo.hasNextPage | type) != "boolean" or
+                    ((.data.node.comments.pageInfo.endCursor == null or
+                      (.data.node.comments.pageInfo.endCursor | type) == "string") | not) or
+                    (.data.node.comments.totalCount | type) != "number" or
+                    (.data.node.comments.nodes | type) != "array") or
+                 ($totals | length) != 1 or $totals[0] != $expected_total or
+                 (.[-1].data.node.comments.pageInfo.hasNextPage != false) or
+                 (length > 1 and any(.[0:-1][];
+                    .data.node.comments.pageInfo.hasNextPage != true)) or
+                 ([.[0].data.node.comments.nodes[].id] | sort) != $initial_ids or
+                 ($comments | length) != $expected_total or
+                 any($comments[]; (.id | type) != "string" or (.id | length) == 0) or
+                 ([$comments[].id] | length) !=
+                    ([$comments[].id] | unique | length)
+              then error("review-thread comment pagination was incomplete or inconsistent")
+              else {id:$thread_id, isResolved:$expected_is_resolved,
+                    comment_ids:([$comments[].id] | unique | sort)}
+              end
+        ' "$comment_pages_file" >> "$thread_records_file" || return 1
+    done < "$overflow_threads_file"
+
+    jq -n -e \
+        --slurpfile issue_comment_ids "$issue_ids_file" \
+        --slurpfile review_ids "$review_ids_file" \
+        --slurpfile threads "$thread_records_file" '
+        {
+            issue_comment_ids: $issue_comment_ids[0],
+            review_ids: $review_ids[0],
+            inline_comment_ids: ([$threads[].comment_ids[]] | unique | sort),
+            unresolved: ([$threads[] | select(.isResolved == false)] | length)
+        }
     '
-}
+)
 
 watch_selected_analysis_identity() {
     local report_dir="$1" repository="$2" pr_number="$3" selected_file digest
@@ -1727,7 +1864,9 @@ validate_selected_workspace() {
     local analysis_file="$2"
     local context_file="${3:-$report_dir/analysis-context.json}"
     validate_selected_provenance "$report_dir" "$analysis_file" "$context_file" || return 1
-    if jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
+    if [ "$(jq -r '.coverage.code_access.state // "disabled"' \
+            "$context_file" 2>/dev/null || echo disabled)" = "enabled" ] || \
+       jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
             "$analysis_file" > /dev/null 2>&1; then
         validate_code_access_grant "$context_file" "$report_dir"
     fi
@@ -1737,22 +1876,12 @@ validate_address_selection_pair() {
     local report_dir="$1"
     local frozen_analysis_file="$2"
     local live_analysis_file="$3"
-    local context_file="${4:-$report_dir/analysis-context.json}"
-    local require_workspace=false
+    local frozen_context_file="$4"
+    local live_context_file="$5"
     validate_selected_provenance "$report_dir" "$frozen_analysis_file" \
-        "$context_file" || return 1
+        "$frozen_context_file" || return 1
     validate_selected_provenance "$report_dir" "$live_analysis_file" \
-        "$context_file" || return 1
-    if [ "$(jq -r '.coverage.code_access.state // "disabled"' \
-            "$context_file" 2>/dev/null || echo "disabled")" = "enabled" ] || \
-       jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
-            "$frozen_analysis_file" > /dev/null 2>&1 || \
-       jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
-            "$live_analysis_file" > /dev/null 2>&1; then
-        require_workspace=true
-    fi
-    [ "$require_workspace" = false ] || \
-        validate_code_access_grant "$context_file" "$report_dir"
+        "$live_context_file"
 }
 
 # Prefer the provider-neutral selected analysis while retaining compatibility
@@ -3767,31 +3896,64 @@ if [ "$1" = "address" ]; then
     fi
 
     ADDRESS_LIVE_ANALYSIS_FILE="$ANALYSIS_FILE"
+    ADDRESS_LIVE_CONTEXT_FILE="$ANALYSIS_DIR/analysis-context.json"
     ADDRESS_FROZEN_ANALYSIS="$(mktemp "/tmp/gh-pr-enrich-address-analysis.XXXXXX")" || exit 1
-    cleanup_address_analysis() {
+    ADDRESS_FROZEN_CONTEXT="$(mktemp "/tmp/gh-pr-enrich-address-context.XXXXXX")" || {
         rm -f "$ADDRESS_FROZEN_ANALYSIS"
+        exit 1
+    }
+    cleanup_address_analysis() {
+        rm -f "$ADDRESS_FROZEN_ANALYSIS" "$ADDRESS_FROZEN_CONTEXT"
     }
     trap cleanup_address_analysis EXIT
-    if ! cp "$ADDRESS_LIVE_ANALYSIS_FILE" "$ADDRESS_FROZEN_ANALYSIS"; then
-        echo "Error: Could not freeze selected analysis before displaying tasks"
+    ADDRESS_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+    ADDRESS_ANALYSIS_MODE="$(workspace_file_mode "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+    ADDRESS_CONTEXT_DIGEST="$(sha256_file "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
+    ADDRESS_CONTEXT_MODE="$(workspace_file_mode "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
+    if [ -z "$ADDRESS_ANALYSIS_DIGEST" ] || [ -z "$ADDRESS_ANALYSIS_MODE" ] || \
+       [ -z "$ADDRESS_CONTEXT_DIGEST" ] || [ -z "$ADDRESS_CONTEXT_MODE" ] || \
+       ! cp "$ADDRESS_LIVE_ANALYSIS_FILE" "$ADDRESS_FROZEN_ANALYSIS" || \
+       ! cp "$ADDRESS_LIVE_CONTEXT_FILE" "$ADDRESS_FROZEN_CONTEXT" || \
+       ! chmod 600 "$ADDRESS_FROZEN_ANALYSIS" "$ADDRESS_FROZEN_CONTEXT"; then
+        echo "Error: Could not freeze selected analysis and context before displaying tasks"
         exit 1
     fi
-    ADDRESS_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_FROZEN_ANALYSIS" 2>/dev/null || echo "")"
+    FROZEN_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_FROZEN_ANALYSIS" 2>/dev/null || echo "")"
+    FROZEN_CONTEXT_DIGEST="$(sha256_file "$ADDRESS_FROZEN_CONTEXT" 2>/dev/null || echo "")"
     LIVE_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
-    if [ -z "$ADDRESS_ANALYSIS_DIGEST" ] || \
-       [ "$LIVE_ANALYSIS_DIGEST" != "$ADDRESS_ANALYSIS_DIGEST" ]; then
+    LIVE_ANALYSIS_MODE="$(workspace_file_mode "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+    LIVE_CONTEXT_DIGEST="$(sha256_file "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
+    LIVE_CONTEXT_MODE="$(workspace_file_mode "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
+    if [ "$FROZEN_ANALYSIS_DIGEST" != "$ADDRESS_ANALYSIS_DIGEST" ] || \
+       [ "$FROZEN_CONTEXT_DIGEST" != "$ADDRESS_CONTEXT_DIGEST" ] || \
+       [ "$LIVE_ANALYSIS_DIGEST" != "$ADDRESS_ANALYSIS_DIGEST" ] || \
+       [ "$LIVE_ANALYSIS_MODE" != "$ADDRESS_ANALYSIS_MODE" ] || \
+       [ "$LIVE_CONTEXT_DIGEST" != "$ADDRESS_CONTEXT_DIGEST" ] || \
+       [ "$LIVE_CONTEXT_MODE" != "$ADDRESS_CONTEXT_MODE" ]; then
         invalidate_selected_analysis "$ANALYSIS_DIR" || true
-        echo "Error: Selected analysis changed while address mode was starting"
+        echo "Error: Selected analysis or context changed while address mode was starting"
         exit 1
     fi
     if [ "$(basename "$ADDRESS_LIVE_ANALYSIS_FILE")" = "analysis.json" ] && \
        ! validate_address_selection_pair "$ANALYSIS_DIR" \
-            "$ADDRESS_FROZEN_ANALYSIS" "$ADDRESS_LIVE_ANALYSIS_FILE"; then
+            "$ADDRESS_FROZEN_ANALYSIS" "$ADDRESS_LIVE_ANALYSIS_FILE" \
+            "$ADDRESS_FROZEN_CONTEXT" "$ADDRESS_LIVE_CONTEXT_FILE"; then
         invalidate_selected_analysis "$ANALYSIS_DIR" || true
         echo "Error: Selected analysis provenance changed before tasks could be displayed"
         exit 1
     fi
+    if [ "$(basename "$ADDRESS_LIVE_ANALYSIS_FILE")" = "analysis.json" ] && \
+       { [ "$(jq -r '.coverage.code_access.state // "disabled"' \
+                    "$ADDRESS_FROZEN_CONTEXT" 2>/dev/null || echo disabled)" = "enabled" ] || \
+         jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
+            "$ADDRESS_FROZEN_ANALYSIS" > /dev/null 2>&1; } && \
+       ! validate_code_access_grant "$ADDRESS_FROZEN_CONTEXT" "$ANALYSIS_DIR"; then
+        invalidate_selected_analysis "$ANALYSIS_DIR" || true
+        echo "Error: Selected analysis code-access grant changed before tasks could be displayed"
+        exit 1
+    fi
     ANALYSIS_FILE="$ADDRESS_FROZEN_ANALYSIS"
+    ADDRESS_CONTEXT_FILE="$ADDRESS_FROZEN_CONTEXT"
 
     # Validate JSON structure before use
     if ! jq -e '.task_list' "$ANALYSIS_FILE" > /dev/null 2>&1; then
@@ -3801,7 +3963,6 @@ if [ "$1" = "address" ]; then
         exit 1
     fi
 
-    ADDRESS_CONTEXT_FILE="$ANALYSIS_DIR/analysis-context.json"
     ADDRESS_CURRENT_PROVENANCE=false
     ADDRESS_CONTEXT_PR=""
     ADDRESS_CONTEXT_REPOSITORY=""
@@ -3899,10 +4060,17 @@ if [ "$1" = "address" ]; then
                                 continue
                             fi
                             LIVE_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+                            LIVE_ANALYSIS_MODE="$(workspace_file_mode "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+                            LIVE_CONTEXT_DIGEST="$(sha256_file "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
+                            LIVE_CONTEXT_MODE="$(workspace_file_mode "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
                             if [ -z "$LIVE_ANALYSIS_DIGEST" ] || \
                                [ "$LIVE_ANALYSIS_DIGEST" != "$ADDRESS_ANALYSIS_DIGEST" ] || \
+                               [ "$LIVE_ANALYSIS_MODE" != "$ADDRESS_ANALYSIS_MODE" ] || \
+                               [ "$LIVE_CONTEXT_DIGEST" != "$ADDRESS_CONTEXT_DIGEST" ] || \
+                               [ "$LIVE_CONTEXT_MODE" != "$ADDRESS_CONTEXT_MODE" ] || \
                                ! validate_address_selection_pair "$ANALYSIS_DIR" \
-                                    "$ANALYSIS_FILE" "$ADDRESS_LIVE_ANALYSIS_FILE"; then
+                                    "$ANALYSIS_FILE" "$ADDRESS_LIVE_ANALYSIS_FILE" \
+                                    "$ADDRESS_CONTEXT_FILE" "$ADDRESS_LIVE_CONTEXT_FILE"; then
                                 invalidate_selected_analysis "$ANALYSIS_DIR" || true
                                 echo "  ❌ Selected analysis or thread provenance changed. Re-run before resolving threads."
                                 exit 1
@@ -3959,10 +4127,17 @@ if [ "$1" = "address" ]; then
 
                             POST_LOCAL_VALID=true
                             LIVE_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+                            LIVE_ANALYSIS_MODE="$(workspace_file_mode "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+                            LIVE_CONTEXT_DIGEST="$(sha256_file "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
+                            LIVE_CONTEXT_MODE="$(workspace_file_mode "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
                             if [ -z "$LIVE_ANALYSIS_DIGEST" ] || \
                                [ "$LIVE_ANALYSIS_DIGEST" != "$ADDRESS_ANALYSIS_DIGEST" ] || \
+                               [ "$LIVE_ANALYSIS_MODE" != "$ADDRESS_ANALYSIS_MODE" ] || \
+                               [ "$LIVE_CONTEXT_DIGEST" != "$ADDRESS_CONTEXT_DIGEST" ] || \
+                               [ "$LIVE_CONTEXT_MODE" != "$ADDRESS_CONTEXT_MODE" ] || \
                                ! validate_address_selection_pair "$ANALYSIS_DIR" \
-                                    "$ANALYSIS_FILE" "$ADDRESS_LIVE_ANALYSIS_FILE"; then
+                                    "$ANALYSIS_FILE" "$ADDRESS_LIVE_ANALYSIS_FILE" \
+                                    "$ADDRESS_CONTEXT_FILE" "$ADDRESS_LIVE_CONTEXT_FILE"; then
                                 POST_LOCAL_VALID=false
                             fi
 

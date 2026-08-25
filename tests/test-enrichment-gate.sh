@@ -202,10 +202,74 @@ if [ "$1 $2" = "api graphql" ]; then
         *closingIssuesReferences*)
             echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[]}}}}}'
             ;;
-        *)
+        *WatchThreadComments*)
+            [ -z "${WATCH_GRAPHQL_LOG:-}" ] || printf '%s\n' "$*" >> "$WATCH_GRAPHQL_LOG"
+            watch_reply_connection_count="$(
+                printf '%s\n' "$*" |
+                    grep -F -c 'comments(first: 100, after: $endCursor)' || true
+            )"
+            [ "$watch_reply_connection_count" -eq 1 ] || exit 47
+            watch_reply_resolved=false
+            watch_mutate_reply_ids=false
+            [ "${WATCH_INCONSISTENT_THREAD_STATE:-false}" != true ] || \
+                watch_reply_resolved=true
+            [ "${WATCH_INCONSISTENT_THREAD_COMMENTS:-false}" != true ] || \
+                watch_mutate_reply_ids=true
+            if [ "${WATCH_THREAD_COMMENT_ERROR:-false}" = true ]; then
+                echo '{"errors":[{"message":"reply page failed"}],"data":{"node":null}}'
+            elif [ "${WATCH_INCOMPLETE_THREAD_COMMENTS:-false}" = true ]; then
+                jq -nc --argjson resolved "$watch_reply_resolved" \
+                    '[range(1; 101) | {id:("INLINE_" + tostring)}] as $comments
+                    | {data:{node:{id:"THREAD_1",isResolved:$resolved,comments:{
+                        pageInfo:{hasNextPage:false,endCursor:null},
+                        totalCount:101,nodes:$comments}}}}'
+            else
+                jq -nc --argjson resolved "$watch_reply_resolved" \
+                    --argjson mutate_ids "$watch_mutate_reply_ids" '
+                    [range(1; 101) | {id:(if . == 1 and $mutate_ids then
+                        "INLINE_CHANGED" else ("INLINE_" + tostring) end)}] as $comments
+                    | {data:{node:{id:"THREAD_1",isResolved:$resolved,comments:{
+                        pageInfo:{hasNextPage:true,endCursor:"reply-page-1"},
+                        totalCount:101,nodes:$comments}}}}'
+                jq -nc --argjson resolved "$watch_reply_resolved" \
+                    '{data:{node:{id:"THREAD_1",isResolved:$resolved,comments:{
+                    pageInfo:{hasNextPage:false,endCursor:null},
+                    totalCount:101,nodes:[{id:"INLINE_101"}]}}}}'
+            fi
+            ;;
+        *WatchReviewThreads*)
+            [ -z "${WATCH_GRAPHQL_LOG:-}" ] || printf '%s\n' "$*" >> "$WATCH_GRAPHQL_LOG"
             if [ "${WATCH_INCOMPLETE_THREADS:-false}" = true ]; then
                 echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":101,"pageInfo":{"hasNextPage":true,"endCursor":"x"},"nodes":[]}}}}}'
+            elif [ "${WATCH_TWO_LEVEL:-false}" = true ] || \
+                 [ "${WATCH_INCOMPLETE_THREAD_COMMENTS:-false}" = true ] || \
+                 [ "${WATCH_THREAD_COMMENT_ERROR:-false}" = true ] || \
+                 [ "${WATCH_INCONSISTENT_THREAD_STATE:-false}" = true ] || \
+                 [ "${WATCH_INCONSISTENT_THREAD_COMMENTS:-false}" = true ]; then
+                jq -nc '
+                    [range(1; 101) | . as $thread_number | {
+                        id:("THREAD_" + tostring),
+                        isResolved:($thread_number != 1),
+                        comments:(if $thread_number == 1 then {
+                            totalCount:101,
+                            nodes:[range(1; 101) | {id:("INLINE_" + tostring)}]
+                        } else {totalCount:0,nodes:[]} end)
+                    }] as $threads
+                    | {data:{repository:{pullRequest:{reviewThreads:{
+                        pageInfo:{hasNextPage:true,endCursor:"thread-page-1"},
+                        totalCount:101,nodes:$threads}}}}}'
+                jq -nc '{data:{repository:{pullRequest:{reviewThreads:{
+                    pageInfo:{hasNextPage:false,endCursor:null},totalCount:101,
+                    nodes:[{id:"THREAD_101",isResolved:true,
+                        comments:{totalCount:0,nodes:[]}}]}}}}}'
             elif [ "$poll" -eq 0 ]; then
+                echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"THREAD_OLD","isResolved":true,"isOutdated":false,"path":"a.js","line":1,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"INLINE_OLD","databaseId":10,"body":"old","author":{"login":"rev"},"createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/1#discussion_r10"}]}}]}}}}}'
+            else
+                echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+            fi
+            ;;
+        *)
+            if [ "$poll" -eq 0 ]; then
                 echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"THREAD_OLD","isResolved":true,"isOutdated":false,"path":"a.js","line":1,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"INLINE_OLD","databaseId":10,"body":"old","author":{"login":"rev"},"createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/1#discussion_r10"}]}}]}}}}}'
             else
                 echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
@@ -376,6 +440,88 @@ assert_contains "$(cat "$WATCH_PROJECTION_LOG")" "--jq" \
     "paginated base comment and review fetches project IDs before shell capture"
 assert_contains "$(cat "$WATCH_PROJECTION_LOG")" "1100000" \
     "the large-body regression exercises a payload beyond macOS ARG_MAX"
+
+# The watch snapshot paginates the two GraphQL levels independently. The top
+# query follows reviewThreads across 101 nodes without exposing a nested
+# pageInfo to gh, then a comments-only query follows 101 replies for the one
+# overflow thread.
+WATCH_GRAPHQL_LOG="$WATCH_CASE/graphql-pagination.log"
+printf '0\n' > "$WATCH_POLL_FILE"
+printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"
+: > "$WATCH_GRAPHQL_LOG"
+set +e
+TWO_LEVEL_WATCH_OUT=$(
+    cd "$WATCH_WORK_DIR" && \
+    env WATCH_TWO_LEVEL=true WATCH_GRAPHQL_LOG="$WATCH_GRAPHQL_LOG" \
+        WATCH_POLL_FILE="$WATCH_POLL_FILE" \
+        WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" WATCH_SLEEP_LIMIT=0 \
+        PATH="$WATCH_STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" watch 1 --interval 1 2>&1
+)
+set -e
+assert_contains "$TWO_LEVEL_WATCH_OUT" \
+    "Initial state: 304 comments/reviews, 1 unresolved threads" \
+    "watch captures 101 review threads and 101 replies without truncation"
+assert_eq "1" "$(grep -c 'WatchReviewThreads' "$WATCH_GRAPHQL_LOG")" \
+    "watch uses one independently paginated top-level thread query"
+assert_eq "1" "$(grep -c 'WatchThreadComments' "$WATCH_GRAPHQL_LOG")" \
+    "watch separately paginates the overflow thread's replies"
+assert_contains "$(cat "$WATCH_GRAPHQL_LOG")" \
+    'comments(first: 100) { totalCount nodes { id } }' \
+    "top-level pagination omits nested comments pageInfo"
+assert_contains "$(cat "$WATCH_GRAPHQL_LOG")" \
+    'comments(first: 100, after: $endCursor)' \
+    "overflow pagination advances the comments connection"
+
+for reply_failure in incomplete error state-change comment-change; do
+    printf '0\n' > "$WATCH_POLL_FILE"
+    printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"
+    set +e
+    if [ "$reply_failure" = incomplete ]; then
+        REPLY_FAILURE_OUT=$(
+            cd "$WATCH_WORK_DIR" && \
+            env WATCH_INCOMPLETE_THREAD_COMMENTS=true \
+                WATCH_POLL_FILE="$WATCH_POLL_FILE" \
+                WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" \
+                PATH="$WATCH_STUB_DIR:$PATH" \
+                "$GH_PR_ENRICH" watch 1 --interval 1 2>&1
+        )
+    elif [ "$reply_failure" = error ]; then
+        REPLY_FAILURE_OUT=$(
+            cd "$WATCH_WORK_DIR" && \
+            env WATCH_THREAD_COMMENT_ERROR=true \
+                WATCH_POLL_FILE="$WATCH_POLL_FILE" \
+                WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" \
+                PATH="$WATCH_STUB_DIR:$PATH" \
+                "$GH_PR_ENRICH" watch 1 --interval 1 2>&1
+        )
+    elif [ "$reply_failure" = state-change ]; then
+        REPLY_FAILURE_OUT=$(
+            cd "$WATCH_WORK_DIR" && \
+            env WATCH_INCONSISTENT_THREAD_STATE=true \
+                WATCH_POLL_FILE="$WATCH_POLL_FILE" \
+                WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" \
+                PATH="$WATCH_STUB_DIR:$PATH" \
+                "$GH_PR_ENRICH" watch 1 --interval 1 2>&1
+        )
+    else
+        REPLY_FAILURE_OUT=$(
+            cd "$WATCH_WORK_DIR" && \
+            env WATCH_INCONSISTENT_THREAD_COMMENTS=true \
+                WATCH_POLL_FILE="$WATCH_POLL_FILE" \
+                WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" \
+                PATH="$WATCH_STUB_DIR:$PATH" \
+                "$GH_PR_ENRICH" watch 1 --interval 1 2>&1
+        )
+    fi
+    REPLY_FAILURE_RC=$?
+    set -e
+    assert_true "$([ "$REPLY_FAILURE_RC" -ne 0 ] && echo 0 || echo 1)" \
+        "watch fails closed on $reply_failure overflow-reply pagination"
+    assert_contains "$REPLY_FAILURE_OUT" \
+        "Could not fetch the initial PR comment state" \
+        "$reply_failure overflow replies cannot establish a watch baseline"
+done
 
 printf '0\n' > "$WATCH_POLL_FILE"
 printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"

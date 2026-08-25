@@ -440,7 +440,7 @@ jq --arg fingerprint "$LOCAL_CONTEXT_FINGERPRINT" \
     "$LOCAL_MUTATION_CONTEXT_TMP" > "$LOCAL_MUTATION_REPORT/analysis-context.json"
 jq -n --arg fingerprint "$LOCAL_CONTEXT_FINGERPRINT" \
     --arg workspace_fingerprint "$LOCAL_WORKSPACE_FINGERPRINT" '{
-    issue_categories:[{name:"correctness",severity:"high",verdict:"confirmed"}],
+    issue_categories:[{name:"correctness",severity:"high",verdict:"plausible"}],
     task_list:[{priority:"high",task:"LOCAL MUTATION TASK",
         thread_ids:["PRRT_local"],file:"base.txt",line:1,
         suggested_fix:"fix",verification:"test"}],
@@ -464,27 +464,34 @@ LOCAL_ANALYSIS_TEMPLATE="$TEST_OUTPUT_DIR/local-analysis-template.json"
 cp "$LOCAL_MUTATION_REPORT/analysis-context.json" "$LOCAL_CONTEXT_TEMPLATE"
 cp "$LOCAL_MUTATION_REPORT/analysis.json" "$LOCAL_ANALYSIS_TEMPLATE"
 : > "$LOCAL_MUTATION_LOG"
+
+printf 'drift before address starts\n' >> "$LOCAL_MUTATION_WS/base.txt"
+PRESTART_WORKSPACE_OUT=$(printf 'q' | (cd "$LOCAL_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_MUTATIONS_LOG="$LOCAL_MUTATION_LOG" \
+    PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" address 999 2>&1) || true)
+assert_contains "$PRESTART_WORKSPACE_OUT" "Analysis not found" \
+    "address rejects an enabled plausible selection after pre-start workspace drift"
+assert_eq "" "$(cat "$LOCAL_MUTATION_LOG")" \
+    "pre-start workspace drift sends no hosted mutation"
+assert_true "$([ ! -e "$LOCAL_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "pre-start workspace drift invalidates the selected artifact"
+git -C "$LOCAL_MUTATION_WS" checkout -- base.txt
+cp "$LOCAL_CONTEXT_TEMPLATE" "$LOCAL_MUTATION_REPORT/analysis-context.json"
+cp "$LOCAL_ANALYSIS_TEMPLATE" "$LOCAL_MUTATION_REPORT/analysis.json"
+
 LOCAL_MUTATION_OUT=$(printf 'f' | (cd "$LOCAL_MUTATION_WS" && \
     env GH_WORKSPACE_MUTATION="$LOCAL_MUTATION_WS/base.txt" \
     GH_MUTATIONS_LOG="$LOCAL_MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
     "$GH_PR_ENRICH" address 999 2>&1) || true)
-assert_contains "$LOCAL_MUTATION_OUT" "State changed during resolution" \
-    "address detects a workspace mutation during final hosted-head verification"
+assert_contains "$LOCAL_MUTATION_OUT" "Resolved: PRRT_local" \
+    "address permits a workspace edit after tasks are displayed"
 assert_contains "$(cat "$LOCAL_MUTATION_LOG")" "threadId=PRRT_local" \
-    "a mutation occurring inside the final head check is detected post-resolution"
-assert_contains "$(cat "$LOCAL_MUTATION_LOG")" "unresolve:PRRT_local" \
-    "a last-moment workspace mutation is compensated by reopening the thread"
-assert_true "$([ ! -e "$LOCAL_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
-    "a last-moment workspace mutation invalidates the selected artifact"
-assert_contains "$(cat "$LOCAL_MUTATION_REPORT/comprehensive-report.md")" \
-    "Base report content must survive" \
-    "address invalidation preserves the comprehensive base report"
-assert_not_contains "$(cat "$LOCAL_MUTATION_REPORT/comprehensive-report.md")" \
-    "STALE SELECTED FINDING" \
-    "address invalidation removes stale selected findings from the comprehensive report"
-assert_not_contains "$(cat "$LOCAL_MUTATION_REPORT/comprehensive-report.md")" \
-    "<!-- BEGIN SELECTED ANALYSIS -->" \
-    "address invalidation removes the generated selected-analysis marker block"
+    "a post-prompt workspace edit still sends the intended resolution"
+assert_not_contains "$(cat "$LOCAL_MUTATION_LOG")" "unresolve:PRRT_local" \
+    "a post-prompt workspace edit does not trigger compensation"
+assert_true "$([ -e "$LOCAL_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "a post-prompt workspace edit preserves the selected artifact"
+git -C "$LOCAL_MUTATION_WS" checkout -- base.txt
 
 # Invalidation preflights every derived artifact before deleting the selected
 # JSON. A planted report symlink or branch-tracked report must fail closed and
@@ -1380,15 +1387,34 @@ done
 git -C "$LOCAL_MUTATION_WS" checkout -- base.txt
 cp "$LOCAL_CONTEXT_TEMPLATE" "$LOCAL_MUTATION_REPORT/analysis-context.json"
 cp "$LOCAL_ANALYSIS_TEMPLATE" "$LOCAL_MUTATION_REPORT/analysis.json"
+chmod 644 "$LOCAL_MUTATION_REPORT/analysis-context.json" \
+    "$LOCAL_MUTATION_REPORT/analysis.json"
 ANALYSIS_RACE_FIFO="$TEST_OUTPUT_DIR/analysis-race.fifo"
 ANALYSIS_RACE_OUT_FILE="$TEST_OUTPUT_DIR/analysis-race.out"
+FROZEN_MODE_STUBS="$TEST_OUTPUT_DIR/frozen-mode-stubs"
+FROZEN_MODE_LOG="$TEST_OUTPUT_DIR/frozen-mode.log"
+mkdir -p "$FROZEN_MODE_STUBS"
+cat > "$FROZEN_MODE_STUBS/mktemp" << 'STUB'
+#!/bin/bash
+result="$("$REAL_MKTEMP" "$@")" || exit $?
+case "$1" in
+    /tmp/gh-pr-enrich-address-analysis.*|/tmp/gh-pr-enrich-address-context.*)
+        printf '%s\t%s\n' "$1" "$result" >> "$FROZEN_MODE_LOG"
+        ;;
+esac
+printf '%s\n' "$result"
+STUB
+chmod +x "$FROZEN_MODE_STUBS/mktemp"
 rm -f "$ANALYSIS_RACE_FIFO"
 mkfifo "$ANALYSIS_RACE_FIFO"
 : > "$ANALYSIS_RACE_OUT_FILE"
+: > "$FROZEN_MODE_LOG"
 : > "$LOCAL_MUTATION_LOG"
 exec 3<> "$ANALYSIS_RACE_FIFO"
 (cd "$LOCAL_MUTATION_WS" && env GH_HEAD_MODE=captured \
-    GH_MUTATIONS_LOG="$LOCAL_MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    GH_MUTATIONS_LOG="$LOCAL_MUTATION_LOG" REAL_MKTEMP="$(command -v mktemp)" \
+    FROZEN_MODE_LOG="$FROZEN_MODE_LOG" \
+    PATH="$FROZEN_MODE_STUBS:$STUB_DIR:$PATH" \
     "$GH_PR_ENRICH" address 999 < "$ANALYSIS_RACE_FIFO" \
     > "$ANALYSIS_RACE_OUT_FILE" 2>&1) &
 ANALYSIS_RACE_PID=$!
@@ -1396,6 +1422,24 @@ for _attempt in $(seq 1 100); do
     grep -q '\[f\]ixed' "$ANALYSIS_RACE_OUT_FILE" 2>/dev/null && break
     sleep 0.02
 done
+FROZEN_ANALYSIS_PATH=$(awk -F '\t' '$1 ~ /address-analysis/ {print $2; exit}' \
+    "$FROZEN_MODE_LOG")
+FROZEN_CONTEXT_PATH=$(awk -F '\t' '$1 ~ /address-context/ {print $2; exit}' \
+    "$FROZEN_MODE_LOG")
+assert_eq "644" \
+    "$("$GH_PR_ENRICH" --test-call workspace_file_mode \
+        "$LOCAL_MUTATION_REPORT/analysis.json")" \
+    "address can start from a world-readable selected analysis fixture"
+assert_eq "644" \
+    "$("$GH_PR_ENRICH" --test-call workspace_file_mode \
+        "$LOCAL_MUTATION_REPORT/analysis-context.json")" \
+    "address can start from a world-readable context fixture"
+assert_eq "600" \
+    "$("$GH_PR_ENRICH" --test-call workspace_file_mode "$FROZEN_ANALYSIS_PATH")" \
+    "address freezes selected analysis with private permissions"
+assert_eq "600" \
+    "$("$GH_PR_ENRICH" --test-call workspace_file_mode "$FROZEN_CONTEXT_PATH")" \
+    "address freezes analysis context with private permissions"
 jq '.task_list[0].task = "REPLACED AFTER DISPLAY"' \
     "$LOCAL_ANALYSIS_TEMPLATE" > "$LOCAL_MUTATION_REPORT/analysis.json"
 printf 'f' >&3
