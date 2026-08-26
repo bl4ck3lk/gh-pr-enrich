@@ -2609,10 +2609,10 @@ cat > "$SAST_CANCEL_STUBS/semgrep" << 'STUB'
 #!/bin/bash
 printf '%s\n' '{"results":[{"check_id":"partial.cancel","path":"gh-pr-enrich","start":{"line":1},"extra":{"severity":"ERROR","message":"partial","metadata":{}}}],"errors":[]}'
 printf 'ready\n' > "$SAST_CANCEL_READY"
-if [ -n "${SAST_CANCEL_TARGET_PID:-}" ]; then
-    kill -INT "$SAST_CANCEL_TARGET_PID"
-fi
 trap '' TERM INT
+if [ -n "${SAST_CANCEL_TARGET_PID:-}" ]; then
+    kill -"${SAST_CANCEL_SIGNAL:-INT}" "$SAST_CANCEL_TARGET_PID"
+fi
 while :; do :; done
 STUB
 chmod +x "$SAST_CANCEL_STUBS/semgrep"
@@ -2622,22 +2622,19 @@ rm -f "$SAST_CANCEL_READY"
 /bin/sh -c '
     cd "$1" || exit 1
     shift
+    export SAST_CANCEL_TARGET_PID=$$
+    export SAST_CANCEL_SIGNAL=TERM
     exec "$@"
 ' sh "$SAST_WORKSPACE" env PATH="$SAST_CANCEL_STUBS:$STUB_DIR:$PATH" \
     GH_PR_ENRICH_CODE_ACCESS=true SAST_CANCEL_READY="$SAST_CANCEL_READY" \
     "$GH_PR_ENRICH" 1 --prepare-analysis --sast \
     --output-dir term-reports >/dev/null 2>&1 &
 RUNTIME_BACKGROUND_PID=$!
-for (( _wait_attempt=0; _wait_attempt < 200; _wait_attempt++ )); do
-    [ -s "$SAST_CANCEL_READY" ] && break
-    sleep 0.05
-done
-assert_true "$([ -s "$SAST_CANCEL_READY" ] && echo 0 || echo 1)" \
-    "the full-CLI TERM fixture reaches SAST while holding the report lock"
-kill -TERM "$RUNTIME_BACKGROUND_PID"
 rc=0
 wait "$RUNTIME_BACKGROUND_PID" || rc=$?
 RUNTIME_BACKGROUND_PID=""
+assert_true "$([ -s "$SAST_CANCEL_READY" ] && echo 0 || echo 1)" \
+    "the full-CLI TERM fixture reaches SAST while holding the report lock"
 assert_eq "143" "$rc" \
     "full-CLI SAST cancellation preserves the conventional TERM status"
 assert_true "$([ ! -e "$SAST_TERM_REPORT/.selected-analysis.lock" ] && echo 0 || echo 1)" \
