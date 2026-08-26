@@ -393,7 +393,7 @@ build_code_access_workspace_manifest() {
     local transaction_abs="" transaction_rel="" transaction_name="" lock_abs=""
     local records index_state head index_digest record metadata index_mode index_stage
     local index_metadata_rest index_oid source_identity
-    local relative origin file_hash file_mode artifact_relative
+    local relative origin file_hash file_mode artifact_relative link_hash
     if [ -z "$snapshot_source" ]; then
         if [ "${GH_PR_ENRICH_CODE_ACCESS:-}" = true ]; then
             snapshot_source="working_tree"
@@ -484,18 +484,11 @@ build_code_access_workspace_manifest() {
         fi
         if [ "$snapshot_source" = "git_index" ]; then
             source_identity="git:$index_oid"
+            file_hash="$source_identity"
             case "$index_mode" in
                 100644) file_mode="644" ;;
                 100755) file_mode="755" ;;
             esac
-            if ! file_hash="$(
-                    set -o pipefail
-                    git -C "$repo_root" cat-file blob "$index_oid" 2>/dev/null | \
-                        sha256_stream
-                )" || [ -z "$file_hash" ]; then
-                rm -f "$records" "$index_state" "$manifest"
-                return 1
-            fi
         else
             source_identity="workspace"
             if ! file_mode="$(workspace_file_mode "$repo_root/$relative")" || \
@@ -528,13 +521,6 @@ build_code_access_workspace_manifest() {
                     "$transaction_rel"/*) continue ;;
                 esac
             fi
-            if path_has_symlink_component "$repo_root/$relative" || \
-               [ ! -f "$repo_root/$relative" ]; then
-                # Includes nested repositories, which Git reports as directory
-                # entries whose mutable descendants are otherwise invisible.
-                rm -f "$records" "$index_state" "$manifest"
-                return 1
-            fi
             artifact_relative=""
             if [ "$output_is_repo_root" = true ]; then
                 artifact_relative="$relative"
@@ -542,6 +528,32 @@ build_code_access_workspace_manifest() {
                 case "$relative" in
                     "$output_rel"/*) artifact_relative="${relative#"$output_rel/"}" ;;
                 esac
+            fi
+            if [ -L "$repo_root/$relative" ]; then
+                # Bind nontracked links by their literal payload without ever
+                # following them outside the authorized workspace. Generated
+                # report paths remain fail-closed because they are publication
+                # boundaries, not repository inputs.
+                if { [ -n "$artifact_relative" ] && \
+                     is_generated_report_artifact "$artifact_relative"; } || \
+                   path_has_symlink_component "$(dirname "$repo_root/$relative")" || \
+                   ! link_hash="$(
+                       set -o pipefail
+                       readlink "$repo_root/$relative" | sha256_stream
+                   )" || [ -z "$link_hash" ]; then
+                    rm -f "$records" "$index_state" "$manifest"
+                    return 1
+                fi
+                printf 'symlink\0%s\0%s\0%s\0' \
+                    "$origin" "$relative" "$link_hash" >> "$manifest"
+                continue
+            fi
+            if path_has_symlink_component "$repo_root/$relative" || \
+               [ ! -f "$repo_root/$relative" ]; then
+                # Includes nested repositories, which Git reports as directory
+                # entries whose mutable descendants are otherwise invisible.
+                rm -f "$records" "$index_state" "$manifest"
+                return 1
             fi
             if [ -n "$artifact_relative" ] && \
                is_generated_report_artifact "$artifact_relative"; then
@@ -576,6 +588,7 @@ code_access_workspace_fingerprint() {
 }
 
 CODE_ACCESS_SNAPSHOT_DIR=""
+CODE_ACCESS_BATCH_DIR=""
 CODE_ACCESS_SETTINGS_FILE=""
 CODE_ACCESS_TRAPS_ACTIVE=false
 CODE_ACCESS_PREVIOUS_EXIT_TRAP=""
@@ -619,6 +632,20 @@ is_private_code_snapshot_path() {
     [[ "$basename" =~ ^gh-pr-enrich-(code|analysis)-snapshot\.[A-Za-z0-9]+$ ]]
 }
 
+is_private_code_batch_path() {
+    local candidate="$1" parent expected_parent basename
+    case "$candidate" in
+        /tmp/gh-pr-enrich-git-batch.*|/private/tmp/gh-pr-enrich-git-batch.*) ;;
+        *) return 1 ;;
+    esac
+    [ -d "$candidate" ] && [ ! -L "$candidate" ] || return 1
+    parent="$(cd "$(dirname "$candidate")" && pwd -P)" || return 1
+    expected_parent="$(cd /tmp && pwd -P)" || return 1
+    basename="$(basename "$candidate")"
+    [ "$parent" = "$expected_parent" ] && \
+    [[ "$basename" =~ ^gh-pr-enrich-git-batch\.[A-Za-z0-9]+$ ]]
+}
+
 restore_code_access_cleanup_traps() {
     [ "$CODE_ACCESS_TRAPS_ACTIVE" = true ] || return 0
     trap - EXIT INT TERM
@@ -636,6 +663,10 @@ cleanup_code_access_artifacts() {
         chmod -R u+w "$CODE_ACCESS_SNAPSHOT_DIR" 2>/dev/null || true
         rm -rf "$CODE_ACCESS_SNAPSHOT_DIR"
     fi
+    if is_private_code_batch_path "$CODE_ACCESS_BATCH_DIR"; then
+        chmod -R u+w "$CODE_ACCESS_BATCH_DIR" 2>/dev/null || true
+        rm -rf "$CODE_ACCESS_BATCH_DIR"
+    fi
     case "$CODE_ACCESS_SETTINGS_FILE" in
         /tmp/gh-pr-enrich-claude-settings.*|/private/tmp/gh-pr-enrich-claude-settings.*)
             rm -f "$CODE_ACCESS_SETTINGS_FILE"
@@ -652,6 +683,7 @@ cleanup_code_access_artifacts() {
             ;;
     esac
     CODE_ACCESS_SNAPSHOT_DIR=""
+    CODE_ACCESS_BATCH_DIR=""
     CODE_ACCESS_SETTINGS_FILE=""
     ANALYZER_PROMPT_FILE=""
     ANALYZER_CONTEXT_FILE=""
@@ -699,6 +731,9 @@ create_code_access_snapshot() {
     local snapshot_source="${3:-}"
     local repo_root manifest manifest_digest kind origin relative mode source_identity
     local source_oid expected_hash destination destination_hash destination_mode
+    local current_link_hash batch_requests batch_response=/dev/null
+    local response_oid response_type response_size response_separator
+    local block_count remainder
     cleanup_code_access_snapshot
     repo_root="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
     [ -n "$repo_root" ] || return 1
@@ -715,7 +750,98 @@ create_code_access_snapshot() {
         return 1
     }
     install_code_access_cleanup_traps
-    while IFS= read -r -d '' kind <&3; do
+    if [ "$snapshot_source" = "git_index" ]; then
+        CODE_ACCESS_BATCH_DIR="$(mktemp -d "/tmp/gh-pr-enrich-git-batch.XXXXXX")" || {
+            rm -f "$manifest"
+            cleanup_code_access_snapshot
+            return 1
+        }
+        chmod 700 "$CODE_ACCESS_BATCH_DIR" || {
+            rm -f "$manifest"
+            cleanup_code_access_snapshot
+            return 1
+        }
+        batch_requests="$CODE_ACCESS_BATCH_DIR/requests"
+        batch_response="$CODE_ACCESS_BATCH_DIR/response"
+        : > "$batch_requests" || {
+            rm -f "$manifest"
+            cleanup_code_access_snapshot
+            return 1
+        }
+        while IFS= read -r -d '' kind <&5; do
+            case "$kind" in
+                head|index)
+                    IFS= read -r -d '' _ <&5 || {
+                        rm -f "$manifest"
+                        cleanup_code_access_snapshot
+                        return 1
+                    }
+                    ;;
+                missing)
+                    IFS= read -r -d '' _ <&5 && \
+                        IFS= read -r -d '' _ <&5 || {
+                            rm -f "$manifest"
+                            cleanup_code_access_snapshot
+                            return 1
+                        }
+                    ;;
+                symlink)
+                    IFS= read -r -d '' _ <&5 && \
+                        IFS= read -r -d '' _ <&5 && \
+                        IFS= read -r -d '' _ <&5 || {
+                            rm -f "$manifest"
+                            cleanup_code_access_snapshot
+                            return 1
+                        }
+                    ;;
+                file)
+                    IFS= read -r -d '' _ <&5 && \
+                        IFS= read -r -d '' _ <&5 && \
+                        IFS= read -r -d '' _ <&5 && \
+                        IFS= read -r -d '' source_identity <&5 && \
+                        IFS= read -r -d '' _ <&5 || {
+                            rm -f "$manifest"
+                            cleanup_code_access_snapshot
+                            return 1
+                        }
+                    case "$source_identity" in
+                        git:*)
+                            source_oid="${source_identity#git:}"
+                            if { ! [[ "$source_oid" =~ ^[0-9a-fA-F]{40}$ ]] && \
+                                 ! [[ "$source_oid" =~ ^[0-9a-fA-F]{64}$ ]]; }; then
+                                rm -f "$manifest"
+                                cleanup_code_access_snapshot
+                                return 1
+                            fi
+                            printf '%s\n' "$source_oid" >> "$batch_requests" || {
+                                rm -f "$manifest"
+                                cleanup_code_access_snapshot
+                                return 1
+                            }
+                            ;;
+                        *)
+                            rm -f "$manifest"
+                            cleanup_code_access_snapshot
+                            return 1
+                            ;;
+                    esac
+                    ;;
+                *)
+                    rm -f "$manifest"
+                    cleanup_code_access_snapshot
+                    return 1
+                    ;;
+            esac
+        done 5< "$manifest"
+        if ! git --no-replace-objects -C "$repo_root" cat-file --batch \
+                < "$batch_requests" > "$batch_response" 2>/dev/null; then
+            rm -f "$manifest"
+            cleanup_code_access_snapshot
+            return 1
+        fi
+    fi
+    {
+      while IFS= read -r -d '' kind <&3; do
         case "$kind" in
             head|index)
                 IFS= read -r -d '' _ <&3 || {
@@ -731,6 +857,42 @@ create_code_access_snapshot() {
                         cleanup_code_access_snapshot
                         return 1
                     }
+                ;;
+            symlink)
+                IFS= read -r -d '' origin <&3 && \
+                    IFS= read -r -d '' relative <&3 && \
+                    IFS= read -r -d '' expected_hash <&3 || {
+                        rm -f "$manifest"
+                        cleanup_code_access_snapshot
+                        return 1
+                    }
+                case "$origin" in
+                    untracked|ignored) ;;
+                    *)
+                        rm -f "$manifest"
+                        cleanup_code_access_snapshot
+                        return 1
+                        ;;
+                esac
+                case "$relative" in ""|/*|../*|*/../*|*/..)
+                    rm -f "$manifest"
+                    cleanup_code_access_snapshot
+                    return 1
+                    ;;
+                esac
+                if ! [[ "$expected_hash" =~ ^[0-9a-fA-F]{64}$ ]] || \
+                   [ ! -L "$repo_root/$relative" ] || \
+                   path_has_symlink_component "$(dirname "$repo_root/$relative")" || \
+                   ! current_link_hash="$(
+                       set -o pipefail
+                       readlink "$repo_root/$relative" | sha256_stream
+                   )" || [ "$current_link_hash" != "$expected_hash" ]; then
+                    rm -f "$manifest"
+                    cleanup_code_access_snapshot
+                    return 1
+                fi
+                # The link identity is part of the fingerprint, but the link is
+                # intentionally absent from the immutable analysis snapshot.
                 ;;
             file)
                 IFS= read -r -d '' origin <&3 && \
@@ -764,8 +926,32 @@ create_code_access_snapshot() {
                         source_oid="${source_identity#git:}"
                         if { ! [[ "$source_oid" =~ ^[0-9a-fA-F]{40}$ ]] && \
                              ! [[ "$source_oid" =~ ^[0-9a-fA-F]{64}$ ]]; } || \
-                           ! git -C "$repo_root" cat-file blob "$source_oid" \
-                                > "$destination" 2>/dev/null; then
+                           [ "$snapshot_source" != "git_index" ] || \
+                           [ "$expected_hash" != "$source_identity" ] || \
+                           ! IFS=' ' read -r response_oid response_type response_size <&4 || \
+                           [ "$response_oid" != "$source_oid" ] || \
+                           [ "$response_type" != "blob" ] || \
+                           ! [[ "$response_size" =~ ^(0|[1-9][0-9]*)$ ]] || \
+                           [ "${#response_size}" -gt 18 ]; then
+                            rm -f "$manifest"
+                            cleanup_code_access_snapshot
+                            return 1
+                        fi
+                        : > "$destination" || {
+                            rm -f "$manifest"
+                            cleanup_code_access_snapshot
+                            return 1
+                        }
+                        block_count=$((response_size / 65536))
+                        remainder=$((response_size % 65536))
+                        if { [ "$block_count" -gt 0 ] && \
+                             ! dd bs=65536 count="$block_count" <&4 \
+                                > "$destination" 2>/dev/null; } || \
+                           { [ "$remainder" -gt 0 ] && \
+                             ! dd bs=1 count="$remainder" <&4 \
+                                >> "$destination" 2>/dev/null; } || \
+                           ! IFS= read -r response_separator <&4 || \
+                           [ -n "$response_separator" ]; then
                             rm -f "$manifest"
                             cleanup_code_access_snapshot
                             return 1
@@ -785,10 +971,15 @@ create_code_access_snapshot() {
                         ;;
                 esac
                 if ! chmod "$mode" "$destination" || \
-                   ! destination_hash="$(sha256_file "$destination")" || \
                    ! destination_mode="$(workspace_file_mode "$destination")" || \
-                   [ "$destination_hash" != "$expected_hash" ] || \
                    [ "$destination_mode" != "$mode" ]; then
+                    rm -f "$manifest"
+                    cleanup_code_access_snapshot
+                    return 1
+                fi
+                if [ "$source_identity" = "workspace" ] && \
+                   { ! destination_hash="$(sha256_file "$destination")" || \
+                     [ "$destination_hash" != "$expected_hash" ]; }; then
                     rm -f "$manifest"
                     cleanup_code_access_snapshot
                     return 1
@@ -800,7 +991,24 @@ create_code_access_snapshot() {
                 return 1
                 ;;
         esac
-    done 3< "$manifest"
+      done
+      if [ "$snapshot_source" = "git_index" ]; then
+          if IFS= read -r -n 1 _ <&4; then
+              rm -f "$manifest"
+              cleanup_code_access_snapshot
+              return 1
+          fi
+      fi
+    } 3< "$manifest" 4< "$batch_response"
+    if [ "$snapshot_source" = "git_index" ]; then
+        if ! rm -f "$batch_requests" "$batch_response" || \
+           ! rmdir "$CODE_ACCESS_BATCH_DIR"; then
+            rm -f "$manifest"
+            cleanup_code_access_snapshot
+            return 1
+        fi
+        CODE_ACCESS_BATCH_DIR=""
+    fi
     rm -f "$manifest"
     chmod -R a-w "$CODE_ACCESS_SNAPSHOT_DIR" || {
         cleanup_code_access_snapshot
@@ -4782,14 +4990,17 @@ RETRO_HELP
             fi
 
             # Apply author filter
-            if [ -n "$author_filter" ] && [ -f "$summary_file" ]; then
-                local pr_author
-                pr_author=$(jq -r '.author.login // ""' "$summary_file" 2>/dev/null)
+            if [ -n "$author_filter" ]; then
+                local pr_author=""
+                if [ -f "$summary_file" ]; then
+                    pr_author=$(jq -r '.author.login // ""' "$summary_file" 2>/dev/null)
+                fi
                 # Check if author matches any in comma-separated list
                 local author_match=false
                 IFS=',' read -ra AUTHORS <<< "$author_filter"
                 for auth in "${AUTHORS[@]}"; do
                     auth=$(echo "$auth" | xargs)  # trim whitespace
+                    [ -n "$auth" ] || continue
                     if [ "$pr_author" = "$auth" ]; then
                         author_match=true
                         break
@@ -4806,7 +5017,17 @@ RETRO_HELP
             # .category. Mixing them in would collapse every one of their findings
             # into a single "uncategorized" hotspot — a confident, useless answer.
             # Name them and leave them out instead.
-            if jq -e '(.issue_categories // []) | length > 0 and (map(has("category")) | any | not)' \
+            if jq -e '
+                ["logic_error", "boundary_condition", "concurrency",
+                 "error_handling", "resource_lifecycle", "security",
+                 "secrets_exposure", "data_integrity", "api_contract",
+                 "performance", "test_gap", "observability", "maintainability",
+                 "documentation", "build_ci", "dependency_risk"] as $allowed
+                | (.issue_categories // []) as $issues
+                | ($issues | length > 0) and
+                  any($issues[]; .category as $category |
+                      ($allowed | index($category)) == null)
+            ' \
                     "$analysis_file" > /dev/null 2>&1; then
                 legacy_reports+=("$(basename "$pr_dir")")
                 cleanup_retrospective_report_snapshot "$analysis_file" || return 1
@@ -5046,9 +5267,9 @@ RETRO_HELP
             top_issue_categories: (
                 [$agg.prs[] | (.issue_categories // [])[]
                     | select(.verdict == "confirmed")] |
-                sort_by(.name) |
-                group_by(.name) |
-                map({name: .[0].name, count: length, severities: (sort_by(.severity) | group_by(.severity) | map({s: .[0].severity, c: length}))}) |
+                sort_by(.category) |
+                group_by(.category) |
+                map({name: .[0].category, count: length, severities: (sort_by(.severity) | group_by(.severity) | map({s: .[0].severity, c: length}))}) |
                 sort_by(-.count) |
                 .[0:5]
             ),

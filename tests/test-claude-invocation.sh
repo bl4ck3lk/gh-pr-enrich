@@ -225,13 +225,34 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
 rm "$FINGERPRINT_REPORT/claude-analysis.json" "$FINGERPRINT_REPORT/claude-raw-response.json"
 rmdir "$FINGERPRINT_REPORT"
 
-ln -s tracked.txt "$CODE_ACCESS_REPO/.env"
-rc=0
-(cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
-    code_access_workspace_fingerprint "$TEST_OUTPUT_DIR" >/dev/null 2>&1) || rc=$?
-assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
-    "ignored repository-visible symlinks fail closed"
+echo outside-one > "$TEST_OUTPUT_DIR/ignored-link-target-one"
+echo outside-two > "$TEST_OUTPUT_DIR/ignored-link-target-two"
+ln -s ../ignored-link-target-one "$CODE_ACCESS_REPO/.env"
+IGNORED_LINK_FINGERPRINT=$(cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
+    code_access_workspace_fingerprint "$TEST_OUTPUT_DIR")
+echo changed-outside > "$TEST_OUTPUT_DIR/ignored-link-target-one"
+IGNORED_LINK_TARGET_CHANGED=$(cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
+    code_access_workspace_fingerprint "$TEST_OUTPUT_DIR")
+assert_eq "$IGNORED_LINK_FINGERPRINT" "$IGNORED_LINK_TARGET_CHANGED" \
+    "ignored symlink fingerprints never follow an external target"
 rm "$CODE_ACCESS_REPO/.env"
+ln -s ../ignored-link-target-two "$CODE_ACCESS_REPO/.env"
+IGNORED_LINK_PAYLOAD_CHANGED=$(cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
+    code_access_workspace_fingerprint "$TEST_OUTPUT_DIR")
+assert_true "$([ "$IGNORED_LINK_FINGERPRINT" != "$IGNORED_LINK_PAYLOAD_CHANGED" ] && echo 0 || echo 1)" \
+    "ignored symlink fingerprints bind the literal link payload"
+IGNORED_LINK_ACCESS=$(cd "$CODE_ACCESS_REPO" && env GH_PR_ENRICH_CODE_ACCESS=true \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "$HEAD_SHA" "$TEST_OUTPUT_DIR")
+assert_contains "$IGNORED_LINK_ACCESS" "enabled:" \
+    "explicit code access remains available with ignored symlinks"
+rm "$CODE_ACCESS_REPO/.env"
+
+ln -s ../ignored-link-target-one "$CODE_ACCESS_REPO/untracked-link"
+UNTRACKED_LINK_FINGERPRINT=$(cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
+    code_access_workspace_fingerprint "$TEST_OUTPUT_DIR")
+assert_true "$([ -n "$UNTRACKED_LINK_FINGERPRINT" ] && echo 0 || echo 1)" \
+    "untracked symlinks are identity-bound without disabling code access"
+rm "$CODE_ACCESS_REPO/untracked-link"
 
 ln -s tracked.txt "$CODE_ACCESS_REPO/tracked-link"
 git -C "$CODE_ACCESS_REPO" add tracked-link
@@ -363,6 +384,162 @@ jq --arg fingerprint "$WORKTREE_CONTEXT_FINGERPRINT" \
     '.coverage.context_fingerprint = $fingerprint' \
     "$WORKTREE_CONTEXT.tmp" > "$WORKTREE_CONTEXT"
 rm "$WORKTREE_CONTEXT.tmp"
+
+# Nontracked symlinks are part of explicit workspace identity, but an analysis
+# snapshot must neither follow nor recreate them.
+ln -s ../ignored-link-target-one "$CODE_ACCESS_REPO/.env"
+SYMLINK_WORKTREE_FINGERPRINT=$(cd "$CODE_ACCESS_REPO" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint \
+        "$TEST_OUTPUT_DIR" "" working_tree)
+SYMLINK_REPORT="$TEST_OUTPUT_DIR/symlink-worktree-report"
+mkdir -p "$SYMLINK_REPORT"
+jq --arg workspace_fingerprint "$SYMLINK_WORKTREE_FINGERPRINT" '
+    .coverage.code_access.snapshot_source = "working_tree"
+    | .coverage.code_access.workspace_fingerprint = $workspace_fingerprint
+    | del(.coverage.context_fingerprint)' "$CONTEXT" > "$SYMLINK_REPORT/context.tmp"
+SYMLINK_CONTEXT_FINGERPRINT=$(
+    "$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+        "$SYMLINK_REPORT/context.tmp")
+jq --arg fingerprint "$SYMLINK_CONTEXT_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$SYMLINK_REPORT/context.tmp" > "$SYMLINK_REPORT/analysis-context.json"
+rm "$SYMLINK_REPORT/context.tmp"
+
+SYMLINK_SNAPSHOT_JSON=$(cd "$CODE_ACCESS_REPO" && \
+    env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" materialize-analysis-snapshot "$SYMLINK_REPORT")
+SYMLINK_SNAPSHOT_PATH=$(printf '%s' "$SYMLINK_SNAPSHOT_JSON" | jq -r '.path')
+assert_true "$([ ! -e "$SYMLINK_SNAPSHOT_PATH/.env" ] && [ ! -L "$SYMLINK_SNAPSHOT_PATH/.env" ] && echo 0 || echo 1)" \
+    "immutable snapshots omit ignored symlinks instead of following them"
+assert_eq "clean" "$(cat "$SYMLINK_SNAPSHOT_PATH/tracked.txt")" \
+    "immutable snapshots retain regular workspace files beside omitted symlinks"
+env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" cleanup-analysis-snapshot "$SYMLINK_SNAPSHOT_PATH"
+
+rm "$CODE_ACCESS_REPO/.env"
+ln -s ../ignored-link-target-two "$CODE_ACCESS_REPO/.env"
+rc=0
+(cd "$CODE_ACCESS_REPO" && env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" materialize-analysis-snapshot "$SYMLINK_REPORT" \
+    >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "snapshot materialization rejects stale symlink identity"
+rm "$CODE_ACCESS_REPO/.env" "$SYMLINK_REPORT/analysis-context.json"
+rmdir "$SYMLINK_REPORT"
+
+# Indexed snapshots reuse the validated Git object IDs and materialize them
+# through one raw batch stream instead of launching one Git process per file.
+BATCH_REPO="$TEST_OUTPUT_DIR/batch-index-repo"
+BATCH_REPORT="$BATCH_REPO/report"
+BATCH_STUBS="$TEST_OUTPUT_DIR/batch-index-stubs"
+BATCH_GIT_LOG="$TEST_OUTPUT_DIR/batch-index-git.log"
+mkdir -p "$BATCH_REPO" "$BATCH_REPORT" "$BATCH_STUBS"
+(cd "$BATCH_REPO" && git init -q . && git config user.email t@t && git config user.name t)
+BATCH_INDEX=0
+while [ "$BATCH_INDEX" -lt 200 ]; do
+    printf 'fixture-%s\n' "$BATCH_INDEX" > "$BATCH_REPO/file-$BATCH_INDEX.txt"
+    BATCH_INDEX=$((BATCH_INDEX + 1))
+done
+printf 'same\n' > "$BATCH_REPO/duplicate-one.txt"
+printf 'same\n' > "$BATCH_REPO/duplicate-two.txt"
+dd if=/dev/zero bs=65536 count=1 of="$BATCH_REPO/binary.bin" 2>/dev/null
+printf 'tail\0bytes\n' >> "$BATCH_REPO/binary.bin"
+BATCH_NEWLINE_PATH=$'line\nbreak.txt'
+printf 'before\n' > "$BATCH_REPO/$BATCH_NEWLINE_PATH"
+printf 'tracked request sentinel\n' > "$BATCH_REPO/.git-batch-requests"
+printf 'tracked response sentinel\n' > "$BATCH_REPO/.git-batch-response"
+git -C "$BATCH_REPO" add -A
+git -C "$BATCH_REPO" commit -qm init
+BATCH_HEAD=$(git -C "$BATCH_REPO" rev-parse HEAD)
+REAL_BATCH_GIT=$(command -v git)
+cat > "$BATCH_STUBS/git" << 'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$BATCH_GIT_LOG"
+exec "$REAL_BATCH_GIT" "$@"
+STUB
+chmod +x "$BATCH_STUBS/git"
+
+: > "$BATCH_GIT_LOG"
+BATCH_FINGERPRINT=$(cd "$BATCH_REPO" && \
+    env PATH="$BATCH_STUBS:$PATH" REAL_BATCH_GIT="$REAL_BATCH_GIT" \
+        BATCH_GIT_LOG="$BATCH_GIT_LOG" \
+        "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint \
+            "$BATCH_REPORT" "" git_index)
+BATCH_FINGERPRINT_REPEAT=$(cd "$BATCH_REPO" && \
+    env PATH="$BATCH_STUBS:$PATH" REAL_BATCH_GIT="$REAL_BATCH_GIT" \
+        BATCH_GIT_LOG="$BATCH_GIT_LOG" \
+        "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint \
+            "$BATCH_REPORT" "" git_index)
+assert_eq "$BATCH_FINGERPRINT" "$BATCH_FINGERPRINT_REPEAT" \
+    "large indexed workspace fingerprints remain stable"
+assert_eq "0" "$(grep -c 'cat-file blob' "$BATCH_GIT_LOG" || true)" \
+    "indexed fingerprinting launches no per-file Git blob processes"
+
+jq -n --arg sha "$BATCH_HEAD" --arg workspace_fingerprint "$BATCH_FINGERPRINT" '{
+    pr: {title: "batch fixture", base_sha: "base123", base_ref_name: "main"},
+    unresolved_threads: [], issue_comments: [],
+    coverage: {code_access: {
+        state: "enabled", reason: "batch fixture",
+        pr_head_sha: $sha, inspected_sha: $sha, revision_matches: true,
+        snapshot_source: "git_index", workspace_fingerprint: $workspace_fingerprint
+    }}
+}' > "$BATCH_REPORT/context.tmp"
+BATCH_CONTEXT_FINGERPRINT=$(
+    "$GH_PR_ENRICH" --test-call analysis_context_fingerprint "$BATCH_REPORT/context.tmp")
+jq --arg fingerprint "$BATCH_CONTEXT_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$BATCH_REPORT/context.tmp" > "$BATCH_REPORT/analysis-context.json"
+rm "$BATCH_REPORT/context.tmp"
+BATCH_REPLACED_OID=$(git -C "$BATCH_REPO" rev-parse HEAD:file-0.txt)
+BATCH_REPLACEMENT_OID=$(printf 'LOCAL_REPLACEMENT_SECRET\n' | \
+    git -C "$BATCH_REPO" hash-object -w --stdin)
+git -C "$BATCH_REPO" replace "$BATCH_REPLACED_OID" "$BATCH_REPLACEMENT_OID"
+: > "$BATCH_GIT_LOG"
+BATCH_SNAPSHOT_JSON=$(cd "$BATCH_REPO" && \
+    env PATH="$BATCH_STUBS:$STUB_DIR:$PATH" REAL_BATCH_GIT="$REAL_BATCH_GIT" \
+        BATCH_GIT_LOG="$BATCH_GIT_LOG" PS_CALLED_LOG="$PS_CALLED_LOG" \
+        "$GH_PR_ENRICH" materialize-analysis-snapshot "$BATCH_REPORT")
+BATCH_SNAPSHOT_PATH=$(printf '%s' "$BATCH_SNAPSHOT_JSON" | jq -r '.path')
+assert_eq "1" "$(grep -c 'cat-file --batch' "$BATCH_GIT_LOG" || true)" \
+    "indexed snapshot materialization uses one raw Git batch process"
+assert_eq "0" "$(grep -c 'cat-file blob' "$BATCH_GIT_LOG" || true)" \
+    "indexed snapshot materialization launches no per-file Git blob processes"
+assert_contains "$(cat "$BATCH_GIT_LOG")" "--no-replace-objects" \
+    "indexed materialization disables local Git replacement objects"
+assert_eq "fixture-0" "$(cat "$BATCH_SNAPSHOT_PATH/file-0.txt")" \
+    "local replacement refs cannot substitute unbound snapshot bytes"
+assert_eq "same" "$(cat "$BATCH_SNAPSHOT_PATH/duplicate-one.txt")" \
+    "batched materialization preserves duplicate-content paths"
+assert_eq "same" "$(cat "$BATCH_SNAPSHOT_PATH/duplicate-two.txt")" \
+    "batched materialization retains every duplicate-content entry"
+assert_true "$(cmp -s "$BATCH_REPO/binary.bin" "$BATCH_SNAPSHOT_PATH/binary.bin" && echo 0 || echo 1)" \
+    "batched materialization preserves binary bytes across full blocks and a remainder"
+assert_true "$(cmp -s "$BATCH_REPO/$BATCH_NEWLINE_PATH" "$BATCH_SNAPSHOT_PATH/$BATCH_NEWLINE_PATH" && echo 0 || echo 1)" \
+    "batched materialization preserves exact bytes for newline-containing paths"
+assert_eq "tracked request sentinel" \
+    "$(cat "$BATCH_SNAPSHOT_PATH/.git-batch-requests")" \
+    "tracked batch-request lookalikes cannot collide with private batch state"
+assert_eq "tracked response sentinel" \
+    "$(cat "$BATCH_SNAPSHOT_PATH/.git-batch-response")" \
+    "tracked batch-response lookalikes cannot collide with private batch state"
+env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" cleanup-analysis-snapshot "$BATCH_SNAPSHOT_PATH"
+git -C "$BATCH_REPO" replace -d "$BATCH_REPLACED_OID"
+
+printf 'after\n' > "$BATCH_REPO/$BATCH_NEWLINE_PATH"
+git -C "$BATCH_REPO" add -- "$BATCH_NEWLINE_PATH"
+BATCH_CHANGED_FINGERPRINT=$(cd "$BATCH_REPO" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint \
+        "$BATCH_REPORT" "" git_index)
+assert_true "$([ "$BATCH_CHANGED_FINGERPRINT" != "$BATCH_FINGERPRINT" ] && echo 0 || echo 1)" \
+    "staged changes to newline-containing paths change the indexed fingerprint"
+
+# The full analyzer suite includes deliberate timeout and signal fixtures. Keep
+# snapshot development checks independently runnable in seconds.
+if [ "${GH_PR_ENRICH_TEST_SCOPE:-}" = "snapshot" ]; then
+    suite_end
+fi
+
 RESPONSE="$TEST_OUTPUT_DIR/response.json"
 
 NATIVE_REPORT="$CODE_ACCESS_REPO/report"

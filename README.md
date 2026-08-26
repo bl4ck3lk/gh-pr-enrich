@@ -229,6 +229,8 @@ The list is closed, and the analysis must return a verdict for every one of them
 - Immutable code snapshots currently support tracked regular files only.
   Repositories containing tracked symlinks, gitlinks/submodules, or other
   non-regular index entries run without repository code access.
+- With an explicit override, untracked and ignored symlinks are fingerprinted
+  by their literal link identity but are never followed or materialized.
 - Every selected result is bound to a recomputed SHA-256 digest of the analysis
   context. Failed comment, thread, check, or linked-issue fetches remain visible
   in coverage and prevent publication of a clean selected verdict.

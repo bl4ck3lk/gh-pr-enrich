@@ -91,6 +91,9 @@ access. Tracked symlinks, gitlinks/submodules, and other non-regular index
 entries are not materialized; repositories containing them run without code
 access.
 
+With an explicit override, untracked and ignored symlinks are fingerprinted by
+their literal link identity but are never followed or materialized.
+
 `--code-access` (or `GH_PR_ENRICH_CODE_ACCESS=true`) overrides revision, dirty-tree,
 and unknown-PR-head denials. A Git checkout is still required because the
 extension must fingerprint and materialize an immutable repository snapshot.

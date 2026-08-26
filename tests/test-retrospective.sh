@@ -569,6 +569,27 @@ test_author_filter() {
     fi
 }
 
+test_author_filter_excludes_unknown_authors() {
+    local reports_root="$TEST_OUTPUT_DIR/unknown-author-reports"
+    local output_dir="$TEST_OUTPUT_DIR/unknown-author-out"
+    local output
+    mkdir -p "$reports_root"
+    cp -R "$FIXTURES_DIR/pr-1" "$reports_root/pr-known"
+    cp -R "$FIXTURES_DIR/pr-1" "$reports_root/pr-unknown"
+    rm "$reports_root/pr-unknown/pr-summary.json"
+
+    output=$("$GH_PR_ENRICH" retrospective --reports-dir "$reports_root" \
+        --output-dir "$output_dir" --author ', alice,, bob, ' --min-prs 1 2>&1)
+
+    assert_contains "$output" "Found 1 PR reports with structured analysis" \
+        "author filtering ignores empty tokens and excludes unverifiable authors"
+    assert_contains "$output" "Skipped 1 PRs by other authors" \
+        "unknown authors are reported as nonmatching"
+    assert_jq_eq "$output_dir/retrospective-data.json" \
+        '.summary.overview.total_prs_analyzed' "1" \
+        "unknown-author reports cannot contaminate an author-scoped aggregate"
+}
+
 test_author_filter_uses_frozen_summary() {
     local reports_root="$TEST_OUTPUT_DIR/frozen-summary-reports"
     local report_dir="$reports_root/pr-1"
@@ -730,6 +751,17 @@ test_hotspots_group_by_taxonomy() {
     else
         fail "hotspots no longer keyed by free-text finding name" "found a name-keyed hotspot"
     fi
+
+    assert_jq <(printf '%s\n' "$output") \
+        '[.summary.top_issue_categories[] |
+          select(.name == "error_handling" and .count == 4 and
+                 ([.severities[] | select(.s == "high" and .c == 2)] | length == 1) and
+                 ([.severities[] | select(.s == "medium" and .c == 2)] | length == 1))] |
+         length == 1' \
+        "retrospective summaries group finding names under the taxonomy category"
+    assert_contains "$(cat "$TEST_OUTPUT_DIR/hotspots/retrospective-report.md")" \
+        "**error_handling** (4 occurrences)" \
+        "retrospective Markdown renders the grouped taxonomy category"
 }
 
 test_unconfirmed_findings_are_not_aggregated() {
@@ -767,7 +799,7 @@ EOF
         '.summary.overview.total_issues' "1" \
         "retrospective totals count confirmed findings only"
     assert_jq "$output_dir/retrospective-data.json" \
-        '[.summary.top_issue_categories[] | select(.name == "Confirmed issue" and .count == 1)] | length == 1' \
+        '[.summary.top_issue_categories[] | select(.name == "error_handling" and .count == 1)] | length == 1' \
         "retrospective top categories retain confirmed findings"
     assert_jq "$output_dir/retrospective-data.json" \
         '[.summary.top_issue_categories[].name] |
@@ -828,6 +860,25 @@ EOF
   "pr_template_suggestions": []
 }
 EOF
+    local mixed_root="$TEST_OUTPUT_DIR/legacy/pr-78"
+    mkdir -p "$mixed_root"
+    cp "$legacy_root/pr-summary.json" "$mixed_root/pr-summary.json"
+    jq '.number = 78 | .title = "Mixed legacy PR"' \
+        "$mixed_root/pr-summary.json" > "$mixed_root/pr-summary.tmp.json"
+    mv "$mixed_root/pr-summary.tmp.json" "$mixed_root/pr-summary.json"
+    cat > "$mixed_root/claude-analysis.json" << 'EOF'
+{
+  "issue_categories": [
+    {"name":"Current finding","category":"error_handling","severity":"high","verdict":"confirmed"},
+    {"name":"Legacy finding","severity":"medium","verdict":"confirmed"}
+  ],
+  "systemic_issues": [],
+  "adjacent_problems": [],
+  "task_list": [],
+  "process_improvements": [],
+  "pr_template_suggestions": []
+}
+EOF
 
     local output
     output=$("$GH_PR_ENRICH" retrospective --reports-dir "$TEST_OUTPUT_DIR/legacy" \
@@ -844,6 +895,13 @@ EOF
         pass "the specific legacy report is named"
     else
         fail "the specific legacy report is named" "expected pr-77 in the output"
+    fi
+
+    if echo "$output" | grep -q "pr-78"; then
+        pass "mixed legacy reports are excluded instead of emitting null categories"
+    else
+        fail "mixed legacy reports are excluded instead of emitting null categories" \
+            "expected pr-78 in the output"
     fi
 
     local hotspots
@@ -1140,6 +1198,7 @@ test_shared_snapshot_lease_lifecycle
 test_aggregation
 test_pattern_detection
 test_author_filter
+test_author_filter_excludes_unknown_authors
 test_author_filter_uses_frozen_summary
 test_json_output
 test_markdown_output
