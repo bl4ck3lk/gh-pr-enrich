@@ -7223,10 +7223,63 @@ analysis_discussion_fingerprint_from_files() {
     printf '%s\n' "$digest"
 }
 
+# Normalize the check fields that can affect analysis while ignoring response
+# ordering. GitHub does not promise a stable order for `gh pr checks`, and a
+# check transition must change this identity even when the PR head does not.
+analysis_checks_snapshot_from_file() {
+    local checks_file="$1"
+    jq -cS '
+        def text:
+            if . == null then ""
+            elif type == "string" then .
+            else error("check field is not text")
+            end;
+        if type != "array" or any(.[]; type != "object") then
+            error("checks input is not an array of objects")
+        else
+            [ .[] | {
+                name: (.name | text),
+                state: (.state | text),
+                bucket: (.bucket | text),
+                workflow: (
+                    if (.workflow | type) == "object" then
+                        (.workflow.name | text)
+                    else
+                        (.workflow | text)
+                    end
+                ),
+                started_at: (.startedAt | text),
+                completed_at: (.completedAt | text),
+                event: (.event | text),
+                link: (.link | text),
+                description: (.description | text)
+            } ]
+            | sort_by([
+                .name, .workflow, .event, .link, .state, .bucket,
+                .started_at, .completed_at, .description
+            ])
+        end
+    ' "$checks_file"
+}
+
+analysis_checks_fingerprint_from_file() {
+    local checks_file="$1" digest=""
+    digest="$(
+        set -o pipefail
+        analysis_checks_snapshot_from_file "$checks_file" | sha256_stream
+    )" || return 1
+    [ -n "$digest" ] || return 1
+    printf '%s\n' "$digest"
+}
+
 LIVE_DISCUSSION_TEMP_DIR=""
 CURRENT_DISCUSSION_TEMP_FILE=""
 DISCUSSION_STABILITY_FIRST=""
 DISCUSSION_STABILITY_SECOND=""
+LIVE_CHECKS_TEMP_FILE=""
+CURRENT_CHECKS_TEMP_FILE=""
+CHECKS_STABILITY_FIRST=""
+CHECKS_STABILITY_SECOND=""
 cleanup_live_analysis_discussion_temps() {
     case "$LIVE_DISCUSSION_TEMP_DIR" in
         /tmp/gh-pr-enrich-live-discussion.*)
@@ -7248,10 +7301,34 @@ cleanup_live_analysis_discussion_temps() {
             rm -f "$DISCUSSION_STABILITY_SECOND" 2>/dev/null || true
             ;;
     esac
+    case "$LIVE_CHECKS_TEMP_FILE" in
+        /tmp/gh-pr-enrich-live-checks.*)
+            rm -f "$LIVE_CHECKS_TEMP_FILE" 2>/dev/null || true
+            ;;
+    esac
+    case "$CURRENT_CHECKS_TEMP_FILE" in
+        /tmp/gh-pr-enrich-current-checks.*)
+            rm -f "$CURRENT_CHECKS_TEMP_FILE" 2>/dev/null || true
+            ;;
+    esac
+    case "$CHECKS_STABILITY_FIRST" in
+        /tmp/gh-pr-enrich-checks-stability.*)
+            rm -f "$CHECKS_STABILITY_FIRST" 2>/dev/null || true
+            ;;
+    esac
+    case "$CHECKS_STABILITY_SECOND" in
+        /tmp/gh-pr-enrich-checks-stability.*)
+            rm -f "$CHECKS_STABILITY_SECOND" 2>/dev/null || true
+            ;;
+    esac
     LIVE_DISCUSSION_TEMP_DIR=""
     CURRENT_DISCUSSION_TEMP_FILE=""
     DISCUSSION_STABILITY_FIRST=""
     DISCUSSION_STABILITY_SECOND=""
+    LIVE_CHECKS_TEMP_FILE=""
+    CURRENT_CHECKS_TEMP_FILE=""
+    CHECKS_STABILITY_FIRST=""
+    CHECKS_STABILITY_SECOND=""
 }
 
 # Re-fetch the same normalized inputs used by the original collection. The
@@ -7429,14 +7506,164 @@ verify_analysis_discussion_unchanged() {
     DISCUSSION_VERIFICATION_STATUS="unchanged"
 }
 
-# Treat the hosted head and complete discussion snapshot as one final
-# attestation. The head is checked on both sides of the stabilized discussion
-# read, and callers perform every local validation before invoking this helper.
+# Fetch and normalize checks independently of their exit status. `gh pr checks`
+# exits nonzero for pending and failing checks even though its JSON is complete;
+# those states are evidence and must participate in the fingerprint.
+fetch_live_analysis_checks_fingerprint_once() {
+    local repository="$1" pr_number="$2" checks_file fingerprint="" checks_rc=0
+    checks_file="$(mktemp "/tmp/gh-pr-enrich-live-checks.XXXXXX")" || return 1
+    LIVE_CHECKS_TEMP_FILE="$checks_file"
+    chmod 600 "$checks_file" || {
+        rm -f "$checks_file"
+        LIVE_CHECKS_TEMP_FILE=""
+        return 1
+    }
+    run_report_command gh pr checks "$pr_number" --repo "$repository" \
+            --json name,state,bucket,workflow,startedAt,completedAt,event,link,description \
+            > "$checks_file" 2>/dev/null || checks_rc=$?
+    case "$checks_rc" in
+        0)
+            jq -e 'type == "array"' "$checks_file" > /dev/null 2>&1 || {
+                rm -f "$checks_file"
+                LIVE_CHECKS_TEMP_FILE=""
+                return 1
+            }
+            ;;
+        1)
+            jq -e 'type == "array" and any(.[]; .bucket == "fail")' \
+                "$checks_file" > /dev/null 2>&1 || {
+                rm -f "$checks_file"
+                LIVE_CHECKS_TEMP_FILE=""
+                return 1
+            }
+            ;;
+        8)
+            jq -e 'type == "array" and any(.[]; .bucket == "pending")' \
+                "$checks_file" > /dev/null 2>&1 || {
+                rm -f "$checks_file"
+                LIVE_CHECKS_TEMP_FILE=""
+                return 1
+            }
+            ;;
+        *)
+            rm -f "$checks_file"
+            LIVE_CHECKS_TEMP_FILE=""
+            return 1
+            ;;
+    esac
+    fingerprint="$(analysis_checks_fingerprint_from_file \
+        "$checks_file" 2>/dev/null || echo "")"
+    rm -f "$checks_file"
+    LIVE_CHECKS_TEMP_FILE=""
+    [ -n "$fingerprint" ] || return 1
+    printf '%s\n' "$fingerprint"
+}
+
+# Require two consecutive normalized check snapshots to agree. This rejects a
+# transition observed during collection instead of binding a mixed hosted state.
+fetch_live_analysis_checks_fingerprint() {
+    local repository="$1" pr_number="$2" fingerprint=""
+    CHECKS_STABILITY_FIRST="$(mktemp \
+        "/tmp/gh-pr-enrich-checks-stability.XXXXXX")" || return 1
+    CHECKS_STABILITY_SECOND="$(mktemp \
+        "/tmp/gh-pr-enrich-checks-stability.XXXXXX")" || {
+        rm -f "$CHECKS_STABILITY_FIRST"
+        CHECKS_STABILITY_FIRST=""
+        return 1
+    }
+    if ! fetch_live_analysis_checks_fingerprint_once \
+            "$repository" "$pr_number" > "$CHECKS_STABILITY_FIRST" || \
+       ! fetch_live_analysis_checks_fingerprint_once \
+            "$repository" "$pr_number" > "$CHECKS_STABILITY_SECOND" || \
+       ! cmp -s "$CHECKS_STABILITY_FIRST" "$CHECKS_STABILITY_SECOND"; then
+        rm -f "$CHECKS_STABILITY_FIRST" "$CHECKS_STABILITY_SECOND"
+        CHECKS_STABILITY_FIRST=""
+        CHECKS_STABILITY_SECOND=""
+        return 1
+    fi
+    fingerprint="$(cat "$CHECKS_STABILITY_FIRST" 2>/dev/null || echo "")"
+    rm -f "$CHECKS_STABILITY_FIRST" "$CHECKS_STABILITY_SECOND"
+    CHECKS_STABILITY_FIRST=""
+    CHECKS_STABILITY_SECOND=""
+    [ -n "$fingerprint" ] || return 1
+    printf '%s\n' "$fingerprint"
+}
+
+CHECKS_VERIFICATION_STATUS="unavailable"
+verify_analysis_checks_unchanged() {
+    local context_file="$1"
+    local expected repository pr_number current current_file
+    CHECKS_VERIFICATION_STATUS="unavailable"
+    expected="$(jq -r '.coverage.checks.fingerprint // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    repository="$(jq -r '.pr.repository // ""' "$context_file" 2>/dev/null || echo "")"
+    pr_number="$(jq -r '.pr.number // ""' "$context_file" 2>/dev/null || echo "")"
+    if [ -z "$expected" ] || [ -z "$repository" ] || [ -z "$pr_number" ]; then
+        echo "Error: Analysis context is missing its captured checks identity." >&2
+        return 1
+    fi
+    current_file="$(mktemp "/tmp/gh-pr-enrich-current-checks.XXXXXX")" || return 1
+    CURRENT_CHECKS_TEMP_FILE="$current_file"
+    if fetch_live_analysis_checks_fingerprint \
+            "$repository" "$pr_number" > "$current_file" 2>/dev/null; then
+        current="$(cat "$current_file" 2>/dev/null || echo "")"
+    else
+        current=""
+    fi
+    rm -f "$current_file"
+    CURRENT_CHECKS_TEMP_FILE=""
+    if [ -z "$current" ]; then
+        echo "Error: Current GitHub checks state could not be revalidated." >&2
+        return 1
+    fi
+    if [ "$current" != "$expected" ]; then
+        CHECKS_VERIFICATION_STATUS="mismatch"
+        echo "Error: GitHub checks state changed after analysis inputs were captured." >&2
+        return 1
+    fi
+    CHECKS_VERIFICATION_STATUS="unchanged"
+}
+
+# Treat the hosted head, complete discussion snapshot, and check results as one
+# final attestation. The head is checked on both sides of the stabilized remote
+# reads, and callers perform every local validation before invoking this helper.
 # Nothing except signal handling and the atomic rename transaction may follow.
 HOSTED_ATTESTATION_COMPONENT=""
+verify_analysis_partial_hosted_attestation() {
+    local context_file="$1" component="$2"
+    local expected_head repository pr_number first_head
+    HOSTED_ATTESTATION_COMPONENT="head"
+    expected_head="$(jq -r '.pr.head_sha // .coverage.code_access.pr_head_sha // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    repository="$(jq -r '.pr.repository // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    pr_number="$(jq -r '.pr.number // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    [ -n "$expected_head" ] && [ -n "$repository" ] && \
+        [ -n "$pr_number" ] || return 1
+    case "$component" in
+        discussion|checks) ;;
+        *) return 1 ;;
+    esac
+    verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
+    first_head="$CURRENT_HOSTED_HEAD"
+    HOSTED_ATTESTATION_COMPONENT="$component"
+    case "$component" in
+        discussion) verify_analysis_discussion_unchanged "$context_file" || return 1 ;;
+        checks) verify_analysis_checks_unchanged "$context_file" || return 1 ;;
+    esac
+    HOSTED_ATTESTATION_COMPONENT="head"
+    verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
+    [ "$CURRENT_HOSTED_HEAD" = "$first_head" ] || {
+        HOSTED_HEAD_VERIFICATION_STATUS="mismatch"
+        return 1
+    }
+    HOSTED_ATTESTATION_COMPONENT=""
+}
+
 verify_analysis_hosted_attestation() {
     local context_file="$1"
-    local expected_head repository pr_number first_head expected_discussion
+    local expected_head repository pr_number first_head expected_discussion expected_checks
     HOSTED_ATTESTATION_COMPONENT="head"
     expected_head="$(jq -r '.pr.head_sha // .coverage.code_access.pr_head_sha // ""' \
         "$context_file" 2>/dev/null || echo "")"
@@ -7446,12 +7673,19 @@ verify_analysis_hosted_attestation() {
         "$context_file" 2>/dev/null || echo "")"
     expected_discussion="$(jq -r '.coverage.discussion.fingerprint // ""' \
         "$context_file" 2>/dev/null || echo "")"
+    expected_checks="$(jq -r '.coverage.checks.fingerprint // ""' \
+        "$context_file" 2>/dev/null || echo "")"
     [ -n "$expected_head" ] && [ -n "$repository" ] && \
-        [ -n "$pr_number" ] && [ -n "$expected_discussion" ] || return 1
+        [ -n "$pr_number" ] && [ -n "$expected_discussion" ] && \
+        [ -n "$expected_checks" ] || return 1
     verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
     first_head="$CURRENT_HOSTED_HEAD"
+    HOSTED_ATTESTATION_COMPONENT="checks"
+    verify_analysis_checks_unchanged "$context_file" || return 1
     HOSTED_ATTESTATION_COMPONENT="discussion"
     verify_analysis_discussion_unchanged "$context_file" || return 1
+    HOSTED_ATTESTATION_COMPONENT="checks"
+    verify_analysis_checks_unchanged "$context_file" || return 1
     HOSTED_ATTESTATION_COMPONENT="head"
     verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
     [ "$CURRENT_HOSTED_HEAD" = "$first_head" ] || {
@@ -8088,6 +8322,15 @@ build_analysis_context() (
     # too long") on exactly the PRs that most need analysis. Absent or unreadable
     # files are replaced with an empty document so one missing input cannot take
     # the whole context down.
+    local checks_source_status=""
+    checks_source_status="$(jq -r '.status // ""' \
+        "$output_dir/checks-status.json" 2>/dev/null || echo "")"
+    if [ "$checks_source_status" = "completed" ] && \
+       { [ ! -s "$output_dir/checks.json" ] || \
+         ! jq -e 'type == "array"' "$output_dir/checks.json" > /dev/null 2>&1; }; then
+        echo "Error: Completed GitHub checks input is missing or malformed." >&2
+        return 1
+    fi
     local optional
     for optional in review-comments.json inline-comments.json checks.json linked-issues.json; do
         if [ ! -s "$output_dir/$optional" ] || ! jq -e 'type == "array"' "$output_dir/$optional" > /dev/null 2>&1; then
@@ -8225,7 +8468,7 @@ build_analysis_context() (
         fi
     fi
 
-    local discussion_fingerprint=""
+    local discussion_fingerprint="" checks_fingerprint=""
     if jq -e -n \
         --slurpfile issue_status "$output_dir/issue-comments-status.json" \
         --slurpfile review_status "$output_dir/review-comments-status.json" \
@@ -8238,6 +8481,14 @@ build_analysis_context() (
             "$output_dir" 2>/dev/null || echo "")"
         if [ -z "$discussion_fingerprint" ]; then
             echo "Error: Complete GitHub discussion inputs could not be fingerprinted." >&2
+            return 1
+        fi
+    fi
+    if [ "$checks_source_status" = "completed" ]; then
+        checks_fingerprint="$(analysis_checks_fingerprint_from_file \
+            "$output_dir/checks.json" 2>/dev/null || echo "")"
+        if [ -z "$checks_fingerprint" ]; then
+            echo "Error: Complete GitHub checks input could not be fingerprinted." >&2
             return 1
         fi
     fi
@@ -8273,6 +8524,7 @@ build_analysis_context() (
         --arg snapshot_source "$snapshot_source" \
         --arg workspace_fingerprint "$workspace_fingerprint" \
         --arg discussion_fingerprint "$discussion_fingerprint" \
+        --arg checks_fingerprint "$checks_fingerprint" \
         --arg repository "$repository" \
         --argjson thread_comment_limit "$THREAD_COMMENT_LIMIT" \
         '
@@ -8367,6 +8619,10 @@ build_analysis_context() (
                 discussion: {
                     fingerprint: (if $discussion_fingerprint == ""
                         then null else $discussion_fingerprint end)
+                },
+                checks: {
+                    fingerprint: (if $checks_fingerprint == ""
+                        then null else $checks_fingerprint end)
                 },
                 issue_comments: {
                     total: ($raw | length),
@@ -10050,6 +10306,19 @@ _select_analysis_artifact() (
         fi
         return 1
     fi
+    if ! verify_analysis_checks_unchanged "$context_file"; then
+        case "$selected_writer_signal" in
+            INT) return 130 ;;
+            TERM) return 143 ;;
+        esac
+        if [ "$CHECKS_VERIFICATION_STATUS" = "mismatch" ]; then
+            echo "Error: GitHub checks state changed before selection; stale selected artifacts will be invalidated. Rebuild the analysis context." >&2
+            return 42
+        else
+            echo "Error: GitHub checks state could not be revalidated before selection; prior selected artifacts were preserved." >&2
+        fi
+        return 1
+    fi
     if ! validate_selected_workspace "$report_dir" "$source_file" "$context_file"; then
         echo "Error: Selected analysis contains confirmed findings without enabled repository code access in a current matching fingerprinted context." >&2
         return 1
@@ -10222,6 +10491,10 @@ _select_analysis_artifact() (
            [ "$DISCUSSION_VERIFICATION_STATUS" = "mismatch" ]; then
             echo "Error: GitHub discussion state changed during selection; no selected artifacts were published and stale selected artifacts will be invalidated. Rebuild the analysis context." >&2
             return 42
+        elif [ "$HOSTED_ATTESTATION_COMPONENT" = "checks" ] && \
+             [ "$CHECKS_VERIFICATION_STATUS" = "mismatch" ]; then
+            echo "Error: GitHub checks state changed during selection; no selected artifacts were published and stale selected artifacts will be invalidated. Rebuild the analysis context." >&2
+            return 42
         elif [ "$HOSTED_ATTESTATION_COMPONENT" = "head" ]; then
             invalidate_on_confirmed_hosted_head_mismatch "$report_dir" || return 1
             if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
@@ -10229,6 +10502,8 @@ _select_analysis_artifact() (
             else
                 echo "Error: Hosted PR head could not be revalidated during final hosted-state attestation; prior selected artifacts were preserved." >&2
             fi
+        elif [ "$HOSTED_ATTESTATION_COMPONENT" = "checks" ]; then
+            echo "Error: GitHub checks state could not be revalidated during selection; prior selected artifacts were preserved." >&2
         else
             echo "Error: GitHub discussion state could not be revalidated during selection; prior selected artifacts were preserved." >&2
         fi
@@ -10447,7 +10722,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job"
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in
@@ -10771,27 +11046,54 @@ echo "Fetching checks and status..."
 # wrote if it parses; only fall back to an empty set when there is nothing usable.
 # Otherwise a PR with pending or failing checks reports "no checks", exactly when
 # the failing-checks input matters most.
-if ! run_report_command gh pr checks "$PR_NUMBER" \
-        --json name,state,bucket,workflow,startedAt,completedAt,event,link,description \
-        > "$OUTPUT_DIR/checks.json" 2>/dev/null; then
-    if jq -e 'type == "array"' "$OUTPUT_DIR/checks.json" > /dev/null 2>&1; then
-        echo "Note: gh pr checks exited non-zero (checks pending or failing); using the results it returned."
-        write_input_status "$OUTPUT_DIR/checks-status.json" true "completed" \
-            "gh pr checks exited non-zero but returned a complete parseable result"
-    else
-        echo "Note: Could not fetch checks (may require additional permissions or no checks configured)."
+CHECKS_FETCH_RC=0
+run_report_command gh pr checks "$PR_NUMBER" \
+    --json name,state,bucket,workflow,startedAt,completedAt,event,link,description \
+    > "$OUTPUT_DIR/checks.json" 2>/dev/null || CHECKS_FETCH_RC=$?
+case "$CHECKS_FETCH_RC" in
+    0)
+        if jq -e 'type == "array"' "$OUTPUT_DIR/checks.json" > /dev/null 2>&1; then
+            write_input_status "$OUTPUT_DIR/checks-status.json" true "completed" ""
+        else
+            echo "Note: Checks response was not a JSON array; analysis input coverage will remain incomplete."
+            echo '[]' > "$OUTPUT_DIR/checks.json"
+            write_input_status "$OUTPUT_DIR/checks-status.json" true "failed" \
+                "GitHub checks normalization failed"
+        fi
+        ;;
+    1)
+        if jq -e 'type == "array" and any(.[]; .bucket == "fail")' \
+                "$OUTPUT_DIR/checks.json" > /dev/null 2>&1; then
+            echo "Note: gh pr checks reported failing checks; using the complete results it returned."
+            write_input_status "$OUTPUT_DIR/checks-status.json" true "completed" \
+                "gh pr checks reported failing checks with complete parseable results"
+        else
+            echo "Note: Could not fetch a complete failing-checks result."
+            echo '[]' > "$OUTPUT_DIR/checks.json"
+            write_input_status "$OUTPUT_DIR/checks-status.json" true "failed" \
+                "GitHub checks command failed without matching complete failing results"
+        fi
+        ;;
+    8)
+        if jq -e 'type == "array" and any(.[]; .bucket == "pending")' \
+                "$OUTPUT_DIR/checks.json" > /dev/null 2>&1; then
+            echo "Note: gh pr checks reported pending checks; using the complete results it returned."
+            write_input_status "$OUTPUT_DIR/checks-status.json" true "completed" \
+                "gh pr checks reported pending checks with complete parseable results"
+        else
+            echo "Note: Could not fetch a complete pending-checks result."
+            echo '[]' > "$OUTPUT_DIR/checks.json"
+            write_input_status "$OUTPUT_DIR/checks-status.json" true "failed" \
+                "GitHub checks command returned pending status without matching complete results"
+        fi
+        ;;
+    *)
+        echo "Note: GitHub checks request failed or timed out (status $CHECKS_FETCH_RC)."
         echo '[]' > "$OUTPUT_DIR/checks.json"
         write_input_status "$OUTPUT_DIR/checks-status.json" true "failed" \
-            "GitHub checks fetch failed without a parseable result"
-    fi
-elif jq -e 'type == "array"' "$OUTPUT_DIR/checks.json" > /dev/null 2>&1; then
-    write_input_status "$OUTPUT_DIR/checks-status.json" true "completed" ""
-else
-    echo "Note: Checks response was not a JSON array; analysis input coverage will remain incomplete."
-    echo '[]' > "$OUTPUT_DIR/checks.json"
-    write_input_status "$OUTPUT_DIR/checks-status.json" true "failed" \
-        "GitHub checks normalization failed"
-fi
+            "GitHub checks request failed or timed out with status $CHECKS_FETCH_RC"
+        ;;
+esac
 
 # 5. Generate statistics
 echo "Generating statistics..."
@@ -11016,10 +11318,30 @@ if [ "$REFRESH_EXISTING_ANALYSIS" = true ] || [ "$PREPARE_ANALYSIS" = true ] || 
         exit 1
     fi
     build_analysis_context "$OUTPUT_DIR" "$INCLUDE_DIFF" "$RUN_SAST" "$REPO"
-    if jq -e '.coverage.discussion.fingerprint | type == "string" and length > 0' \
-            "$OUTPUT_DIR/analysis-context.json" > /dev/null 2>&1 && \
-       ! verify_analysis_discussion_unchanged "$OUTPUT_DIR/analysis-context.json"; then
-        echo "Error: GitHub discussion state changed or could not be revalidated while analysis inputs were collected." >&2
+    CAPTURED_DISCUSSION_IDENTITY=false
+    CAPTURED_CHECKS_IDENTITY=false
+    jq -e '.coverage.discussion.fingerprint | type == "string" and length > 0' \
+        "$OUTPUT_DIR/analysis-context.json" > /dev/null 2>&1 && \
+        CAPTURED_DISCUSSION_IDENTITY=true
+    jq -e '.coverage.checks.fingerprint | type == "string" and length > 0' \
+        "$OUTPUT_DIR/analysis-context.json" > /dev/null 2>&1 && \
+        CAPTURED_CHECKS_IDENTITY=true
+    HOSTED_INPUTS_VERIFIED=true
+    if [ "$CAPTURED_DISCUSSION_IDENTITY" = true ] && \
+       [ "$CAPTURED_CHECKS_IDENTITY" = true ]; then
+        verify_analysis_hosted_attestation \
+            "$OUTPUT_DIR/analysis-context.json" || HOSTED_INPUTS_VERIFIED=false
+    elif [ "$CAPTURED_DISCUSSION_IDENTITY" = true ]; then
+        verify_analysis_partial_hosted_attestation \
+            "$OUTPUT_DIR/analysis-context.json" discussion || \
+            HOSTED_INPUTS_VERIFIED=false
+    elif [ "$CAPTURED_CHECKS_IDENTITY" = true ]; then
+        verify_analysis_partial_hosted_attestation \
+            "$OUTPUT_DIR/analysis-context.json" checks || \
+            HOSTED_INPUTS_VERIFIED=false
+    fi
+    if [ "$HOSTED_INPUTS_VERIFIED" != true ]; then
+        echo "Error: GitHub head, checks, or discussion state changed or could not be revalidated while analysis inputs were collected." >&2
         echo "Re-run to collect one coherent snapshot." >&2
         exit 1
     fi
@@ -11037,15 +11359,12 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
             ANALYSIS_USABLE=false
             CAPTURED_PR_HEAD=$(jq -r '.coverage.code_access.pr_head_sha // ""' \
                 "$OUTPUT_DIR/analysis-context.json")
-            if ! verify_pr_head_unchanged "$PR_NUMBER" "$CAPTURED_PR_HEAD"; then
-                invalidate_on_confirmed_hosted_head_mismatch "$OUTPUT_DIR"
-                echo "⚠️  PR head changed or could not be revalidated during Claude analysis; the response was not published." >&2
-                [ -z "$CURRENT_HOSTED_HEAD" ] || \
-                    echo "   Expected $CAPTURED_PR_HEAD, now $CURRENT_HOSTED_HEAD. Re-run the analysis." >&2
-            elif ! verify_analysis_discussion_unchanged \
+            if ! verify_analysis_hosted_attestation \
                     "$OUTPUT_DIR/analysis-context.json"; then
-                echo "⚠️  GitHub discussion state changed or could not be revalidated during Claude analysis; the response was not published." >&2
-                echo "   Re-run the analysis against the current comments and review threads." >&2
+                [ "$HOSTED_ATTESTATION_COMPONENT" != "head" ] || \
+                    invalidate_on_confirmed_hosted_head_mismatch "$OUTPUT_DIR"
+                echo "⚠️  GitHub head, checks, or discussion state changed or could not be revalidated during Claude analysis; the response was not published." >&2
+                echo "   Re-run the analysis against the current hosted state." >&2
             elif jq -e '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" > /dev/null 2>&1; then
                 ANALYSIS_USABLE=true
             else
@@ -11188,7 +11507,7 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                     [ "$HOSTED_ATTESTATION_COMPONENT" != "head" ] || \
                         invalidate_on_confirmed_hosted_head_mismatch \
                             "$OUTPUT_DIR" || true
-                    echo "Error: Hosted PR head and discussion could not be attested before provider publication." >&2
+                    echo "Error: Hosted PR head, checks, and discussion could not be attested before provider publication." >&2
                     exit 1
                 fi
                 if [ -n "$PROVIDER_WRITER_SIGNAL" ]; then

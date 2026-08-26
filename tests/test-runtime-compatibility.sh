@@ -2138,6 +2138,114 @@ assert_jq "$PREPARED/analysis-context.json" \
 assert_not_contains "$PREP_OUT" "Claude analysis" \
     "context preparation does not invoke an external analyzer"
 
+# A checks outage must not disable discussion revalidation. Make checks fail
+# without usable state, then mutate issue comments between the two stabilized
+# post-build discussion reads.
+CHECKS_UNAVAILABLE_STUBS="$TEST_OUTPUT_DIR/checks-unavailable-stubs"
+CHECKS_UNAVAILABLE_COUNT="$TEST_OUTPUT_DIR/checks-unavailable-discussion-count"
+CHECKS_UNAVAILABLE_REPORT="$TEST_OUTPUT_DIR/checks-unavailable-report"
+mkdir -p "$CHECKS_UNAVAILABLE_STUBS"
+cat > "$CHECKS_UNAVAILABLE_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr checks" ]; then
+    printf '[]\n'
+    exit 1
+fi
+if [ "$1" = "api" ] && [ "$2" != "graphql" ]; then
+    case "$*" in
+        *repos/o/r/issues/1/comments*)
+            count=$(cat "$CHECKS_UNAVAILABLE_COUNT" 2>/dev/null || echo 0)
+            count=$((count + 1))
+            printf '%s\n' "$count" > "$CHECKS_UNAVAILABLE_COUNT"
+            if [ "$count" -ge 3 ]; then
+                cat << 'JSON'
+[{"id":99,"body":"changed after context build","user":{"login":"reviewer"},"created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-99"}]
+JSON
+            else
+                printf '[]\n'
+            fi
+            exit 0
+            ;;
+    esac
+fi
+exec "$CHECKS_UNAVAILABLE_BASE_GH" "$@"
+STUB
+chmod +x "$CHECKS_UNAVAILABLE_STUBS/gh"
+rc=0
+CHECKS_UNAVAILABLE_OUT=$(env PATH="$CHECKS_UNAVAILABLE_STUBS:$STUB_DIR:$PATH" \
+    CHECKS_UNAVAILABLE_COUNT="$CHECKS_UNAVAILABLE_COUNT" \
+    CHECKS_UNAVAILABLE_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" 1 --prepare-analysis \
+        --output-dir "$CHECKS_UNAVAILABLE_REPORT" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && \
+    [ "$(cat "$CHECKS_UNAVAILABLE_COUNT" 2>/dev/null || echo 0)" -ge 3 ] && \
+    echo 0 || echo 1)" \
+    "failed checks coverage does not skip post-build discussion revalidation"
+assert_jq "$CHECKS_UNAVAILABLE_REPORT/analysis-context.json" \
+    '.coverage.sources.checks.status == "failed" and
+     .coverage.checks.fingerprint == null' \
+    "unavailable checks remain failed coverage without a trusted fingerprint"
+assert_contains "$CHECKS_UNAVAILABLE_OUT" \
+    "GitHub head, checks, or discussion state changed or could not be revalidated" \
+    "discussion drift still blocks context preparation when checks are unavailable"
+
+# When only discussion identity is available, its fallback attestation still
+# has to bracket the remote reads with the captured head. Advance the head
+# during the stable discussion reads and prove the provider is never invoked.
+CHECKS_UNAVAILABLE_HEAD_STUBS="$TEST_OUTPUT_DIR/checks-unavailable-head-stubs"
+CHECKS_UNAVAILABLE_HEAD_COUNT="$TEST_OUTPUT_DIR/checks-unavailable-head-discussion-count"
+CHECKS_UNAVAILABLE_HEAD_MARKER="$TEST_OUTPUT_DIR/checks-unavailable-head-drift"
+CHECKS_UNAVAILABLE_HEAD_REPORT="$TEST_OUTPUT_DIR/checks-unavailable-head-report"
+CHECKS_UNAVAILABLE_HEAD_CLAUDE_LOG="$TEST_OUTPUT_DIR/checks-unavailable-head-claude-invoked.txt"
+mkdir -p "$CHECKS_UNAVAILABLE_HEAD_STUBS"
+cat > "$CHECKS_UNAVAILABLE_HEAD_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr checks" ]; then
+    printf '[]\n'
+    exit 1
+fi
+if [ "$1 $2" = "pr view" ] && [ -e "$CHECKS_UNAVAILABLE_HEAD_MARKER" ]; then
+    PR_HEAD_OID=new-hosted-head exec "$CHECKS_UNAVAILABLE_HEAD_BASE_GH" "$@"
+fi
+if [ "$1" = "api" ] && [ "$2" != "graphql" ]; then
+    case "$*" in
+        *repos/o/r/issues/1/comments*)
+            count=$(cat "$CHECKS_UNAVAILABLE_HEAD_COUNT" 2>/dev/null || echo 0)
+            count=$((count + 1))
+            printf '%s\n' "$count" > "$CHECKS_UNAVAILABLE_HEAD_COUNT"
+            [ "$count" -lt 2 ] || : > "$CHECKS_UNAVAILABLE_HEAD_MARKER"
+            printf '[]\n'
+            exit 0
+            ;;
+    esac
+fi
+exec "$CHECKS_UNAVAILABLE_HEAD_BASE_GH" "$@"
+STUB
+chmod +x "$CHECKS_UNAVAILABLE_HEAD_STUBS/gh"
+rc=0
+CHECKS_UNAVAILABLE_HEAD_OUT=$(env \
+    PATH="$CHECKS_UNAVAILABLE_HEAD_STUBS:$STUB_DIR:$PATH" \
+    CHECKS_UNAVAILABLE_HEAD_COUNT="$CHECKS_UNAVAILABLE_HEAD_COUNT" \
+    CHECKS_UNAVAILABLE_HEAD_MARKER="$CHECKS_UNAVAILABLE_HEAD_MARKER" \
+    CHECKS_UNAVAILABLE_HEAD_BASE_GH="$STUB_DIR/gh" \
+    CLAUDE_INVOKED_LOG="$CHECKS_UNAVAILABLE_HEAD_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich --allow-external \
+        --output-dir "$CHECKS_UNAVAILABLE_HEAD_REPORT" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$CHECKS_UNAVAILABLE_HEAD_MARKER" ] && \
+    echo 0 || echo 1)" \
+    "discussion-only fallback rejects a head advance during its remote reads" \
+    "$CHECKS_UNAVAILABLE_HEAD_OUT"
+assert_true "$([ ! -s "$CHECKS_UNAVAILABLE_HEAD_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "partial hosted attestation blocks external invocation after head drift"
+assert_jq "$CHECKS_UNAVAILABLE_HEAD_REPORT/analysis-context.json" \
+    '.coverage.code_access.pr_head_sha == "abc123" and
+     .coverage.sources.checks.status == "failed" and
+     .coverage.checks.fingerprint == null' \
+    "the blocked context remains bound to its original head and failed check coverage"
+assert_contains "$CHECKS_UNAVAILABLE_HEAD_OUT" \
+    "GitHub head, checks, or discussion state changed or could not be revalidated" \
+    "partial attestation head drift identifies the hosted-state boundary"
+
 PRIVATE_LINKED_LOCAL_DIR="$TEST_OUTPUT_DIR/private-linked-local"
 env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PUBLIC \
     LINKED_ISSUE_VISIBILITY=PRIVATE \
@@ -2681,7 +2789,7 @@ assert_true "$([ "$rc" -ne 0 ] && [ -e "$PROVIDER_DISCUSSION_MARKER" ] && \
     "provider publication detects discussion drift after private staging" \
     "$PROVIDER_DISCUSSION_OUT"
 assert_contains "$PROVIDER_DISCUSSION_OUT" \
-    "Hosted PR head and discussion could not be attested before provider publication" \
+    "Hosted PR head, checks, and discussion could not be attested before provider publication" \
     "provider rejection names the final hosted discussion boundary"
 assert_true "$([ ! -e "$PROVIDER_DISCUSSION_DIR/claude-analysis.json" ] && \
     [ ! -e "$PROVIDER_DISCUSSION_DIR/claude-analysis.md" ] && \
@@ -2841,7 +2949,7 @@ env PATH="$PROVIDER_SIGNAL_STUBS:$STUB_DIR:$PATH" \
     --output-dir "$PROVIDER_SIGNAL_DIR" \
     > "$PROVIDER_SIGNAL_OUT" 2>&1 &
 RUNTIME_BACKGROUND_PID=$!
-for (( _provider_wait=0; _provider_wait < 200; _provider_wait++ )); do
+for (( _provider_wait=0; _provider_wait < 600; _provider_wait++ )); do
     [ -e "$PROVIDER_SIGNAL_READY" ] && break
     kill -0 "$RUNTIME_BACKGROUND_PID" 2>/dev/null || break
     sleep 0.05
@@ -3821,6 +3929,109 @@ assert_no_selection_transaction_residue "$SELECTION_REPORT" \
     "late discussion rejection leaves no selection transaction residue"
 (cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
     "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null)
+
+# Keep the head and discussion fixed, but transition a check during discussion
+# verification after replacement staging. The second stabilized checks read
+# must close that window. Nonzero `gh pr checks` is normal for failing checks;
+# parseable JSON must still be fingerprinted against the captured no-check state.
+LATE_CHECKS_STUBS="$TEST_OUTPUT_DIR/late-checks-stubs"
+LATE_CHECKS_MARKER="$TEST_OUTPUT_DIR/late-checks-fired"
+LATE_CHECKS_CHANGED="$TEST_OUTPUT_DIR/late-checks-changed"
+mkdir -p "$LATE_CHECKS_STUBS"
+cat > "$LATE_CHECKS_STUBS/cp" << 'STUB'
+#!/bin/bash
+destination=""
+for argument in "$@"; do destination="$argument"; done
+case "$destination" in
+    "$LATE_CHECKS_REPORT"/.selected-analysis-replacements.*/analysis.json)
+        : > "$LATE_CHECKS_MARKER"
+        ;;
+esac
+exec "$LATE_CHECKS_REAL_CP" "$@"
+STUB
+cat > "$LATE_CHECKS_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1" = "api" ] && [ "$2" != "graphql" ] && \
+   [ -e "$LATE_CHECKS_MARKER" ] && [ ! -e "$LATE_CHECKS_CHANGED" ]; then
+    : > "$LATE_CHECKS_CHANGED"
+fi
+if [ "$1 $2" = "pr checks" ] && [ -e "$LATE_CHECKS_CHANGED" ]; then
+    cat << 'JSON'
+[{"name":"unit-tests","state":"FAILURE","bucket":"fail","workflow":"tests","startedAt":"2026-01-01T00:00:00Z","completedAt":"2026-01-01T00:01:00Z","event":"pull_request","link":"https://ci/1","description":"failed"}]
+JSON
+    exit 1
+fi
+exec "$LATE_CHECKS_BASE_GH" "$@"
+STUB
+chmod +x "$LATE_CHECKS_STUBS/cp" "$LATE_CHECKS_STUBS/gh"
+rc=0
+LATE_CHECKS_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$LATE_CHECKS_STUBS:$PATH" \
+    LATE_CHECKS_REPORT="$SELECTION_REPORT" \
+    LATE_CHECKS_MARKER="$LATE_CHECKS_MARKER" \
+    LATE_CHECKS_CHANGED="$LATE_CHECKS_CHANGED" \
+    LATE_CHECKS_REAL_CP="$(command -v cp)" \
+    LATE_CHECKS_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$LATE_CHECKS_MARKER" ] && \
+    [ -e "$LATE_CHECKS_CHANGED" ] && echo 0 || echo 1)" \
+    "selection detects checks drift during final discussion verification" \
+    "$LATE_CHECKS_OUT"
+assert_contains "$LATE_CHECKS_OUT" "GitHub checks state changed during selection" \
+    "late checks rejection identifies the prepublication boundary"
+assert_true "$([ ! -e "$SELECTION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "late checks drift invalidates stale selected artifacts"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "late checks rejection leaves no selection transaction residue"
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null)
+
+# A checks command can print a complete JSON array and then hang. The managed
+# timeout status must win over those bytes; otherwise two timed-out reads can
+# masquerade as a stable hosted snapshot.
+CHECKS_TIMEOUT_STUBS="$TEST_OUTPUT_DIR/checks-timeout-stubs"
+CHECKS_TIMEOUT_CHILD_PID="$TEST_OUTPUT_DIR/checks-timeout-child-pid"
+CHECKS_TIMEOUT_BACKUP="$TEST_OUTPUT_DIR/checks-timeout-backup"
+mkdir -p "$CHECKS_TIMEOUT_STUBS" "$CHECKS_TIMEOUT_BACKUP"
+for CHECKS_TIMEOUT_VIEW in analysis.json analysis.md context-coverage.md \
+        combined-data.json comprehensive-report.md; do
+    [ ! -f "$SELECTION_REPORT/$CHECKS_TIMEOUT_VIEW" ] || \
+        cp "$SELECTION_REPORT/$CHECKS_TIMEOUT_VIEW" \
+            "$CHECKS_TIMEOUT_BACKUP/$CHECKS_TIMEOUT_VIEW"
+done
+cat > "$CHECKS_TIMEOUT_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr checks" ]; then
+    printf '[]\n'
+    printf '%s\n' "$$" > "$CHECKS_TIMEOUT_CHILD_PID"
+    trap '' TERM INT
+    while true; do sleep 0.05; done
+fi
+exec "$CHECKS_TIMEOUT_BASE_GH" "$@"
+STUB
+chmod +x "$CHECKS_TIMEOUT_STUBS/gh"
+rc=0
+CHECKS_TIMEOUT_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$CHECKS_TIMEOUT_STUBS:$PATH" \
+    GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
+    CHECKS_TIMEOUT_CHILD_PID="$CHECKS_TIMEOUT_CHILD_PID" \
+    CHECKS_TIMEOUT_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -s "$CHECKS_TIMEOUT_CHILD_PID" ] && echo 0 || echo 1)" \
+    "a timed-out checks command cannot publish its parseable partial output"
+CHECKS_TIMEOUT_PID=$(cat "$CHECKS_TIMEOUT_CHILD_PID" 2>/dev/null || echo "")
+assert_true "$([ -n "$CHECKS_TIMEOUT_PID" ] && \
+    ! kill -0 "$CHECKS_TIMEOUT_PID" 2>/dev/null && echo 0 || echo 1)" \
+    "checks timeout reaps the GitHub child before selection returns"
+assert_contains "$CHECKS_TIMEOUT_OUT" \
+    "GitHub checks state could not be revalidated before selection" \
+    "checks timeout is reported as unavailable rather than unchanged"
+assert_selection_views_match "$SELECTION_REPORT" "$CHECKS_TIMEOUT_BACKUP" \
+    "checks timeout preserves the prior selected views"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "checks timeout leaves no selection transaction residue"
 
 FINAL_BOUNDARY_BACKUP="$TEST_OUTPUT_DIR/final-boundary-backup"
 mkdir -p "$FINAL_BOUNDARY_BACKUP"

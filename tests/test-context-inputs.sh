@@ -621,6 +621,88 @@ assert_jq "$CTX" '.coverage.diff.files_truncated | index("src/retry.js") != null
 assert_jq_eq "$CTX" '.coverage.truncation_limit_chars' "5000" "coverage states the truncation limit"
 assert_jq "$CTX" '.coverage.sources | to_entries | all(.value.status == "completed")' \
     "coverage records successful GitHub source fetches explicitly"
+assert_jq "$CTX" \
+    '.coverage.checks.fingerprint | type == "string" and length > 0' \
+    "coverage binds a completed checks snapshot to the analysis context"
+
+CHECKS_FINGERPRINT="$($GH_PR_ENRICH --test-call \
+    analysis_checks_fingerprint_from_file "$CTX_DIR/checks.json")"
+jq 'reverse' "$CTX_DIR/checks.json" > "$CTX_DIR/checks-reordered.json"
+REORDERED_CHECKS_FINGERPRINT="$($GH_PR_ENRICH --test-call \
+    analysis_checks_fingerprint_from_file "$CTX_DIR/checks-reordered.json")"
+assert_eq "$CHECKS_FINGERPRINT" "$REORDERED_CHECKS_FINGERPRINT" \
+    "checks fingerprint ignores response ordering"
+jq '.[0].state = "SUCCESS" | .[0].bucket = "pass"' \
+    "$CTX_DIR/checks.json" > "$CTX_DIR/checks-state-changed.json"
+CHANGED_CHECKS_FINGERPRINT="$($GH_PR_ENRICH --test-call \
+    analysis_checks_fingerprint_from_file "$CTX_DIR/checks-state-changed.json")"
+assert_true "$([ "$CHECKS_FINGERPRINT" != "$CHANGED_CHECKS_FINGERPRINT" ] && echo 0 || echo 1)" \
+    "a check result transition changes the checks fingerprint"
+printf '[]\n' > "$CTX_DIR/checks-empty.json"
+EMPTY_CHECKS_FINGERPRINT="$($GH_PR_ENRICH --test-call \
+    analysis_checks_fingerprint_from_file "$CTX_DIR/checks-empty.json")"
+assert_true "$([ -n "$EMPTY_CHECKS_FINGERPRINT" ] && echo 0 || echo 1)" \
+    "an empty no-checks snapshot has a valid fingerprint"
+
+LIVE_CHECKS_STUB_DIR="$TEST_OUTPUT_DIR/live-checks-stubs"
+LIVE_CHECKS_COUNT="$TEST_OUTPUT_DIR/live-checks-count"
+mkdir -p "$LIVE_CHECKS_STUB_DIR"
+cat > "$LIVE_CHECKS_STUB_DIR/gh" << 'STUB'
+#!/bin/bash
+[ "$1 $2" = "pr checks" ] || exit 1
+count=$(cat "$LIVE_CHECKS_COUNT" 2>/dev/null || echo 0)
+count=$((count + 1))
+printf '%s\n' "$count" > "$LIVE_CHECKS_COUNT"
+failing='[{"name":"unit","state":"FAILURE","bucket":"fail","workflow":"tests","startedAt":"s","completedAt":"c","event":"pull_request","link":"u","description":"failed"}]'
+case "$LIVE_CHECKS_MODE" in
+    stable-failing) printf '%s\n' "$failing"; exit 1 ;;
+    unstable)
+        if [ "$count" -eq 1 ]; then printf '[]\n'; exit 0; fi
+        printf '%s\n' "$failing"; exit 1
+        ;;
+    malformed) printf '{not-json\n'; exit 1 ;;
+esac
+exit 1
+STUB
+chmod +x "$LIVE_CHECKS_STUB_DIR/gh"
+printf '0\n' > "$LIVE_CHECKS_COUNT"
+rc=0
+STABLE_FAILING_FINGERPRINT=$(env PATH="$LIVE_CHECKS_STUB_DIR:$PATH" \
+    LIVE_CHECKS_MODE=stable-failing LIVE_CHECKS_COUNT="$LIVE_CHECKS_COUNT" \
+    "$GH_PR_ENRICH" --test-call fetch_live_analysis_checks_fingerprint \
+        o/r 1 2>/dev/null) || rc=$?
+assert_true "$([ "$rc" -eq 0 ] && [ -n "$STABLE_FAILING_FINGERPRINT" ] && echo 0 || echo 1)" \
+    "nonzero gh status with stable parseable failing checks remains valid evidence"
+printf '0\n' > "$LIVE_CHECKS_COUNT"
+rc=0
+env PATH="$LIVE_CHECKS_STUB_DIR:$PATH" LIVE_CHECKS_MODE=unstable \
+    LIVE_CHECKS_COUNT="$LIVE_CHECKS_COUNT" \
+    "$GH_PR_ENRICH" --test-call fetch_live_analysis_checks_fingerprint \
+        o/r 1 >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "two different consecutive check snapshots fail closed"
+printf '0\n' > "$LIVE_CHECKS_COUNT"
+rc=0
+env PATH="$LIVE_CHECKS_STUB_DIR:$PATH" LIVE_CHECKS_MODE=malformed \
+    LIVE_CHECKS_COUNT="$LIVE_CHECKS_COUNT" \
+    "$GH_PR_ENRICH" --test-call fetch_live_analysis_checks_fingerprint \
+        o/r 1 >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a malformed live checks response fails closed"
+
+MALFORMED_CHECKS_DIR="$TEST_OUTPUT_DIR/malformed-completed-checks"
+mkdir -p "$MALFORMED_CHECKS_DIR"
+cp "$CTX_DIR/pr-summary.json" "$MALFORMED_CHECKS_DIR/pr-summary.json"
+printf '[]\n' > "$MALFORMED_CHECKS_DIR/unresolved-threads.json"
+printf '[]\n' > "$MALFORMED_CHECKS_DIR/issue-comments.json"
+printf '{not valid JSON\n' > "$MALFORMED_CHECKS_DIR/checks.json"
+jq -n '{requested:true,status:"completed",reason:""}' \
+    > "$MALFORMED_CHECKS_DIR/checks-status.json"
+rc=0
+"$GH_PR_ENRICH" --test-call build_claude_context \
+    "$MALFORMED_CHECKS_DIR" false >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a malformed checks document cannot satisfy completed checks coverage"
 
 # A thread's replies are fetched with a per-thread cap. A thread that hits the
 # cap has lost replies, and the coverage block is the only place that can say so.
