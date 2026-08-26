@@ -13,7 +13,7 @@ for suite in "$SCRIPT_DIR"/test-*.sh; do
         printf 'PASS  (%s)\n' "$(printf '%s' "$output" | grep -o 'Results: [0-9]*/[0-9]* passed' | tail -1)"
     else
         printf 'FAIL\n'
-        printf '%s\n' "$output" | tail -25
+        printf '%s\n' "$output"
         FAILED=1
     fi
 done
