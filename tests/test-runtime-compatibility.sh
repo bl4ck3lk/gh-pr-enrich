@@ -104,7 +104,6 @@ cat > "$STUB_DIR/sleep" << 'STUB'
 #!/bin/bash
 if [ "${GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP:-false}" != true ]; then
     case "${1:-}" in
-        0.05) exec /bin/sleep 0.005 ;;
         0.2) exec /bin/sleep 0.01 ;;
         1) exec /bin/sleep 0.02 ;;
     esac
@@ -150,7 +149,7 @@ assert_process_reaped() {
     if [ -n "$pid" ]; then
         for (( _wait_attempt=0; _wait_attempt < 40; _wait_attempt++ )); do
             kill -0 "$pid" 2>/dev/null || break
-            sleep 0.01
+            sleep 0.05
         done
     fi
     if [ -z "$pid" ] || kill -0 "$pid" 2>/dev/null; then
