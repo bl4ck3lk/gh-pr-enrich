@@ -93,6 +93,13 @@ case "$previous" in
     /tmp/gh-pr-enrich-claude-context.*|/private/tmp/gh-pr-enrich-claude-context.*)
         [ -z "${ANALYZER_CONTEXT_COPY_LOG:-}" ] || \
             printf '%s\n' "$previous" >> "$ANALYZER_CONTEXT_COPY_LOG"
+        /bin/cp "$@" || exit $?
+        if [ -n "${ANALYZER_CONTEXT_MODE_LOG:-}" ]; then
+            mode=$(stat -c '%a' "$previous" 2>/dev/null || \
+                stat -f '%Lp' "$previous") || exit 1
+            printf '%s\n' "$mode" >> "$ANALYZER_CONTEXT_MODE_LOG"
+        fi
+        exit 0
         ;;
 esac
 exec /bin/cp "$@"
@@ -138,7 +145,7 @@ cat > "$STUB_DIR/gh" << 'STUB'
 #!/bin/bash
 case "$1 $2" in
     "repo view")
-        echo '{"nameWithOwner":"o/r","visibility":"PUBLIC"}'
+        echo '{"id":"REPO_o_r","nameWithOwner":"o/r","visibility":"PUBLIC"}'
         exit 0
         ;;
     "pr view")
@@ -157,10 +164,10 @@ esac
 if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
     case "$*" in
         *ExternalDisclosureVisibility*)
-            echo '{"data":{"repository":{"nameWithOwner":"o/r","visibility":"PUBLIC"},"nodes":[]}}'
+            echo '{"data":{"primaryRepository":{"id":"REPO_o_r","nameWithOwner":"o/r","visibility":"PUBLIC"},"nodes":[]}}'
             ;;
         *closingIssuesReferences*)
-            echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+            echo '{"data":{"repository":{"pullRequest":{"number":1,"title":"t","body":"b","closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
             ;;
         *)
             echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PRRT_open","isResolved":false,"isOutdated":false,"path":"a.js","line":1,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"c","databaseId":1,"body":"check this","author":{"login":"rev"},"createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/1#discussion_r1"}]}}]}}}}}'
@@ -388,6 +395,39 @@ done
 assert_true "$([ ! -e "$NATIVE_JANITOR_SIDECAR" ] && ! process_is_active "$NATIVE_JANITOR_PID" && echo 0 || echo 1)" \
     "explicit snapshot cleanup stops the recorded janitor and removes its sidecar"
 
+JANITOR_SLEEP_CLEAR_SNAPSHOT=$(mktemp -d \
+    "/tmp/gh-pr-enrich-analysis-snapshot.XXXXXX")
+JANITOR_SLEEP_CLEAR_SIDECAR="$JANITOR_SLEEP_CLEAR_SNAPSHOT.janitor"
+JANITOR_SLEEP_CLEAR_ENV="$TEST_OUTPUT_DIR/janitor-sleep-clear-bash-env"
+JANITOR_SLEEP_CLEAR_LOG="$TEST_OUTPUT_DIR/janitor-sleep-clear-pid.txt"
+cat > "$JANITOR_SLEEP_CLEAR_ENV" <<'STUB'
+__gh_pr_enrich_observe_cleared_sleep_pid() {
+    if [ "$BASH_COMMAND" = '[ "$SECONDS" -lt "$deadline" ]' ]; then
+        JANITOR_LOOP_CHECKS=$(( ${JANITOR_LOOP_CHECKS:-0} + 1 ))
+        if [ "$JANITOR_LOOP_CHECKS" -eq 2 ]; then
+            printf '%s' "$sleep_pid" > "$JANITOR_SLEEP_CLEAR_LOG"
+            kill -TERM "$$"
+        fi
+    fi
+}
+set -T
+trap '__gh_pr_enrich_observe_cleared_sleep_pid' DEBUG
+STUB
+rc=0
+env BASH_ENV="$JANITOR_SLEEP_CLEAR_ENV" \
+    JANITOR_SLEEP_CLEAR_LOG="$JANITOR_SLEEP_CLEAR_LOG" \
+    GH_PR_ENRICH_SNAPSHOT_POLL_SECONDS=0.01 \
+    "$GH_PR_ENRICH" __snapshot-janitor "$JANITOR_SLEEP_CLEAR_SNAPSHOT" \
+    "$JANITOR_SLEEP_CLEAR_SIDECAR" sleepclear 5 || rc=$?
+assert_eq "0" "$rc" \
+    "TERM after a completed janitor poll exits cleanly"
+assert_true "$([ -e "$JANITOR_SLEEP_CLEAR_LOG" ] && echo 0 || echo 1)" \
+    "the janitor regression observes the sleep PID after a successful wait"
+assert_eq "" "$(cat "$JANITOR_SLEEP_CLEAR_LOG" 2>/dev/null || true)" \
+    "the janitor clears the actual completed sleep PID before the next poll"
+rm -f "$JANITOR_SLEEP_CLEAR_SIDECAR"
+rmdir "$JANITOR_SLEEP_CLEAR_SNAPSHOT"
+
 EXPIRING_SNAPSHOT_JSON=$(cd "$CODE_ACCESS_REPO" && \
     env GH_PR_ENRICH_SNAPSHOT_TTL_SECONDS=1 \
     PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
@@ -459,6 +499,7 @@ run_analysis_context() {
     shift
     (cd "$CODE_ACCESS_REPO" && env CLAUDE_ARG_LOG="$ARG_LOG" \
         ANALYZER_CONTEXT_COPY_LOG="$TEST_OUTPUT_DIR/context-copy-paths.txt" \
+        ANALYZER_CONTEXT_MODE_LOG="$TEST_OUTPUT_DIR/context-copy-modes.txt" \
         CLAUDE_SETTINGS_LOG="$TEST_OUTPUT_DIR/claude-settings.json" \
         CLAUDE_SETTINGS_PATH_LOG="$TEST_OUTPUT_DIR/claude-settings-path.txt" \
         CLAUDE_MEMORY_ENV_LOG="$TEST_OUTPUT_DIR/claude-memory-env.txt" \
@@ -584,6 +625,9 @@ env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
 # ---------------------------------------------------------------------------
 # Code access
 # ---------------------------------------------------------------------------
+chmod 644 "$CONTEXT"
+assert_eq "644" "$("$GH_PR_ENRICH" --test-call workspace_file_mode "$CONTEXT")" \
+    "the source analysis context can use normal report-artifact permissions"
 run_analysis
 ARGS=$(cat "$ARG_LOG" 2>/dev/null || echo "")
 
@@ -626,6 +670,8 @@ SUCCESS_CONTEXT_COPY=$(tail -1 "$TEST_OUTPUT_DIR/context-copy-paths.txt" 2>/dev/
 assert_true "$([ -n "$SUCCESS_CONTEXT_COPY" ] && \
     [ ! -e "$SUCCESS_CONTEXT_COPY" ] && echo 0 || echo 1)" \
     "successful analysis removes its immutable context copy"
+assert_eq "600" "$(tail -1 "$TEST_OUTPUT_DIR/context-copy-modes.txt")" \
+    "the frozen Claude context remains private when its source is world-readable"
 
 # A context that deliberately withheld code access still runs without tools.
 NO_CODE_CONTEXT="$TEST_OUTPUT_DIR/no-code-context.json"
@@ -1146,6 +1192,22 @@ OUTPUT_SYMLINK=$( (cd "$OUTPUT_SYMLINK_REPO" && \
 assert_contains "$OUTPUT_SYMLINK" "disabled" \
     "a generated-name symlink cannot hide behind the output allowlist"
 
+OUTPUT_NEWLINE_REPO="$TEST_OUTPUT_DIR/output-newline-repo"
+mkdir -p "$OUTPUT_NEWLINE_REPO/report"
+(cd "$OUTPUT_NEWLINE_REPO" && git init -q . && git config user.email t@t && \
+    git config user.name t && echo tracked > tracked.txt && \
+    git add tracked.txt && git commit -qm init)
+OUTPUT_NEWLINE_HEAD=$(git -C "$OUTPUT_NEWLINE_REPO" rev-parse HEAD)
+printf '%s\n' "local secret" > \
+    "$OUTPUT_NEWLINE_REPO/report/"$'analysis.json\ncombined-data.json'
+OUTPUT_NEWLINE=$( (cd "$OUTPUT_NEWLINE_REPO" && \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "$OUTPUT_NEWLINE_HEAD" \
+        "$OUTPUT_NEWLINE_REPO/report" 2>&1) || true)
+assert_contains "$OUTPUT_NEWLINE" "disabled" \
+    "a newline filename cannot bypass automatic code-access cleanliness"
+assert_contains "$OUTPUT_NEWLINE" "uncommitted or untracked files" \
+    "the newline filename denial identifies unsafe local output content"
+
 MISMATCHED=$(revision_state "0000000000000000000000000000000000000000")
 assert_contains "$MISMATCHED" "disabled" "code access is disabled when the tree is not at the PR head"
 assert_contains "$MISMATCHED" "gh pr checkout" "the user is told how to align the working tree"
@@ -1216,7 +1278,10 @@ assert_contains "$NOGIT_OUT" "not a git checkout" "the reason names the missing 
 
 NOGIT_FORCED=$( (cd "$NOGIT" && env GH_PR_ENRICH_CODE_ACCESS=true \
     "$GH_PR_ENRICH" --test-call resolve_code_access "$LOCAL_HEAD" 2>&1) || true)
-assert_contains "$NOGIT_FORCED" "enabled" "the override also applies outside a git checkout"
+assert_contains "$NOGIT_FORCED" "disabled" \
+    "the override cannot bypass the immutable snapshot requirement outside a git checkout"
+assert_contains "$NOGIT_FORCED" "immutable repository snapshot" \
+    "the forced no-checkout denial explains the immutable snapshot requirement"
 
 # Unknown PR head (a summary without headRefOid).
 UNKNOWN=$(revision_state "")

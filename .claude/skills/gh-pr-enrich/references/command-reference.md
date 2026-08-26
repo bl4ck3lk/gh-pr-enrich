@@ -91,9 +91,10 @@ access. Tracked symlinks, gitlinks/submodules, and other non-regular index
 entries are not materialized; repositories containing them run without code
 access.
 
-`--code-access` (or `GH_PR_ENRICH_CODE_ACCESS=true`) overrides every denial above,
-including a missing checkout and an unknown PR head. `--no-code-access` wins over
-all of them.
+`--code-access` (or `GH_PR_ENRICH_CODE_ACCESS=true`) overrides revision, dirty-tree,
+and unknown-PR-head denials. A Git checkout is still required because the
+extension must fingerprint and materialize an immutable repository snapshot.
+`--no-code-access` wins over every override.
 
 Analyzing PR #123 from `main` without this check produced confident verdicts and `file:line` anchors for code the PR does not contain. The decision, both revisions and the reason are recorded in the coverage block and the report.
 

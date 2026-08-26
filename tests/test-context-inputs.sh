@@ -524,7 +524,7 @@ cat > "$CTX_DIR/checks.json" << 'EOF'
 EOF
 
 cat > "$CTX_DIR/linked-issues.json" << 'EOF'
-[{"number": 42, "title": "Requests fail on flaky network", "body": "Users see 500s when upstream is slow.", "url": "https://gh/42", "repository":{"nameWithOwner":"intent/issues","visibility":"PRIVATE"}}]
+[{"id":"ISSUE_42","number": 42, "title": "Requests fail on flaky network", "body": "Users see 500s when upstream is slow.", "url": "https://gh/42", "repository":{"nameWithOwner":"intent/issues","visibility":"PRIVATE"}}]
 EOF
 
 cat > "$CTX_DIR/review-comments.json" << 'EOF'
@@ -797,7 +797,7 @@ jq '.body = "PR description beyond five"
     | .commits[0].messageBody = "commit body beyond five"' \
     "$CTX_DIR/pr-summary.json" > "$INTENT_DIR/pr-summary.json"
 printf '%s\n' \
-    '[{"number":42,"title":"intent","body":"linked issue body beyond five","url":"https://gh/42"}]' \
+    '[{"id":"ISSUE_42","number":42,"title":"intent","body":"linked issue body beyond five","url":"https://gh/42","repository":{"nameWithOwner":"intent/issues","visibility":"PUBLIC"}}]' \
     > "$INTENT_DIR/linked-issues.json"
 GH_PR_ENRICH_TRUNCATE_CHARS=5 "$GH_PR_ENRICH" --test-call \
     build_claude_context "$INTENT_DIR" false >/dev/null 2>&1

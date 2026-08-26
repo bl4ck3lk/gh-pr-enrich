@@ -32,7 +32,7 @@ cat > "$STUB_DIR/gh" << 'STUB'
 case "$1 $2" in
     "repo view")
         case "$*" in
-            *nameWithOwner,visibility*) printf '{"nameWithOwner":"o/r","visibility":"%s"}\n' "${REPO_VISIBILITY:-PUBLIC}" ;;
+            *id,nameWithOwner,visibility*) printf '{"id":"REPO_o_r","nameWithOwner":"o/r","visibility":"%s"}\n' "${REPO_VISIBILITY:-PUBLIC}" ;;
             *visibility*) echo "${REPO_VISIBILITY:-PUBLIC}" ;;
             *) echo "o/r" ;;
         esac
@@ -47,8 +47,8 @@ case "$1 $2" in
 esac
 if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
     case "$*" in
-        *ExternalDisclosureVisibility*) echo '{"data":{"repository":{"nameWithOwner":"o/r","visibility":"PUBLIC"},"nodes":[]}}' ;;
-        *closingIssuesReferences*) echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' ;;
+        *ExternalDisclosureVisibility*) echo '{"data":{"primaryRepository":{"id":"REPO_o_r","nameWithOwner":"o/r","visibility":"PUBLIC"},"nodes":[]}}' ;;
+        *closingIssuesReferences*) echo '{"data":{"repository":{"pullRequest":{"number":1,"title":"t","body":"b","closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' ;;
         *) cat "$FIXTURE_DIR/threads.json" ;;
     esac
     exit 0
@@ -218,7 +218,7 @@ summary='{"number":1,"title":"t","body":"b","author":{"login":"u"},"state":"OPEN
 case "$1 $2" in
     "repo view")
         case "$*" in
-            *nameWithOwner,visibility*) echo '{"nameWithOwner":"o/r","visibility":"PUBLIC"}' ;;
+            *id,nameWithOwner,visibility*) echo '{"id":"REPO_o_r","nameWithOwner":"o/r","visibility":"PUBLIC"}' ;;
             *visibility*) echo 'PUBLIC' ;;
             *) echo 'o/r' ;;
         esac
@@ -237,10 +237,10 @@ esac
 if [ "$1 $2" = "api graphql" ]; then
     case "$*" in
         *ExternalDisclosureVisibility*)
-            echo '{"data":{"repository":{"nameWithOwner":"o/r","visibility":"PUBLIC"},"nodes":[]}}'
+            echo '{"data":{"primaryRepository":{"id":"REPO_o_r","nameWithOwner":"o/r","visibility":"PUBLIC"},"nodes":[]}}'
             ;;
         *closingIssuesReferences*)
-            echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+            echo '{"data":{"repository":{"pullRequest":{"number":1,"title":"t","body":"b","closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
             ;;
         *WatchThreadComments*)
             [ -z "${WATCH_GRAPHQL_LOG:-}" ] || printf '%s\n' "$*" >> "$WATCH_GRAPHQL_LOG"

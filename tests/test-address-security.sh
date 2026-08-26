@@ -88,6 +88,47 @@ case "$1 $2" in
         ;;
     "api graphql")
         case "$*" in
+            *"AnalysisIntentSnapshot"*)
+                if [ "${GH_LIVE_INTENT_MODE:-}" = "unavailable" ]; then
+                    exit 1
+                fi
+                live_intent_body="${GH_LIVE_INTENT_BODY:-captured intent}"
+                if [ -n "${GH_LIVE_INTENT_COUNT_FILE:-}" ]; then
+                    live_intent_count=0
+                    [ ! -f "$GH_LIVE_INTENT_COUNT_FILE" ] || \
+                        live_intent_count="$(cat "$GH_LIVE_INTENT_COUNT_FILE")"
+                    live_intent_count=$((live_intent_count + 1))
+                    printf '%s\n' "$live_intent_count" \
+                        > "$GH_LIVE_INTENT_COUNT_FILE"
+                    if [ "${GH_LIVE_INTENT_MODE:-}" = "drift_after_start" ] && \
+                       [ "$live_intent_count" -gt 2 ]; then
+                        live_intent_body="changed intent"
+                    elif [ "${GH_LIVE_INTENT_MODE:-}" = "drift_only_post_mutation" ] && \
+                         [ "$live_intent_count" -ge 7 ] && \
+                         [ "$live_intent_count" -le 8 ]; then
+                        live_intent_body="changed intent"
+                    elif [ "${GH_LIVE_INTENT_MODE:-}" = "drift_at_batch_commit" ] && \
+                         [ "$live_intent_count" -gt 8 ]; then
+                        live_intent_body="changed intent"
+                    fi
+                    if [ -n "${GH_BLOCK_INTENT_AT_COUNT:-}" ] && \
+                       [ "$live_intent_count" -eq "$GH_BLOCK_INTENT_AT_COUNT" ]; then
+                        address_owner_pid="${GH_PR_ENRICH_ADDRESS_OWNER_PID:-$PPID}"
+                        [ -z "${GH_ADDRESS_OWNER_PID_FILE:-}" ] || \
+                            printf '%s\n' "$address_owner_pid" \
+                                > "$GH_ADDRESS_OWNER_PID_FILE"
+                        [ -z "${GH_BLOCK_INTENT_READY_FILE:-}" ] || \
+                            : > "$GH_BLOCK_INTENT_READY_FILE"
+                        trap '' TERM INT
+                        while :; do sleep 1; done
+                    fi
+                fi
+                jq -n --arg body "$live_intent_body" '{data:{repository:{
+                    pullRequest:{number:999,title:"Fixture PR",body:$body,
+                    closingIssuesReferences:{totalCount:0,pageInfo:{
+                        hasNextPage:false,endCursor:null},nodes:[]}}}}}'
+                exit 0
+                ;;
             *"unresolveReviewThread"*)
                 unresolved_thread_id=""
                 for arg in "$@"; do
@@ -129,6 +170,10 @@ case "$1 $2" in
                 done
                 if [ -n "${GH_BLOCK_BEFORE_RESOLVE_THREAD:-}" ] && \
                    [ "$resolved_thread_id" = "$GH_BLOCK_BEFORE_RESOLVE_THREAD" ]; then
+                    address_owner_pid="${GH_PR_ENRICH_ADDRESS_OWNER_PID:-$PPID}"
+                    [ -z "${GH_ADDRESS_OWNER_PID_FILE:-}" ] || \
+                        printf '%s\n' "$address_owner_pid" \
+                            > "$GH_ADDRESS_OWNER_PID_FILE"
                     [ -z "${GH_SIGNAL_CHILD_PID_FILE:-}" ] || \
                         printf '%s\n' "$$" > "$GH_SIGNAL_CHILD_PID_FILE"
                     (
@@ -371,13 +416,23 @@ chmod +x "$STUB_DIR/gh"
 
 # Give address a current provider-neutral selection. Strict mutation consumers
 # no longer accept metadata-less legacy reports, even for task display.
+write_fixture_intent_inputs() {
+    local report_dir="$1"
+    jq -n '{number:999,title:"Fixture PR",body:"captured intent"}' \
+        > "$report_dir/pr-summary.json"
+    printf '%s\n' '[]' > "$report_dir/linked-issues.json"
+    "$GH_PR_ENRICH" --test-call \
+        analysis_intent_fingerprint_from_files "$report_dir"
+}
+
 write_current_selection() {
     local ws="$1"
     local source_file="$2"
     local thread_id="${3:-}"
     local report_dir="$ws/.reports/pr-reviews/pr-999"
     local context_file="$report_dir/analysis-context.json"
-    local context_fingerprint workspace_fingerprint inspected_sha thread_ids existing_root
+    local context_fingerprint workspace_fingerprint intent_fingerprint
+    local inspected_sha thread_ids existing_root
 
     existing_root=$(git -C "$ws" rev-parse --show-toplevel 2>/dev/null || echo "")
     if [ "$existing_root" != "$ws" ]; then
@@ -412,12 +467,16 @@ write_current_selection() {
         | map(select(type == "string" and test("^PRRT_[A-Za-z0-9_-]+$")))
         | unique
     ' "$report_dir/analysis.json")
+    intent_fingerprint="$(write_fixture_intent_inputs "$report_dir")"
 
-    jq -n --argjson tids "$thread_ids" --arg inspected_sha "$inspected_sha" '{
-        pr: {repository:"o/r", number:999},
+    jq -n --argjson tids "$thread_ids" --arg inspected_sha "$inspected_sha" \
+        --arg intent_fingerprint "$intent_fingerprint" '{
+        pr: {repository:"o/r", number:999,
+            title:"Fixture PR",body:"captured intent"},
         unresolved_threads: [$tids[] | {thread_id:.,comments_complete:true,comment_identity:[]}],
-        coverage: {code_access:{state:"enabled", pr_head_sha:"captured-head",
-            inspected_sha:$inspected_sha, revision_matches:false}}
+        coverage: {intent:{fingerprint:$intent_fingerprint},
+            code_access:{state:"enabled", pr_head_sha:"captured-head",
+                inspected_sha:$inspected_sha, revision_matches:false}}
     }' > "$context_file"
     workspace_fingerprint=$(cd "$ws" && "$GH_PR_ENRICH" --test-call \
         code_access_workspace_fingerprint "$report_dir")
@@ -773,6 +832,105 @@ restore_stale_selection() {
     cp "$STALE_BATCH_TEMPLATE" "$STALE_MUTATION_REPORT/claude-analysis.json"
 }
 : > "$MUTATION_LOG"
+
+STARTUP_INTENT_OUT=$(printf 'q' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_LIVE_INTENT_BODY="changed intent" \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1) || true)
+assert_contains "$STARTUP_INTENT_OUT" \
+    "intent changed before tasks could be displayed" \
+    "address rejects stale PR intent before displaying actionable tasks"
+assert_not_contains "$STARTUP_INTENT_OUT" "Found 1 tasks" \
+    "stale PR intent never reaches the task prompt"
+assert_eq "" "$(cat "$MUTATION_LOG")" \
+    "startup intent drift sends no resolution mutation"
+assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "confirmed startup intent drift invalidates the selected artifact"
+
+restore_stale_selection
+STARTUP_INTENT_UNAVAILABLE_OUT=$(printf 'q' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_LIVE_INTENT_MODE=unavailable \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1) || true)
+assert_contains "$STARTUP_INTENT_UNAVAILABLE_OUT" \
+    "intent could not be revalidated" \
+    "address blocks when current PR intent is unavailable"
+assert_not_contains "$STARTUP_INTENT_UNAVAILABLE_OUT" "Found 1 tasks" \
+    "unavailable PR intent never reaches the task prompt"
+assert_true "$([ -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "unavailable startup intent preserves the selected artifact"
+
+LATE_INTENT_COUNT_FILE="$TEST_OUTPUT_DIR/late-intent-count"
+rm -f "$LATE_INTENT_COUNT_FILE"
+LATE_INTENT_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_LIVE_INTENT_MODE=drift_after_start \
+    GH_LIVE_INTENT_COUNT_FILE="$LATE_INTENT_COUNT_FILE" \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1) || true)
+assert_contains "$LATE_INTENT_OUT" \
+    "intent changed since analysis" \
+    "address revalidates PR intent after the prompt and before mutation"
+assert_eq "4" "$(cat "$LATE_INTENT_COUNT_FILE")" \
+    "the mutation gate performs a second stabilized intent verification"
+assert_eq "" "$(cat "$MUTATION_LOG")" \
+    "late intent drift sends no resolution mutation"
+assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "confirmed late intent drift invalidates the selected artifact"
+
+restore_stale_selection
+: > "$MUTATION_LOG"
+POST_MUTATION_INTENT_COUNT="$TEST_OUTPUT_DIR/post-mutation-intent-count"
+rm -f "$POST_MUTATION_INTENT_COUNT"
+set +e
+POST_MUTATION_INTENT_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_LIVE_INTENT_MODE=drift_only_post_mutation \
+    GH_LIVE_INTENT_COUNT_FILE="$POST_MUTATION_INTENT_COUNT" \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1))
+POST_MUTATION_INTENT_RC=$?
+set -e
+assert_true "$([ "$POST_MUTATION_INTENT_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "intent drift immediately after mutation exits nonzero"
+assert_eq "1" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
+    "post-mutation intent drift is detected only after one resolution attempt"
+assert_eq "8" "$(cat "$POST_MUTATION_INTENT_COUNT")" \
+    "post-mutation intent drift fails before the batch-commit verifier can run"
+assert_contains "$POST_MUTATION_INTENT_OUT" "Manual reconciliation is required" \
+    "post-mutation intent drift reports manual reconciliation"
+assert_contains "$POST_MUTATION_INTENT_OUT" "State changed during resolution" \
+    "post-mutation intent drift fails at the per-mutation boundary"
+assert_not_contains "$POST_MUTATION_INTENT_OUT" "before batch commit" \
+    "post-mutation intent drift cannot be deferred to batch commit"
+assert_not_contains "$POST_MUTATION_INTENT_OUT" "Resolved: PRRT_stale" \
+    "post-mutation intent drift is never reported as success"
+assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "post-mutation intent drift invalidates the selected artifact"
+
+restore_stale_selection
+: > "$MUTATION_LOG"
+BATCH_INTENT_COUNT="$TEST_OUTPUT_DIR/batch-intent-count"
+rm -f "$BATCH_INTENT_COUNT"
+set +e
+BATCH_INTENT_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_LIVE_INTENT_MODE=drift_at_batch_commit \
+    GH_LIVE_INTENT_COUNT_FILE="$BATCH_INTENT_COUNT" \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1))
+BATCH_INTENT_RC=$?
+set -e
+assert_true "$([ "$BATCH_INTENT_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "intent drift at final batch commit exits nonzero"
+assert_eq "1" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
+    "batch-commit intent drift follows exactly one resolution attempt"
+assert_contains "$BATCH_INTENT_OUT" "Manual reconciliation is required" \
+    "batch-commit intent drift reports manual reconciliation"
+assert_not_contains "$BATCH_INTENT_OUT" "Resolved: PRRT_stale" \
+    "batch-commit intent drift is never reported as success"
+assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "batch-commit intent drift invalidates the selected artifact"
+
+restore_stale_selection
+: > "$MUTATION_LOG"
 INCOMPLETE_STAGE_DIR="$TEST_OUTPUT_DIR/incomplete-pagination-tmp"
 mkdir -p "$INCOMPLETE_STAGE_DIR"
 INCOMPLETE_THREAD_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
@@ -1005,6 +1163,67 @@ assert_eq "2" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
     "a complete two-thread batch sends exactly two resolve mutations"
 assert_not_contains "$(cat "$MUTATION_LOG")" "unresolve:" \
     "a complete two-thread batch sends no reopening mutation"
+
+# Address holds the selected-analysis writer lock from final preflight through
+# the hosted mutation boundary. A concurrent selected-view writer must fail
+# without changing or invalidating the live publication.
+restore_stale_selection
+jq '.task_list[0].thread_ids = ["PRRT_stale"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
+: > "$MUTATION_LOG"
+ADDRESS_LOCK_DIR="$TEST_OUTPUT_DIR/address-held-lock"
+ADDRESS_LOCK_OUT="$ADDRESS_LOCK_DIR/address-output"
+ADDRESS_LOCK_OWNER_PID_FILE="$ADDRESS_LOCK_DIR/address-owner.pid"
+ADDRESS_LOCK_INTENT_COUNT_FILE="$ADDRESS_LOCK_DIR/intent-count"
+ADDRESS_LOCK_READY_FILE="$ADDRESS_LOCK_DIR/intent-ready"
+ADDRESS_LOCK_INPUT="$ADDRESS_LOCK_DIR/input"
+mkdir -p "$ADDRESS_LOCK_DIR"
+printf 'f' > "$ADDRESS_LOCK_INPUT"
+set +e
+(cd "$STALE_MUTATION_WS" && env GH_HEAD_MODE=captured \
+    GH_LIVE_INTENT_COUNT_FILE="$ADDRESS_LOCK_INTENT_COUNT_FILE" \
+    GH_BLOCK_INTENT_AT_COUNT=5 \
+    GH_BLOCK_INTENT_READY_FILE="$ADDRESS_LOCK_READY_FILE" \
+    GH_ADDRESS_OWNER_PID_FILE="$ADDRESS_LOCK_OWNER_PID_FILE" \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 \
+        < "$ADDRESS_LOCK_INPUT" > "$ADDRESS_LOCK_OUT" 2>&1) &
+ADDRESS_LOCK_PROCESS_PID=$!
+set -e
+for _ in $(seq 1 100); do
+    [ ! -e "$ADDRESS_LOCK_READY_FILE" ] || break
+    sleep 0.05
+done
+assert_true "$([ -e "$ADDRESS_LOCK_READY_FILE" ] && \
+    [ -s "$ADDRESS_LOCK_OWNER_PID_FILE" ] && \
+    [ -d "$STALE_MUTATION_REPORT/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "address holds the selected-analysis writer lock during final pre-dispatch attestation"
+set +e
+ADDRESS_CONCURRENT_WRITER_OUT=$("$GH_PR_ENRICH" --test-call \
+    invalidate_selected_analysis "$STALE_MUTATION_REPORT" 2>&1)
+ADDRESS_CONCURRENT_WRITER_RC=$?
+set -e
+assert_true "$([ "$ADDRESS_CONCURRENT_WRITER_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "a concurrent selected-analysis writer is rejected during address mutation"
+assert_contains "$ADDRESS_CONCURRENT_WRITER_OUT" \
+    "Another selected-analysis writer is active" \
+    "the concurrent writer reports the held address lock"
+assert_true "$([ -f "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "the rejected writer cannot alter the selected publication"
+assert_eq "" "$(cat "$MUTATION_LOG")" \
+    "lock contention is exercised before any resolution mutation is dispatched"
+kill -TERM "$(cat "$ADDRESS_LOCK_OWNER_PID_FILE")"
+set +e
+wait "$ADDRESS_LOCK_PROCESS_PID"
+ADDRESS_LOCK_PROCESS_RC=$?
+set -e
+assert_eq "143" "$ADDRESS_LOCK_PROCESS_RC" \
+    "terminating the locked address batch preserves the conventional status"
+assert_true "$([ ! -e "$STALE_MUTATION_REPORT/.selected-analysis.lock" ] && echo 0 || echo 1)" \
+    "address cleanup releases its selected-analysis writer lock"
 
 # Address owns each hosted mutation and its descendants as a managed process
 # group. Both conventional cancellation signals reap the in-flight request,
@@ -1364,13 +1583,18 @@ mkdir -p "$LOCAL_MUTATION_REPORT"
 LOCAL_WORKSPACE_FINGERPRINT=$(cd "$LOCAL_MUTATION_WS" && \
     "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint \
         .reports/pr-reviews/pr-999)
+LOCAL_INTENT_FINGERPRINT="$(write_fixture_intent_inputs \
+    "$LOCAL_MUTATION_REPORT")"
 jq -n --arg workspace_fingerprint "$LOCAL_WORKSPACE_FINGERPRINT" \
-    '{pr:{repository:"o/r",number:999},
+    --arg intent_fingerprint "$LOCAL_INTENT_FINGERPRINT" \
+    '{pr:{repository:"o/r",number:999,
+        title:"Fixture PR",body:"captured intent"},
     unresolved_threads:[{thread_id:"PRRT_local",comments_complete:true,
-        comment_identity:[]}],coverage:{code_access:{
-        state:"enabled",pr_head_sha:"captured-head",
-        snapshot_source:"git_index",
-        workspace_fingerprint:$workspace_fingerprint}}}' \
+        comment_identity:[]}],coverage:{
+        intent:{fingerprint:$intent_fingerprint},code_access:{
+            state:"enabled",pr_head_sha:"captured-head",
+            snapshot_source:"git_index",
+            workspace_fingerprint:$workspace_fingerprint}}}' \
     > "$LOCAL_MUTATION_CONTEXT_TMP"
 LOCAL_CONTEXT_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
     "$LOCAL_MUTATION_CONTEXT_TMP")
@@ -2434,7 +2658,8 @@ wait "$ANALYSIS_RACE_PID" || true
 ANALYSIS_RACE_OUT=$(cat "$ANALYSIS_RACE_OUT_FILE")
 assert_contains "$ANALYSIS_RACE_OUT" "LOCAL MUTATION TASK" \
     "address displays tasks from its private frozen analysis"
-assert_contains "$ANALYSIS_RACE_OUT" "Selected analysis or thread provenance changed" \
+assert_contains "$ANALYSIS_RACE_OUT" \
+    "Selected analysis changed before the mutation batch began" \
     "address rejects selected-analysis replacement while the prompt is open"
 assert_eq "" "$(cat "$LOCAL_MUTATION_LOG")" \
     "analysis replacement sends no thread-resolution mutation"

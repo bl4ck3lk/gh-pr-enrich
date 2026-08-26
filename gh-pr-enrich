@@ -1299,6 +1299,30 @@ invalidate_on_confirmed_hosted_head_mismatch() {
         invalidate_selected_analysis "$report_dir"
 }
 
+invalidate_on_confirmed_hosted_attestation_mismatch() {
+    local report_dir="$1" confirmed_mismatch=false
+    case "$HOSTED_ATTESTATION_COMPONENT" in
+        head)
+            [ "$HOSTED_HEAD_VERIFICATION_STATUS" != "mismatch" ] || \
+                confirmed_mismatch=true
+            ;;
+        discussion)
+            [ "$DISCUSSION_VERIFICATION_STATUS" != "mismatch" ] || \
+                confirmed_mismatch=true
+            ;;
+        checks)
+            [ "$CHECKS_VERIFICATION_STATUS" != "mismatch" ] || \
+                confirmed_mismatch=true
+            ;;
+        intent)
+            [ "$INTENT_VERIFICATION_STATUS" != "mismatch" ] || \
+                confirmed_mismatch=true
+            ;;
+    esac
+    [ "$confirmed_mismatch" != true ] || \
+        invalidate_selected_analysis "$report_dir"
+}
+
 ADDRESS_LIVE_THREAD_RAW_FILE=""
 ADDRESS_LIVE_THREAD_OUTPUT_FILE=""
 
@@ -1481,6 +1505,10 @@ ADDRESS_PENDING_SIGNAL_STATUS=""
 ADDRESS_BATCH_ACTIVE=false
 ADDRESS_BATCH_ATTEMPTED_THREAD_IDS=()
 ADDRESS_BATCH_CONFIRMED_THREAD_IDS=()
+ADDRESS_SELECTED_IDENTITY=""
+ADDRESS_BATCH_LOCK_DIR=""
+ADDRESS_BATCH_LOCK_TOKEN=""
+ADDRESS_BATCH_LOCK_OWNED=false
 
 address_job_is_running() {
     local job_spec="$1" running_pid
@@ -1636,6 +1664,69 @@ run_address_hosted_command() {
         exit "$ADDRESS_PENDING_SIGNAL_STATUS"
     fi
     return "$command_rc"
+}
+
+# Address mode runs before the analysis helper definitions below. Invoke the
+# shipped verifier through the managed child boundary so its GitHub requests,
+# timeout, signals, and temporary files remain owned by the address workflow.
+verify_address_analysis_intent_unchanged() {
+    local context_file="$1" status_file="" command_rc=0 status=""
+    status_file="$(mktemp \
+        "${TMPDIR:-/tmp}/gh-pr-enrich-address-intent.XXXXXX")" || return 1
+    chmod 600 "$status_file" || {
+        rm -f "$status_file"
+        return 1
+    }
+    run_address_hosted_command "$status_file" env \
+        ADDRESS_COMMAND_MANAGEMENT_ENABLED=false \
+        "$0" --test-call verify_analysis_intent_with_status \
+        "$context_file" || command_rc=$?
+    status="$(sed -n \
+        's/^GH_PR_ENRICH_INTENT_STATUS=//p' "$status_file" | tail -n 1)"
+    rm -f "$status_file"
+    [ "$ADDRESS_HOSTED_RESULT_FILE" != "$status_file" ] || \
+        ADDRESS_HOSTED_RESULT_FILE=""
+    case "$status" in
+        unchanged|mismatch|unavailable)
+            INTENT_VERIFICATION_STATUS="$status"
+            ;;
+        *)
+            INTENT_VERIFICATION_STATUS="unavailable"
+            ;;
+    esac
+    [ "$command_rc" -eq 0 ] && \
+        [ "$INTENT_VERIFICATION_STATUS" = "unchanged" ]
+}
+
+release_address_batch_lock() {
+    [ "$ADDRESS_BATCH_LOCK_OWNED" = true ] || return 0
+    # A terminal invalidation runs in a subshell, reuses this token, and may
+    # complete the shared release before parent cleanup resumes.
+    if [ ! -e "$ADDRESS_BATCH_LOCK_DIR" ] && \
+       [ ! -L "$ADDRESS_BATCH_LOCK_DIR" ] && \
+       [ ! -e "$(dirname "$ADDRESS_BATCH_LOCK_DIR")/.selected-analysis-release.$ADDRESS_BATCH_LOCK_TOKEN" ]; then
+        ADDRESS_BATCH_LOCK_DIR=""
+        ADDRESS_BATCH_LOCK_TOKEN=""
+        ADDRESS_BATCH_LOCK_OWNED=false
+        SELECTED_ANALYSIS_LOCK_DIR=""
+        SELECTED_ANALYSIS_LOCK_TOKEN=""
+        SELECTED_ANALYSIS_LOCK_OWNED=false
+        return 0
+    fi
+    if ! release_selected_analysis_lock \
+            "$ADDRESS_BATCH_LOCK_DIR" "$ADDRESS_BATCH_LOCK_TOKEN"; then
+        echo "Error: Selected-analysis writer lock remains after address cleanup." >&2
+        return 1
+    fi
+    if [ "$SELECTED_ANALYSIS_LOCK_DIR" = "$ADDRESS_BATCH_LOCK_DIR" ] && \
+       [ "$SELECTED_ANALYSIS_LOCK_TOKEN" = "$ADDRESS_BATCH_LOCK_TOKEN" ]; then
+        SELECTED_ANALYSIS_LOCK_DIR=""
+        SELECTED_ANALYSIS_LOCK_TOKEN=""
+        SELECTED_ANALYSIS_LOCK_OWNED=false
+    fi
+    ADDRESS_BATCH_LOCK_DIR=""
+    ADDRESS_BATCH_LOCK_TOKEN=""
+    ADDRESS_BATCH_LOCK_OWNED=false
 }
 
 rollback_active_address_thread_batch() {
@@ -2470,12 +2561,12 @@ validate_output_directory_for_writes() {
 
     inventory="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-preflight.XXXXXX")"
     if ! find "$output_abs" -mindepth 1 \( -type f -o -type l \) \
-            -print > "$inventory" 2>/dev/null; then
+            -print0 > "$inventory" 2>/dev/null; then
         rm -f "$inventory"
         echo "Error: Report output directory could not be inspected safely." >&2
         return 1
     fi
-    while IFS= read -r candidate; do
+    while IFS= read -r -d '' candidate; do
         relative="${candidate#"$output_abs/"}"
         if [ -L "$candidate" ]; then
             invalid_reason="symbolic link: $relative"
@@ -2601,7 +2692,7 @@ run_analysis_snapshot_janitor() {
         sleep "$poll_seconds" &
         sleep_pid=$!
         wait "$sleep_pid" 2>/dev/null || return 0
-        heartbeat_sleep_pid=""
+        sleep_pid=""
     done
     trap - TERM INT
     analysis_snapshot_sidecar_matches "$snapshot_path" "$sidecar_path" \
@@ -6138,6 +6229,13 @@ if [ "$1" = "address" ]; then
         exit 1
     fi
 
+    ADDRESS_SELECTED_IDENTITY="$(selected_analysis_live_identity \
+        "$ANALYSIS_DIR" 2>/dev/null || echo "")"
+    if [ -z "$ADDRESS_SELECTED_IDENTITY" ]; then
+        echo "Error: Selected analysis identity could not be captured"
+        exit 1
+    fi
+
     ADDRESS_LIVE_ANALYSIS_FILE="$ANALYSIS_FILE"
     ADDRESS_LIVE_CONTEXT_FILE="$ANALYSIS_DIR/analysis-context.json"
     ADDRESS_FROZEN_ANALYSIS="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-address-analysis.XXXXXX")" || exit 1
@@ -6153,6 +6251,7 @@ if [ "$1" = "address" ]; then
         cleanup_address_hosted_control
         cleanup_address_live_thread_stages
         rollback_active_address_thread_batch || true
+        release_address_batch_lock || true
         cleanup_address_live_thread_stages
         [ -z "$ADDRESS_MUTATION_RESULT_FILE" ] || \
             rm -f "$ADDRESS_MUTATION_RESULT_FILE"
@@ -6190,7 +6289,8 @@ if [ "$1" = "address" ]; then
        [ "$LIVE_ANALYSIS_MODE" != "$ADDRESS_ANALYSIS_MODE" ] || \
        [ "$LIVE_CONTEXT_DIGEST" != "$ADDRESS_CONTEXT_DIGEST" ] || \
        [ "$LIVE_CONTEXT_MODE" != "$ADDRESS_CONTEXT_MODE" ]; then
-        invalidate_selected_analysis "$ANALYSIS_DIR" || true
+        invalidate_selected_analysis "$ANALYSIS_DIR" \
+            "$ADDRESS_SELECTED_IDENTITY" || true
         echo "Error: Selected analysis or context changed while address mode was starting"
         exit 1
     fi
@@ -6198,7 +6298,8 @@ if [ "$1" = "address" ]; then
        ! validate_address_selection_pair "$ANALYSIS_DIR" \
             "$ADDRESS_FROZEN_ANALYSIS" "$ADDRESS_LIVE_ANALYSIS_FILE" \
             "$ADDRESS_FROZEN_CONTEXT" "$ADDRESS_LIVE_CONTEXT_FILE"; then
-        invalidate_selected_analysis "$ANALYSIS_DIR" || true
+        invalidate_selected_analysis "$ANALYSIS_DIR" \
+            "$ADDRESS_SELECTED_IDENTITY" || true
         echo "Error: Selected analysis provenance changed before tasks could be displayed"
         exit 1
     fi
@@ -6208,7 +6309,8 @@ if [ "$1" = "address" ]; then
          jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
             "$ADDRESS_FROZEN_ANALYSIS" > /dev/null 2>&1; } && \
        ! validate_code_access_grant "$ADDRESS_FROZEN_CONTEXT" "$ANALYSIS_DIR"; then
-        invalidate_selected_analysis "$ANALYSIS_DIR" || true
+        invalidate_selected_analysis "$ANALYSIS_DIR" \
+            "$ADDRESS_SELECTED_IDENTITY" || true
         echo "Error: Selected analysis code-access grant changed before tasks could be displayed"
         exit 1
     fi
@@ -6239,6 +6341,20 @@ if [ "$1" = "address" ]; then
         if [ -n "$ADDRESS_CONTEXT_REPOSITORY" ] && [ -n "$ADDRESS_CONTEXT_HEAD" ]; then
             ADDRESS_CURRENT_PROVENANCE=true
         fi
+    fi
+
+    if [ "$ADDRESS_CURRENT_PROVENANCE" = true ] && \
+       ! verify_address_analysis_intent_unchanged \
+            "$ADDRESS_CONTEXT_FILE"; then
+        [ "$INTENT_VERIFICATION_STATUS" != "mismatch" ] || \
+            invalidate_selected_analysis "$ANALYSIS_DIR" \
+                "$ADDRESS_SELECTED_IDENTITY" || true
+        if [ "$INTENT_VERIFICATION_STATUS" = "mismatch" ]; then
+            echo "Error: GitHub PR or linked-issue intent changed before tasks could be displayed. Re-run the analysis."
+        else
+            echo "Error: GitHub PR or linked-issue intent could not be revalidated; tasks were not displayed and the selected analysis was preserved."
+        fi
+        exit 1
     fi
 
     # Get task count
@@ -6314,19 +6430,36 @@ if [ "$1" = "address" ]; then
                         THREAD_IDS_TO_RESOLVE=()
                         for TID in $THREAD_ARRAY; do
                             if [[ ! "$TID" =~ ^PRRT_[A-Za-z0-9_-]+$ ]]; then
-                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                invalidate_selected_analysis "$ANALYSIS_DIR" \
+                                    "$ADDRESS_SELECTED_IDENTITY" || true
                                 echo "  ❌ Invalid thread ID format: $TID"
                                 exit 1
                             fi
                             for EXISTING_TID in "${THREAD_IDS_TO_RESOLVE[@]}"; do
                                 if [ "$EXISTING_TID" = "$TID" ]; then
-                                    invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                    invalidate_selected_analysis "$ANALYSIS_DIR" \
+                                        "$ADDRESS_SELECTED_IDENTITY" || true
                                     echo "  ❌ Duplicate thread ID in one task: $TID"
                                     exit 1
                                 fi
                             done
                             THREAD_IDS_TO_RESOLVE+=("$TID")
                         done
+
+                        if ! acquire_selected_analysis_lock "$ANALYSIS_DIR"; then
+                            echo "  ❌ Another selected-analysis writer is active. Re-run address mode against the completed publication."
+                            exit 1
+                        fi
+                        ADDRESS_BATCH_LOCK_DIR="$SELECTED_ANALYSIS_LOCK_DIR"
+                        ADDRESS_BATCH_LOCK_TOKEN="$SELECTED_ANALYSIS_LOCK_TOKEN"
+                        ADDRESS_BATCH_LOCK_OWNED=true
+                        if [ "$(selected_analysis_live_identity \
+                                "$ANALYSIS_DIR" 2>/dev/null || echo "")" != \
+                             "$ADDRESS_SELECTED_IDENTITY" ]; then
+                            release_address_batch_lock || true
+                            echo "  ❌ Selected analysis changed before the mutation batch began. The newer publication was preserved."
+                            exit 1
+                        fi
 
                         # Validate the complete task batch before resolving any
                         # thread. Per-thread checks are repeated below to close
@@ -6352,6 +6485,18 @@ if [ "$1" = "address" ]; then
                                     "$ADDRESS_CONTEXT_FILE" "$TID" false; then
                                 invalidate_selected_analysis "$ANALYSIS_DIR" || true
                                 echo "  ❌ Live review discussion changed or could not be fetched completely. Re-run before resolving threads."
+                                exit 1
+                            fi
+                            if ! verify_address_analysis_intent_unchanged \
+                                    "$ADDRESS_CONTEXT_FILE"; then
+                                [ "$INTENT_VERIFICATION_STATUS" != "mismatch" ] || \
+                                    invalidate_selected_analysis \
+                                        "$ANALYSIS_DIR" || true
+                                if [ "$INTENT_VERIFICATION_STATUS" = "mismatch" ]; then
+                                    echo "  ❌ GitHub PR or linked-issue intent changed since analysis. Re-run before resolving threads."
+                                else
+                                    echo "  ❌ GitHub PR or linked-issue intent could not be revalidated; no thread mutation was sent and the selected analysis was preserved."
+                                fi
                                 exit 1
                             fi
                             # Hosted head is the final check immediately before
@@ -6400,6 +6545,19 @@ if [ "$1" = "address" ]; then
                                 rollback_active_address_thread_batch || true
                                 invalidate_selected_analysis "$ANALYSIS_DIR" || true
                                 echo "  ❌ Live review discussion changed or could not be fetched completely. Re-run before resolving threads."
+                                exit 1
+                            fi
+                            if ! verify_address_analysis_intent_unchanged \
+                                    "$ADDRESS_CONTEXT_FILE"; then
+                                rollback_active_address_thread_batch || true
+                                [ "$INTENT_VERIFICATION_STATUS" != "mismatch" ] || \
+                                    invalidate_selected_analysis \
+                                        "$ANALYSIS_DIR" || true
+                                if [ "$INTENT_VERIFICATION_STATUS" = "mismatch" ]; then
+                                    echo "  ❌ GitHub PR or linked-issue intent changed since analysis. Re-run before resolving threads."
+                                else
+                                    echo "  ❌ GitHub PR or linked-issue intent could not be revalidated; no further thread mutation was sent."
+                                fi
                                 exit 1
                             fi
                             if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
@@ -6511,6 +6669,11 @@ if [ "$1" = "address" ]; then
                             fi
                             rm -f "$POST_LIVE_FILE"
 
+                            POST_INTENT_VALID=true
+                            if ! verify_address_analysis_intent_unchanged \
+                                    "$ADDRESS_CONTEXT_FILE"; then
+                                POST_INTENT_VALID=false
+                            fi
                             POST_HEAD_VALID=true
                             if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
                                     "$ADDRESS_CONTEXT_HEAD" \
@@ -6531,6 +6694,7 @@ if [ "$1" = "address" ]; then
                                 exit 1
                             fi
                             if [ "$POST_LOCAL_VALID" != true ] || \
+                               [ "$POST_INTENT_VALID" != true ] || \
                                [ "$POST_HEAD_VALID" != true ]; then
                                 rollback_active_address_thread_batch || true
                                 invalidate_selected_analysis "$ANALYSIS_DIR" || true
@@ -6560,6 +6724,15 @@ if [ "$1" = "address" ]; then
                                 BATCH_COMMIT_FAILURE="discussion_changed"
                                 break
                             fi
+                            if ! verify_address_analysis_intent_unchanged \
+                                    "$ADDRESS_CONTEXT_FILE"; then
+                                if [ "$INTENT_VERIFICATION_STATUS" = "mismatch" ]; then
+                                    BATCH_COMMIT_FAILURE="intent_mismatch"
+                                else
+                                    BATCH_COMMIT_FAILURE="intent_unavailable"
+                                fi
+                                break
+                            fi
                             if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
                                     "$ADDRESS_CONTEXT_HEAD" \
                                     "$ADDRESS_CONTEXT_REPOSITORY"; then
@@ -6574,8 +6747,9 @@ if [ "$1" = "address" ]; then
                         if [ -n "$BATCH_COMMIT_FAILURE" ]; then
                             rollback_active_address_thread_batch || true
                             invalidate_selected_analysis "$ANALYSIS_DIR" || true
-                            if [ "$BATCH_COMMIT_FAILURE" = "head_unavailable" ]; then
-                                echo "  ❌ Hosted PR head could not be revalidated before batch commit; resolved threads were left unchanged and the analysis was invalidated. Manual reconciliation is required."
+                            if [ "$BATCH_COMMIT_FAILURE" = "head_unavailable" ] || \
+                               [ "$BATCH_COMMIT_FAILURE" = "intent_unavailable" ]; then
+                                echo "  ❌ Hosted PR state could not be revalidated before batch commit; resolved threads were left unchanged and the analysis was invalidated. Manual reconciliation is required."
                             else
                                 echo "  ❌ Task thread state changed before batch commit. Re-run before resolving threads."
                             fi
@@ -6584,6 +6758,7 @@ if [ "$1" = "address" ]; then
                         ADDRESS_BATCH_ACTIVE=false
                         ADDRESS_BATCH_ATTEMPTED_THREAD_IDS=()
                         ADDRESS_BATCH_CONFIRMED_THREAD_IDS=()
+                        release_address_batch_lock || exit 1
                         for TID in "${THREAD_IDS_TO_RESOLVE[@]}"; do
                             echo "  ✅ Resolved: $TID"
                         done
@@ -6794,7 +6969,7 @@ if [ -z "$TEST_CALL_FN" ]; then
         "${TMPDIR:-/tmp}/gh-pr-enrich-prelock-output.XXXXXX")" || exit 1
     if run_parent_managed_capture "$REPO_INFO_FILE" \
             run_watch_github_command gh repo view \
-            --json nameWithOwner,visibility 2>/dev/null; then
+            --json id,nameWithOwner,visibility 2>/dev/null; then
         REPO_INFO="$(cat "$REPO_INFO_FILE")"
     else
         REPO_INFO='{}'
@@ -6802,6 +6977,7 @@ if [ -z "$TEST_CALL_FN" ]; then
     rm -f "$REPO_INFO_FILE"
     REPO_INFO_FILE=""
     REPO=$(printf '%s' "$REPO_INFO" | jq -r '.nameWithOwner // "current-repo"' 2>/dev/null || echo "current-repo")
+    REPOSITORY_ID=$(printf '%s' "$REPO_INFO" | jq -r '.id // ""' 2>/dev/null || echo "")
     REPOSITORY_VISIBILITY=$(printf '%s' "$REPO_INFO" | jq -r '.visibility // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
     REPOSITORY_VISIBILITY=$(printf '%s' "$REPOSITORY_VISIBILITY" | tr '[:lower:]' '[:upper:]')
 fi
@@ -7223,6 +7399,72 @@ analysis_discussion_fingerprint_from_files() {
     printf '%s\n' "$digest"
 }
 
+# Normalize the mutable requirements inputs that analysis consumes outside the
+# reviewed Git revision. PR and linked-issue bodies can change without a new
+# head commit, so their exact complete state participates in hosted freshness.
+analysis_intent_snapshot_from_files() {
+    local report_dir="$1"
+    jq -cS -n \
+        --slurpfile pr_doc "$report_dir/pr-summary.json" \
+        --slurpfile linked_doc "$report_dir/linked-issues.json" '
+        def text:
+            if . == null then ""
+            elif type == "string" then .
+            else error("intent field is not text")
+            end;
+        ($pr_doc[0] // null) as $pr
+        | ($linked_doc[0] // null) as $linked
+        | if ($pr | type) != "object" or
+             ($pr.number | type) != "number" or
+             ($pr.number != ($pr.number | floor)) or
+             ($pr.title | type) != "string" or
+             ($pr.body != null and ($pr.body | type) != "string") or
+             ($linked | type) != "array" or
+             any($linked[];
+                type != "object" or
+                (.id | type) != "string" or (.id | length) == 0 or
+                (.number | type) != "number" or
+                .number != (.number | floor) or
+                (.title | type) != "string" or
+                (.body != null and (.body | type) != "string") or
+                (.url | type) != "string" or
+                (.repository | type) != "object" or
+                (.repository.nameWithOwner | type) != "string" or
+                (.repository.visibility | type) != "string") or
+             (([$linked[].id] | unique | length) != ($linked | length))
+          then error("intent inputs have invalid shapes")
+          else {
+            pr: {
+                number: $pr.number,
+                title: $pr.title,
+                body: ($pr.body | text)
+            },
+            linked_issues: ([$linked[] | {
+                id: .id,
+                number: .number,
+                title: .title,
+                body: (.body | text),
+                url: .url,
+                repository: {
+                    name_with_owner: .repository.nameWithOwner,
+                    visibility: (.repository.visibility | ascii_upcase)
+                }
+            }] | sort_by(.id))
+          }
+          end
+    '
+}
+
+analysis_intent_fingerprint_from_files() {
+    local report_dir="$1" digest=""
+    digest="$(
+        set -o pipefail
+        analysis_intent_snapshot_from_files "$report_dir" | sha256_stream
+    )" || return 1
+    [ -n "$digest" ] || return 1
+    printf '%s\n' "$digest"
+}
+
 # Normalize the check fields that can affect analysis while ignoring response
 # ordering. GitHub does not promise a stable order for `gh pr checks`, and a
 # check transition must change this identity even when the PR head does not.
@@ -7276,6 +7518,10 @@ LIVE_DISCUSSION_TEMP_DIR=""
 CURRENT_DISCUSSION_TEMP_FILE=""
 DISCUSSION_STABILITY_FIRST=""
 DISCUSSION_STABILITY_SECOND=""
+LIVE_INTENT_TEMP_DIR=""
+CURRENT_INTENT_TEMP_FILE=""
+INTENT_STABILITY_FIRST=""
+INTENT_STABILITY_SECOND=""
 LIVE_CHECKS_TEMP_FILE=""
 CURRENT_CHECKS_TEMP_FILE=""
 CHECKS_STABILITY_FIRST=""
@@ -7299,6 +7545,26 @@ cleanup_live_analysis_discussion_temps() {
     case "$DISCUSSION_STABILITY_SECOND" in
         /tmp/gh-pr-enrich-discussion-stability.*)
             rm -f "$DISCUSSION_STABILITY_SECOND" 2>/dev/null || true
+            ;;
+    esac
+    case "$LIVE_INTENT_TEMP_DIR" in
+        /tmp/gh-pr-enrich-live-intent.*)
+            rm -rf "$LIVE_INTENT_TEMP_DIR" 2>/dev/null || true
+            ;;
+    esac
+    case "$CURRENT_INTENT_TEMP_FILE" in
+        /tmp/gh-pr-enrich-current-intent.*)
+            rm -f "$CURRENT_INTENT_TEMP_FILE" 2>/dev/null || true
+            ;;
+    esac
+    case "$INTENT_STABILITY_FIRST" in
+        /tmp/gh-pr-enrich-intent-stability.*)
+            rm -f "$INTENT_STABILITY_FIRST" 2>/dev/null || true
+            ;;
+    esac
+    case "$INTENT_STABILITY_SECOND" in
+        /tmp/gh-pr-enrich-intent-stability.*)
+            rm -f "$INTENT_STABILITY_SECOND" 2>/dev/null || true
             ;;
     esac
     case "$LIVE_CHECKS_TEMP_FILE" in
@@ -7325,6 +7591,10 @@ cleanup_live_analysis_discussion_temps() {
     CURRENT_DISCUSSION_TEMP_FILE=""
     DISCUSSION_STABILITY_FIRST=""
     DISCUSSION_STABILITY_SECOND=""
+    LIVE_INTENT_TEMP_DIR=""
+    CURRENT_INTENT_TEMP_FILE=""
+    INTENT_STABILITY_FIRST=""
+    INTENT_STABILITY_SECOND=""
     LIVE_CHECKS_TEMP_FILE=""
     CURRENT_CHECKS_TEMP_FILE=""
     CHECKS_STABILITY_FIRST=""
@@ -7506,6 +7776,201 @@ verify_analysis_discussion_unchanged() {
     DISCUSSION_VERIFICATION_STATUS="unchanged"
 }
 
+# Re-fetch one complete PR/linked-issue intent snapshot. The pull request fields
+# are repeated on every GraphQL page and must agree, preventing pagination from
+# combining requirements from different hosted states.
+fetch_live_analysis_intent_fingerprint_once() {
+    local repository="$1" pr_number="$2"
+    local owner="${repository%%/*}" repo_name="${repository#*/}"
+    local live_dir pages_file snapshot_file fingerprint="" intent_fetch_rc=0
+    local query='
+    query AnalysisIntentSnapshot($owner: String!, $name: String!, $prNumber: Int!, $pageSize: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $prNumber) {
+          number title body
+          closingIssuesReferences(first: $pageSize, after: $endCursor) {
+            totalCount
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id number title body url
+              repository { nameWithOwner visibility }
+            }
+          }
+        }
+      }
+    }'
+    [ -n "$owner" ] && [ -n "$repo_name" ] && [ "$owner" != "$repo_name" ] || return 1
+    live_dir="$(mktemp -d "/tmp/gh-pr-enrich-live-intent.XXXXXX")" || return 1
+    LIVE_INTENT_TEMP_DIR="$live_dir"
+    chmod 700 "$live_dir" || {
+        rmdir "$live_dir" 2>/dev/null || true
+        LIVE_INTENT_TEMP_DIR=""
+        return 1
+    }
+    pages_file="$live_dir/pages.json"
+    snapshot_file="$live_dir/snapshot.json"
+    if [ "${ADDRESS_COMMAND_MANAGEMENT_ENABLED:-false}" = true ]; then
+        run_address_hosted_command "$pages_file" gh api graphql --paginate \
+            -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
+            -F pageSize="$LINKED_ISSUE_PAGE_SIZE" -f query="$query" || \
+            intent_fetch_rc=$?
+    else
+        run_report_command gh api graphql --paginate \
+            -F owner="$owner" -F name="$repo_name" -F prNumber="$pr_number" \
+            -F pageSize="$LINKED_ISSUE_PAGE_SIZE" -f query="$query" \
+            > "$pages_file" 2>/dev/null || intent_fetch_rc=$?
+    fi
+    if [ "$intent_fetch_rc" -ne 0 ] || [ ! -s "$pages_file" ] || \
+       ! jq -s -cS -e '
+            def pr: .data.repository.pullRequest;
+            def connection: pr.closingIssuesReferences;
+            def valid_text: type == "string";
+            . as $pages
+            | ($pages[0] | pr) as $first
+            | [$pages[] | connection.nodes[]] as $nodes
+            | ($pages[0] | connection.totalCount) as $total
+            | (
+                (($pages | length) > 0) and
+                (($first.number | type) == "number") and
+                ($first.number == ($first.number | floor)) and
+                ($first.title | valid_text) and
+                ($first.body == null or ($first.body | valid_text)) and
+                (all($pages[];
+                  (((.errors // []) | length) == 0) and
+                  ((pr.number) == $first.number) and
+                  ((pr.title) == $first.title) and
+                  ((pr.body // "") == ($first.body // "")) and
+                  ((connection.nodes | type) == "array") and
+                  ((connection.totalCount | type) == "number") and
+                  (connection.totalCount >= 0) and
+                  (connection.totalCount == (connection.totalCount | floor)) and
+                  ((connection.pageInfo | type) == "object") and
+                  ((connection.pageInfo.hasNextPage | type) == "boolean"))) and
+                (all($pages[]; (. | connection.totalCount) == $total)) and
+                ($pages | to_entries | all(
+                  . as $entry
+                  | ($entry.value | connection) as $connection
+                  | if $entry.key < (($pages | length) - 1)
+                    then ($connection.pageInfo.hasNextPage == true and
+                          ($connection.pageInfo.endCursor | type) == "string" and
+                          ($connection.pageInfo.endCursor | length) > 0)
+                    else $connection.pageInfo.hasNextPage == false
+                    end)) and
+                (($nodes | length) == $total) and
+                (all($nodes[];
+                  ((.id | type) == "string") and (.id | length) > 0 and
+                  ((.number | type) == "number") and
+                  (.number == (.number | floor)) and
+                  ((.title | type) == "string") and
+                  (.body == null or (.body | type) == "string") and
+                  ((.url | type) == "string") and
+                  ((.repository.nameWithOwner | type) == "string") and
+                  ((.repository.visibility | type) == "string"))) and
+                (([$nodes[].id] | unique | length) == ($nodes | length))
+              ) as $valid
+            | if $valid then {
+                pr: {
+                    number: $first.number,
+                    title: $first.title,
+                    body: ($first.body // "")
+                },
+                linked_issues: ([$nodes[] | {
+                    id: .id,
+                    number: .number,
+                    title: .title,
+                    body: (.body // ""),
+                    url: .url,
+                    repository: {
+                        name_with_owner: .repository.nameWithOwner,
+                        visibility: (.repository.visibility | ascii_upcase)
+                    }
+                }] | sort_by(.id))
+              }
+              else error("incomplete hosted intent connection") end
+        ' "$pages_file" > "$snapshot_file" 2>/dev/null; then
+        rm -rf "$live_dir"
+        LIVE_INTENT_TEMP_DIR=""
+        return 1
+    fi
+    fingerprint="$(sha256_file "$snapshot_file" 2>/dev/null || echo "")"
+    rm -rf "$live_dir"
+    LIVE_INTENT_TEMP_DIR=""
+    [ -n "$fingerprint" ] || return 1
+    printf '%s\n' "$fingerprint"
+}
+
+fetch_live_analysis_intent_fingerprint() {
+    local repository="$1" pr_number="$2" fingerprint=""
+    INTENT_STABILITY_FIRST="$(mktemp \
+        "/tmp/gh-pr-enrich-intent-stability.XXXXXX")" || return 1
+    INTENT_STABILITY_SECOND="$(mktemp \
+        "/tmp/gh-pr-enrich-intent-stability.XXXXXX")" || {
+        rm -f "$INTENT_STABILITY_FIRST"
+        INTENT_STABILITY_FIRST=""
+        return 1
+    }
+    if ! fetch_live_analysis_intent_fingerprint_once \
+            "$repository" "$pr_number" > "$INTENT_STABILITY_FIRST" || \
+       ! fetch_live_analysis_intent_fingerprint_once \
+            "$repository" "$pr_number" > "$INTENT_STABILITY_SECOND" || \
+       ! cmp -s "$INTENT_STABILITY_FIRST" "$INTENT_STABILITY_SECOND"; then
+        rm -f "$INTENT_STABILITY_FIRST" "$INTENT_STABILITY_SECOND"
+        INTENT_STABILITY_FIRST=""
+        INTENT_STABILITY_SECOND=""
+        return 1
+    fi
+    fingerprint="$(cat "$INTENT_STABILITY_FIRST" 2>/dev/null || echo "")"
+    rm -f "$INTENT_STABILITY_FIRST" "$INTENT_STABILITY_SECOND"
+    INTENT_STABILITY_FIRST=""
+    INTENT_STABILITY_SECOND=""
+    [ -n "$fingerprint" ] || return 1
+    printf '%s\n' "$fingerprint"
+}
+
+INTENT_VERIFICATION_STATUS="unavailable"
+verify_analysis_intent_unchanged() {
+    local context_file="$1"
+    local expected repository pr_number current current_file
+    INTENT_VERIFICATION_STATUS="unavailable"
+    expected="$(jq -r '.coverage.intent.fingerprint // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    repository="$(jq -r '.pr.repository // ""' "$context_file" 2>/dev/null || echo "")"
+    pr_number="$(jq -r '.pr.number // ""' "$context_file" 2>/dev/null || echo "")"
+    if [ -z "$expected" ] || [ -z "$repository" ] || [ -z "$pr_number" ]; then
+        echo "Error: Analysis context is missing its captured intent identity." >&2
+        return 1
+    fi
+    current_file="$(mktemp "/tmp/gh-pr-enrich-current-intent.XXXXXX")" || return 1
+    CURRENT_INTENT_TEMP_FILE="$current_file"
+    if fetch_live_analysis_intent_fingerprint \
+            "$repository" "$pr_number" > "$current_file" 2>/dev/null; then
+        current="$(cat "$current_file" 2>/dev/null || echo "")"
+    else
+        current=""
+    fi
+    rm -f "$current_file"
+    CURRENT_INTENT_TEMP_FILE=""
+    if [ -z "$current" ]; then
+        echo "Error: Current GitHub intent state could not be revalidated." >&2
+        return 1
+    fi
+    if [ "$current" != "$expected" ]; then
+        INTENT_VERIFICATION_STATUS="mismatch"
+        echo "Error: GitHub PR or linked-issue intent changed after analysis inputs were captured." >&2
+        return 1
+    fi
+    INTENT_VERIFICATION_STATUS="unchanged"
+}
+
+verify_analysis_intent_with_status() (
+    local verification_rc=0
+    trap cleanup_live_analysis_discussion_temps EXIT
+    verify_analysis_intent_unchanged "$1" || verification_rc=$?
+    printf 'GH_PR_ENRICH_INTENT_STATUS=%s\n' \
+        "$INTENT_VERIFICATION_STATUS"
+    return "$verification_rc"
+)
+
 # Fetch and normalize checks independently of their exit status. `gh pr checks`
 # exits nonzero for pending and failing checks even though its JSON is complete;
 # those states are evidence and must participate in the fingerprint.
@@ -7624,14 +8089,15 @@ verify_analysis_checks_unchanged() {
     CHECKS_VERIFICATION_STATUS="unchanged"
 }
 
-# Treat the hosted head, complete discussion snapshot, and check results as one
-# final attestation. The head is checked on both sides of the stabilized remote
-# reads, and callers perform every local validation before invoking this helper.
+# Treat the hosted head, mutable PR/linked-issue intent, complete discussion
+# snapshot, and check results as one final attestation. The head is checked on
+# both sides of the stabilized remote reads, and callers perform every local
+# validation before invoking this helper.
 # Nothing except signal handling and the atomic rename transaction may follow.
 HOSTED_ATTESTATION_COMPONENT=""
 verify_analysis_partial_hosted_attestation() {
     local context_file="$1" component="$2"
-    local expected_head repository pr_number first_head
+    local expected_head repository pr_number first_head expected_intent
     HOSTED_ATTESTATION_COMPONENT="head"
     expected_head="$(jq -r '.pr.head_sha // .coverage.code_access.pr_head_sha // ""' \
         "$context_file" 2>/dev/null || echo "")"
@@ -7639,10 +8105,12 @@ verify_analysis_partial_hosted_attestation() {
         "$context_file" 2>/dev/null || echo "")"
     pr_number="$(jq -r '.pr.number // ""' \
         "$context_file" 2>/dev/null || echo "")"
+    expected_intent="$(jq -r '.coverage.intent.fingerprint // ""' \
+        "$context_file" 2>/dev/null || echo "")"
     [ -n "$expected_head" ] && [ -n "$repository" ] && \
         [ -n "$pr_number" ] || return 1
     case "$component" in
-        discussion|checks) ;;
+        discussion|checks|intent) ;;
         *) return 1 ;;
     esac
     verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
@@ -7651,7 +8119,19 @@ verify_analysis_partial_hosted_attestation() {
     case "$component" in
         discussion) verify_analysis_discussion_unchanged "$context_file" || return 1 ;;
         checks) verify_analysis_checks_unchanged "$context_file" || return 1 ;;
+        intent) verify_analysis_intent_unchanged "$context_file" || return 1 ;;
     esac
+    if [ -n "$expected_intent" ] && [ "$component" != "intent" ]; then
+        HOSTED_ATTESTATION_COMPONENT="intent"
+        verify_analysis_intent_unchanged "$context_file" || return 1
+        HOSTED_ATTESTATION_COMPONENT="$component"
+        case "$component" in
+            discussion) verify_analysis_discussion_unchanged "$context_file" || return 1 ;;
+            checks) verify_analysis_checks_unchanged "$context_file" || return 1 ;;
+        esac
+        HOSTED_ATTESTATION_COMPONENT="intent"
+        verify_analysis_intent_unchanged "$context_file" || return 1
+    fi
     HOSTED_ATTESTATION_COMPONENT="head"
     verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
     [ "$CURRENT_HOSTED_HEAD" = "$first_head" ] || {
@@ -7664,6 +8144,7 @@ verify_analysis_partial_hosted_attestation() {
 verify_analysis_hosted_attestation() {
     local context_file="$1"
     local expected_head repository pr_number first_head expected_discussion expected_checks
+    local expected_intent
     HOSTED_ATTESTATION_COMPONENT="head"
     expected_head="$(jq -r '.pr.head_sha // .coverage.code_access.pr_head_sha // ""' \
         "$context_file" 2>/dev/null || echo "")"
@@ -7675,6 +8156,8 @@ verify_analysis_hosted_attestation() {
         "$context_file" 2>/dev/null || echo "")"
     expected_checks="$(jq -r '.coverage.checks.fingerprint // ""' \
         "$context_file" 2>/dev/null || echo "")"
+    expected_intent="$(jq -r '.coverage.intent.fingerprint // ""' \
+        "$context_file" 2>/dev/null || echo "")"
     [ -n "$expected_head" ] && [ -n "$repository" ] && \
         [ -n "$pr_number" ] && [ -n "$expected_discussion" ] && \
         [ -n "$expected_checks" ] || return 1
@@ -7684,8 +8167,18 @@ verify_analysis_hosted_attestation() {
     verify_analysis_checks_unchanged "$context_file" || return 1
     HOSTED_ATTESTATION_COMPONENT="discussion"
     verify_analysis_discussion_unchanged "$context_file" || return 1
+    if [ -n "$expected_intent" ]; then
+        HOSTED_ATTESTATION_COMPONENT="intent"
+        verify_analysis_intent_unchanged "$context_file" || return 1
+        HOSTED_ATTESTATION_COMPONENT="discussion"
+        verify_analysis_discussion_unchanged "$context_file" || return 1
+    fi
     HOSTED_ATTESTATION_COMPONENT="checks"
     verify_analysis_checks_unchanged "$context_file" || return 1
+    if [ -n "$expected_intent" ]; then
+        HOSTED_ATTESTATION_COMPONENT="intent"
+        verify_analysis_intent_unchanged "$context_file" || return 1
+    fi
     HOSTED_ATTESTATION_COMPONENT="head"
     verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
     [ "$CURRENT_HOSTED_HEAD" = "$first_head" ] || {
@@ -8223,6 +8716,7 @@ build_analysis_context() (
     local output_dir="$1"
     local include_diff="${2:-false}"
     local repository="${4:-${REPO:-unknown}}"
+    local repository_id="${5:-${REPOSITORY_ID:-}}"
     local include_sast sast_legacy_direct=false
     local context_lock_dir="" context_lock_token="" context_lock_owned=false
     local context_writer_signal=""
@@ -8322,13 +8816,21 @@ build_analysis_context() (
     # too long") on exactly the PRs that most need analysis. Absent or unreadable
     # files are replaced with an empty document so one missing input cannot take
     # the whole context down.
-    local checks_source_status=""
+    local checks_source_status="" linked_issues_source_status=""
     checks_source_status="$(jq -r '.status // ""' \
         "$output_dir/checks-status.json" 2>/dev/null || echo "")"
+    linked_issues_source_status="$(jq -r '.status // ""' \
+        "$output_dir/linked-issues-status.json" 2>/dev/null || echo "")"
     if [ "$checks_source_status" = "completed" ] && \
        { [ ! -s "$output_dir/checks.json" ] || \
          ! jq -e 'type == "array"' "$output_dir/checks.json" > /dev/null 2>&1; }; then
         echo "Error: Completed GitHub checks input is missing or malformed." >&2
+        return 1
+    fi
+    if [ "$linked_issues_source_status" = "completed" ] && \
+       { [ ! -s "$output_dir/linked-issues.json" ] || \
+         ! jq -e 'type == "array"' "$output_dir/linked-issues.json" > /dev/null 2>&1; }; then
+        echo "Error: Completed linked-issue intent input is missing or malformed." >&2
         return 1
     fi
     local optional
@@ -8468,7 +8970,7 @@ build_analysis_context() (
         fi
     fi
 
-    local discussion_fingerprint="" checks_fingerprint=""
+    local discussion_fingerprint="" checks_fingerprint="" intent_fingerprint=""
     if jq -e -n \
         --slurpfile issue_status "$output_dir/issue-comments-status.json" \
         --slurpfile review_status "$output_dir/review-comments-status.json" \
@@ -8489,6 +8991,14 @@ build_analysis_context() (
             "$output_dir/checks.json" 2>/dev/null || echo "")"
         if [ -z "$checks_fingerprint" ]; then
             echo "Error: Complete GitHub checks input could not be fingerprinted." >&2
+            return 1
+        fi
+    fi
+    if [ "$linked_issues_source_status" = "completed" ]; then
+        intent_fingerprint="$(analysis_intent_fingerprint_from_files \
+            "$output_dir" 2>/dev/null || echo "")"
+        if [ -z "$intent_fingerprint" ]; then
+            echo "Error: Complete PR and linked-issue intent could not be fingerprinted." >&2
             return 1
         fi
     fi
@@ -8525,7 +9035,9 @@ build_analysis_context() (
         --arg workspace_fingerprint "$workspace_fingerprint" \
         --arg discussion_fingerprint "$discussion_fingerprint" \
         --arg checks_fingerprint "$checks_fingerprint" \
+        --arg intent_fingerprint "$intent_fingerprint" \
         --arg repository "$repository" \
+        --arg repository_id "$repository_id" \
         --argjson thread_comment_limit "$THREAD_COMMENT_LIMIT" \
         '
         def trunc($text): if (($text // "") | length) > $limit
@@ -8550,6 +9062,7 @@ build_analysis_context() (
         | {
             pr: {
                 repository: $repository,
+                repository_id: $repository_id,
                 number: ($pr.number // null),
                 title: $pr.title,
                 body: trunc($pr.body // "No description"),
@@ -8623,6 +9136,10 @@ build_analysis_context() (
                 checks: {
                     fingerprint: (if $checks_fingerprint == ""
                         then null else $checks_fingerprint end)
+                },
+                intent: {
+                    fingerprint: (if $intent_fingerprint == ""
+                        then null else $intent_fingerprint end)
                 },
                 issue_comments: {
                     total: ($raw | length),
@@ -9415,11 +9932,7 @@ resolve_code_access() {
     fi
 
     if [ -z "$local_head" ]; then
-        if [ "$explicit" = "true" ]; then
-            echo "enabled: not a git checkout, but access was requested explicitly"
-            return 0
-        fi
-        echo "disabled: not a git checkout, so the working tree cannot be matched to the PR"
+        echo "disabled: not a git checkout, so an immutable repository snapshot cannot be created"
         return 0
     fi
 
@@ -9470,12 +9983,12 @@ resolve_code_access() {
                     if [ -d "$output_abs" ]; then
                         output_inventory="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-output.XXXXXX")"
                         if ! find "$output_abs" -mindepth 1 \( -type f -o -type l \) \
-                                -print > "$output_inventory" 2>/dev/null; then
+                                -print0 > "$output_inventory" 2>/dev/null; then
                             rm -f "$output_inventory"
                             echo "disabled: report output directory could not be inspected safely"
                             return 0
                         fi
-                        while IFS= read -r candidate; do
+                        while IFS= read -r -d '' candidate; do
                             relative="${candidate#"$output_abs/"}"
                             if [ -L "$candidate" ]; then
                                 unexpected_output="$relative (symbolic link)"
@@ -9570,8 +10083,8 @@ verify_external_disclosure_sources() {
     local primary_visibility="$1"
     local allow_external="$2"
     local context_payload linked_issue_ids expected_linked_issues
-    local primary_repository primary_owner primary_name
-    local live_repository live_visibility linked_issue_id
+    local primary_repository primary_repository_id
+    local live_repository live_repository_id live_visibility linked_issue_id
     local visibility_query
     local -a linked_issue_args=()
 
@@ -9590,6 +10103,8 @@ verify_external_disclosure_sources() {
     if [ "$primary_visibility" != "PUBLIC" ] || ! printf '%s' "$context_payload" | jq -e '
         (.pr.repository | type) == "string" and
         (.pr.repository | test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+        ((.pr.repository_id | type) == "string") and
+        (.pr.repository_id | length) > 0 and
         ((.pr.linked_issues // []) | type) == "array" and
         all((.pr.linked_issues // [])[];
           ((.id | type) == "string") and (.id | length) > 0 and
@@ -9604,8 +10119,7 @@ verify_external_disclosure_sources() {
         return 1
     fi
     primary_repository="$(printf '%s' "$context_payload" | jq -r '.pr.repository')"
-    primary_owner="${primary_repository%%/*}"
-    primary_name="${primary_repository#*/}"
+    primary_repository_id="$(printf '%s' "$context_payload" | jq -r '.pr.repository_id')"
 
     cleanup_external_visibility_temp
     EXTERNAL_VISIBILITY_TEMP_FILE="$(mktemp \
@@ -9635,9 +10149,11 @@ verify_external_disclosure_sources() {
 
     if [ "${#linked_issue_args[@]}" -gt 0 ]; then
         visibility_query='query ExternalDisclosureVisibility(
-          $owner: String!, $name: String!, $ids: [ID!]!
+          $primaryId: ID!, $ids: [ID!]!
         ) {
-          repository(owner: $owner, name: $name) { nameWithOwner visibility }
+          primaryRepository: node(id: $primaryId) {
+            ... on Repository { id nameWithOwner visibility }
+          }
           nodes(ids: $ids) {
             id
             ... on Issue { repository { nameWithOwner visibility } }
@@ -9648,9 +10164,11 @@ verify_external_disclosure_sources() {
         # applying a GraphQL default. Use a literal empty list so the live
         # attestation succeeds for the common no-linked-issues case.
         visibility_query='query ExternalDisclosureVisibility(
-          $owner: String!, $name: String!
+          $primaryId: ID!
         ) {
-          repository(owner: $owner, name: $name) { nameWithOwner visibility }
+          primaryRepository: node(id: $primaryId) {
+            ... on Repository { id nameWithOwner visibility }
+          }
           nodes(ids: []) {
             id
             ... on Issue { repository { nameWithOwner visibility } }
@@ -9659,12 +10177,12 @@ verify_external_disclosure_sources() {
     fi
     : > "$EXTERNAL_VISIBILITY_TEMP_FILE"
     if ! run_report_command gh api graphql \
-            -F owner="$primary_owner" -F name="$primary_name" \
+            -F primaryId="$primary_repository_id" \
             "${linked_issue_args[@]}" -f query="$visibility_query" \
             > "$EXTERNAL_VISIBILITY_TEMP_FILE" 2>/dev/null || \
        ! jq -e '
             ((.errors // []) | length) == 0 and
-            (.data.repository | type) == "object" and
+            (.data.primaryRepository | type) == "object" and
             ((.data.nodes // null) | type) == "array"
         ' "$EXTERNAL_VISIBILITY_TEMP_FILE" > /dev/null 2>&1; then
         cleanup_external_visibility_temp
@@ -9672,12 +10190,15 @@ verify_external_disclosure_sources() {
         return 1
     fi
 
-    live_repository="$(jq -r '.data.repository.nameWithOwner // ""' \
+    live_repository="$(jq -r '.data.primaryRepository.nameWithOwner // ""' \
+        "$EXTERNAL_VISIBILITY_TEMP_FILE" 2>/dev/null || echo "")"
+    live_repository_id="$(jq -r '.data.primaryRepository.id // ""' \
         "$EXTERNAL_VISIBILITY_TEMP_FILE" 2>/dev/null || echo "")"
     live_visibility="$(jq -r \
-        '(.data.repository.visibility // "UNKNOWN") | ascii_upcase' \
+        '(.data.primaryRepository.visibility // "UNKNOWN") | ascii_upcase' \
         "$EXTERNAL_VISIBILITY_TEMP_FILE" 2>/dev/null || echo "UNKNOWN")"
-    if [ "$live_repository" != "$primary_repository" ] || \
+    if [ "$live_repository_id" != "$primary_repository_id" ] || \
+       [ "$live_repository" != "$primary_repository" ] || \
        [ "$live_visibility" != "PUBLIC" ]; then
         cleanup_external_visibility_temp
         echo "Error: Repository visibility for $primary_repository changed from PUBLIC to $live_visibility; Claude enrichment is blocked." >&2
@@ -9742,7 +10263,8 @@ run_claude_analysis() {
     ANALYZER_CONTEXT_FILE="$(mktemp "/tmp/gh-pr-enrich-claude-context.XXXXXX")" || \
         return 1
     install_code_access_cleanup_traps
-    if ! cp -p "$context_file" "$ANALYZER_CONTEXT_FILE"; then
+    if ! cp "$context_file" "$ANALYZER_CONTEXT_FILE" || \
+       ! chmod 600 "$ANALYZER_CONTEXT_FILE"; then
         cleanup_code_access_snapshot
         echo "Error: Analysis context could not be frozen before Claude analysis." >&2
         return 1
@@ -9752,7 +10274,7 @@ run_claude_analysis() {
     immediate_context_digest="$(sha256_file "$context_file" 2>/dev/null || echo "")"
     immediate_context_mode="$(workspace_file_mode "$context_file" 2>/dev/null || echo "")"
     if [ "$frozen_context_digest" != "$context_digest" ] || \
-       [ "$frozen_context_mode" != "$context_mode" ] || \
+       [ "$frozen_context_mode" != "600" ] || \
        [ "$immediate_context_digest" != "$context_digest" ] || \
        [ "$immediate_context_mode" != "$context_mode" ]; then
         cleanup_code_access_snapshot
@@ -9953,7 +10475,9 @@ select_analysis_artifact() {
     local captured_context_fingerprint rc=0
     local stale_selected_identity=""
     local source_digest="" source_mode="" frozen_digest="" frozen_mode=""
-    local live_digest="" live_mode=""
+    local context_digest="" context_mode="" frozen_context_digest=""
+    local frozen_context_mode="" live_digest="" live_mode=""
+    local live_context_digest="" live_context_mode=""
     if path_has_symlink_component "$report_dir" || [ -L "$source_file" ] || \
        [ -L "$live_context_file" ] || path_is_git_tracked "$source_file" || \
        path_is_git_tracked "$live_context_file" || [ ! -f "$source_file" ] || \
@@ -9968,7 +10492,10 @@ select_analysis_artifact() {
         "$report_dir" 2>/dev/null || echo "")"
     source_digest="$(sha256_file "$source_file" 2>/dev/null || echo "")"
     source_mode="$(workspace_file_mode "$source_file" 2>/dev/null || echo "")"
-    [ -n "$source_digest" ] && [ -n "$source_mode" ] || return 1
+    context_digest="$(sha256_file "$live_context_file" 2>/dev/null || echo "")"
+    context_mode="$(workspace_file_mode "$live_context_file" 2>/dev/null || echo "")"
+    [ -n "$source_digest" ] && [ -n "$source_mode" ] && \
+        [ -n "$context_digest" ] && [ -n "$context_mode" ] || return 1
     frozen_source="$(mktemp "/tmp/gh-pr-enrich-analysis-source.XXXXXX")" || return 1
     frozen_context="$(mktemp "/tmp/gh-pr-enrich-analysis-context.XXXXXX")" || {
         rm -f "$frozen_source"
@@ -9995,21 +10522,31 @@ select_analysis_artifact() {
             esac
         fi
     done
-    if ! cp -p "$source_file" "$frozen_source" || \
-       ! cp -p "$live_context_file" "$frozen_context"; then
+    if ! cp "$source_file" "$frozen_source" || \
+       ! chmod 600 "$frozen_source" || \
+       ! cp "$live_context_file" "$frozen_context" || \
+       ! chmod 600 "$frozen_context"; then
         rm -f "$frozen_source" "$frozen_context"
         return 1
     fi
     frozen_digest="$(sha256_file "$frozen_source" 2>/dev/null || echo "")"
     frozen_mode="$(workspace_file_mode "$frozen_source" 2>/dev/null || echo "")"
+    frozen_context_digest="$(sha256_file "$frozen_context" 2>/dev/null || echo "")"
+    frozen_context_mode="$(workspace_file_mode "$frozen_context" 2>/dev/null || echo "")"
     live_digest="$(sha256_file "$source_file" 2>/dev/null || echo "")"
     live_mode="$(workspace_file_mode "$source_file" 2>/dev/null || echo "")"
+    live_context_digest="$(sha256_file "$live_context_file" 2>/dev/null || echo "")"
+    live_context_mode="$(workspace_file_mode "$live_context_file" 2>/dev/null || echo "")"
     if [ "$frozen_digest" != "$source_digest" ] || \
-       [ "$frozen_mode" != "$source_mode" ] || \
+       [ "$frozen_mode" != "600" ] || \
+       [ "$frozen_context_digest" != "$context_digest" ] || \
+       [ "$frozen_context_mode" != "600" ] || \
        [ "$live_digest" != "$source_digest" ] || \
-       [ "$live_mode" != "$source_mode" ]; then
+       [ "$live_mode" != "$source_mode" ] || \
+       [ "$live_context_digest" != "$context_digest" ] || \
+       [ "$live_context_mode" != "$context_mode" ]; then
         rm -f "$frozen_source" "$frozen_context"
-        echo "Error: Analysis source changed while its immutable copy was captured." >&2
+        echo "Error: Analysis source or context changed while its immutable copy was captured." >&2
         return 1
     fi
     captured_context_fingerprint="$(analysis_context_fingerprint \
@@ -10094,7 +10631,8 @@ _select_analysis_artifact() (
         | (.coverage.sources // {}) as $sources
         | (($sources | keys | sort) == ($required | sort)) and
           ($sources | to_entries | all(
-            .value.requested == true and .value.status == "completed"))
+            .value.requested == true and .value.status == "completed")) and
+          (.coverage.intent.fingerprint | type == "string" and length > 0)
     ' "$context_file" > /dev/null 2>&1; then
         echo "Error: Required GitHub analysis inputs failed; no clean selected verdict can be published." >&2
         return 1
@@ -10285,9 +10823,9 @@ _select_analysis_artifact() (
         return 1
     fi
     if ! verify_pr_head_unchanged "$context_pr_number" "$context_head" "$context_repository"; then
-        invalidate_on_confirmed_hosted_head_mismatch "$report_dir" || return 1
         if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
-            echo "Error: Hosted PR head changed before selection (expected $context_head, found $CURRENT_HOSTED_HEAD). Rebuild the analysis context." >&2
+            echo "Error: Hosted PR head changed before selection (expected $context_head, found $CURRENT_HOSTED_HEAD); stale selected artifacts will be invalidated. Rebuild the analysis context." >&2
+            return 42
         else
             echo "Error: Hosted PR head could not be revalidated before selection; prior selected artifacts were preserved." >&2
         fi
@@ -10495,6 +11033,10 @@ _select_analysis_artifact() (
              [ "$CHECKS_VERIFICATION_STATUS" = "mismatch" ]; then
             echo "Error: GitHub checks state changed during selection; no selected artifacts were published and stale selected artifacts will be invalidated. Rebuild the analysis context." >&2
             return 42
+        elif [ "$HOSTED_ATTESTATION_COMPONENT" = "intent" ] && \
+             [ "$INTENT_VERIFICATION_STATUS" = "mismatch" ]; then
+            echo "Error: GitHub PR or linked-issue intent changed during selection; no selected artifacts were published and stale selected artifacts will be invalidated. Rebuild the analysis context." >&2
+            return 42
         elif [ "$HOSTED_ATTESTATION_COMPONENT" = "head" ]; then
             invalidate_on_confirmed_hosted_head_mismatch "$report_dir" || return 1
             if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
@@ -10504,6 +11046,8 @@ _select_analysis_artifact() (
             fi
         elif [ "$HOSTED_ATTESTATION_COMPONENT" = "checks" ]; then
             echo "Error: GitHub checks state could not be revalidated during selection; prior selected artifacts were preserved." >&2
+        elif [ "$HOSTED_ATTESTATION_COMPONENT" = "intent" ]; then
+            echo "Error: GitHub PR or linked-issue intent could not be revalidated during selection; prior selected artifacts were preserved." >&2
         else
             echo "Error: GitHub discussion state could not be revalidated during selection; prior selected artifacts were preserved." >&2
         fi
@@ -10722,7 +11266,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job"
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged analysis_intent_snapshot_from_files analysis_intent_fingerprint_from_files fetch_live_analysis_intent_fingerprint verify_analysis_intent_unchanged verify_analysis_intent_with_status analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in
@@ -11317,15 +11861,20 @@ if [ "$REFRESH_EXISTING_ANALYSIS" = true ] || [ "$PREPARE_ANALYSIS" = true ] || 
             echo "Expected $CAPTURED_PR_HEAD, now $CURRENT_HOSTED_HEAD. Re-run to collect one coherent snapshot." >&2
         exit 1
     fi
-    build_analysis_context "$OUTPUT_DIR" "$INCLUDE_DIFF" "$RUN_SAST" "$REPO"
+    build_analysis_context "$OUTPUT_DIR" "$INCLUDE_DIFF" "$RUN_SAST" \
+        "$REPO" "$REPOSITORY_ID"
     CAPTURED_DISCUSSION_IDENTITY=false
     CAPTURED_CHECKS_IDENTITY=false
+    CAPTURED_INTENT_IDENTITY=false
     jq -e '.coverage.discussion.fingerprint | type == "string" and length > 0' \
         "$OUTPUT_DIR/analysis-context.json" > /dev/null 2>&1 && \
         CAPTURED_DISCUSSION_IDENTITY=true
     jq -e '.coverage.checks.fingerprint | type == "string" and length > 0' \
         "$OUTPUT_DIR/analysis-context.json" > /dev/null 2>&1 && \
         CAPTURED_CHECKS_IDENTITY=true
+    jq -e '.coverage.intent.fingerprint | type == "string" and length > 0' \
+        "$OUTPUT_DIR/analysis-context.json" > /dev/null 2>&1 && \
+        CAPTURED_INTENT_IDENTITY=true
     HOSTED_INPUTS_VERIFIED=true
     if [ "$CAPTURED_DISCUSSION_IDENTITY" = true ] && \
        [ "$CAPTURED_CHECKS_IDENTITY" = true ]; then
@@ -11339,9 +11888,13 @@ if [ "$REFRESH_EXISTING_ANALYSIS" = true ] || [ "$PREPARE_ANALYSIS" = true ] || 
         verify_analysis_partial_hosted_attestation \
             "$OUTPUT_DIR/analysis-context.json" checks || \
             HOSTED_INPUTS_VERIFIED=false
+    elif [ "$CAPTURED_INTENT_IDENTITY" = true ]; then
+        verify_analysis_partial_hosted_attestation \
+            "$OUTPUT_DIR/analysis-context.json" intent || \
+            HOSTED_INPUTS_VERIFIED=false
     fi
     if [ "$HOSTED_INPUTS_VERIFIED" != true ]; then
-        echo "Error: GitHub head, checks, or discussion state changed or could not be revalidated while analysis inputs were collected." >&2
+        echo "Error: GitHub head, checks, discussion, or intent state changed or could not be revalidated while analysis inputs were collected." >&2
         echo "Re-run to collect one coherent snapshot." >&2
         exit 1
     fi
@@ -11361,9 +11914,9 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                 "$OUTPUT_DIR/analysis-context.json")
             if ! verify_analysis_hosted_attestation \
                     "$OUTPUT_DIR/analysis-context.json"; then
-                [ "$HOSTED_ATTESTATION_COMPONENT" != "head" ] || \
-                    invalidate_on_confirmed_hosted_head_mismatch "$OUTPUT_DIR"
-                echo "⚠️  GitHub head, checks, or discussion state changed or could not be revalidated during Claude analysis; the response was not published." >&2
+                invalidate_on_confirmed_hosted_attestation_mismatch \
+                    "$OUTPUT_DIR"
+                echo "⚠️  GitHub head, checks, discussion, or intent state changed or could not be revalidated during Claude analysis; the response was not published." >&2
                 echo "   Re-run the analysis against the current hosted state." >&2
             elif jq -e '.structured_output' "$OUTPUT_DIR/claude-raw-response.json" > /dev/null 2>&1; then
                 ANALYSIS_USABLE=true
@@ -11504,10 +12057,9 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                 [ -n "$PROVIDER_REPLACEMENT_IDENTITY" ] || exit 1
                 if ! verify_analysis_hosted_attestation \
                         "$OUTPUT_DIR/analysis-context.json"; then
-                    [ "$HOSTED_ATTESTATION_COMPONENT" != "head" ] || \
-                        invalidate_on_confirmed_hosted_head_mismatch \
-                            "$OUTPUT_DIR" || true
-                    echo "Error: Hosted PR head, checks, and discussion could not be attested before provider publication." >&2
+                    invalidate_on_confirmed_hosted_attestation_mismatch \
+                        "$OUTPUT_DIR" || exit 1
+                    echo "Error: Hosted PR head, checks, discussion, and intent could not be attested before provider publication." >&2
                     exit 1
                 fi
                 if [ -n "$PROVIDER_WRITER_SIGNAL" ]; then

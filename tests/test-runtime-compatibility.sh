@@ -1267,8 +1267,8 @@ case "$1 $2" in
             *) source_visibility="UNKNOWN" ;;
         esac
         case "$*" in
-            *nameWithOwner,visibility*) printf '{"nameWithOwner":"%s","visibility":"%s"}\n' \
-                "$source_repository" "$source_visibility" ;;
+            *id,nameWithOwner,visibility*) printf '{"id":"%s","nameWithOwner":"%s","visibility":"%s"}\n' \
+                "${REPO_ID:-REPO_o_r}" "$source_repository" "$source_visibility" ;;
             *visibility*) echo "$source_visibility" ;;
             *) echo "$source_repository" ;;
         esac
@@ -1327,20 +1327,26 @@ if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
                 live_linked_visibility="${LIVE_LINKED_ISSUE_VISIBILITY:-$LINKED_ISSUE_VISIBILITY}"
                 [ -z "${VISIBILITY_QUERY_LOG:-}" ] || \
                     printf '%s\n' "$live_linked_repository" >> "$VISIBILITY_QUERY_LOG"
-                printf '{"data":{"repository":{"nameWithOwner":"o/r","visibility":"%s"},"nodes":[{"id":"ISSUE_linked","repository":{"nameWithOwner":"%s","visibility":"%s"}}]}}\n' \
+                printf '{"data":{"primaryRepository":{"id":"%s","nameWithOwner":"o/r","visibility":"%s"},"nodes":[{"id":"ISSUE_linked","repository":{"nameWithOwner":"%s","visibility":"%s"}}]}}\n' \
+                    "${LIVE_REPO_ID:-${REPO_ID:-REPO_o_r}}" \
                     "${LIVE_REPO_VISIBILITY:-${REPO_VISIBILITY:-PUBLIC}}" \
                     "$live_linked_repository" "$live_linked_visibility"
             else
-                printf '{"data":{"repository":{"nameWithOwner":"o/r","visibility":"%s"},"nodes":[]}}\n' \
+                printf '{"data":{"primaryRepository":{"id":"%s","nameWithOwner":"o/r","visibility":"%s"},"nodes":[]}}\n' \
+                    "${LIVE_REPO_ID:-${REPO_ID:-REPO_o_r}}" \
                     "${LIVE_REPO_VISIBILITY:-${REPO_VISIBILITY:-PUBLIC}}"
             fi
             ;;
         *closingIssuesReferences*)
+            live_intent_title="${LIVE_INTENT_TITLE:-t}"
+            live_intent_body="${LIVE_INTENT_BODY:-b}"
             if [ -n "${LINKED_ISSUE_VISIBILITY:-}" ]; then
-                printf '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"ISSUE_linked","number":42,"title":"linked intent","body":"linked repository secret","url":"https://github.com/intent/issues/42","repository":{"nameWithOwner":"intent/issues","visibility":"%s"}}]}}}}}\n' \
+                printf '{"data":{"repository":{"pullRequest":{"number":1,"title":"%s","body":"%s","closingIssuesReferences":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"ISSUE_linked","number":42,"title":"linked intent","body":"linked repository secret","url":"https://github.com/intent/issues/42","repository":{"nameWithOwner":"intent/issues","visibility":"%s"}}]}}}}}\n' \
+                    "$live_intent_title" "$live_intent_body" \
                     "$LINKED_ISSUE_VISIBILITY"
             else
-                echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+                printf '{"data":{"repository":{"pullRequest":{"number":1,"title":"%s","body":"%s","closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}\n' \
+                    "$live_intent_title" "$live_intent_body"
             fi
             ;;
         *) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PRRT_open","isResolved":false,"isOutdated":false,"path":"a.js","line":1,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"c","databaseId":1,"body":"check this","author":{"login":"rev"},"createdAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/1#discussion_r1"}]}}]}}}}}' ;;
@@ -2083,6 +2089,18 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
 assert_contains "$TRAILING_SYMLINK_OUT" "symbolic-link component" \
     "the trailing-slash rejection identifies the symbolic-link path"
 
+NEWLINE_OUTPUT_DIR="$TEST_OUTPUT_DIR/newline-output"
+mkdir -p "$NEWLINE_OUTPUT_DIR"
+printf '%s\n' "local secret" > \
+    "$NEWLINE_OUTPUT_DIR/"$'analysis.json\ncombined-data.json'
+rc=0
+NEWLINE_OUTPUT_OUT=$(env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" 1 \
+    --output-dir "$NEWLINE_OUTPUT_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "report preflight rejects a newline filename assembled from allowlisted fragments"
+assert_contains "$NEWLINE_OUTPUT_OUT" "unrelated file" \
+    "newline filename rejection is reported as unrelated output content"
+
 # macOS implements /tmp as a root-level operating-system alias to /private/tmp.
 # That trusted platform link must not make all standard temporary output paths
 # unusable, while the nested user-controlled link above remains rejected.
@@ -2135,6 +2153,11 @@ PREPARED_DISCUSSION_FINGERPRINT=$("$GH_PR_ENRICH" --test-call \
 assert_jq "$PREPARED/analysis-context.json" \
     ".coverage.discussion.fingerprint == \"$PREPARED_DISCUSSION_FINGERPRINT\"" \
     "the context fingerprint binds the exact collected discussion snapshot"
+PREPARED_INTENT_FINGERPRINT=$("$GH_PR_ENRICH" --test-call \
+    analysis_intent_fingerprint_from_files "$PREPARED")
+assert_jq "$PREPARED/analysis-context.json" \
+    ".coverage.intent.fingerprint == \"$PREPARED_INTENT_FINGERPRINT\"" \
+    "the context fingerprint binds mutable PR and linked-issue intent"
 assert_not_contains "$PREP_OUT" "Claude analysis" \
     "context preparation does not invoke an external analyzer"
 
@@ -2186,7 +2209,7 @@ assert_jq "$CHECKS_UNAVAILABLE_REPORT/analysis-context.json" \
      .coverage.checks.fingerprint == null' \
     "unavailable checks remain failed coverage without a trusted fingerprint"
 assert_contains "$CHECKS_UNAVAILABLE_OUT" \
-    "GitHub head, checks, or discussion state changed or could not be revalidated" \
+    "GitHub head, checks, discussion, or intent state changed or could not be revalidated" \
     "discussion drift still blocks context preparation when checks are unavailable"
 
 # When only discussion identity is available, its fallback attestation still
@@ -2243,7 +2266,7 @@ assert_jq "$CHECKS_UNAVAILABLE_HEAD_REPORT/analysis-context.json" \
      .coverage.checks.fingerprint == null' \
     "the blocked context remains bound to its original head and failed check coverage"
 assert_contains "$CHECKS_UNAVAILABLE_HEAD_OUT" \
-    "GitHub head, checks, or discussion state changed or could not be revalidated" \
+    "GitHub head, checks, discussion, or intent state changed or could not be revalidated" \
     "partial attestation head drift identifies the hosted-state boundary"
 
 PRIVATE_LINKED_LOCAL_DIR="$TEST_OUTPUT_DIR/private-linked-local"
@@ -2320,6 +2343,22 @@ assert_contains "$(cat "$PUBLIC_PRIMARY_QUERY_ARGS_LOG")" "nodes(ids: [])" \
     "an empty linked-issue set is encoded as a valid literal GraphQL list"
 assert_not_contains "$(cat "$PUBLIC_PRIMARY_QUERY_ARGS_LOG")" "ids[]=" \
     "an empty linked-issue set never emits an absent list variable"
+
+PRIMARY_ID_REUSE_DIR="$TEST_OUTPUT_DIR/primary-repository-id-reuse"
+PRIMARY_ID_REUSE_CLAUDE_LOG="$TEST_OUTPUT_DIR/primary-repository-id-reuse-claude.txt"
+rc=0
+PRIMARY_ID_REUSE_OUT=$(env PATH="$STUB_DIR:$PATH" \
+    REPO_VISIBILITY=PUBLIC REPO_ID=REPO_original LIVE_REPO_ID=REPO_replacement \
+    CLAUDE_INVOKED_LOG="$PRIMARY_ID_REUSE_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich --output-dir "$PRIMARY_ID_REUSE_DIR" \
+    2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a same-name replacement repository cannot reuse the original disclosure grant"
+assert_true "$([ ! -s "$PRIMARY_ID_REUSE_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "primary repository node identity drift is blocked before external egress"
+assert_contains "$PRIMARY_ID_REUSE_OUT" \
+    "Repository visibility for o/r changed" \
+    "the repository identity mismatch fails the final disclosure attestation"
 
 CLAUDE_78_DIR="$TEST_OUTPUT_DIR/claude-exit-78"
 CLAUDE_78_LOG="$TEST_OUTPUT_DIR/claude-exit-78-invoked.txt"
@@ -2773,7 +2812,42 @@ if [ "$1" = "api" ] && [ "$2" != "graphql" ] && \
 fi
 exec "$PROVIDER_DISCUSSION_BASE_GH" "$@"
 STUB
-chmod +x "$PROVIDER_DISCUSSION_STUBS/cp" "$PROVIDER_DISCUSSION_STUBS/gh"
+cat > "$PROVIDER_DISCUSSION_STUBS/claude" << 'STUB'
+#!/bin/bash
+"$PROVIDER_DISCUSSION_BASE_CLAUDE" "$@"
+claude_rc=$?
+if [ "$claude_rc" -eq 0 ]; then
+    cp "$PROVIDER_DISCUSSION_STALE_ANALYSIS" \
+        "$PROVIDER_DISCUSSION_REPORT/analysis.json"
+    cp "$PROVIDER_DISCUSSION_STALE_ANALYSIS" \
+        "$PROVIDER_DISCUSSION_REPORT/claude-analysis.json"
+    printf '%s\n' '# stale selected report' \
+        > "$PROVIDER_DISCUSSION_REPORT/analysis.md"
+    printf '%s\n' '# stale context coverage' \
+        > "$PROVIDER_DISCUSSION_REPORT/context-coverage.md"
+    printf '%s\n' '# stale provider report' \
+        > "$PROVIDER_DISCUSSION_REPORT/claude-analysis.md"
+    combined_tmp="$(mktemp \
+        "$PROVIDER_DISCUSSION_REPORT/.provider-stale-combined.XXXXXX")" || exit 1
+    jq --slurpfile stale "$PROVIDER_DISCUSSION_STALE_ANALYSIS" \
+        '.analysis=$stale[0] | .claude_analysis=$stale[0]
+         | .analysis_context_coverage={stale:true}' \
+        "$PROVIDER_DISCUSSION_REPORT/combined-data.json" > "$combined_tmp" || exit 1
+    mv "$combined_tmp" "$PROVIDER_DISCUSSION_REPORT/combined-data.json"
+    cat >> "$PROVIDER_DISCUSSION_REPORT/comprehensive-report.md" << 'EOF'
+
+<!-- BEGIN SELECTED ANALYSIS -->
+
+stale selected result
+
+<!-- END SELECTED ANALYSIS -->
+EOF
+fi
+exit "$claude_rc"
+STUB
+chmod +x "$PROVIDER_DISCUSSION_STUBS/cp" \
+    "$PROVIDER_DISCUSSION_STUBS/gh" \
+    "$PROVIDER_DISCUSSION_STUBS/claude"
 rc=0
 PROVIDER_DISCUSSION_OUT=$(env PATH="$PROVIDER_DISCUSSION_STUBS:$STUB_DIR:$PATH" \
     REPO_VISIBILITY=PRIVATE GH_PR_ENRICH_CODE_ACCESS=false \
@@ -2782,6 +2856,8 @@ PROVIDER_DISCUSSION_OUT=$(env PATH="$PROVIDER_DISCUSSION_STUBS:$STUB_DIR:$PATH" 
     PROVIDER_DISCUSSION_MARKER="$PROVIDER_DISCUSSION_MARKER" \
     PROVIDER_DISCUSSION_REAL_CP="$(command -v cp)" \
     PROVIDER_DISCUSSION_BASE_GH="$STUB_DIR/gh" \
+    PROVIDER_DISCUSSION_BASE_CLAUDE="$STUB_DIR/claude" \
+    PROVIDER_DISCUSSION_STALE_ANALYSIS="$AUTHORIZED_CLAUDE_FIXTURE" \
     "$GH_PR_ENRICH" 1 --enrich --allow-external \
     --output-dir "$PROVIDER_DISCUSSION_DIR" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && [ -e "$PROVIDER_DISCUSSION_MARKER" ] && \
@@ -2789,12 +2865,22 @@ assert_true "$([ "$rc" -ne 0 ] && [ -e "$PROVIDER_DISCUSSION_MARKER" ] && \
     "provider publication detects discussion drift after private staging" \
     "$PROVIDER_DISCUSSION_OUT"
 assert_contains "$PROVIDER_DISCUSSION_OUT" \
-    "Hosted PR head, checks, and discussion could not be attested before provider publication" \
+    "Hosted PR head, checks, discussion, and intent could not be attested before provider publication" \
     "provider rejection names the final hosted discussion boundary"
 assert_true "$([ ! -e "$PROVIDER_DISCUSSION_DIR/claude-analysis.json" ] && \
     [ ! -e "$PROVIDER_DISCUSSION_DIR/claude-analysis.md" ] && \
-    [ ! -e "$PROVIDER_DISCUSSION_DIR/analysis.json" ] && echo 0 || echo 1)" \
-    "late provider discussion drift publishes no provider or selected analysis"
+    [ ! -e "$PROVIDER_DISCUSSION_DIR/analysis.json" ] && \
+    [ ! -e "$PROVIDER_DISCUSSION_DIR/analysis.md" ] && \
+    [ ! -e "$PROVIDER_DISCUSSION_DIR/context-coverage.md" ] && echo 0 || echo 1)" \
+    "late provider discussion drift invalidates prior provider and selected views"
+assert_jq "$PROVIDER_DISCUSSION_DIR/combined-data.json" \
+    '(has("analysis") | not) and
+     (has("analysis_context_coverage") | not) and
+     (has("claude_analysis") | not)' \
+    "late provider discussion drift strips every stale embedded analysis"
+assert_true "$(! grep -Fq '<!-- BEGIN SELECTED ANALYSIS -->' \
+    "$PROVIDER_DISCUSSION_DIR/comprehensive-report.md" && echo 0 || echo 1)" \
+    "late provider discussion drift removes stale selected report sections"
 assert_no_selection_transaction_residue "$PROVIDER_DISCUSSION_DIR" \
     "late provider discussion drift cleans every publication transaction"
 
@@ -2998,6 +3084,61 @@ assert_true "$([ ! -e "$PROVIDER_SIGNAL_SOURCE_DIR" ] && \
 assert_no_selection_transaction_residue "$PROVIDER_SIGNAL_DIR" \
     "provider TERM cleans every lock and publication transaction"
 
+# Standalone immutable selection inputs are created directly in the system
+# temporary directory. Their source artifacts may be world-readable, but the
+# frozen copies must remain private from the instant cp writes them.
+PRIVATE_FREEZE_DIR="$TEST_OUTPUT_DIR/private-selection-freeze"
+PRIVATE_FREEZE_STUBS="$TEST_OUTPUT_DIR/private-selection-freeze-stubs"
+PRIVATE_FREEZE_MODE_LOG="$TEST_OUTPUT_DIR/private-selection-freeze-modes.txt"
+mkdir -p "$PRIVATE_FREEZE_DIR" "$PRIVATE_FREEZE_STUBS"
+cp -R "$AUTHORIZED_DIR/." "$PRIVATE_FREEZE_DIR/"
+PRIVATE_FREEZE_SOURCE="$PRIVATE_FREEZE_DIR/private-freeze-source.json"
+cp "$AUTHORIZED_DIR/analysis.json" "$PRIVATE_FREEZE_SOURCE"
+chmod 644 "$PRIVATE_FREEZE_SOURCE" \
+    "$PRIVATE_FREEZE_DIR/analysis-context.json"
+cat > "$PRIVATE_FREEZE_STUBS/cp" << 'STUB'
+#!/bin/bash
+destination=""
+for argument in "$@"; do destination="$argument"; done
+"$REAL_CP" "$@" || exit $?
+case "$destination" in
+    /tmp/gh-pr-enrich-analysis-source.*|\
+    /private/tmp/gh-pr-enrich-analysis-source.*|\
+    /tmp/gh-pr-enrich-analysis-context.*|\
+    /private/tmp/gh-pr-enrich-analysis-context.*)
+        mode=$(stat -c '%a' "$destination" 2>/dev/null || \
+            stat -f '%Lp' "$destination") || exit 1
+        printf '%s\t%s\n' "$destination" "$mode" \
+            >> "$PRIVATE_FREEZE_MODE_LOG"
+        ;;
+esac
+STUB
+chmod +x "$PRIVATE_FREEZE_STUBS/cp"
+rc=0
+env PATH="$PRIVATE_FREEZE_STUBS:$STUB_DIR:$PATH" \
+    REAL_CP="$(command -v cp)" \
+    PRIVATE_FREEZE_MODE_LOG="$PRIVATE_FREEZE_MODE_LOG" \
+    "$GH_PR_ENRICH" select-analysis "$PRIVATE_FREEZE_DIR" \
+    "$PRIVATE_FREEZE_SOURCE" >/dev/null 2>&1 || rc=$?
+assert_eq "0" "$rc" \
+    "selection succeeds while freezing normally readable source artifacts"
+assert_true "$([ "$(wc -l < "$PRIVATE_FREEZE_MODE_LOG" | tr -d ' ')" = 2 ] && \
+    [ "$(awk -F '\t' '$2 == 600 { count++ } END { print count + 0 }' \
+        "$PRIVATE_FREEZE_MODE_LOG")" = 2 ] && echo 0 || echo 1)" \
+    "selection copies both standalone immutable inputs with private permissions"
+assert_true "$([ "$("$GH_PR_ENRICH" --test-call workspace_file_mode \
+        "$PRIVATE_FREEZE_SOURCE")" = 644 ] && \
+    [ "$("$GH_PR_ENRICH" --test-call workspace_file_mode \
+        "$PRIVATE_FREEZE_DIR/analysis-context.json")" = 644 ] && \
+    echo 0 || echo 1)" \
+    "selection does not change the live source artifact permissions"
+PRIVATE_FREEZE_RESIDUE=false
+while IFS=$'\t' read -r frozen_path _mode; do
+    [ ! -e "$frozen_path" ] || PRIVATE_FREEZE_RESIDUE=true
+done < "$PRIVATE_FREEZE_MODE_LOG"
+assert_eq "false" "$PRIVATE_FREEZE_RESIDUE" \
+    "selection removes both private standalone immutable inputs"
+
 # Read-only freezing binds each copied file to the initial baseline, not merely
 # to a later live value. A coherent A->B->A swap during cp cannot return B while
 # both outer identity checks observe A.
@@ -3100,7 +3241,8 @@ SELECT_ABA_OUT=$(env PATH="$SELECT_ABA_STUBS:$STUB_DIR:$PATH" \
     "$SELECT_ABA_DIR/candidate.json" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "select-analysis rejects a source ABA during immutable copy"
-assert_contains "$SELECT_ABA_OUT" "source changed while its immutable copy" \
+assert_contains "$SELECT_ABA_OUT" \
+    "source or context changed while its immutable copy" \
     "source ABA rejection names the immutable-copy boundary"
 assert_true "$([ ! -e "$SELECT_ABA_DIR/analysis.json" ] && \
     cmp -s "$SELECT_ABA_DIR/candidate.json" \
@@ -3930,6 +4072,73 @@ assert_no_selection_transaction_residue "$SELECTION_REPORT" \
 (cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
     "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null)
 
+# PR and linked-issue requirements can change without a new commit or comment.
+# A confirmed same-head intent change invalidates every stale selected view.
+rc=0
+LATE_INTENT_OUT=$(cd "$SELECTION_REPO" && \
+    LIVE_INTENT_BODY="changed same-head requirements" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection detects same-head PR intent drift before publication" \
+    "$LATE_INTENT_OUT"
+assert_contains "$LATE_INTENT_OUT" \
+    "GitHub PR or linked-issue intent changed during selection" \
+    "intent drift is identified at the final hosted-state boundary"
+assert_true "$([ ! -e "$SELECTION_REPORT/analysis.json" ] && \
+    [ ! -e "$SELECTION_REPORT/analysis.md" ] && echo 0 || echo 1)" \
+    "confirmed intent drift invalidates stale selected views"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "intent drift leaves no selection transaction residue"
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null)
+
+# Intent must be checked again after the later discussion/check reads. Change
+# the same-head PR body only after the first stabilized intent verification.
+LATE_INTENT_WINDOW_STUBS="$TEST_OUTPUT_DIR/late-intent-window-stubs"
+LATE_INTENT_WINDOW_COUNT="$TEST_OUTPUT_DIR/late-intent-window-count"
+mkdir -p "$LATE_INTENT_WINDOW_STUBS"
+cat > "$LATE_INTENT_WINDOW_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "api graphql" ]; then
+    case "$*" in
+        *AnalysisIntentSnapshot*)
+            count=$(cat "$LATE_INTENT_WINDOW_COUNT" 2>/dev/null || echo 0)
+            count=$((count + 1))
+            printf '%s\n' "$count" > "$LATE_INTENT_WINDOW_COUNT"
+            if [ "$count" -ge 3 ]; then
+                LIVE_INTENT_BODY="changed after first intent verification" \
+                    exec "$LATE_INTENT_WINDOW_BASE_GH" "$@"
+            fi
+            ;;
+    esac
+fi
+exec "$LATE_INTENT_WINDOW_BASE_GH" "$@"
+STUB
+chmod +x "$LATE_INTENT_WINDOW_STUBS/gh"
+rc=0
+LATE_INTENT_WINDOW_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$LATE_INTENT_WINDOW_STUBS:$PATH" \
+    LATE_INTENT_WINDOW_COUNT="$LATE_INTENT_WINDOW_COUNT" \
+    LATE_INTENT_WINDOW_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && \
+    [ "$(cat "$LATE_INTENT_WINDOW_COUNT" 2>/dev/null || echo 0)" -eq 4 ] && \
+    echo 0 || echo 1)" \
+    "selection repeats intent attestation after later hosted-state reads" \
+    "$LATE_INTENT_WINDOW_OUT"
+assert_contains "$LATE_INTENT_WINDOW_OUT" \
+    "GitHub PR or linked-issue intent changed during selection" \
+    "late intent-window drift is rejected at the final hosted boundary"
+assert_true "$([ ! -e "$SELECTION_REPORT/analysis.json" ] && \
+    [ ! -e "$SELECTION_REPORT/claude-analysis.json" ] && echo 0 || echo 1)" \
+    "late intent-window drift invalidates selected and provider views"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "late intent-window drift leaves no selection transaction residue"
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$SELECTION_REPORT/hybrid-analysis.json" >/dev/null)
+
 # Keep the head and discussion fixed, but transition a check during discussion
 # verification after replacement staging. The second stabilized checks read
 # must close that window. Nonzero `gh pr checks` is normal for failing checks;
@@ -4411,6 +4620,47 @@ assert_selection_views_match "$PRELOCK_SELECTION_REPORT" \
 assert_no_selection_transaction_residue "$PRELOCK_SELECTION_REPORT" \
     "the pre-lock timeout creates no selection transaction residue"
 
+# A concurrent publisher can replace selected views while the initial hosted
+# head lookup is in flight. Deferred invalidation is identity-scoped to the
+# views that existed when this stale selection started.
+PRELOCK_DRIFT_STUBS="$TEST_OUTPUT_DIR/prelock-drift-stubs"
+PRELOCK_DRIFT_REPO="$TEST_OUTPUT_DIR/prelock-drift-workspace"
+PRELOCK_DRIFT_MARKER="$TEST_OUTPUT_DIR/prelock-drift-fired"
+cp -R "$SELECTION_REPO" "$PRELOCK_DRIFT_REPO"
+PRELOCK_DRIFT_REPORT="$PRELOCK_DRIFT_REPO/report"
+mkdir -p "$PRELOCK_DRIFT_STUBS"
+cat > "$PRELOCK_DRIFT_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ] && [ ! -e "$PRELOCK_DRIFT_MARKER" ]; then
+    jq '.process_improvements[0].suggestion = "concurrent newer publication"' \
+        "$PRELOCK_DRIFT_REPORT/analysis.json" \
+        > "$PRELOCK_DRIFT_REPORT/analysis.concurrent.json"
+    mv "$PRELOCK_DRIFT_REPORT/analysis.concurrent.json" \
+        "$PRELOCK_DRIFT_REPORT/analysis.json"
+    : > "$PRELOCK_DRIFT_MARKER"
+    PR_HEAD_OID=new-hosted-head exec "$PRELOCK_DRIFT_BASE_GH" "$@"
+fi
+exec "$PRELOCK_DRIFT_BASE_GH" "$@"
+STUB
+chmod +x "$PRELOCK_DRIFT_STUBS/gh"
+rc=0
+PRELOCK_DRIFT_OUT=$(cd "$PRELOCK_DRIFT_REPO" && \
+    env PATH="$PRELOCK_DRIFT_STUBS:$PATH" \
+    PRELOCK_DRIFT_REPORT="$PRELOCK_DRIFT_REPORT" \
+    PRELOCK_DRIFT_MARKER="$PRELOCK_DRIFT_MARKER" \
+    PRELOCK_DRIFT_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" select-analysis "$PRELOCK_DRIFT_REPORT" \
+        "$PRELOCK_DRIFT_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$PRELOCK_DRIFT_MARKER" ] && echo 0 || echo 1)" \
+    "initial hosted-head drift rejects the stale selection"
+assert_jq "$PRELOCK_DRIFT_REPORT/analysis.json" \
+    '.process_improvements[0].suggestion == "concurrent newer publication"' \
+    "initial hosted-head invalidation preserves a newer concurrent publication"
+assert_contains "$PRELOCK_DRIFT_OUT" "newer publication was preserved" \
+    "identity-scoped pre-lock invalidation reports the preserved publication"
+assert_no_selection_transaction_residue "$PRELOCK_DRIFT_REPORT" \
+    "pre-lock hosted-head drift leaves no selection transaction residue"
+
 # The standalone selector owns and bounds its final GitHub child while holding
 # the writer lock. Cancellation terminates the child before releasing the lock.
 BLOCKED_HEAD_STUBS="$TEST_OUTPUT_DIR/blocked-head-stubs"
@@ -4611,6 +4861,36 @@ assert_eq "do not overwrite" "$(cat "$TEST_OUTPUT_DIR/selection-temp-target.json
     "selection invalidation never follows a planted fixed-name temp symlink"
 rm "$AUTHORIZED_DIR/combined-data.tmp.json"
 "$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$HYBRID_SOURCE" >/dev/null
+
+MISSING_INTENT_DIR="$TEST_OUTPUT_DIR/missing-intent-context"
+cp -R "$AUTHORIZED_DIR" "$MISSING_INTENT_DIR"
+jq 'del(.coverage.intent.fingerprint, .coverage.context_fingerprint)' \
+    "$MISSING_INTENT_DIR/analysis-context.json" \
+    > "$MISSING_INTENT_DIR/analysis-context.tmp.json"
+MISSING_INTENT_FINGERPRINT=$("$GH_PR_ENRICH" --test-call \
+    analysis_context_fingerprint "$MISSING_INTENT_DIR/analysis-context.tmp.json")
+jq --arg fingerprint "$MISSING_INTENT_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$MISSING_INTENT_DIR/analysis-context.tmp.json" \
+    > "$MISSING_INTENT_DIR/analysis-context.json"
+rm "$MISSING_INTENT_DIR/analysis-context.tmp.json"
+jq --arg fingerprint "$MISSING_INTENT_FINGERPRINT" \
+    '._metadata.context_fingerprint = $fingerprint' \
+    "$MISSING_INTENT_DIR/hybrid-analysis.json" \
+    > "$MISSING_INTENT_DIR/hybrid-analysis.tmp.json"
+mv "$MISSING_INTENT_DIR/hybrid-analysis.tmp.json" \
+    "$MISSING_INTENT_DIR/hybrid-analysis.json"
+MISSING_INTENT_SELECTED_BEFORE=$(jq -c . "$MISSING_INTENT_DIR/analysis.json")
+rc=0
+MISSING_INTENT_OUT=$("$GH_PR_ENRICH" select-analysis "$MISSING_INTENT_DIR" \
+    "$MISSING_INTENT_DIR/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects completed hosted inputs without an intent fingerprint"
+assert_contains "$MISSING_INTENT_OUT" "Required GitHub analysis inputs failed" \
+    "missing intent identity fails at the required-input gate"
+assert_eq "$MISSING_INTENT_SELECTED_BEFORE" \
+    "$(jq -c . "$MISSING_INTENT_DIR/analysis.json")" \
+    "missing intent identity preserves the prior selected result"
 
 FORGED_IDENTITY_SOURCE="$AUTHORIZED_DIR/forged-identity-analysis.json"
 jq '._metadata.repository = "attacker/shadow" | ._metadata.pr_number = 999' \
