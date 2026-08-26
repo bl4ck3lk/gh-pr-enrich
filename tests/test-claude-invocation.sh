@@ -369,7 +369,9 @@ assert_eq "$WORKSPACE_FINGERPRINT" \
     "native snapshot materialization reports the validated workspace fingerprint"
 assert_eq "clean" "$(cat "$NATIVE_SNAPSHOT_PATH/tracked.txt")" \
     "native snapshot materialization copies the bound repository bytes"
-assert_true "$([ ! -w "$NATIVE_SNAPSHOT_PATH/tracked.txt" ] && echo 0 || echo 1)" \
+NATIVE_SNAPSHOT_MODE=$("$GH_PR_ENRICH" --test-call workspace_file_mode \
+    "$NATIVE_SNAPSHOT_PATH/tracked.txt")
+assert_true "$([[ "$NATIVE_SNAPSHOT_MODE" != *[2367]* ]] && echo 0 || echo 1)" \
     "native snapshot materialization produces read-only files"
 NATIVE_JANITOR_SIDECAR="$NATIVE_SNAPSHOT_PATH.janitor"
 NATIVE_JANITOR_PID=$(awk -F '\t' 'NR == 1 { print $2 }' "$NATIVE_JANITOR_SIDECAR")
