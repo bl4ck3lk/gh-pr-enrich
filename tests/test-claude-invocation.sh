@@ -1609,9 +1609,11 @@ WATCHDOG_PID_LOG="$TEST_OUTPUT_DIR/semgrep-watchdog.pid"
 WATCHDOG_CHILD_PID_LOG="$TEST_OUTPUT_DIR/semgrep-watchdog-child.pid"
 WATCHDOG_CWD_LOG="$TEST_OUTPUT_DIR/semgrep-watchdog-cwd.log"
 WATCHDOG_TIMEOUT_LOG="$TEST_OUTPUT_DIR/semgrep-timeout-command.log"
+WATCHDOG_SLEEP_LOG="$TEST_OUTPUT_DIR/semgrep-watchdog-sleeps.log"
 mkdir -p "$WATCHDOG_REPORTS" "$WATCHDOG_STUBS"
 cp "$SAST_DIR/pr-summary.json" "$WATCHDOG_REPORTS/pr-summary.json"
 : > "$WATCHDOG_TIMEOUT_LOG"
+: > "$WATCHDOG_SLEEP_LOG"
 cat > "$WATCHDOG_STUBS/semgrep" << 'STUB'
 #!/bin/bash
 printf '%s\n' "$$" > "$SEMGREP_PID_LOG"
@@ -1639,7 +1641,6 @@ exit 99
 STUB
 chmod +x "$WATCHDOG_STUBS/timeout"
 
-SECONDS=0
 set +e
 WATCHDOG_OUT=$(cd "$WORKSPACE" && env \
     PATH="$WATCHDOG_STUBS:$STUB_DIR:$PATH" \
@@ -1649,15 +1650,17 @@ WATCHDOG_OUT=$(cd "$WORKSPACE" && env \
     SEMGREP_CHILD_STUB="$WATCHDOG_STUBS/semgrep-child" \
     SEMGREP_CWD_LOG="$WATCHDOG_CWD_LOG" \
     SEMGREP_GNU_TIMEOUT_LOG="$WATCHDOG_TIMEOUT_LOG" \
+    SLEEP_INTERVAL_LOG="$WATCHDOG_SLEEP_LOG" \
     "$GH_PR_ENRICH" --test-call collect_sast_findings \
     "watchdog-reports" 2>&1)
 WATCHDOG_RC=$?
 set -e
-WATCHDOG_ELAPSED=$SECONDS
 assert_eq "0" "$WATCHDOG_RC" \
     "the top-level command survives the managed Semgrep timeout"
-assert_true "$([ "$WATCHDOG_ELAPSED" -ge 1 ] && [ "$WATCHDOG_ELAPSED" -lt 8 ] && echo 0 || echo 1)" \
-    "the portable Semgrep watchdog enforces the configured timeout without spinning"
+assert_eq "10:0" \
+    "$(awk '{ if ($0 != "0.1") bad++ } END { print NR ":" (bad + 0) }' \
+        "$WATCHDOG_SLEEP_LOG")" \
+    "the portable Semgrep watchdog enforces the configured timeout with bounded sleep polls"
 assert_true "$([ ! -s "$WATCHDOG_TIMEOUT_LOG" ] && echo 0 || echo 1)" \
     "the portable Semgrep watchdog does not invoke GNU timeout even when one is present"
 assert_jq "$WATCHDOG_REPORTS/sast-status.json" '.status == "failed"' \
