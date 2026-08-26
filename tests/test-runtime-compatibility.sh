@@ -8,7 +8,15 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 GH_PR_ENRICH="$PROJECT_DIR/gh-pr-enrich"
-TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output/runtime-compatibility"
+RUNTIME_COMPATIBILITY_SHARD="${GH_PR_ENRICH_RUNTIME_SHARD:-collection}"
+case "$RUNTIME_COMPATIBILITY_SHARD" in
+    collection|selection) ;;
+    *)
+        echo "Error: unknown runtime compatibility shard: $RUNTIME_COMPATIBILITY_SHARD" >&2
+        exit 1
+        ;;
+esac
+TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output/runtime-compatibility-$RUNTIME_COMPATIBILITY_SHARD"
 STUB_DIR="$TEST_OUTPUT_DIR/stubs"
 TMP_ALIAS_OUTPUT="/tmp/gh-pr-enrich-runtime-$$"
 TMP_ALIAS_SELECTION="/tmp/gh-pr-enrich-selection-$$"
@@ -105,7 +113,7 @@ exec /bin/sleep "$@"
 STUB
 chmod +x "$STUB_DIR/sleep"
 
-suite_start "gh pr-enrich runtime compatibility suite"
+suite_start "gh pr-enrich runtime compatibility ($RUNTIME_COMPATIBILITY_SHARD) suite"
 
 assert_no_selection_transaction_residue() {
     local report_dir="$1"
@@ -1408,6 +1416,9 @@ JSON
 STUB
 chmod +x "$STUB_DIR/semgrep"
 
+CLAUDE_LOG="$TEST_OUTPUT_DIR/claude-invoked.txt"
+
+if [ "$RUNTIME_COMPATIBILITY_SHARD" = collection ]; then
 # Startup and watch-mode repository discovery happen before a report lease
 # exists. A signal sent only to the advertised CLI PID must still terminate the
 # parent-owned capture supervisor and its TERM-ignoring GitHub request.
@@ -2721,7 +2732,6 @@ for SAST_PRELAUNCH_SIGNAL in TERM INT; do
 done
 
 PRIVATE_OUT_DIR="$TEST_OUTPUT_DIR/private"
-CLAUDE_LOG="$TEST_OUTPUT_DIR/claude-invoked.txt"
 rc=0
 PRIVATE_OUT=$(env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PRIVATE CLAUDE_INVOKED_LOG="$CLAUDE_LOG" \
     "$GH_PR_ENRICH" 1 --enrich --output-dir "$PRIVATE_OUT_DIR" 2>&1) || rc=$?
@@ -2747,6 +2757,9 @@ for VISIBILITY in INTERNAL UNKNOWN; do
     assert_contains "$VISIBILITY_OUT" "$VISIBILITY" \
         "$VISIBILITY disclosure failure identifies the repository visibility"
 done
+
+suite_end
+fi
 
 AUTHORIZED_DIR="$TEST_OUTPUT_DIR/private-authorized"
 rc=0
