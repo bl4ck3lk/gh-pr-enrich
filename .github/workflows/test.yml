@@ -2,13 +2,16 @@ name: tests
 
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
     branches: ['**']
 
 jobs:
-  test:
+  prepare:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      suites: ${{ steps.suites.outputs.suites }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,7 +28,44 @@ jobs:
       - name: Lint shell scripts
         run: shellcheck -S error gh-pr-enrich tests/*.sh tests/lib/*.sh
 
-      # Runs every suite, including any suite added later. Individual suites are
-      # not listed here so a new test file cannot be silently left out of CI.
-      - name: Test suites
-        run: tests/run-all.sh
+      - name: Discover test suites
+        id: suites
+        run: |
+          suites=$(find tests -maxdepth 1 -type f -name 'test-*.sh' -print \
+            | sort \
+            | jq -Rsc 'split("\n") | map(select(length > 0))')
+          test "$suites" != '[]'
+          printf 'suites=%s\n' "$suites" >> "$GITHUB_OUTPUT"
+
+  suite:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.prepare.outputs.suites) }}
+    name: ${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run suite
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: bash "$SUITE"
+
+  # Preserve the stable aggregate check name used by branch protection while
+  # allowing independent suites to run concurrently.
+  test:
+    if: always()
+    needs: [prepare, suite]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require preparation and every suite
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          SUITE_RESULT: ${{ needs.suite.result }}
+        run: |
+          test "$PREPARE_RESULT" = success
+          test "$SUITE_RESULT" = success

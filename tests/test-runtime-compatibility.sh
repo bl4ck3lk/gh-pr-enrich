@@ -88,6 +88,20 @@ trap cleanup EXIT
 cleanup
 mkdir -p "$STUB_DIR"
 
+# End-to-end fixtures use immediate GitHub command stubs, but each managed
+# request still waits for the production 200 ms watchdog poll. Compress only
+# that poll in this test process so timeout state transitions and iteration
+# counts remain unchanged without adding minutes of idle wall time to the suite.
+cat > "$STUB_DIR/sleep" << 'STUB'
+#!/bin/bash
+if [ "${1:-}" = "0.2" ] && \
+   [ "${GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP:-false}" != true ]; then
+    exec /bin/sleep 0.01
+fi
+exec /bin/sleep "$@"
+STUB
+chmod +x "$STUB_DIR/sleep"
+
 suite_start "gh pr-enrich runtime compatibility suite"
 
 assert_no_selection_transaction_residue() {
@@ -1865,6 +1879,7 @@ env PATH="$REPORT_WATCHDOG_STUBS:$STUB_DIR:$PATH" \
     REPORT_WATCHDOG_CHILD_PID_FILE="$REPORT_WATCHDOG_CHILD_PID_FILE" \
     REPORT_WATCHDOG_PID_FILE="$REPORT_WATCHDOG_PID_FILE" \
     REPORT_WATCHDOG_MARKER="$REPORT_WATCHDOG_MARKER" \
+    GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
     GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
     "$GH_PR_ENRICH" 1 --output-dir "$REPORT_WATCHDOG_REPORT" \
     >/dev/null 2>&1 || rc=$?
@@ -2532,6 +2547,7 @@ for VISIBILITY_SIGNAL in INT TERM; do
     rc=0
     env PATH="$STUB_DIR:$PATH" BASH_ENV="$VISIBILITY_SIGNAL_BASH_ENV" \
         TMPDIR="$VISIBILITY_SIGNAL_TMP" REPO_VISIBILITY=PUBLIC \
+        GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
         GH_PR_ENRICH_CODE_ACCESS=false GH_PR_ENRICH_GITHUB_TIMEOUT=2 \
         VISIBILITY_SIGNAL="$VISIBILITY_SIGNAL" \
         VISIBILITY_SIGNAL_READY="$VISIBILITY_SIGNAL_READY" \
@@ -4267,6 +4283,7 @@ chmod +x "$CHECKS_TIMEOUT_STUBS/gh"
 rc=0
 CHECKS_TIMEOUT_OUT=$(cd "$SELECTION_REPO" && \
     env PATH="$CHECKS_TIMEOUT_STUBS:$PATH" \
+    GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
     GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
     CHECKS_TIMEOUT_CHILD_PID="$CHECKS_TIMEOUT_CHILD_PID" \
     CHECKS_TIMEOUT_BASE_GH="$STUB_DIR/gh" \
@@ -4667,7 +4684,9 @@ BLOCKED_HEAD_CHILD_PID_FILE="$PRELOCK_HEAD_CHILD_PID"
 BLOCKED_HEAD_DESCENDANT_PID_FILE="$PRELOCK_HEAD_DESCENDANT_PID"
 rc=0
 PRELOCK_HEAD_OUT=$(cd "$PRELOCK_SELECTION_REPO" && \
-    env PATH="$PRELOCK_HEAD_STUBS:$PATH" GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
+    env PATH="$PRELOCK_HEAD_STUBS:$PATH" \
+    GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
+    GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
     PRELOCK_HEAD_BASE_GH="$STUB_DIR/gh" \
     PRELOCK_HEAD_READY="$PRELOCK_HEAD_READY" \
     PRELOCK_HEAD_CHILD_PID="$PRELOCK_HEAD_CHILD_PID" \
@@ -4846,7 +4865,9 @@ rm -f "$BLOCKED_HEAD_MARKER" "$BLOCKED_HEAD_READY" \
     "$BLOCKED_HEAD_CHILD_PID" "$BLOCKED_HEAD_DESCENDANT_PID"
 rc=0
 BOUNDED_HEAD_OUT=$(cd "$TIMEOUT_SELECTION_REPO" && \
-    env PATH="$BLOCKED_HEAD_STUBS:$PATH" GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
+    env PATH="$BLOCKED_HEAD_STUBS:$PATH" \
+    GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
+    GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
     UNAVAILABLE_HEAD_REPORT="$TIMEOUT_SELECTION_REPORT" \
     UNAVAILABLE_HEAD_MARKER="$BLOCKED_HEAD_MARKER" \
     UNAVAILABLE_HEAD_REAL_CP="$(command -v cp)" \

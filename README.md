@@ -399,7 +399,7 @@ The canonical skill is `.claude/skills/gh-pr-enrich/SKILL.md`; `.agents/skills/g
 
 ## Development
 
-Run the test suite (CI runs the same scripts on every push and PR):
+Run the test suite (CI runs the same scripts for every PR and push to `main`):
 
 ```bash
 tests/run-all.sh                  # All runtime, contract, security, and workflow suites
