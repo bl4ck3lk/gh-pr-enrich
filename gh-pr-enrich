@@ -83,25 +83,32 @@ copy_compatibility_file() {
 }
 
 sha256_file() {
-    local source_file="$1"
-    if command -v shasum > /dev/null 2>&1; then
-        shasum -a 256 "$source_file" | awk '{print $1}'
-    elif command -v sha256sum > /dev/null 2>&1; then
-        sha256sum "$source_file" | awk '{print $1}'
+    local source_file="$1" digest_output
+    if command -v sha256sum > /dev/null 2>&1; then
+        digest_output="$(sha256sum < "$source_file")" || return 1
+        printf '%s\n' "${digest_output%% *}"
+    elif command -v shasum > /dev/null 2>&1; then
+        digest_output="$(shasum -a 256 < "$source_file")" || return 1
+        printf '%s\n' "${digest_output%% *}"
     elif command -v openssl > /dev/null 2>&1; then
-        openssl dgst -sha256 "$source_file" | awk '{print $NF}'
+        digest_output="$(openssl dgst -sha256 < "$source_file")" || return 1
+        printf '%s\n' "${digest_output##* }"
     else
         return 1
     fi
 }
 
 sha256_stream() {
-    if command -v shasum > /dev/null 2>&1; then
-        shasum -a 256 | awk '{print $1}'
-    elif command -v sha256sum > /dev/null 2>&1; then
-        sha256sum | awk '{print $1}'
+    local digest_output
+    if command -v sha256sum > /dev/null 2>&1; then
+        digest_output="$(sha256sum)" || return 1
+        printf '%s\n' "${digest_output%% *}"
+    elif command -v shasum > /dev/null 2>&1; then
+        digest_output="$(shasum -a 256)" || return 1
+        printf '%s\n' "${digest_output%% *}"
     elif command -v openssl > /dev/null 2>&1; then
-        openssl dgst -sha256 | awk '{print $NF}'
+        digest_output="$(openssl dgst -sha256)" || return 1
+        printf '%s\n' "${digest_output##* }"
     else
         return 1
     fi
@@ -596,23 +603,84 @@ CODE_ACCESS_PREVIOUS_INT_TRAP=""
 CODE_ACCESS_PREVIOUS_TERM_TRAP=""
 ANALYZER_CHILD_PID=""
 ANALYZER_HEARTBEAT_PID=""
+ANALYZER_TIMEOUT_WATCHER_PID=""
+ANALYZER_TIMEOUT_STATE_DIR=""
+ANALYZER_OWNER_LEASE_FD=""
+ANALYZER_OWNER_BOOTSTRAP_FD=""
+ANALYZER_OWNER_TOKEN=""
 ANALYZER_PROMPT_FILE=""
 ANALYZER_CONTEXT_FILE=""
 ANALYZER_CHILD_STARTING=false
 ANALYZER_HEARTBEAT_STARTING=false
+ANALYZER_TIMEOUT_WATCHER_STARTING=false
 ANALYZER_PENDING_SIGNAL=""
+
+terminate_analyzer_timeout_watcher() {
+    [ -n "$ANALYZER_TIMEOUT_WATCHER_PID" ] || return 0
+    case "$ANALYZER_TIMEOUT_STATE_DIR" in
+        /tmp/gh-pr-enrich-analyzer-timeout.*|/private/tmp/gh-pr-enrich-analyzer-timeout.*)
+            : > "$ANALYZER_TIMEOUT_STATE_DIR/release"
+            ;;
+        *) return 1 ;;
+    esac
+    wait "$ANALYZER_TIMEOUT_WATCHER_PID" 2>/dev/null || true
+    ANALYZER_TIMEOUT_WATCHER_PID=""
+}
+
+close_analyzer_owner_fd() {
+    case "$1" in
+        9) exec 9>&- ;;
+        8) exec 8>&- ;;
+        7) exec 7>&- ;;
+        6) exec 6>&- ;;
+        5) exec 5>&- ;;
+        "") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+close_analyzer_owner_bootstrap() {
+    close_analyzer_owner_fd "$ANALYZER_OWNER_BOOTSTRAP_FD" || return 1
+    ANALYZER_OWNER_BOOTSTRAP_FD=""
+}
+
+release_analyzer_owner_channel() {
+    local previous_pipe_trap write_status=0
+    [ -n "$ANALYZER_OWNER_LEASE_FD" ] || return 0
+    previous_pipe_trap="$(trap -p PIPE)"
+    trap '' PIPE
+    case "$ANALYZER_OWNER_LEASE_FD" in
+        9) printf '%s\n%s\n' "$ANALYZER_OWNER_TOKEN" "$ANALYZER_OWNER_TOKEN" >&9 2>/dev/null || write_status=$? ;;
+        8) printf '%s\n%s\n' "$ANALYZER_OWNER_TOKEN" "$ANALYZER_OWNER_TOKEN" >&8 2>/dev/null || write_status=$? ;;
+        7) printf '%s\n%s\n' "$ANALYZER_OWNER_TOKEN" "$ANALYZER_OWNER_TOKEN" >&7 2>/dev/null || write_status=$? ;;
+        6) printf '%s\n%s\n' "$ANALYZER_OWNER_TOKEN" "$ANALYZER_OWNER_TOKEN" >&6 2>/dev/null || write_status=$? ;;
+        5) printf '%s\n%s\n' "$ANALYZER_OWNER_TOKEN" "$ANALYZER_OWNER_TOKEN" >&5 2>/dev/null || write_status=$? ;;
+        *) write_status=1 ;;
+    esac
+    close_analyzer_owner_fd "$ANALYZER_OWNER_LEASE_FD" || write_status=1
+    ANALYZER_OWNER_LEASE_FD=""
+    trap - PIPE
+    [ -z "$previous_pipe_trap" ] || eval "$previous_pipe_trap"
+    [ "$write_status" -eq 0 ]
+}
 
 terminate_analyzer_child() {
     local analyzer_pid="$ANALYZER_CHILD_PID"
     [ -n "$analyzer_pid" ] || return 0
-    kill -TERM "$analyzer_pid" 2>/dev/null || true
+    # The wrapper publishes completion before it exits, then remains alive until
+    # this owner releases it. That handshake makes this PID identity-safe even
+    # when cancellation arrives after completion but before the outer wait.
+    if [ ! -e "$ANALYZER_TIMEOUT_STATE_DIR/complete" ]; then
+        kill -TERM "$analyzer_pid" 2>/dev/null || true
+    fi
+    release_analyzer_owner_channel || true
     wait "$analyzer_pid" 2>/dev/null || true
     ANALYZER_CHILD_PID=""
 }
 
 terminate_analyzer_heartbeat() {
     [ -n "$ANALYZER_HEARTBEAT_PID" ] || return 0
-    kill -TERM "$ANALYZER_HEARTBEAT_PID" 2>/dev/null || true
+    release_analyzer_owner_channel || true
     wait "$ANALYZER_HEARTBEAT_PID" 2>/dev/null || true
     ANALYZER_HEARTBEAT_PID=""
 }
@@ -659,6 +727,8 @@ restore_code_access_cleanup_traps() {
 }
 
 cleanup_code_access_artifacts() {
+    release_analyzer_owner_channel || true
+    close_analyzer_owner_bootstrap || true
     if is_private_code_snapshot_path "$CODE_ACCESS_SNAPSHOT_DIR"; then
         chmod -R u+w "$CODE_ACCESS_SNAPSHOT_DIR" 2>/dev/null || true
         rm -rf "$CODE_ACCESS_SNAPSHOT_DIR"
@@ -682,11 +752,19 @@ cleanup_code_access_artifacts() {
             rm -f "$ANALYZER_CONTEXT_FILE"
             ;;
     esac
+    case "$ANALYZER_TIMEOUT_STATE_DIR" in
+        /tmp/gh-pr-enrich-analyzer-timeout.*|/private/tmp/gh-pr-enrich-analyzer-timeout.*)
+            [ ! -d "$ANALYZER_TIMEOUT_STATE_DIR" ] || \
+                rm -rf "$ANALYZER_TIMEOUT_STATE_DIR"
+            ;;
+    esac
     CODE_ACCESS_SNAPSHOT_DIR=""
     CODE_ACCESS_BATCH_DIR=""
     CODE_ACCESS_SETTINGS_FILE=""
     ANALYZER_PROMPT_FILE=""
     ANALYZER_CONTEXT_FILE=""
+    ANALYZER_TIMEOUT_STATE_DIR=""
+    ANALYZER_OWNER_TOKEN=""
 }
 
 handle_code_access_cleanup_signal() {
@@ -694,11 +772,15 @@ handle_code_access_cleanup_signal() {
     local exit_status="${2:-0}"
     if [ "$signal_name" != "EXIT" ] && \
        { [ "$ANALYZER_CHILD_STARTING" = true ] || \
-         [ "$ANALYZER_HEARTBEAT_STARTING" = true ]; }; then
+         [ "$ANALYZER_HEARTBEAT_STARTING" = true ] || \
+         [ "$ANALYZER_TIMEOUT_WATCHER_STARTING" = true ]; }; then
         [ -n "$ANALYZER_PENDING_SIGNAL" ] || \
             ANALYZER_PENDING_SIGNAL="$signal_name"
         return 0
     fi
+    # Reap the state-only timeout watcher before releasing the analyzer owner
+    # channel so no delayed deadline publication can race cleanup.
+    terminate_analyzer_timeout_watcher
     terminate_analyzer_child
     terminate_analyzer_heartbeat
     cleanup_code_access_artifacts
@@ -3569,6 +3651,12 @@ invoke_claude() {
     local -a tools=("$@")
     ANALYZER_CHILD_STARTING=false
     ANALYZER_HEARTBEAT_STARTING=false
+    ANALYZER_TIMEOUT_WATCHER_STARTING=false
+    ANALYZER_TIMEOUT_WATCHER_PID=""
+    ANALYZER_TIMEOUT_STATE_DIR=""
+    ANALYZER_OWNER_LEASE_FD=""
+    ANALYZER_OWNER_BOOTSTRAP_FD=""
+    ANALYZER_OWNER_TOKEN=""
     ANALYZER_PENDING_SIGNAL=""
 
     local model="${GH_PR_ENRICH_MODEL:-sonnet}"
@@ -3599,11 +3687,54 @@ invoke_claude() {
     ANALYZER_PROMPT_FILE="$(mktemp "/tmp/gh-pr-enrich-claude-prompt.XXXXXX")" || \
         return 1
     install_code_access_cleanup_traps
-    if ! chmod 600 "$ANALYZER_PROMPT_FILE" || \
+    ANALYZER_TIMEOUT_STATE_DIR="$(mktemp -d \
+        "/tmp/gh-pr-enrich-analyzer-timeout.XXXXXX")" || {
+        cleanup_code_access_artifacts
+        return 1
+    }
+    local owner_fifo="$ANALYZER_TIMEOUT_STATE_DIR/owner" candidate_fd
+    ANALYZER_OWNER_TOKEN="${ANALYZER_TIMEOUT_STATE_DIR##*.}"
+    if ! chmod 700 "$ANALYZER_TIMEOUT_STATE_DIR" || \
+       ! (umask 077; mkfifo "$owner_fifo") || \
+       ! chmod 600 "$ANALYZER_PROMPT_FILE" || \
        ! printf '%s\n' "$user_prompt" > "$ANALYZER_PROMPT_FILE"; then
         cleanup_code_access_artifacts
         return 1
     fi
+    for candidate_fd in 9 8 7 6 5; do
+        case "$candidate_fd" in
+            9) { { : >&9; } || { : <&9; }; } 2>/dev/null && continue ;;
+            8) { { : >&8; } || { : <&8; }; } 2>/dev/null && continue ;;
+            7) { { : >&7; } || { : <&7; }; } 2>/dev/null && continue ;;
+            6) { { : >&6; } || { : <&6; }; } 2>/dev/null && continue ;;
+            5) { { : >&5; } || { : <&5; }; } 2>/dev/null && continue ;;
+        esac
+        if [ -z "$ANALYZER_OWNER_LEASE_FD" ]; then
+            ANALYZER_OWNER_LEASE_FD="$candidate_fd"
+        else
+            ANALYZER_OWNER_BOOTSTRAP_FD="$candidate_fd"
+            break
+        fi
+    done
+    if [ -z "$ANALYZER_OWNER_LEASE_FD" ] || \
+       [ -z "$ANALYZER_OWNER_BOOTSTRAP_FD" ]; then
+        cleanup_code_access_artifacts
+        return 1
+    fi
+    case "$ANALYZER_OWNER_BOOTSTRAP_FD" in
+        9) exec 9<>"$owner_fifo" ;;
+        8) exec 8<>"$owner_fifo" ;;
+        7) exec 7<>"$owner_fifo" ;;
+        6) exec 6<>"$owner_fifo" ;;
+        5) exec 5<>"$owner_fifo" ;;
+    esac
+    case "$ANALYZER_OWNER_LEASE_FD" in
+        9) exec 9>"$owner_fifo" ;;
+        8) exec 8>"$owner_fifo" ;;
+        7) exec 7>"$owner_fifo" ;;
+        6) exec 6>"$owner_fifo" ;;
+        5) exec 5>"$owner_fifo" ;;
+    esac
 
     # Elapsed time is the only progress signal available: --output-format json
     # writes nothing until the run completes. The heartbeat is the background job
@@ -3615,51 +3746,35 @@ invoke_claude() {
     local start_ts=$SECONDS
     ANALYZER_HEARTBEAT_STARTING=true
     (
-        # The sleep runs as a killable child: terminating only the subshell would
-        # orphan a sleeping process that still holds this function's stderr open,
-        # which stalls any caller reading the output through a pipe.
-        sleep_pid=""
-        sleep_starting=false
-        heartbeat_signal=""
-        stop_heartbeat_sleep() {
-            [ -n "$heartbeat_signal" ] || heartbeat_signal="$1"
-            [ "$sleep_starting" != true ] || return 0
-            if [ -n "$heartbeat_sleep_pid" ]; then
-                kill "$heartbeat_sleep_pid" 2>/dev/null || true
-                wait "$heartbeat_sleep_pid" 2>/dev/null || true
-                heartbeat_sleep_pid=""
-            fi
-            exit 0
-        }
-        # Guard the empty case explicitly: `kill 0` signals the entire process
-        # group, which would take the parent script and the analyzer with it.
-        trap 'stop_heartbeat_sleep TERM' TERM
-        trap 'stop_heartbeat_sleep INT' INT
+        close_analyzer_owner_fd "$ANALYZER_OWNER_LEASE_FD" || exit 1
+        close_analyzer_owner_fd "$ANALYZER_OWNER_BOOTSTRAP_FD" || exit 1
+        ANALYZER_OWNER_LEASE_FD=""
+        ANALYZER_OWNER_BOOTSTRAP_FD=""
         waited=0
         while true; do
-            sleep_starting=true
-            sleep "$heartbeat_interval" &
-            heartbeat_sleep_pid=$!
-            sleep_starting=false
-            [ -z "$heartbeat_signal" ] || \
-                stop_heartbeat_sleep "$heartbeat_signal"
-            if ! wait "$heartbeat_sleep_pid" 2>/dev/null; then
-                heartbeat_sleep_pid=""
+            heartbeat_read_status=0
+            IFS= read -r -t "$heartbeat_interval" heartbeat_owner_message <&4 || \
+                heartbeat_read_status=$?
+            if [ "$heartbeat_read_status" -eq 0 ] || \
+               [ "$heartbeat_read_status" -eq 1 ]; then
                 exit 0
             fi
-            heartbeat_sleep_pid=""
             waited=$((waited + heartbeat_interval))
             echo "   ⏳ still running ${label} — ${waited}s elapsed of ${timeout_secs}s" >&2
         done
-    ) &
+    ) 4<"$owner_fifo" &
     ANALYZER_HEARTBEAT_PID=$!
+    close_analyzer_owner_bootstrap || {
+        cleanup_code_access_artifacts
+        return 1
+    }
     ANALYZER_HEARTBEAT_STARTING=false
     if [ -n "$ANALYZER_PENDING_SIGNAL" ]; then
         handle_code_access_cleanup_signal "$ANALYZER_PENDING_SIGNAL"
     fi
     disown "$ANALYZER_HEARTBEAT_PID" 2>/dev/null || true
 
-    local exit_code=0
+    local exit_code=0 analyzer_timed_out=false
     # --safe-mode disables snapshot-owned CLAUDE.md, skills, hooks, plugins,
     # MCP servers, and other repository customizations. Auto memory is disabled
     # separately so untrusted PR content cannot influence or persist into later
@@ -3671,37 +3786,63 @@ invoke_claude() {
     # ("Killed: 9" plus the whole command line) never reaches the user.
     ANALYZER_CHILD_STARTING=true
     (
+        close_analyzer_owner_fd "$ANALYZER_OWNER_LEASE_FD" || exit 1
+        ANALYZER_OWNER_LEASE_FD=""
         claude_pid=""
-        timeout_watcher_pid=""
+        claude_job_spec=""
         claude_starting=false
-        timeout_watcher_starting=false
         analyzer_wrapper_signal=""
-        stop_timeout_watcher() {
-            [ -n "$timeout_watcher_pid" ] || return 0
-            kill -TERM "$timeout_watcher_pid" 2>/dev/null || true
-            wait "$timeout_watcher_pid" 2>/dev/null || true
-            timeout_watcher_pid=""
+        publish_analyzer_completion() {
+            local wrapper_exit=$?
+            # This also releases the parent-owned deadline watcher if the owner
+            # disappeared without running its cleanup trap.
+            : > "$ANALYZER_TIMEOUT_STATE_DIR/release"
+            : > "$ANALYZER_TIMEOUT_STATE_DIR/complete"
+            # The FIFO is an identity-safe owner lease. A normal parent writes
+            # the private token; abrupt owner death closes the only writer and
+            # produces EOF, so this wrapper never needs to trust a saved PID.
+            owner_message=""
+            IFS= read -r owner_message <&4 || true
+            exec 4<&-
+            # The parent reaps the state-only watcher before releasing this
+            # lease, so descendant cleanup is safe on both token and EOF paths.
+            ANALYZER_OWNER_BOOTSTRAP_FD=""
+            cleanup_code_access_artifacts
+            trap - EXIT
+            exit "$wrapper_exit"
         }
         stop_claude_child() {
             [ -n "$claude_pid" ] || return 0
-            kill -KILL "$claude_pid" 2>/dev/null || true
+            [ -z "$claude_job_spec" ] || \
+                kill -KILL "$claude_job_spec" 2>/dev/null || true
             wait "$claude_pid" 2>/dev/null || true
             claude_pid=""
+            claude_job_spec=""
         }
         stop_analyzer_wrapper() {
             local signal_exit="$1"
             [ -n "$analyzer_wrapper_signal" ] || \
                 analyzer_wrapper_signal="$signal_exit"
-            if [ "$claude_starting" = true ] || \
-               [ "$timeout_watcher_starting" = true ]; then
+            if [ "$claude_starting" = true ]; then
                 return 0
             fi
-            stop_timeout_watcher
             stop_claude_child
             exit "$analyzer_wrapper_signal"
         }
+        claude_job_is_running() {
+            local running_pid=""
+            # Run jobs in this owning shell. Command/process substitution would
+            # inspect a stale copied job table on Bash 5 after Claude completes.
+            jobs -r -p > "$ANALYZER_TIMEOUT_STATE_DIR/running-jobs" 2>/dev/null || \
+                return 1
+            IFS= read -r running_pid \
+                < "$ANALYZER_TIMEOUT_STATE_DIR/running-jobs" || true
+            [ "$running_pid" = "$claude_pid" ]
+        }
+        trap 'publish_analyzer_completion' EXIT
         trap 'stop_analyzer_wrapper 143' TERM
         trap 'stop_analyzer_wrapper 130' INT
+        trap 'stop_analyzer_wrapper 137' USR1
 
         if [ -n "$ANALYZER_WORKING_DIRECTORY" ]; then
             cd "$ANALYZER_WORKING_DIRECTORY" || exit 1
@@ -3725,61 +3866,97 @@ invoke_claude() {
             "${tool_args[@]+"${tool_args[@]}"}" \
             < "$ANALYZER_PROMPT_FILE" > "$output_file" 2> "$stderr_log" &
         claude_pid=$!
+        claude_job_spec="%+"
         claude_starting=false
         [ -z "$analyzer_wrapper_signal" ] || \
             stop_analyzer_wrapper "$analyzer_wrapper_signal"
 
-        timeout_watcher_starting=true
-        (
-            watcher_sleep_pid=""
-            watcher_sleep_starting=false
-            timeout_sleep_signal=""
-            stop_timeout_sleep() {
-                [ -n "$timeout_sleep_signal" ] || timeout_sleep_signal="$1"
-                [ "$watcher_sleep_starting" != true ] || return 0
-                if [ -n "$watcher_sleep_pid" ]; then
-                    kill "$watcher_sleep_pid" 2>/dev/null || true
-                    wait "$watcher_sleep_pid" 2>/dev/null || true
-                    watcher_sleep_pid=""
-                fi
-                exit 0
-            }
-            trap 'stop_timeout_sleep TERM' TERM
-            trap 'stop_timeout_sleep INT' INT
-            watcher_sleep_starting=true
-            sleep "$timeout_secs" &
-            watcher_sleep_pid=$!
-            watcher_sleep_starting=false
-            [ -z "$timeout_sleep_signal" ] || \
-                stop_timeout_sleep "$timeout_sleep_signal"
-            wait "$watcher_sleep_pid" 2>/dev/null || exit 0
-            watcher_sleep_pid=""
-            kill -KILL "$claude_pid" 2>/dev/null || true
-        ) &
-        timeout_watcher_pid=$!
-        timeout_watcher_starting=false
-        [ -z "$analyzer_wrapper_signal" ] || \
-            stop_analyzer_wrapper "$analyzer_wrapper_signal"
-
+        # Poll Bash's job table rather than a numeric PID. A jobspec is resolved
+        # by the owning shell, so timeout cancellation cannot target a reused PID.
+        analyzer_timeout_attempt=0
+        analyzer_timeout_limit=$((timeout_secs * 20))
+        while claude_job_is_running && \
+              [ "$analyzer_timeout_attempt" -lt "$analyzer_timeout_limit" ]; do
+            sleep 0.05
+            analyzer_timeout_attempt=$((analyzer_timeout_attempt + 1))
+        done
+        analyzer_wrapper_timed_out=false
+        if claude_job_is_running; then
+            analyzer_wrapper_timed_out=true
+            kill -KILL "$claude_job_spec" 2>/dev/null || true
+        fi
         claude_exit=0
         wait "$claude_pid" || claude_exit=$?
         claude_pid=""
-        stop_timeout_watcher
+        claude_job_spec=""
+        [ "$analyzer_wrapper_timed_out" != true ] || claude_exit=137
         exit "$claude_exit"
-    ) 2>/dev/null &
+    ) 4<"$owner_fifo" 2>/dev/null &
     ANALYZER_CHILD_PID=$!
+    rm -f "$owner_fifo"
     ANALYZER_CHILD_STARTING=false
     if [ -n "$ANALYZER_PENDING_SIGNAL" ]; then
         handle_code_access_cleanup_signal "$ANALYZER_PENDING_SIGNAL"
     fi
+
+    # The deadline watcher only publishes private state. It never signals a PID;
+    # the wrapper synchronously polls its Bash-owned Claude job and enforces the
+    # same deadline without a reusable numeric identity.
+    ANALYZER_TIMEOUT_WATCHER_STARTING=true
+    (
+        close_analyzer_owner_fd "$ANALYZER_OWNER_LEASE_FD" || exit 1
+        ANALYZER_OWNER_LEASE_FD=""
+        timeout_attempt=0
+        timeout_limit=$((timeout_secs * 5))
+        while [ "$timeout_attempt" -lt "$timeout_limit" ]; do
+            [ -d "$ANALYZER_TIMEOUT_STATE_DIR" ] || exit 0
+            [ ! -e "$ANALYZER_TIMEOUT_STATE_DIR/release" ] || exit 0
+            sleep 0.2
+            timeout_attempt=$((timeout_attempt + 1))
+        done
+        [ -d "$ANALYZER_TIMEOUT_STATE_DIR" ] || exit 0
+        [ ! -e "$ANALYZER_TIMEOUT_STATE_DIR/release" ] || exit 0
+        : > "$ANALYZER_TIMEOUT_STATE_DIR/deadline"
+        while [ ! -e "$ANALYZER_TIMEOUT_STATE_DIR/release" ]; do
+            [ -d "$ANALYZER_TIMEOUT_STATE_DIR" ] || exit 0
+            sleep 0.05
+        done
+    ) &
+    ANALYZER_TIMEOUT_WATCHER_PID=$!
+    ANALYZER_TIMEOUT_WATCHER_STARTING=false
+    if [ -n "$ANALYZER_PENDING_SIGNAL" ]; then
+        handle_code_access_cleanup_signal "$ANALYZER_PENDING_SIGNAL"
+    fi
+
+    while [ ! -e "$ANALYZER_TIMEOUT_STATE_DIR/complete" ] && \
+          [ ! -e "$ANALYZER_TIMEOUT_STATE_DIR/deadline" ]; do
+        sleep 0.05
+    done
+    terminate_analyzer_timeout_watcher
+    if [ -e "$ANALYZER_TIMEOUT_STATE_DIR/deadline" ] && \
+       [ ! -e "$ANALYZER_TIMEOUT_STATE_DIR/complete" ]; then
+        analyzer_timed_out=true
+        # The wrapper enforces the same deadline through its owned Bash jobspec;
+        # this parent only waits for its completion marker and reports timeout.
+        while [ ! -e "$ANALYZER_TIMEOUT_STATE_DIR/complete" ]; do
+            sleep 0.05
+        done
+    fi
+    release_analyzer_owner_channel || true
     if wait "$ANALYZER_CHILD_PID"; then
         ANALYZER_CHILD_PID=""
         terminate_analyzer_heartbeat
-        echo "✅ ${label} complete ($((SECONDS - start_ts))s)" >&2
+        if [ "$analyzer_timed_out" = true ]; then
+            exit_code=137
+            echo "⏱️  ${label} timed out after ${timeout_secs}s (set CLAUDE_TIMEOUT to increase)" >&2
+        else
+            echo "✅ ${label} complete ($((SECONDS - start_ts))s)" >&2
+        fi
     else
         exit_code=$?
         ANALYZER_CHILD_PID=""
         terminate_analyzer_heartbeat
+        [ "$analyzer_timed_out" != true ] || exit_code=137
         # 124 = timeout with SIGTERM, 137 = timeout with SIGKILL (128 + 9)
         if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
             echo "⏱️  ${label} timed out after ${timeout_secs}s (set CLAUDE_TIMEOUT to increase)" >&2
@@ -3791,6 +3968,9 @@ invoke_claude() {
             echo "   Full log: $stderr_log" >&2
         fi
     fi
+
+    rm -rf "$ANALYZER_TIMEOUT_STATE_DIR"
+    ANALYZER_TIMEOUT_STATE_DIR=""
 
     rm -f "$ANALYZER_PROMPT_FILE"
     ANALYZER_PROMPT_FILE=""
@@ -7511,6 +7691,7 @@ if [ -z "$TEST_CALL_FN" ]; then
     ALLOW_EXTERNAL=false
     INCLUDE_DIFF=false
     RUN_SAST=false
+    NO_CODE_ACCESS_REQUESTED=false
     CUSTOM_PROMPT_FILE=""
     REPO_INFO_FILE="$(mktemp \
         "${TMPDIR:-/tmp}/gh-pr-enrich-prelock-output.XXXXXX")" || exit 1
@@ -7616,13 +7797,16 @@ if [ -z "$TEST_CALL_FN" ]; then
         --no-code-access)
             # For sandboxed or offline runs: the analyzer reasons from the supplied
             # context only and cannot open the repository to verify claims.
+            NO_CODE_ACCESS_REQUESTED=true
             export GH_PR_ENRICH_CODE_ACCESS=false
             shift
             ;;
         --code-access)
             # Analyze the working tree even when it is not the PR's revision.
             # Findings may then cite code this PR does not contain.
-            export GH_PR_ENRICH_CODE_ACCESS=true
+            if [ "$NO_CODE_ACCESS_REQUESTED" != true ]; then
+                export GH_PR_ENRICH_CODE_ACCESS=true
+            fi
             shift
             ;;
         --model)
@@ -9876,8 +10060,8 @@ ANALYSIS_SCHEMA='{
             "items": {
               "type": "object",
               "properties": {
-                "file": { "type": "string" },
-                "line": { "type": "integer" },
+                "file": { "type": "string", "minLength": 1, "pattern": "\\S" },
+                "line": { "type": "integer", "minimum": 1 },
                 "detail": { "type": "string" }
               },
               "required": ["file", "line", "detail"]
@@ -9963,12 +10147,29 @@ ANALYSIS_SCHEMA='{
             "items": { "type": "string", "minLength": 1 }
           },
           "thread_ids": { "type": "array", "items": { "type": "string" } },
-          "file": { "type": "string" },
-          "line": { "type": "integer" },
+          "file": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "line": { "type": "integer", "minimum": 0 },
           "suggested_fix": { "type": "string" },
           "verification": { "type": "string" }
         },
-        "required": ["priority", "task", "finding_ids", "thread_ids", "file", "line", "suggested_fix", "verification"]
+        "required": ["priority", "task", "finding_ids", "thread_ids", "file", "line", "suggested_fix", "verification"],
+        "oneOf": [
+          {
+            "properties": {
+              "file": { "const": "n/a" },
+              "line": { "const": 0 }
+            }
+          },
+          {
+            "properties": {
+              "file": {
+                "type": "string", "minLength": 1, "pattern": "\\S",
+                "not": { "const": "n/a" }
+              },
+              "line": { "type": "integer", "minimum": 1 }
+            }
+          }
+        ]
       }
     },
     "process_improvements": {
@@ -11173,6 +11374,7 @@ _select_analysis_artifact() (
     local source_file="$2"
     local context_file="$3"
     local captured_context_fingerprint="$4"
+    local validation_only="${5:-false}"
     local live_context_file="$report_dir/analysis-context.json"
     local selected_file="$report_dir/analysis.json"
     local guarded_path
@@ -11271,8 +11473,9 @@ _select_analysis_artifact() (
             (.confidence | IN("high", "medium", "low")) and
             (.description | type == "string") and
             (.evidence | type == "array") and (.evidence | length > 0) and
-            (all(.evidence[]; (.file | type == "string") and
-                (.line | (type == "number" and . == floor)) and
+            (all(.evidence[];
+                (.file | type == "string" and test("\\S") and . != "n/a") and
+                (.line | (type == "number" and . == floor and . >= 1)) and
                 (.detail | type == "string"))) and
             (.thread_ids | type == "array") and (all(.thread_ids[]; type == "string")))) and
         (.category_coverage | type == "array") and
@@ -11310,8 +11513,12 @@ _select_analysis_artifact() (
         (.task_list | type == "array") and
         (all(.task_list[];
             (.priority | IN("critical", "high", "medium", "low")) and
-            (.task | type == "string") and (.file | type == "string") and
-            (.line | (type == "number" and . == floor)) and (.suggested_fix | type == "string") and
+            (.task | type == "string") and
+            (.file | type == "string" and test("\\S")) and
+            (.line | (type == "number" and . == floor and . >= 0)) and
+            (((.file == "n/a") and (.line == 0)) or
+             ((.file != "n/a") and (.line >= 1))) and
+            (.suggested_fix | type == "string") and
             (.verification | type == "string"))) and
         (.process_improvements | type == "array") and
         (all(.process_improvements[];
@@ -11435,6 +11642,13 @@ _select_analysis_artifact() (
        [ "$source_repository" != "$context_repository" ]; then
         echo "Error: Selected analysis repository or PR number does not match the fingerprinted context." >&2
         return 1
+    fi
+    if ! validate_analysis_thread_ids "$context_file" "$source_file"; then
+        echo "Error: Selected analysis is missing required findings or provenance: review references are absent from the fingerprinted context." >&2
+        return 1
+    fi
+    if [ "$validation_only" = true ]; then
+        return 0
     fi
     if ! verify_pr_head_unchanged "$context_pr_number" "$context_head" \
             "$context_repository" "$context_base" "$context_base_ref"; then
@@ -11702,6 +11916,14 @@ _select_analysis_artifact() (
     echo "✅ Selected $(jq -r '._metadata.provider' "$selected_file") analysis at $selected_file"
 )
 
+# Validate the immutable local candidate/context contract without performing
+# hosted revalidation or publication. This is test-callable so contract matrices
+# do not pay for a complete selected-analysis transaction on every invalid case.
+validate_analysis_candidate() {
+    [ "$#" -eq 4 ] || return 1
+    _select_analysis_artifact "$1" "$2" "$3" "$4" true
+}
+
 # Render what the analyzer was and was not shown. A bounded input that reads as a
 # complete one is how a review misses things without anyone noticing.
 generate_coverage_section() {
@@ -11881,7 +12103,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged analysis_intent_snapshot_from_files analysis_intent_fingerprint_from_files fetch_live_analysis_intent_fingerprint verify_analysis_intent_unchanged verify_analysis_intent_with_status analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job"
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace validate_analysis_candidate build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged analysis_intent_snapshot_from_files analysis_intent_fingerprint_from_files fetch_live_analysis_intent_fingerprint verify_analysis_intent_unchanged verify_analysis_intent_with_status analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in

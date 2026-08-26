@@ -40,7 +40,9 @@ jobs:
   suite:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # A suite that cannot finish within five minutes must be split or made
+    # cheaper; CI should never normalize multi-minute serial bottlenecks.
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:

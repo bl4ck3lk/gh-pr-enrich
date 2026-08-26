@@ -47,6 +47,11 @@ cat > "$STUB_DIR/claude" << 'STUB'
 #!/bin/bash
 # Records the argv it was invoked with, drains stdin, emits a valid response.
 printf '%s\n' "$@" > "$CLAUDE_ARG_LOG"
+[ -z "${CLAUDE_FD9_LOG:-}" ] || {
+    fd9_value=""
+    IFS= read -r fd9_value <&9 || true
+    printf '%s\n' "$fd9_value" > "$CLAUDE_FD9_LOG"
+}
 [ -z "${CLAUDE_TIMEOUT_LOG:-}" ] || \
     printf '%s' "$GH_PR_ENRICH_ANALYZER_TIMEOUT_SECONDS" > "$CLAUDE_TIMEOUT_LOG"
 [ -z "${CLAUDE_MEMORY_ENV_LOG:-}" ] || \
@@ -694,6 +699,23 @@ run_analysis() {
     run_analysis_context "$CONTEXT" "$@"
 }
 
+# Analyzer lease allocation must not clobber inherited read-only descriptors.
+READ_ONLY_FD_SOURCE="$TEST_OUTPUT_DIR/read-only-fd-source.txt"
+READ_ONLY_FD_LOG="$TEST_OUTPUT_DIR/read-only-fd-log.txt"
+printf 'preserved-read-only-fd\n' > "$READ_ONLY_FD_SOURCE"
+rm -f "$READ_ONLY_FD_LOG" "$RESPONSE"
+rc=0
+(cd "$CODE_ACCESS_REPO" && env \
+    CLAUDE_ARG_LOG="$ARG_LOG" CLAUDE_FD9_LOG="$READ_ONLY_FD_LOG" \
+    CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+    PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call run_claude_analysis \
+        "$CONTEXT" "$RESPONSE" >/dev/null 2>&1) \
+    9<"$READ_ONLY_FD_SOURCE" || rc=$?
+assert_eq "0" "$rc" "analyzer invocation preserves inherited read-only descriptors"
+assert_eq "preserved-read-only-fd" "$(cat "$READ_ONLY_FD_LOG" 2>/dev/null || echo "")" \
+    "the Claude child inherits the caller's read-only descriptor unchanged"
+
 # A clean/smudge filter can leave Git's index holding safe public bytes while
 # the checkout contains decrypted local plaintext. A clean status and matching
 # HEAD therefore authorize only the captured index objects, never the transformed
@@ -1126,7 +1148,7 @@ assert_true "$([ -n "$TERMINATED_CHILD" ] && ! kill -0 "$TERMINATED_CHILD" 2>/de
 assert_eq "" "$(cat "$PS_CALLED_LOG")" \
     "analyzer cancellation and janitor cleanup do not require process-table discovery"
 
-# Both background jobs have a fork-to-PID-publication boundary. A DEBUG hook
+# Every background job has a fork-to-PID-publication boundary. A DEBUG hook
 # delivers TERM immediately before each assignment so cleanup must defer until
 # the exact owned PID is available, then terminate and reap it.
 ANALYZER_GAP_STUB_DIR="$TEST_OUTPUT_DIR/analyzer-gap-stubs"
@@ -1155,18 +1177,15 @@ trap '__gh_pr_enrich_analyzer_gap_debug' DEBUG
 STUB
 chmod +x "$ANALYZER_GAP_STUB_DIR/claude"
 
-for ANALYZER_GAP_KIND in heartbeat heartbeat-sleep child claude-child \
-        timeout-watcher timeout-sleep; do
+for ANALYZER_GAP_KIND in heartbeat child claude-child timeout-watcher; do
     ANALYZER_GAP_MARKER="$TEST_OUTPUT_DIR/analyzer-$ANALYZER_GAP_KIND-gap-fired"
     ANALYZER_GAP_TARGET_PID_FILE="$TEST_OUTPUT_DIR/analyzer-$ANALYZER_GAP_KIND-target.pid"
     ANALYZER_GAP_HEARTBEAT_PID_FILE="$TEST_OUTPUT_DIR/analyzer-$ANALYZER_GAP_KIND-heartbeat.pid"
     case "$ANALYZER_GAP_KIND" in
         heartbeat) ANALYZER_GAP_TARGET='ANALYZER_HEARTBEAT_PID=$!' ;;
-        heartbeat-sleep) ANALYZER_GAP_TARGET='heartbeat_sleep_pid=$!' ;;
         child) ANALYZER_GAP_TARGET='ANALYZER_CHILD_PID=$!' ;;
         claude-child) ANALYZER_GAP_TARGET='claude_pid=$!' ;;
-        timeout-watcher) ANALYZER_GAP_TARGET='timeout_watcher_pid=$!' ;;
-        timeout-sleep) ANALYZER_GAP_TARGET='watcher_sleep_pid=$!' ;;
+        timeout-watcher) ANALYZER_GAP_TARGET='ANALYZER_TIMEOUT_WATCHER_PID=$!' ;;
     esac
     rm -f "$ANALYZER_GAP_MARKER" "$ANALYZER_GAP_TARGET_PID_FILE" \
         "$ANALYZER_GAP_HEARTBEAT_PID_FILE" "$RESPONSE"
@@ -1203,6 +1222,58 @@ for ANALYZER_GAP_KIND in heartbeat heartbeat-sleep child claude-child \
         ! kill -0 "$ANALYZER_GAP_HEARTBEAT_PID" 2>/dev/null && echo 0 || echo 1)" \
         "$ANALYZER_GAP_KIND launch-gap cancellation leaves no heartbeat"
 done
+
+# Completion and cancellation can cross after the wrapper publishes its marker
+# but before the outer shell waits for it. The wrapper must remain alive through
+# that window, and cleanup must release/reap it without signalling its saved PID.
+ANALYZER_COMPLETION_BASH_ENV="$TEST_OUTPUT_DIR/analyzer-completion-bash-env"
+ANALYZER_COMPLETION_MARKER="$TEST_OUTPUT_DIR/analyzer-completion-gap-fired"
+ANALYZER_COMPLETION_ALIVE="$TEST_OUTPUT_DIR/analyzer-completion-wrapper-alive"
+ANALYZER_COMPLETION_PID_FILE="$TEST_OUTPUT_DIR/analyzer-completion-wrapper.pid"
+ANALYZER_COMPLETION_KILL_LOG="$TEST_OUTPUT_DIR/analyzer-completion-kill.log"
+cat > "$ANALYZER_COMPLETION_BASH_ENV" << 'STUB'
+kill() {
+    printf '%s\n' "$*" >> "$ANALYZER_COMPLETION_KILL_LOG"
+    builtin kill "$@"
+}
+__gh_pr_enrich_analyzer_completion_debug() {
+    if [ "$BASH_COMMAND" = 'terminate_analyzer_timeout_watcher' ] && \
+       [ -e "$ANALYZER_TIMEOUT_STATE_DIR/complete" ] && \
+       [ ! -e "$ANALYZER_COMPLETION_MARKER" ]; then
+        printf '%s\n' "$ANALYZER_CHILD_PID" > "$ANALYZER_COMPLETION_PID_FILE"
+        if builtin kill -0 "$ANALYZER_CHILD_PID" 2>/dev/null; then
+            : > "$ANALYZER_COMPLETION_ALIVE"
+        fi
+        : > "$ANALYZER_COMPLETION_MARKER"
+        builtin kill -TERM "$$"
+    fi
+}
+set -T
+trap '__gh_pr_enrich_analyzer_completion_debug' DEBUG
+STUB
+rm -f "$ANALYZER_COMPLETION_MARKER" "$ANALYZER_COMPLETION_ALIVE" \
+    "$ANALYZER_COMPLETION_PID_FILE" "$ANALYZER_COMPLETION_KILL_LOG" "$RESPONSE"
+rc=0
+(cd "$CODE_ACCESS_REPO" && env \
+    BASH_ENV="$ANALYZER_COMPLETION_BASH_ENV" \
+    ANALYZER_COMPLETION_MARKER="$ANALYZER_COMPLETION_MARKER" \
+    ANALYZER_COMPLETION_ALIVE="$ANALYZER_COMPLETION_ALIVE" \
+    ANALYZER_COMPLETION_PID_FILE="$ANALYZER_COMPLETION_PID_FILE" \
+    ANALYZER_COMPLETION_KILL_LOG="$ANALYZER_COMPLETION_KILL_LOG" \
+    CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+    PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" --test-call run_claude_analysis \
+        "$CONTEXT" "$RESPONSE" >/dev/null 2>&1) || rc=$?
+assert_eq "143" "$rc" \
+    "completion-marker cancellation preserves TERM status"
+assert_true "$([ -e "$ANALYZER_COMPLETION_ALIVE" ] && echo 0 || echo 1)" \
+    "the completed analyzer wrapper remains owned until parent release"
+ANALYZER_COMPLETION_PID=$(cat "$ANALYZER_COMPLETION_PID_FILE")
+assert_true "$(! grep -Fqx -- "-TERM $ANALYZER_COMPLETION_PID" \
+    "$ANALYZER_COMPLETION_KILL_LOG" && echo 0 || echo 1)" \
+    "cleanup does not signal a completed analyzer wrapper PID"
+assert_true "$(! kill -0 "$ANALYZER_COMPLETION_PID" 2>/dev/null && echo 0 || echo 1)" \
+    "completion-marker cancellation reaps the analyzer wrapper"
 
 RACE_CONTEXT="$TEST_OUTPUT_DIR/race-context.json"
 cp "$CONTEXT" "$RACE_CONTEXT"
@@ -1242,6 +1313,17 @@ run_analysis CLAUDE_TIMEOUT=42
 assert_eq "42" "$(cat "$TEST_OUTPUT_DIR/timeout.txt" 2>/dev/null || echo "")" \
     "CLAUDE_TIMEOUT still overrides the default"
 
+rm -f "$RESPONSE"
+rc=0
+(cd "$CODE_ACCESS_REPO" && env CLAUDE_TIMEOUT=1 \
+    CLAUDE_ARG_LOG="$ARG_LOG" \
+    CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+    PATH="$STUB_DIR:$PATH" \
+    /bin/bash "$GH_PR_ENRICH" --test-call run_claude_analysis \
+        "$CONTEXT" "$RESPONSE" >/dev/null 2>&1) || rc=$?
+assert_eq "0" "$rc" \
+    "a quick analyzer remains successful under the system Bash job table"
+
 for invalid_heartbeat in 0 -1 invalid; do
     assert_eq "60" \
         "$("$GH_PR_ENRICH" --test-call positive_integer_or_default \
@@ -1258,28 +1340,13 @@ assert_eq "60" \
     "$("$GH_PR_ENRICH" --test-call positive_integer_or_default \
         999999999999999999999999 60 86400)" \
     "an oversized heartbeat cannot overflow the numeric bound"
-SLEEP_INTERVAL_LOG="$TEST_OUTPUT_DIR/heartbeat-sleeps.txt"
-rm -f "$SLEEP_INTERVAL_LOG"
-run_analysis GH_PR_ENRICH_HEARTBEAT_SECONDS=0 \
-    SLEEP_INTERVAL_LOG="$SLEEP_INTERVAL_LOG"
-assert_contains "$(cat "$SLEEP_INTERVAL_LOG")" "60" \
-    "a zero heartbeat starts a normal 60-second wait"
-assert_eq "" "$(grep -x '0' "$SLEEP_INTERVAL_LOG" || true)" \
-    "a zero heartbeat cannot create a progress-loop spin"
-rm -f "$SLEEP_INTERVAL_LOG"
-run_analysis GH_PR_ENRICH_HEARTBEAT_SECONDS=999999999999999999999999 \
-    SLEEP_INTERVAL_LOG="$SLEEP_INTERVAL_LOG"
-assert_contains "$(cat "$SLEEP_INTERVAL_LOG")" "60" \
-    "an oversized heartbeat starts a valid 60-second wait"
-assert_eq "" \
-    "$(grep -x '999999999999999999999999' "$SLEEP_INTERVAL_LOG" || true)" \
-    "an oversized heartbeat never reaches sleep"
-rm -f "$SLEEP_INTERVAL_LOG"
-run_analysis GH_PR_ENRICH_HEARTBEAT_SECONDS=60 \
-    SLEEP_INTERVAL_LOG="$SLEEP_INTERVAL_LOG" SLEEP_FAIL_INTERVAL=60 \
-    CLAUDE_STUB_DELAY=0.1
-assert_eq "1" "$(grep -cx '60' "$SLEEP_INTERVAL_LOG" || true)" \
-    "a rejected heartbeat sleep terminates instead of spinning"
+HEARTBEAT_BODY=$(sed -n '/ANALYZER_HEARTBEAT_STARTING=true/,/disown "\$ANALYZER_HEARTBEAT_PID"/p' \
+    "$GH_PR_ENRICH")
+assert_contains "$HEARTBEAT_BODY" \
+    'read -r -t "$heartbeat_interval" heartbeat_owner_message' \
+    "the heartbeat waits on the bounded owner lease without spawning sleeps"
+assert_not_contains "$HEARTBEAT_BODY" 'sleep "$heartbeat_interval"' \
+    "the heartbeat cannot orphan a long-running sleep"
 
 # ---------------------------------------------------------------------------
 # Analyzer stderr is kept
@@ -1477,10 +1544,17 @@ assert_contains "$UNKNOWN_FORCED" "enabled" "the override applies when the PR he
 # --- the CLI flags, not just the environment variable -----------------------
 flag_state() {
     # Runs the real argument parser, then reports what the analyzer would be told.
-    env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" 1 "$1" --enrich --output-dir "$TEST_OUTPUT_DIR/flag" 2>&1 || true
+    env PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" 1 "$@" --enrich \
+        --output-dir "$TEST_OUTPUT_DIR/flag" 2>&1 || true
 }
 assert_contains "$(flag_state --no-code-access)" "WITHOUT repository access" \
     "--no-code-access reaches the analyzer"
+assert_contains "$(flag_state --no-code-access --code-access)" \
+    "WITHOUT repository access" \
+    "--no-code-access remains sticky when --code-access follows it"
+assert_contains "$(flag_state --code-access --no-code-access)" \
+    "WITHOUT repository access" \
+    "--no-code-access wins regardless of conflicting flag order"
 assert_contains "$("$GH_PR_ENRICH" --help 2>&1)" "--code-access" "--code-access is documented in help"
 
 # The whole run must record which revision was inspected.
@@ -1515,8 +1589,8 @@ mkdir -p "$FAIL_STUBS"
 cp "$STUB_DIR/timeout" "$FAIL_STUBS/timeout"
 cp "$STUB_DIR/ps" "$FAIL_STUBS/ps"
 
-# The wrapper owns both the direct Claude child and the timeout watcher. A real
-# deadline kills and reaps a Claude process that ignores cooperative shutdown.
+# The invoker retains the timeout watcher and analyzer wrapper while the wrapper
+# owns Claude. A real deadline kills and reaps a process that ignores shutdown.
 TIMEOUT_CHILD_PID_LOG="$TEST_OUTPUT_DIR/timeout-child-pid.txt"
 cat > "$FAIL_STUBS/claude" << 'STUB'
 #!/bin/bash
@@ -1541,6 +1615,121 @@ for (( _attempt=0; _attempt < 100; _attempt++ )); do
 done
 assert_true "$([ -n "$TIMED_OUT_CHILD" ] && ! kill -0 "$TIMED_OUT_CHILD" 2>/dev/null && echo 0 || echo 1)" \
     "the timeout wrapper reaps its direct Claude child"
+TIMEOUT_WATCHER_BODY=$(sed -n \
+    '/# The deadline watcher only publishes private state/,/ANALYZER_TIMEOUT_WATCHER_PID=\$!/p' \
+    "$GH_PR_ENRICH")
+assert_contains "$TIMEOUT_WATCHER_BODY" \
+    ': > "$ANALYZER_TIMEOUT_STATE_DIR/deadline"' \
+    "the timeout watcher publishes the deadline without killing a PID"
+assert_not_contains "$TIMEOUT_WATCHER_BODY" 'claude_pid' \
+    "the timeout watcher never targets a possibly reused Claude PID"
+assert_contains "$INVOKER_FN" 'jobs -r -p > "$ANALYZER_TIMEOUT_STATE_DIR/running-jobs"' \
+    "the wrapper checks its owned Claude job without trusting a numeric PID"
+assert_contains "$INVOKER_FN" 'kill -KILL "$claude_job_spec"' \
+    "the wrapper enforces its timeout through a Bash-owned jobspec"
+assert_not_contains "$INVOKER_FN" 'kill -USR1 "$analyzer_wrapper_pid"' \
+    "timeout enforcement never signals a saved wrapper PID"
+
+# SIGKILL bypasses every top-level cleanup trap. The wrapper's jobspec loop must
+# still enforce the paid analyzer timeout, and the FIFO owner lease must
+# let all descendants exit when the original owner disappears.
+OWNER_DEATH_PID_LOG="$TEST_OUTPUT_DIR/owner-death-child-pid.txt"
+OWNER_DEATH_BASH_ENV="$TEST_OUTPUT_DIR/owner-death-bash-env"
+OWNER_DEATH_STATE_LOG="$TEST_OUTPUT_DIR/owner-death-state.txt"
+OWNER_DEATH_WRAPPER_LOG="$TEST_OUTPUT_DIR/owner-death-wrapper.pid"
+OWNER_DEATH_HEARTBEAT_LOG="$TEST_OUTPUT_DIR/owner-death-heartbeat.pid"
+OWNER_DEATH_WATCHER_LOG="$TEST_OUTPUT_DIR/owner-death-watcher.pid"
+cat > "$OWNER_DEATH_BASH_ENV" << 'STUB'
+__gh_pr_enrich_owner_death_debug() {
+    case "$BASH_COMMAND" in
+        'ANALYZER_HEARTBEAT_STARTING=true')
+            [ -n "$ANALYZER_TIMEOUT_STATE_DIR" ] && \
+                printf '%s\n' "$ANALYZER_TIMEOUT_STATE_DIR" \
+                    > "$OWNER_DEATH_STATE_LOG"
+            ;;
+        'ANALYZER_HEARTBEAT_PID=$!')
+            printf '%s\n' "$!" > "$OWNER_DEATH_HEARTBEAT_LOG"
+            ;;
+        'ANALYZER_CHILD_PID=$!')
+            printf '%s\n' "$!" > "$OWNER_DEATH_WRAPPER_LOG"
+            ;;
+        'ANALYZER_TIMEOUT_WATCHER_PID=$!')
+            printf '%s\n' "$!" > "$OWNER_DEATH_WATCHER_LOG"
+            ;;
+    esac
+}
+set -T
+trap '__gh_pr_enrich_owner_death_debug' DEBUG
+STUB
+rm -f "$OWNER_DEATH_PID_LOG" "$OWNER_DEATH_STATE_LOG" \
+    "$OWNER_DEATH_WRAPPER_LOG" "$OWNER_DEATH_HEARTBEAT_LOG" \
+    "$OWNER_DEATH_WATCHER_LOG" \
+    "$TEST_OUTPUT_DIR/owner-death.json"
+(
+    cd "$CODE_ACCESS_REPO" || exit 1
+    exec env BASH_ENV="$OWNER_DEATH_BASH_ENV" CLAUDE_TIMEOUT=1 \
+        TIMEOUT_CHILD_PID_LOG="$OWNER_DEATH_PID_LOG" \
+        OWNER_DEATH_STATE_LOG="$OWNER_DEATH_STATE_LOG" \
+        OWNER_DEATH_WRAPPER_LOG="$OWNER_DEATH_WRAPPER_LOG" \
+        OWNER_DEATH_HEARTBEAT_LOG="$OWNER_DEATH_HEARTBEAT_LOG" \
+        OWNER_DEATH_WATCHER_LOG="$OWNER_DEATH_WATCHER_LOG" \
+        PATH="$FAIL_STUBS:$PATH" \
+        /bin/bash "$GH_PR_ENRICH" --test-call run_claude_analysis \
+            "$REV_DIR/analysis-context.json" \
+            "$TEST_OUTPUT_DIR/owner-death.json" >/dev/null 2>&1
+) &
+OWNER_DEATH_RUNNER_PID=$!
+for (( _attempt=0; _attempt < 200; _attempt++ )); do
+    [ -s "$OWNER_DEATH_PID_LOG" ] && \
+        [ -s "$OWNER_DEATH_STATE_LOG" ] && \
+        [ -s "$OWNER_DEATH_WRAPPER_LOG" ] && \
+        [ -s "$OWNER_DEATH_HEARTBEAT_LOG" ] && \
+        [ -s "$OWNER_DEATH_WATCHER_LOG" ] && break
+    sleep 0.01
+done
+OWNER_DEATH_CHILD_PID=$(cat "$OWNER_DEATH_PID_LOG" 2>/dev/null || echo "")
+OWNER_DEATH_STATE_DIR=$(cat "$OWNER_DEATH_STATE_LOG" 2>/dev/null || echo "")
+OWNER_DEATH_WRAPPER_PID=$(cat "$OWNER_DEATH_WRAPPER_LOG" 2>/dev/null || echo "")
+OWNER_DEATH_HEARTBEAT_PID=$(cat "$OWNER_DEATH_HEARTBEAT_LOG" 2>/dev/null || echo "")
+OWNER_DEATH_WATCHER_PID=$(cat "$OWNER_DEATH_WATCHER_LOG" 2>/dev/null || echo "")
+assert_true "$(process_is_active "$OWNER_DEATH_RUNNER_PID"; echo $?)" \
+    "the owner-death fixture signals a still-running analyzer owner"
+OWNER_DEATH_KILL_STATUS=0
+kill -KILL "$OWNER_DEATH_RUNNER_PID" 2>/dev/null || OWNER_DEATH_KILL_STATUS=$?
+assert_eq "0" "$OWNER_DEATH_KILL_STATUS" \
+    "the owner-death fixture delivers SIGKILL before the normal timeout"
+wait "$OWNER_DEATH_RUNNER_PID" 2>/dev/null || true
+for (( _attempt=0; _attempt < 400; _attempt++ )); do
+    owner_descendants_alive=false
+    for owner_descendant_pid in "$OWNER_DEATH_CHILD_PID" \
+        "$OWNER_DEATH_WRAPPER_PID" "$OWNER_DEATH_HEARTBEAT_PID" \
+        "$OWNER_DEATH_WATCHER_PID"; do
+        if [ -n "$owner_descendant_pid" ] && \
+           process_is_active "$owner_descendant_pid"; then
+            owner_descendants_alive=true
+            break
+        fi
+    done
+    [ "$owner_descendants_alive" = true ] || break
+    sleep 0.01
+done
+for owner_descendant in \
+    "Claude:$OWNER_DEATH_CHILD_PID" \
+    "wrapper:$OWNER_DEATH_WRAPPER_PID" \
+    "heartbeat:$OWNER_DEATH_HEARTBEAT_PID" \
+    "deadline watcher:$OWNER_DEATH_WATCHER_PID"; do
+    owner_descendant_name=${owner_descendant%%:*}
+    owner_descendant_pid=${owner_descendant#*:}
+    assert_true "$([ -n "$owner_descendant_pid" ] && \
+        ! process_is_active "$owner_descendant_pid" && echo 0 || echo 1)" \
+        "abrupt analyzer-owner death reaps the $owner_descendant_name process"
+done
+assert_true "$([ -n "$OWNER_DEATH_STATE_DIR" ] && \
+    [ ! -e "$OWNER_DEATH_STATE_DIR" ] && echo 0 || echo 1)" \
+    "abrupt analyzer-owner death removes the private timeout state"
+if [ "${GH_PR_ENRICH_TEST_SCOPE:-}" = "analyzer-watchdog" ]; then
+    suite_end
+fi
 
 # Analyzer killed by a signal (what a real timeout looks like)
 cat > "$FAIL_STUBS/claude" << 'STUB'

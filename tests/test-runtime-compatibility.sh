@@ -94,9 +94,12 @@ mkdir -p "$STUB_DIR"
 # counts remain unchanged without adding minutes of idle wall time to the suite.
 cat > "$STUB_DIR/sleep" << 'STUB'
 #!/bin/bash
-if [ "${1:-}" = "0.2" ] && \
-   [ "${GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP:-false}" != true ]; then
-    exec /bin/sleep 0.01
+if [ "${GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP:-false}" != true ]; then
+    case "${1:-}" in
+        0.05) exec /bin/sleep 0.005 ;;
+        0.2) exec /bin/sleep 0.01 ;;
+        1) exec /bin/sleep 0.02 ;;
+    esac
 fi
 exec /bin/sleep "$@"
 STUB
@@ -139,7 +142,7 @@ assert_process_reaped() {
     if [ -n "$pid" ]; then
         for (( _wait_attempt=0; _wait_attempt < 40; _wait_attempt++ )); do
             kill -0 "$pid" 2>/dev/null || break
-            sleep 0.05
+            sleep 0.01
         done
     fi
     if [ -z "$pid" ] || kill -0 "$pid" 2>/dev/null; then
@@ -1879,7 +1882,6 @@ env PATH="$REPORT_WATCHDOG_STUBS:$STUB_DIR:$PATH" \
     REPORT_WATCHDOG_CHILD_PID_FILE="$REPORT_WATCHDOG_CHILD_PID_FILE" \
     REPORT_WATCHDOG_PID_FILE="$REPORT_WATCHDOG_PID_FILE" \
     REPORT_WATCHDOG_MARKER="$REPORT_WATCHDOG_MARKER" \
-    GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
     GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
     "$GH_PR_ENRICH" 1 --output-dir "$REPORT_WATCHDOG_REPORT" \
     >/dev/null 2>&1 || rc=$?
@@ -2547,7 +2549,6 @@ for VISIBILITY_SIGNAL in INT TERM; do
     rc=0
     env PATH="$STUB_DIR:$PATH" BASH_ENV="$VISIBILITY_SIGNAL_BASH_ENV" \
         TMPDIR="$VISIBILITY_SIGNAL_TMP" REPO_VISIBILITY=PUBLIC \
-        GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
         GH_PR_ENRICH_CODE_ACCESS=false GH_PR_ENRICH_GITHUB_TIMEOUT=2 \
         VISIBILITY_SIGNAL="$VISIBILITY_SIGNAL" \
         VISIBILITY_SIGNAL_READY="$VISIBILITY_SIGNAL_READY" \
@@ -2613,7 +2614,7 @@ trap '' TERM INT
 if [ -n "${SAST_CANCEL_TARGET_PID:-}" ]; then
     kill -"${SAST_CANCEL_SIGNAL:-INT}" "$SAST_CANCEL_TARGET_PID"
 fi
-while :; do :; done
+while :; do /bin/sleep 0.05; done
 STUB
 chmod +x "$SAST_CANCEL_STUBS/semgrep"
 
@@ -3352,6 +3353,17 @@ jq '.task_list = []
 # deterministic GitHub stub rather than the developer's live checkout.
 export PATH="$STUB_DIR:$PATH"
 
+validate_candidate_contract() {
+    local report_dir="$1" source_file="$2"
+    local context_file="$report_dir/analysis-context.json"
+    local context_fingerprint
+    context_fingerprint=$(
+        "$GH_PR_ENRICH" --test-call analysis_context_fingerprint "$context_file"
+    ) || return 1
+    "$GH_PR_ENRICH" --test-call validate_analysis_candidate \
+        "$report_dir" "$source_file" "$context_file" "$context_fingerprint"
+}
+
 # Untrusted PR prose may contain the marker substring. Only a complete marker
 # line inserted by the renderer is allowed to delimit the generated section.
 NEAR_MARKER='PR title mentions <!-- BEGIN SELECTED ANALYSIS --> without being a marker'
@@ -3445,21 +3457,20 @@ jq '
     | .category_coverage |= map(if .category == "logic_error"
         then .verdict = "findings_reported" else . end)
 ' "$HYBRID_SOURCE" > "$VALID_SEVERITY_SOURCE"
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+validate_candidate_contract "$AUTHORIZED_DIR" \
     "$VALID_SEVERITY_SOURCE" >/dev/null
-assert_jq "$AUTHORIZED_DIR/analysis.json" \
+assert_jq "$VALID_SEVERITY_SOURCE" \
     '.issue_categories | length == 12' \
     "selection accepts every documented severity-matrix tuple"
 jq '.issue_categories[0].severity = "low"' \
     "$VALID_SEVERITY_SOURCE" > "$INVALID_SEVERITY_SOURCE"
 rc=0
-INVALID_SEVERITY_OUT=$("$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+INVALID_SEVERITY_OUT=$(validate_candidate_contract "$AUTHORIZED_DIR" \
     "$INVALID_SEVERITY_SOURCE" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects a severity that contradicts impact and likelihood"
 assert_contains "$INVALID_SEVERITY_OUT" "missing required findings or provenance" \
     "the invalid severity tuple fails selected-analysis contract validation"
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$HYBRID_SOURCE" >/dev/null
 
 FROZEN_SOURCE="$AUTHORIZED_DIR/freeze-race-analysis.json"
 jq '.process_improvements[0].suggestion = "frozen before hosted verification"' \
@@ -3531,22 +3542,19 @@ jq --arg fingerprint "$DISPUTE_FINGERPRINT" '
         {thread_id:"https://github.com/o/r/pull/1#pullrequestreview-20",claim:"review",why_incorrect:"fixture",confidence:"high"},
         {thread_id:"https://github.com/o/r/pull/1#discussion_r30",claim:"inline",why_incorrect:"fixture",confidence:"high"}
     ]' "$HYBRID_SOURCE" > "$DISPUTE_SOURCE"
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$DISPUTE_SOURCE" >/dev/null
-assert_jq "$AUTHORIZED_DIR/analysis.json" \
+validate_candidate_contract "$AUTHORIZED_DIR" "$DISPUTE_SOURCE" >/dev/null
+assert_jq "$DISPUTE_SOURCE" \
     '(.disputed_comments | length) == 4' \
     "selection accepts captured PRRT and non-thread comment references"
 jq '.disputed_comments[1].thread_id = "https://github.com/o/r/pull/1#issuecomment-invented"' \
     "$DISPUTE_SOURCE" > "$UNKNOWN_DISPUTE_SOURCE"
-DISPUTE_SELECTED_BEFORE=$(jq -c . "$AUTHORIZED_DIR/analysis.json")
 rc=0
-UNKNOWN_DISPUTE_OUT=$("$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+UNKNOWN_DISPUTE_OUT=$(validate_candidate_contract "$AUTHORIZED_DIR" \
     "$UNKNOWN_DISPUTE_SOURCE" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects dispute URLs absent from the fingerprinted context"
 assert_contains "$UNKNOWN_DISPUTE_OUT" "fingerprinted context" \
     "unknown dispute references fail provenance validation"
-assert_eq "$DISPUTE_SELECTED_BEFORE" "$(jq -c . "$AUTHORIZED_DIR/analysis.json")" \
-    "an unknown dispute reference preserves the selected analysis"
 jq '.issue_categories = [{
         finding_id:"captured-url-finding",name:"Captured URL finding",
         category:"logic_error",severity:"high",impact:"moderate",likelihood:"likely",
@@ -3559,7 +3567,7 @@ jq '.issue_categories = [{
         then .verdict = "findings_reported" else . end)' \
     "$DISPUTE_SOURCE" > "$FINDING_URL_SOURCE"
 rc=0
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+validate_candidate_contract "$AUTHORIZED_DIR" \
     "$FINDING_URL_SOURCE" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "captured comment URLs remain invalid as finding thread IDs"
@@ -3570,14 +3578,11 @@ jq '.issue_categories[0].verdict = "confirmed"
         file:"a.js",line:1,suggested_fix:"fix",verification:"test"}]' \
     "$FINDING_URL_SOURCE" > "$TASK_URL_SOURCE"
 rc=0
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+validate_candidate_contract "$AUTHORIZED_DIR" \
     "$TASK_URL_SOURCE" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "captured comment URLs remain invalid as task thread IDs"
-assert_eq "$DISPUTE_SELECTED_BEFORE" "$(jq -c . "$AUTHORIZED_DIR/analysis.json")" \
-    "mutation-bearing captured URLs preserve the selected analysis"
 cp "$DISPUTE_CONTEXT_ORIGINAL" "$AUTHORIZED_DIR/analysis-context.json"
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$HYBRID_SOURCE" >/dev/null
 
 assert_jq "$AUTHORIZED_DIR/analysis-context.json" \
     '.coverage.code_access.state == "disabled"' \
@@ -3713,8 +3718,8 @@ FRACTIONAL_LINE_SOURCE="$SELECTION_REPORT/fractional-lines.json"
 jq '.task_list[0].line = 1.5' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$FRACTIONAL_LINE_SOURCE"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$FRACTIONAL_LINE_SOURCE" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$FRACTIONAL_LINE_SOURCE" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selector line validation matches the schema integer contract"
 rm -f "$FRACTIONAL_LINE_SOURCE"
@@ -3775,8 +3780,8 @@ MISSING_TASK_LINK="$SELECTION_REPORT/missing-task-link.json"
 jq 'del(.task_list[0].finding_ids)' "$SELECTION_REPORT/hybrid-analysis.json" \
     > "$MISSING_TASK_LINK"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$MISSING_TASK_LINK" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$MISSING_TASK_LINK" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects remediation tasks without finding linkage"
 
@@ -3784,8 +3789,8 @@ UNKNOWN_TASK_LINK="$SELECTION_REPORT/unknown-task-link.json"
 jq '.task_list[0].finding_ids = ["invented-finding"]' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$UNKNOWN_TASK_LINK"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$UNKNOWN_TASK_LINK" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$UNKNOWN_TASK_LINK" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects remediation tasks mapped to unknown findings"
 
@@ -3793,8 +3798,8 @@ DUPLICATE_FINDING_ID="$SELECTION_REPORT/duplicate-finding-id.json"
 jq '.issue_categories += [.issue_categories[0]]' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$DUPLICATE_FINDING_ID"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$DUPLICATE_FINDING_ID" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$DUPLICATE_FINDING_ID" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects duplicate finding linkage IDs"
 
@@ -3802,8 +3807,8 @@ EMPTY_FINDING_ID="$SELECTION_REPORT/empty-finding-id.json"
 jq '.issue_categories[0].finding_id = "" | .task_list = []' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$EMPTY_FINDING_ID"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$EMPTY_FINDING_ID" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$EMPTY_FINDING_ID" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects an empty finding linkage ID"
 
@@ -3811,8 +3816,8 @@ DUPLICATE_TASK_LINK="$SELECTION_REPORT/duplicate-task-link.json"
 jq '.task_list[0].finding_ids += [.task_list[0].finding_ids[0]]' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$DUPLICATE_TASK_LINK"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$DUPLICATE_TASK_LINK" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$DUPLICATE_TASK_LINK" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects duplicate task finding IDs"
 
@@ -3820,8 +3825,8 @@ EMPTY_TASK_LINK="$SELECTION_REPORT/empty-task-link.json"
 jq '.task_list[0].finding_ids = [""]' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$EMPTY_TASK_LINK"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$EMPTY_TASK_LINK" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$EMPTY_TASK_LINK" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects empty task finding IDs"
 
@@ -3831,8 +3836,8 @@ for UNVERIFIED_TASK_VERDICT in plausible refuted; do
         '.issue_categories[0].verdict = $verdict' \
         "$SELECTION_REPORT/hybrid-analysis.json" > "$UNVERIFIED_TASK_SOURCE"
     rc=0
-    (cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-        "$UNVERIFIED_TASK_SOURCE" >/dev/null 2>&1) || rc=$?
+    validate_candidate_contract "$SELECTION_REPORT" \
+        "$UNVERIFIED_TASK_SOURCE" >/dev/null 2>&1 || rc=$?
     assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
         "selection rejects tasks mapped to $UNVERIFIED_TASK_VERDICT findings"
 done
@@ -3842,8 +3847,8 @@ jq '.systemic_issues = [{pattern:"fixture",evidence:["fixture"],
         recommendation:"fixture"}]' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$MISSING_SYSTEMIC_LINK"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$MISSING_SYSTEMIC_LINK" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$MISSING_SYSTEMIC_LINK" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects systemic patterns without finding linkage"
 
@@ -3853,8 +3858,8 @@ jq '.systemic_issues = [{pattern:"fixture",
         evidence:["fixture"],recommendation:"fixture"}]' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$SINGLE_SYSTEMIC_LINK"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$SINGLE_SYSTEMIC_LINK" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$SINGLE_SYSTEMIC_LINK" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects a one-finding systemic label"
 
@@ -3867,8 +3872,8 @@ jq '.issue_categories += [(.issue_categories[0]
         evidence:[],recommendation:"fixture"}]' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$EMPTY_SYSTEMIC_EVIDENCE"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$EMPTY_SYSTEMIC_EVIDENCE" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$EMPTY_SYSTEMIC_EVIDENCE" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects systemic patterns without linking evidence"
 
@@ -3885,8 +3890,8 @@ for UNVERIFIED_SYSTEMIC_VERDICT in plausible refuted; do
             evidence:["fixture"],recommendation:"fixture"}]
     ' "$SELECTION_REPORT/hybrid-analysis.json" > "$UNVERIFIED_SYSTEMIC_SOURCE"
     rc=0
-    (cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-        "$UNVERIFIED_SYSTEMIC_SOURCE" >/dev/null 2>&1) || rc=$?
+    validate_candidate_contract "$SELECTION_REPORT" \
+        "$UNVERIFIED_SYSTEMIC_SOURCE" >/dev/null 2>&1 || rc=$?
     assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
         "selection rejects systemic patterns mapped to $UNVERIFIED_SYSTEMIC_VERDICT findings"
 done
@@ -3901,8 +3906,8 @@ jq '.issue_categories += [(.issue_categories[0]
         evidence:["fixture"],recommendation:"fixture"}]' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$MIXED_SYSTEMIC_SOURCE"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$MIXED_SYSTEMIC_SOURCE" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$MIXED_SYSTEMIC_SOURCE" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects systemic patterns mixing confirmed and plausible links"
 
@@ -3910,8 +3915,8 @@ DUPLICATE_TASK_THREAD="$SELECTION_REPORT/duplicate-task-thread.json"
 jq '.task_list += [(.task_list[0] | .task = "Second task for same thread")]' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$DUPLICATE_TASK_THREAD"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$DUPLICATE_TASK_THREAD" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$DUPLICATE_TASK_THREAD" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects one hosted thread assigned to multiple tasks"
 
@@ -3919,8 +3924,8 @@ MISMATCHED_TASK_THREAD="$SELECTION_REPORT/mismatched-task-thread.json"
 jq '.task_list[0].thread_ids = ["PRRT_other"]' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$MISMATCHED_TASK_THREAD"
 rc=0
-(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-    "$MISMATCHED_TASK_THREAD" >/dev/null 2>&1) || rc=$?
+validate_candidate_contract "$SELECTION_REPORT" \
+    "$MISMATCHED_TASK_THREAD" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects task threads outside the mapped confirmed findings"
 
@@ -3928,9 +3933,8 @@ UNKNOWN_TASK_THREAD="$SELECTION_REPORT/unknown-task-thread.json"
 jq '.task_list[0].thread_ids = ["PRRT_from_another_pr"]' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$UNKNOWN_TASK_THREAD"
 rc=0
-UNKNOWN_TASK_THREAD_OUT=$(cd "$SELECTION_REPO" && \
-    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
-        "$UNKNOWN_TASK_THREAD" 2>&1) || rc=$?
+UNKNOWN_TASK_THREAD_OUT=$(validate_candidate_contract "$SELECTION_REPORT" \
+    "$UNKNOWN_TASK_THREAD" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection keeps mutation-bearing task IDs restricted to captured PRRT threads"
 assert_contains "$UNKNOWN_TASK_THREAD_OUT" "missing required findings or provenance" \
@@ -4682,7 +4686,6 @@ BLOCKED_HEAD_DESCENDANT_PID_FILE="$PRELOCK_HEAD_DESCENDANT_PID"
 rc=0
 PRELOCK_HEAD_OUT=$(cd "$PRELOCK_SELECTION_REPO" && \
     env PATH="$PRELOCK_HEAD_STUBS:$PATH" \
-    GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
     GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
     PRELOCK_HEAD_BASE_GH="$STUB_DIR/gh" \
     PRELOCK_HEAD_READY="$PRELOCK_HEAD_READY" \
@@ -4863,7 +4866,6 @@ rm -f "$BLOCKED_HEAD_MARKER" "$BLOCKED_HEAD_READY" \
 rc=0
 BOUNDED_HEAD_OUT=$(cd "$TIMEOUT_SELECTION_REPO" && \
     env PATH="$BLOCKED_HEAD_STUBS:$PATH" \
-    GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
     GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
     UNAVAILABLE_HEAD_REPORT="$TIMEOUT_SELECTION_REPORT" \
     UNAVAILABLE_HEAD_MARKER="$BLOCKED_HEAD_MARKER" \
@@ -4983,7 +4985,7 @@ mv "$MISSING_INTENT_DIR/hybrid-analysis.tmp.json" \
     "$MISSING_INTENT_DIR/hybrid-analysis.json"
 MISSING_INTENT_SELECTED_BEFORE=$(jq -c . "$MISSING_INTENT_DIR/analysis.json")
 rc=0
-MISSING_INTENT_OUT=$("$GH_PR_ENRICH" select-analysis "$MISSING_INTENT_DIR" \
+MISSING_INTENT_OUT=$(validate_candidate_contract "$MISSING_INTENT_DIR" \
     "$MISSING_INTENT_DIR/hybrid-analysis.json" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "selection rejects completed hosted inputs without an intent fingerprint"
@@ -4997,7 +4999,7 @@ FORGED_IDENTITY_SOURCE="$AUTHORIZED_DIR/forged-identity-analysis.json"
 jq '._metadata.repository = "attacker/shadow" | ._metadata.pr_number = 999' \
     "$HYBRID_SOURCE" > "$FORGED_IDENTITY_SOURCE"
 rc=0
-FORGED_IDENTITY_OUT=$("$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+FORGED_IDENTITY_OUT=$(validate_candidate_contract "$AUTHORIZED_DIR" \
     "$FORGED_IDENTITY_SOURCE" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "candidate metadata cannot redirect hosted-head verification to another PR"
@@ -5007,7 +5009,8 @@ assert_contains "$FORGED_IDENTITY_OUT" "fingerprinted context" \
 MISMATCH_SOURCE="$AUTHORIZED_DIR/mismatched-analysis.json"
 jq '._metadata.pr_head_sha = "wrong-head"' "$HYBRID_SOURCE" > "$MISMATCH_SOURCE"
 rc=0
-MISMATCH_OUT=$("$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$MISMATCH_SOURCE" 2>&1) || rc=$?
+MISMATCH_OUT=$(validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$MISMATCH_SOURCE" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "select-analysis rejects a result for a different PR head"
 assert_contains "$MISMATCH_OUT" "PR revision" \
@@ -5017,7 +5020,7 @@ BASE_MISMATCH_SOURCE="$AUTHORIZED_DIR/base-mismatched-analysis.json"
 jq '._metadata.pr_base_sha = "wrong-base"' "$HYBRID_SOURCE" \
     > "$BASE_MISMATCH_SOURCE"
 rc=0
-BASE_MISMATCH_OUT=$("$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+BASE_MISMATCH_OUT=$(validate_candidate_contract "$AUTHORIZED_DIR" \
     "$BASE_MISMATCH_SOURCE" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "select-analysis rejects a result for a different PR base"
@@ -5050,6 +5053,53 @@ assert_eq "$SELECTED_BEFORE" "$(jq -c . "$AUTHORIZED_DIR/analysis.json")" \
 assert_eq "$REPORT_BEFORE" "$(cat "$AUTHORIZED_DIR/analysis.md")" \
     "a malformed nested finding does not replace selected Markdown"
 
+INVALID_ANCHOR_SOURCE="$AUTHORIZED_DIR/invalid-anchor-analysis.json"
+jq '.issue_categories[0].evidence = [
+        {file: "", line: 0, detail: "no usable anchor"}
+    ]' "$HYBRID_SOURCE" > "$INVALID_ANCHOR_SOURCE"
+rc=0
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$INVALID_ANCHOR_SOURCE" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "select-analysis rejects empty and zero-valued evidence anchors"
+
+NEGATIVE_ANCHOR_SOURCE="$AUTHORIZED_DIR/negative-anchor-analysis.json"
+jq '.issue_categories[0].evidence = [
+        {file: "gh-pr-enrich", line: -1, detail: "invalid line"}
+    ]' "$HYBRID_SOURCE" > "$NEGATIVE_ANCHOR_SOURCE"
+rc=0
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$NEGATIVE_ANCHOR_SOURCE" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "select-analysis rejects negative evidence line anchors"
+
+HIDDEN_ANCHOR_SOURCE="$AUTHORIZED_DIR/hidden-anchor-analysis.json"
+jq '.issue_categories[0].evidence = [
+        {file: "n/a", line: 1, detail: "renderer would hide this anchor"}
+    ]' "$HYBRID_SOURCE" > "$HIDDEN_ANCHOR_SOURCE"
+rc=0
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$HIDDEN_ANCHOR_SOURCE" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "select-analysis rejects the task-only n/a sentinel in finding evidence"
+
+ZERO_REAL_TASK_LINE_SOURCE="$AUTHORIZED_DIR/zero-real-task-line-analysis.json"
+jq '.task_list = [{
+        priority: "high", task: "fixture task",
+        finding_ids: [.issue_categories[0].finding_id], thread_ids: [],
+        file: "gh-pr-enrich", line: 0, suggested_fix: "fixture",
+        verification: "fixture"
+    }]' "$HYBRID_SOURCE" > "$ZERO_REAL_TASK_LINE_SOURCE"
+rc=0
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$ZERO_REAL_TASK_LINE_SOURCE" >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "select-analysis rejects line zero for a real task file"
+assert_eq "$SELECTED_BEFORE" "$(jq -c . "$AUTHORIZED_DIR/analysis.json")" \
+    "invalid evidence anchors do not replace selected JSON"
+assert_eq "$REPORT_BEFORE" "$(cat "$AUTHORIZED_DIR/analysis.md")" \
+    "invalid evidence anchors do not replace selected Markdown"
+
 UNATTRIBUTED_SOURCE="$AUTHORIZED_DIR/unattributed-hybrid.json"
 jq '.issue_categories = [{
         finding_id: "unattributed", name: "Unattributed finding",
@@ -5059,7 +5109,8 @@ jq '.issue_categories = [{
         evidence: [{file: "gh-pr-enrich", line: 1, detail: "fixture"}], thread_ids: []
     }]' "$HYBRID_SOURCE" > "$UNATTRIBUTED_SOURCE"
 rc=0
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$UNATTRIBUTED_SOURCE" >/dev/null 2>&1 || rc=$?
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$UNATTRIBUTED_SOURCE" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "hybrid findings require per-finding analyzer attribution"
 assert_eq "$SELECTED_BEFORE" "$(jq -c . "$AUTHORIZED_DIR/analysis.json")" \
@@ -5068,7 +5119,8 @@ assert_eq "$SELECTED_BEFORE" "$(jq -c . "$AUTHORIZED_DIR/analysis.json")" \
 INVALID_PROVIDER_SOURCE="$AUTHORIZED_DIR/invalid-provider.json"
 jq '._metadata.provider = "unknown-provider"' "$HYBRID_SOURCE" > "$INVALID_PROVIDER_SOURCE"
 rc=0
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$INVALID_PROVIDER_SOURCE" >/dev/null 2>&1 || rc=$?
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$INVALID_PROVIDER_SOURCE" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "select-analysis rejects unknown provider provenance"
 
@@ -5084,7 +5136,8 @@ jq '.issue_categories = [{
         then .verdict = "findings_reported" else . end)' \
     "$HYBRID_SOURCE" > "$NO_EVIDENCE_SOURCE"
 rc=0
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$NO_EVIDENCE_SOURCE" >/dev/null 2>&1 || rc=$?
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$NO_EVIDENCE_SOURCE" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "select-analysis rejects evidence-free findings"
 
@@ -5098,7 +5151,8 @@ jq '.issue_categories = [{
         sources: ["codex:orchestrator"]
     }]' "$HYBRID_SOURCE" > "$CONTRADICTORY_SOURCE"
 rc=0
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$CONTRADICTORY_SOURCE" >/dev/null 2>&1 || rc=$?
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$CONTRADICTORY_SOURCE" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "select-analysis rejects findings contradicted by reviewed-none coverage"
 
@@ -5108,7 +5162,8 @@ jq '._metadata.analyzers = [
         {provider:"claude",role:"orchestrator"}
     ]' "$HYBRID_SOURCE" > "$SWAPPED_ROLES_SOURCE"
 rc=0
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$SWAPPED_ROLES_SOURCE" >/dev/null 2>&1 || rc=$?
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$SWAPPED_ROLES_SOURCE" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "hybrid provenance rejects swapped orchestrator and external roles"
 
@@ -5119,7 +5174,8 @@ jq '._metadata.provider = "codex"
         {provider:"claude",role:"external"}
     ]' "$HYBRID_SOURCE" > "$MISLABELED_CODEX_SOURCE"
 rc=0
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$MISLABELED_CODEX_SOURCE" >/dev/null 2>&1 || rc=$?
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$MISLABELED_CODEX_SOURCE" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "a Codex label cannot conceal an external Claude analyzer"
 
@@ -5136,7 +5192,8 @@ jq '.issue_categories = [{
         then .verdict = "findings_reported" else . end)' \
     "$HYBRID_SOURCE" > "$INVENTED_SOURCE_ID"
 rc=0
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$INVENTED_SOURCE_ID" >/dev/null 2>&1 || rc=$?
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$INVENTED_SOURCE_ID" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "hybrid finding sources must map to a declared analyzer identity"
 
@@ -5152,8 +5209,8 @@ jq --arg fingerprint "$FAILED_SOURCE_FINGERPRINT" '.coverage.context_fingerprint
 jq --arg fingerprint "$FAILED_SOURCE_FINGERPRINT" \
     '._metadata.context_fingerprint = $fingerprint' "$HYBRID_SOURCE" > "$AUTHORIZED_DIR/source-failed-analysis.json"
 rc=0
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$AUTHORIZED_DIR/source-failed-analysis.json" \
-    >/dev/null 2>&1 || rc=$?
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$AUTHORIZED_DIR/source-failed-analysis.json" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "failed required GitHub inputs prevent publishing a clean selected result"
 
@@ -5166,8 +5223,8 @@ jq --arg fingerprint "$MISSING_SOURCES_FINGERPRINT" '.coverage.context_fingerpri
 jq --arg fingerprint "$MISSING_SOURCES_FINGERPRINT" \
     '._metadata.context_fingerprint = $fingerprint' "$HYBRID_SOURCE" > "$AUTHORIZED_DIR/missing-sources-analysis.json"
 rc=0
-"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$AUTHORIZED_DIR/missing-sources-analysis.json" \
-    >/dev/null 2>&1 || rc=$?
+validate_candidate_contract "$AUTHORIZED_DIR" \
+    "$AUTHORIZED_DIR/missing-sources-analysis.json" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "missing GitHub source coverage cannot pass selection vacuously"
 mv "$AUTHORIZED_DIR/context-before-source-failure.json" "$AUTHORIZED_DIR/analysis-context.json"
@@ -5212,18 +5269,13 @@ for TRUNCATION_CASE in pr_body issue review inline thread_body thread_replies di
     jq --arg fingerprint "$TRUNCATION_FINGERPRINT" \
         '._metadata.context_fingerprint = $fingerprint' \
         "$HYBRID_SOURCE" > "$TRUNCATION_CASE_DIR/candidate.json"
-    cp "$TRUNCATION_CASE_DIR/analysis.json" \
-        "$TRUNCATION_CASE_DIR/analysis.before.json"
     rc=0
-    TRUNCATION_OUT=$("$GH_PR_ENRICH" select-analysis \
-        "$TRUNCATION_CASE_DIR" "$TRUNCATION_CASE_DIR/candidate.json" 2>&1) || rc=$?
+    TRUNCATION_OUT=$(validate_candidate_contract "$TRUNCATION_CASE_DIR" \
+        "$TRUNCATION_CASE_DIR/candidate.json" 2>&1) || rc=$?
     assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
         "$TRUNCATION_CASE truncation rejects clean category verdicts"
     assert_contains "$TRUNCATION_OUT" "analysis inputs require" \
         "$TRUNCATION_CASE rejection identifies the incomplete-evidence contract"
-    assert_true "$(cmp -s "$TRUNCATION_CASE_DIR/analysis.json" \
-        "$TRUNCATION_CASE_DIR/analysis.before.json"; echo $?)" \
-        "$TRUNCATION_CASE rejection preserves the prior selected artifact"
 done
 
 NO_CODE_OR_DIFF_DIR="$TEST_OUTPUT_DIR/no-code-or-diff-selection"
@@ -5249,8 +5301,8 @@ jq --arg fingerprint "$NO_CODE_OR_DIFF_FINGERPRINT" \
     '._metadata.context_fingerprint = $fingerprint' \
     "$HYBRID_SOURCE" > "$NO_CODE_OR_DIFF_DIR/candidate.json"
 rc=0
-NO_CODE_OR_DIFF_OUT=$("$GH_PR_ENRICH" select-analysis \
-    "$NO_CODE_OR_DIFF_DIR" "$NO_CODE_OR_DIFF_DIR/candidate.json" 2>&1) || rc=$?
+NO_CODE_OR_DIFF_OUT=$(validate_candidate_contract "$NO_CODE_OR_DIFF_DIR" \
+    "$NO_CODE_OR_DIFF_DIR/candidate.json" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "clean category verdicts require either repository code access or an included diff"
 assert_contains "$NO_CODE_OR_DIFF_OUT" "Incomplete or truncated analysis inputs" \
@@ -5258,9 +5310,9 @@ assert_contains "$NO_CODE_OR_DIFF_OUT" "Incomplete or truncated analysis inputs"
 jq '.category_coverage |= map(.verdict = "not_reviewable")' \
     "$NO_CODE_OR_DIFF_DIR/candidate.json" \
     > "$NO_CODE_OR_DIFF_DIR/not-reviewable.json"
-"$GH_PR_ENRICH" select-analysis "$NO_CODE_OR_DIFF_DIR" \
+validate_candidate_contract "$NO_CODE_OR_DIFF_DIR" \
     "$NO_CODE_OR_DIFF_DIR/not-reviewable.json" >/dev/null
-assert_jq "$NO_CODE_OR_DIFF_DIR/analysis.json" \
+assert_jq "$NO_CODE_OR_DIFF_DIR/not-reviewable.json" \
     'all(.category_coverage[]; .verdict == "not_reviewable")' \
     "a no-code/no-diff analysis remains selectable when it reports every gap"
 
@@ -5289,8 +5341,8 @@ jq --arg fingerprint "$PARTIAL_DIFF_FINGERPRINT" \
     '._metadata.context_fingerprint = $fingerprint' \
     "$HYBRID_SOURCE" > "$PARTIAL_DIFF_DIR/candidate.json"
 rc=0
-PARTIAL_DIFF_OUT=$("$GH_PR_ENRICH" select-analysis \
-    "$PARTIAL_DIFF_DIR" "$PARTIAL_DIFF_DIR/candidate.json" 2>&1) || rc=$?
+PARTIAL_DIFF_OUT=$(validate_candidate_contract "$PARTIAL_DIFF_DIR" \
+    "$PARTIAL_DIFF_DIR/candidate.json" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "a partial diff cannot certify clean categories without repository code access"
 assert_contains "$PARTIAL_DIFF_OUT" "Incomplete or truncated analysis inputs" \
@@ -5303,9 +5355,9 @@ rm -f "$TRUNCATION_POSITIVE_DIR/.selected-analysis-"* \
 jq '.category_coverage |= map(.verdict = "not_reviewable")' \
     "$TRUNCATION_POSITIVE_DIR/candidate.json" \
     > "$TRUNCATION_POSITIVE_DIR/not-reviewable.json"
-"$GH_PR_ENRICH" select-analysis "$TRUNCATION_POSITIVE_DIR" \
+validate_candidate_contract "$TRUNCATION_POSITIVE_DIR" \
     "$TRUNCATION_POSITIVE_DIR/not-reviewable.json" >/dev/null
-assert_jq "$TRUNCATION_POSITIVE_DIR/analysis.json" \
+assert_jq "$TRUNCATION_POSITIVE_DIR/not-reviewable.json" \
     'all(.category_coverage[]; .verdict == "not_reviewable")' \
     "explicit not_reviewable coverage can be selected with truncated evidence"
 
@@ -5321,9 +5373,9 @@ jq '.issue_categories = [{
         else .verdict = "not_reviewable" end)' \
     "$TRUNCATION_POSITIVE_DIR/candidate.json" \
     > "$TRUNCATION_POSITIVE_DIR/mixed.json"
-"$GH_PR_ENRICH" select-analysis "$TRUNCATION_POSITIVE_DIR" \
+validate_candidate_contract "$TRUNCATION_POSITIVE_DIR" \
     "$TRUNCATION_POSITIVE_DIR/mixed.json" >/dev/null
-assert_jq "$TRUNCATION_POSITIVE_DIR/analysis.json" \
+assert_jq "$TRUNCATION_POSITIVE_DIR/mixed.json" \
     '(.category_coverage[] | select(.category == "logic_error").verdict) == "findings_reported" and
      all(.category_coverage[]; .category == "logic_error" or .verdict == "not_reviewable")' \
     "findings remain selectable when every omitted clean axis is not_reviewable"

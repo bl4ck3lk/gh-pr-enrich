@@ -55,12 +55,39 @@ assert_jq "$SCHEMA_FILE" "$IC.properties.evidence.type == \"array\"" \
     "finding carries an evidence array"
 assert_jq "$SCHEMA_FILE" "$IC.properties.evidence.minItems == 1" \
     "finding evidence requires at least one code anchor"
+assert_jq "$SCHEMA_FILE" \
+    "$IC.properties.evidence.items.properties.file.minLength == 1" \
+    "finding evidence requires a non-empty file anchor"
+assert_jq "$SCHEMA_FILE" \
+    "$IC.properties.evidence.items.properties.file.pattern == \"\\\\S\"" \
+    "finding evidence rejects whitespace-only file anchors"
+assert_jq "$SCHEMA_FILE" \
+    "$IC.properties.evidence.items.properties.line.minimum == 1" \
+    "finding evidence requires a positive line anchor"
 assert_jq "$SCHEMA_FILE" "$IC.required | index(\"verdict\") != null and index(\"confidence\") != null and index(\"evidence\") != null" \
     "verdict, confidence and evidence are required on every finding"
 assert_jq "$SCHEMA_FILE" "$IC.required | index(\"finding_id\") != null" \
     "every finding requires an explicit linkage ID"
 assert_jq "$SCHEMA_FILE" "$IC.properties.finding_id.minLength == 1" \
     "finding linkage IDs cannot be empty"
+assert_jq "$SCHEMA_FILE" \
+    '.properties.task_list.items.properties.file.minLength == 1 and
+     .properties.task_list.items.properties.file.pattern == "\\S" and
+     .properties.task_list.items.properties.line.minimum == 0' \
+    "task anchor schema preserves the documented non-empty file and line-zero exception"
+assert_jq "$SCHEMA_FILE" \
+    '.properties.task_list.items.oneOf[0].properties.file.const == "n/a" and
+     .properties.task_list.items.oneOf[0].properties.line.const == 0 and
+     .properties.task_list.items.oneOf[1].properties.file.not.const == "n/a" and
+     .properties.task_list.items.oneOf[1].properties.line.minimum == 1' \
+    "task schema reserves n/a line zero and requires positive real-file lines"
+SELECTOR_SOURCE=$(sed -n '/^_select_analysis_artifact() (/,/^)/p' "$GH_PR_ENRICH")
+assert_contains "$SELECTOR_SOURCE" \
+    '((.file == "n/a") and (.line == 0))' \
+    "final selection reserves task line zero for the n/a anchor"
+assert_contains "$SELECTOR_SOURCE" \
+    '((.file != "n/a") and (.line >= 1))' \
+    "final selection requires positive lines for real task files"
 assert_jq "$SCHEMA_FILE" '.properties.disputed_comments.type == "array"' \
     "schema has a disputed_comments section"
 assert_jq "$SCHEMA_FILE" '.required | index("disputed_comments") != null' \
