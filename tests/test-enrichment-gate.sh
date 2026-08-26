@@ -47,6 +47,7 @@ case "$1 $2" in
 esac
 if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
     case "$*" in
+        *ExternalDisclosureVisibility*) echo '{"data":{"repository":{"nameWithOwner":"o/r","visibility":"PUBLIC"},"nodes":[]}}' ;;
         *closingIssuesReferences*) echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' ;;
         *) cat "$FIXTURE_DIR/threads.json" ;;
     esac
@@ -235,6 +236,9 @@ case "$1 $2" in
 esac
 if [ "$1 $2" = "api graphql" ]; then
     case "$*" in
+        *ExternalDisclosureVisibility*)
+            echo '{"data":{"repository":{"nameWithOwner":"o/r","visibility":"PUBLIC"},"nodes":[]}}'
+            ;;
         *closingIssuesReferences*)
             echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
             ;;

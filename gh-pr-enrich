@@ -848,6 +848,29 @@ REPORT_RUN_OWNER_PID=""
 REPORT_RUN_WATCHDOG_PID=""
 REPORT_RUN_WATCHDOG_STARTING=false
 REPORT_RUN_WATCHDOG_STATUS=0
+EXTERNAL_VISIBILITY_TEMP_FILE=""
+PARENT_CAPTURE_CONTROL_DIR=""
+
+publish_parent_capture_child() {
+    local control_dir="$1" child_pid="$2" group_owned="$3"
+    [ -n "$control_dir" ] || return 0
+    [ -d "$control_dir" ] && [ ! -L "$control_dir" ] || return 1
+    printf '%s\t%s\n' "$child_pid" "$group_owned" \
+        > "$control_dir/active-child.tmp" || return 1
+    mv "$control_dir/active-child.tmp" "$control_dir/active-child"
+}
+
+clear_parent_capture_child() {
+    local control_dir="${1:-${PARENT_CAPTURE_CONTROL_DIR:-}}"
+    [ -z "$control_dir" ] || rm -f "$control_dir/active-child" \
+        "$control_dir/active-child.tmp"
+}
+
+cleanup_external_visibility_temp() {
+    [ -z "$EXTERNAL_VISIBILITY_TEMP_FILE" ] || \
+        rm -f "$EXTERNAL_VISIBILITY_TEMP_FILE"
+    EXTERNAL_VISIBILITY_TEMP_FILE=""
+}
 
 report_run_is_owner_shell() {
     [ "$REPORT_RUN_STANDALONE" != true ] || return 0
@@ -859,6 +882,7 @@ report_run_is_owner_shell() {
 
 run_report_command() {
     local command_pid command_rc=0 timeout_seconds
+    local parent_capture_control_dir="${PARENT_CAPTURE_CONTROL_DIR:-}"
     local command_group_owned=false
     if ! report_run_is_owner_shell; then
         "$@"
@@ -866,7 +890,7 @@ run_report_command() {
     fi
     REPORT_RUN_CHILD_STARTING=true
     set -m
-    "$@" &
+    PARENT_CAPTURE_CONTROL_DIR="" "$@" &
     command_pid=$!
     if kill -0 -- "-$command_pid" 2>/dev/null; then
         command_group_owned=true
@@ -876,6 +900,11 @@ run_report_command() {
     REPORT_RUN_CHILD_GROUP_OWNED="$command_group_owned"
     REPORT_RUN_CHILD_SUPERVISOR=false
     REPORT_RUN_CHILD_STARTING=false
+    if ! publish_parent_capture_child "$parent_capture_control_dir" \
+            "$command_pid" "$command_group_owned"; then
+        terminate_report_run_child
+        return 125
+    fi
     if [ -n "${selected_writer_signal:-}" ]; then
         terminate_report_run_child
         case "$selected_writer_signal" in
@@ -920,6 +949,7 @@ run_report_command() {
     fi
     wait "$command_pid" || command_rc=$?
     stop_report_run_watchdog
+    clear_parent_capture_child "$parent_capture_control_dir"
     if [ "$REPORT_RUN_WATCHDOG_STATUS" -eq 124 ]; then
         if [ "$REPORT_RUN_CHILD_PID" = "$command_pid" ]; then
             REPORT_RUN_CHILD_PID=""
@@ -993,6 +1023,7 @@ terminate_report_run_child() {
         fi
     fi
     wait "$command_pid" 2>/dev/null || true
+    clear_parent_capture_child
     REPORT_RUN_CHILD_PID=""
     REPORT_RUN_CHILD_GROUP_OWNED=false
     REPORT_RUN_CHILD_SUPERVISOR=false
@@ -1023,6 +1054,169 @@ run_watch_github_command() (
     trap 'handle_report_run_signal TERM 143' TERM
     run_report_command "$@"
 )
+
+# Command substitution hides child ownership in a subshell: a service manager
+# that signals only the advertised CLI PID can then leave the GitHub request
+# running until its timeout. Capture pre-lock and watch commands through a
+# parent-owned process group so INT/TERM always reaches and reaps the active
+# supervisor tree.
+PARENT_CAPTURE_PID=""
+PARENT_CAPTURE_GROUP_OWNED=false
+PARENT_CAPTURE_STARTING=false
+PARENT_CAPTURE_PENDING_SIGNAL=""
+PARENT_CAPTURE_PENDING_STATUS=""
+PARENT_CAPTURE_OUTPUT_FILE=""
+
+cleanup_parent_capture_control() {
+    [ -z "$PARENT_CAPTURE_CONTROL_DIR" ] || {
+        clear_parent_capture_child "$PARENT_CAPTURE_CONTROL_DIR"
+        rmdir "$PARENT_CAPTURE_CONTROL_DIR" 2>/dev/null || true
+    }
+    PARENT_CAPTURE_CONTROL_DIR=""
+}
+
+terminate_parent_capture_active_child() {
+    local child_pid="" group_owned="" attempt=0
+    [ -n "$PARENT_CAPTURE_CONTROL_DIR" ] && \
+        [ -f "$PARENT_CAPTURE_CONTROL_DIR/active-child" ] && \
+        [ ! -L "$PARENT_CAPTURE_CONTROL_DIR/active-child" ] || return 0
+    IFS=$'\t' read -r child_pid group_owned \
+        < "$PARENT_CAPTURE_CONTROL_DIR/active-child" || return 0
+    [[ "$child_pid" =~ ^[1-9][0-9]*$ ]] || return 0
+    case "$group_owned" in true|false) ;; *) return 0 ;; esac
+    if [ "$group_owned" = true ]; then
+        kill -TERM -- "-$child_pid" 2>/dev/null || true
+        while kill -0 -- "-$child_pid" 2>/dev/null && \
+              [ "$attempt" -lt 40 ]; do
+            sleep 0.05
+            attempt=$((attempt + 1))
+        done
+        kill -0 -- "-$child_pid" 2>/dev/null && \
+            kill -KILL -- "-$child_pid" 2>/dev/null || true
+    else
+        kill -TERM "$child_pid" 2>/dev/null || true
+        while kill -0 "$child_pid" 2>/dev/null && \
+              [ "$attempt" -lt 40 ]; do
+            sleep 0.05
+            attempt=$((attempt + 1))
+        done
+        kill -0 "$child_pid" 2>/dev/null && \
+            kill -KILL "$child_pid" 2>/dev/null || true
+    fi
+}
+
+terminate_parent_capture() {
+    local capture_pid="$PARENT_CAPTURE_PID"
+    local attempt=0 fallback_pid=""
+    [ -n "$capture_pid" ] || return 0
+    # The direct request group is published in a private control directory.
+    # Terminate it independently so a stopped or wedged supervisor cannot be
+    # killed together with the request's only watchdog.
+    terminate_parent_capture_active_child
+    if [ "$PARENT_CAPTURE_GROUP_OWNED" = true ]; then
+        kill -TERM -- "-$capture_pid" 2>/dev/null || true
+        kill -CONT -- "-$capture_pid" 2>/dev/null || true
+    else
+        kill -TERM "$capture_pid" 2>/dev/null || true
+        kill -CONT "$capture_pid" 2>/dev/null || true
+    fi
+    # Bound the supervisor wait even if its shell is wedged. The separately
+    # grouped request has already received TERM/KILL through its direct handle.
+    (
+        trap 'exit 0' TERM INT
+        sleep 5
+        if [ "$PARENT_CAPTURE_GROUP_OWNED" = true ]; then
+            kill -KILL -- "-$capture_pid" 2>/dev/null || true
+        else
+            kill -KILL "$capture_pid" 2>/dev/null || true
+        fi
+    ) &
+    fallback_pid=$!
+    wait "$capture_pid" 2>/dev/null || true
+    kill -TERM "$fallback_pid" 2>/dev/null || true
+    wait "$fallback_pid" 2>/dev/null || true
+    if [ "$PARENT_CAPTURE_GROUP_OWNED" = true ]; then
+        while kill -0 -- "-$capture_pid" 2>/dev/null && \
+              [ "$attempt" -lt 40 ]; do
+            sleep 0.05
+            attempt=$((attempt + 1))
+        done
+        if kill -0 -- "-$capture_pid" 2>/dev/null; then
+            kill -KILL -- "-$capture_pid" 2>/dev/null || true
+        fi
+    else
+        if kill -0 "$capture_pid" 2>/dev/null; then
+            kill -KILL "$capture_pid" 2>/dev/null || true
+        fi
+    fi
+    terminate_parent_capture_active_child
+    cleanup_parent_capture_control
+    PARENT_CAPTURE_PID=""
+    PARENT_CAPTURE_GROUP_OWNED=false
+}
+
+handle_parent_capture_signal() {
+    local signal="$1" status="$2"
+    if [ "$PARENT_CAPTURE_STARTING" = true ]; then
+        if [ -z "$PARENT_CAPTURE_PENDING_SIGNAL" ]; then
+            PARENT_CAPTURE_PENDING_SIGNAL="$signal"
+            PARENT_CAPTURE_PENDING_STATUS="$status"
+        fi
+        return 0
+    fi
+    trap '' INT TERM
+    terminate_parent_capture
+    [ -z "$PARENT_CAPTURE_OUTPUT_FILE" ] || \
+        rm -f "$PARENT_CAPTURE_OUTPUT_FILE"
+    exit "$status"
+}
+
+run_parent_managed_capture() {
+    local output_file="$1" capture_rc=0
+    local previous_int_trap previous_term_trap
+    shift
+    previous_int_trap="$(trap -p INT)"
+    previous_term_trap="$(trap -p TERM)"
+    PARENT_CAPTURE_PID=""
+    PARENT_CAPTURE_GROUP_OWNED=false
+    PARENT_CAPTURE_STARTING=true
+    PARENT_CAPTURE_PENDING_SIGNAL=""
+    PARENT_CAPTURE_PENDING_STATUS=""
+    PARENT_CAPTURE_OUTPUT_FILE="$output_file"
+    PARENT_CAPTURE_CONTROL_DIR="$(mktemp -d \
+        "${TMPDIR:-/tmp}/gh-pr-enrich-parent-capture.XXXXXX")" || return 1
+    if ! chmod 700 "$PARENT_CAPTURE_CONTROL_DIR"; then
+        rmdir "$PARENT_CAPTURE_CONTROL_DIR" 2>/dev/null || true
+        PARENT_CAPTURE_CONTROL_DIR=""
+        return 1
+    fi
+    trap 'handle_parent_capture_signal INT 130' INT
+    trap 'handle_parent_capture_signal TERM 143' TERM
+    set -m
+    "$@" > "$output_file" &
+    PARENT_CAPTURE_PID=$!
+    if kill -0 -- "-$PARENT_CAPTURE_PID" 2>/dev/null; then
+        PARENT_CAPTURE_GROUP_OWNED=true
+    fi
+    set +m
+    [ -z "${GH_PR_ENRICH_DEBUG_PARENT_CAPTURE_PID_FILE:-}" ] || \
+        printf '%s\n' "$PARENT_CAPTURE_PID" >> \
+            "$GH_PR_ENRICH_DEBUG_PARENT_CAPTURE_PID_FILE"
+    PARENT_CAPTURE_STARTING=false
+    if [ -n "$PARENT_CAPTURE_PENDING_SIGNAL" ]; then
+        handle_parent_capture_signal "$PARENT_CAPTURE_PENDING_SIGNAL" \
+            "$PARENT_CAPTURE_PENDING_STATUS"
+    fi
+    wait "$PARENT_CAPTURE_PID" || capture_rc=$?
+    PARENT_CAPTURE_PID=""
+    PARENT_CAPTURE_GROUP_OWNED=false
+    PARENT_CAPTURE_OUTPUT_FILE=""
+    cleanup_parent_capture_control
+    trap - INT TERM
+    [ -z "$previous_int_trap" ] || eval "$previous_int_trap"
+    [ -z "$previous_term_trap" ] || eval "$previous_term_trap"
+    return "$capture_rc"
+}
 
 cleanup_report_run_temp_files() {
     local temp_file temp_dir temp_name temp_suffix restore_nullglob=false cleanup_failed=false
@@ -5717,21 +5911,38 @@ if [ "$1" = "watch" ]; then
         esac
     done
 
-    # Validate repository access
-    REPO=$(run_watch_github_command gh repo view \
-        --json nameWithOwner -q .nameWithOwner 2>/dev/null)
+    # Validate repository access. Keep ownership in the advertised watch PID so
+    # targeted cancellation cannot strand the bounded GitHub supervisor.
+    WATCH_CAPTURE_FILE="$(mktemp \
+        "${TMPDIR:-/tmp}/gh-pr-enrich-prelock-output.XXXXXX")" || exit 1
+    if run_parent_managed_capture "$WATCH_CAPTURE_FILE" \
+            run_watch_github_command gh repo view \
+            --json nameWithOwner -q .nameWithOwner 2>/dev/null; then
+        REPO="$(cat "$WATCH_CAPTURE_FILE")"
+    else
+        REPO=""
+    fi
+    rm -f "$WATCH_CAPTURE_FILE"
+    WATCH_CAPTURE_FILE=""
     if [ -z "$REPO" ]; then
         echo "Error: Could not determine repository. Are you in a git repo with a GitHub remote?"
         exit 1
     fi
 
     # Verify PR exists before starting watch loop
-    if ! run_watch_github_command gh pr view "$WATCH_PR" \
-            --json number > /dev/null 2>&1; then
+    WATCH_CAPTURE_FILE="$(mktemp \
+        "${TMPDIR:-/tmp}/gh-pr-enrich-prelock-output.XXXXXX")" || exit 1
+    if ! run_parent_managed_capture "$WATCH_CAPTURE_FILE" \
+            run_watch_github_command gh pr view "$WATCH_PR" \
+            --json number 2>/dev/null; then
+        rm -f "$WATCH_CAPTURE_FILE"
+        WATCH_CAPTURE_FILE=""
         echo "Error: PR #$WATCH_PR not found in $REPO"
         echo "Verify the PR number and that you have access to the repository."
         exit 1
     fi
+    rm -f "$WATCH_CAPTURE_FILE"
+    WATCH_CAPTURE_FILE=""
 
     echo "👀 Watching PR #$WATCH_PR in $REPO"
     echo "   Checking every $WATCH_INTERVAL minute(s)"
@@ -5746,11 +5957,18 @@ if [ "$1" = "watch" ]; then
     # One bounded page is enough only when GitHub confirms it contains every
     # thread and every reply. Incomplete snapshots fail and retry instead of
     # silently advancing the watch baseline.
-    if ! LAST_WATCH_STATE="$(fetch_watch_state "$REPO_OWNER" "$REPO_NAME" \
-            "$WATCH_PR")"; then
+    WATCH_CAPTURE_FILE="$(mktemp \
+        "${TMPDIR:-/tmp}/gh-pr-enrich-prelock-output.XXXXXX")" || exit 1
+    if ! run_parent_managed_capture "$WATCH_CAPTURE_FILE" \
+            fetch_watch_state "$REPO_OWNER" "$REPO_NAME" "$WATCH_PR"; then
+        rm -f "$WATCH_CAPTURE_FILE"
+        WATCH_CAPTURE_FILE=""
         echo "Error: Could not fetch the initial PR comment state." >&2
         exit 1
     fi
+    LAST_WATCH_STATE="$(cat "$WATCH_CAPTURE_FILE")"
+    rm -f "$WATCH_CAPTURE_FILE"
+    WATCH_CAPTURE_FILE=""
     LAST_COUNT="$(jq '
         (.issue_comment_ids | length) + (.review_ids | length)
         + (.inline_comment_ids | length)
@@ -5769,8 +5987,12 @@ if [ "$1" = "watch" ]; then
         TIMESTAMP=$(date '+%H:%M:%S')
 
         # Check for API failures
-        if ! CURRENT_WATCH_STATE="$(fetch_watch_state "$REPO_OWNER" \
-                "$REPO_NAME" "$WATCH_PR")"; then
+        WATCH_CAPTURE_FILE="$(mktemp \
+            "${TMPDIR:-/tmp}/gh-pr-enrich-prelock-output.XXXXXX")" || exit 1
+        if ! run_parent_managed_capture "$WATCH_CAPTURE_FILE" \
+                fetch_watch_state "$REPO_OWNER" "$REPO_NAME" "$WATCH_PR"; then
+            rm -f "$WATCH_CAPTURE_FILE"
+            WATCH_CAPTURE_FILE=""
             CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
             echo "[$TIMESTAMP] ⚠️  API request failed (attempt $CONSECUTIVE_FAILURES/$MAX_FAILURES)"
             if [ "$CONSECUTIVE_FAILURES" -ge "$MAX_FAILURES" ]; then
@@ -5779,6 +6001,9 @@ if [ "$1" = "watch" ]; then
             fi
             continue
         fi
+        CURRENT_WATCH_STATE="$(cat "$WATCH_CAPTURE_FILE")"
+        rm -f "$WATCH_CAPTURE_FILE"
+        WATCH_CAPTURE_FILE=""
         CONSECUTIVE_FAILURES=0
         WATCH_DELTA="$(printf '%s\n%s\n' "$LAST_WATCH_STATE" \
             "$CURRENT_WATCH_STATE" | jq -sec '
@@ -6565,7 +6790,17 @@ if [ -z "$TEST_CALL_FN" ]; then
     INCLUDE_DIFF=false
     RUN_SAST=false
     CUSTOM_PROMPT_FILE=""
-    REPO_INFO=$(gh repo view --json nameWithOwner,visibility 2>/dev/null || echo '{}')
+    REPO_INFO_FILE="$(mktemp \
+        "${TMPDIR:-/tmp}/gh-pr-enrich-prelock-output.XXXXXX")" || exit 1
+    if run_parent_managed_capture "$REPO_INFO_FILE" \
+            run_watch_github_command gh repo view \
+            --json nameWithOwner,visibility 2>/dev/null; then
+        REPO_INFO="$(cat "$REPO_INFO_FILE")"
+    else
+        REPO_INFO='{}'
+    fi
+    rm -f "$REPO_INFO_FILE"
+    REPO_INFO_FILE=""
     REPO=$(printf '%s' "$REPO_INFO" | jq -r '.nameWithOwner // "current-repo"' 2>/dev/null || echo "current-repo")
     REPOSITORY_VISIBILITY=$(printf '%s' "$REPO_INFO" | jq -r '.visibility // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
     REPOSITORY_VISIBILITY=$(printf '%s' "$REPOSITORY_VISIBILITY" | tr '[:lower:]' '[:upper:]')
@@ -8075,6 +8310,7 @@ build_analysis_context() (
                          then "\n" + trunc(.messageBody) else "" end))
                 }],
                 linked_issues: [($linked // [])[] | {
+                    id: .id,
                     number: .number,
                     title: .title,
                     url: .url,
@@ -9068,6 +9304,150 @@ resolve_code_access() {
 CLAUDE_CAPTURED_PR_HEAD=""
 CLAUDE_CAPTURED_CONTEXT_FINGERPRINT=""
 CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT=""
+CLAUDE_DISCLOSURE_GATE_FAILED=false
+
+# Re-query every public repository whose content is about to cross the external
+# provider boundary without an explicit disclosure override. Linked issues are
+# resolved by immutable node ID so a transfer to another repository cannot
+# preserve a stale PUBLIC authorization from the original source name.
+verify_external_disclosure_sources() {
+    local primary_visibility="$1"
+    local allow_external="$2"
+    local context_payload linked_issue_ids expected_linked_issues
+    local primary_repository primary_owner primary_name
+    local live_repository live_visibility linked_issue_id
+    local visibility_query
+    local -a linked_issue_args=()
+
+    # PRIVATE, INTERNAL, and indeterminate sources are allowed only through the
+    # user's explicit override. That authorization does not depend on a cached
+    # visibility value, so no live visibility lookup is required in this path.
+    [ "$allow_external" != true ] || return 0
+
+    if ! context_payload="$(cat)"; then
+        echo "Error: External repository visibility sources could not be frozen; Claude enrichment is blocked." >&2
+        return 1
+    fi
+
+    primary_visibility="$(printf '%s' "$primary_visibility" | \
+        tr '[:lower:]' '[:upper:]')"
+    if [ "$primary_visibility" != "PUBLIC" ] || ! printf '%s' "$context_payload" | jq -e '
+        (.pr.repository | type) == "string" and
+        (.pr.repository | test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+        ((.pr.linked_issues // []) | type) == "array" and
+        all((.pr.linked_issues // [])[];
+          ((.id | type) == "string") and (.id | length) > 0 and
+          ((.repository.name_with_owner | type) == "string") and
+          (.repository.name_with_owner |
+            test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+          (((.repository.visibility // "UNKNOWN") | ascii_upcase) == "PUBLIC")) and
+        ([((.pr.linked_issues // [])[].id)] | unique | length) ==
+          ((.pr.linked_issues // []) | length)
+    ' > /dev/null 2>&1; then
+        echo "Error: External repository visibility sources are incomplete or inconsistent; Claude enrichment is blocked." >&2
+        return 1
+    fi
+    primary_repository="$(printf '%s' "$context_payload" | jq -r '.pr.repository')"
+    primary_owner="${primary_repository%%/*}"
+    primary_name="${primary_repository#*/}"
+
+    cleanup_external_visibility_temp
+    EXTERNAL_VISIBILITY_TEMP_FILE="$(mktemp \
+        "${TMPDIR:-/tmp}/gh-pr-enrich-external-visibility.XXXXXX")" || return 1
+    if ! chmod 600 "$EXTERNAL_VISIBILITY_TEMP_FILE"; then
+        cleanup_external_visibility_temp
+        return 1
+    fi
+
+    if ! linked_issue_ids="$(printf '%s' "$context_payload" | \
+            jq -r '(.pr.linked_issues // [])[].id')" || \
+       ! expected_linked_issues="$(printf '%s' "$context_payload" | jq -c '
+            (.pr.linked_issues // []) | map({
+              id: .id,
+              repository: .repository.name_with_owner,
+              visibility: ((.repository.visibility // "UNKNOWN") | ascii_upcase)
+            }) | sort_by(.id)
+        ')"; then
+        cleanup_external_visibility_temp
+        echo "Error: External linked issue visibility sources could not be frozen; Claude enrichment is blocked." >&2
+        return 1
+    fi
+    while IFS= read -r linked_issue_id; do
+        [ -n "$linked_issue_id" ] || continue
+        linked_issue_args+=("-F" "ids[]=$linked_issue_id")
+    done <<< "$linked_issue_ids"
+
+    if [ "${#linked_issue_args[@]}" -gt 0 ]; then
+        visibility_query='query ExternalDisclosureVisibility(
+          $owner: String!, $name: String!, $ids: [ID!]!
+        ) {
+          repository(owner: $owner, name: $name) { nameWithOwner visibility }
+          nodes(ids: $ids) {
+            id
+            ... on Issue { repository { nameWithOwner visibility } }
+          }
+        }'
+    else
+        # `gh api graphql` supplies an omitted list variable as null instead of
+        # applying a GraphQL default. Use a literal empty list so the live
+        # attestation succeeds for the common no-linked-issues case.
+        visibility_query='query ExternalDisclosureVisibility(
+          $owner: String!, $name: String!
+        ) {
+          repository(owner: $owner, name: $name) { nameWithOwner visibility }
+          nodes(ids: []) {
+            id
+            ... on Issue { repository { nameWithOwner visibility } }
+          }
+        }'
+    fi
+    : > "$EXTERNAL_VISIBILITY_TEMP_FILE"
+    if ! run_report_command gh api graphql \
+            -F owner="$primary_owner" -F name="$primary_name" \
+            "${linked_issue_args[@]}" -f query="$visibility_query" \
+            > "$EXTERNAL_VISIBILITY_TEMP_FILE" 2>/dev/null || \
+       ! jq -e '
+            ((.errors // []) | length) == 0 and
+            (.data.repository | type) == "object" and
+            ((.data.nodes // null) | type) == "array"
+        ' "$EXTERNAL_VISIBILITY_TEMP_FILE" > /dev/null 2>&1; then
+        cleanup_external_visibility_temp
+        echo "Error: Current external repository visibility could not be verified; Claude enrichment is blocked." >&2
+        return 1
+    fi
+
+    live_repository="$(jq -r '.data.repository.nameWithOwner // ""' \
+        "$EXTERNAL_VISIBILITY_TEMP_FILE" 2>/dev/null || echo "")"
+    live_visibility="$(jq -r \
+        '(.data.repository.visibility // "UNKNOWN") | ascii_upcase' \
+        "$EXTERNAL_VISIBILITY_TEMP_FILE" 2>/dev/null || echo "UNKNOWN")"
+    if [ "$live_repository" != "$primary_repository" ] || \
+       [ "$live_visibility" != "PUBLIC" ]; then
+        cleanup_external_visibility_temp
+        echo "Error: Repository visibility for $primary_repository changed from PUBLIC to $live_visibility; Claude enrichment is blocked." >&2
+        echo "Re-run with --allow-external only after the user explicitly authorizes disclosure." >&2
+        return 1
+    fi
+
+    if [ "${#linked_issue_args[@]}" -gt 0 ] && \
+       ! printf '%s' "$expected_linked_issues" | \
+         jq -e --slurpfile live "$EXTERNAL_VISIBILITY_TEMP_FILE" '
+            . as $expected
+            | ($live[0].data.nodes // []) as $nodes
+            | ($expected == ($nodes | map({
+                id: (.id // ""),
+                repository: (.repository.nameWithOwner // ""),
+                visibility: ((.repository.visibility // "UNKNOWN") | ascii_upcase)
+              }) | sort_by(.id)))
+        ' > /dev/null 2>&1; then
+        cleanup_external_visibility_temp
+        echo "Error: Current linked issue repository visibility or identity could not be verified; Claude enrichment is blocked." >&2
+        return 1
+    fi
+
+    cleanup_external_visibility_temp
+}
+
 run_claude_analysis() {
     local context_file="$1"
     local output_file="$2"
@@ -9076,6 +9456,7 @@ run_claude_analysis() {
     CLAUDE_CAPTURED_PR_HEAD=""
     CLAUDE_CAPTURED_CONTEXT_FINGERPRINT=""
     CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT=""
+    CLAUDE_DISCLOSURE_GATE_FAILED=false
     ANALYZER_WORKING_DIRECTORY=""
     ANALYZER_SETTINGS_FILE=""
     cleanup_code_access_snapshot
@@ -9210,6 +9591,16 @@ $context_payload"
         fi
         ANALYZER_WORKING_DIRECTORY="$CODE_ACCESS_SNAPSHOT_DIR"
         ANALYZER_SETTINGS_FILE="$CODE_ACCESS_SETTINGS_FILE"
+    fi
+
+    if ! verify_external_disclosure_sources \
+            "${REPOSITORY_VISIBILITY:-UNKNOWN}" \
+            "${ALLOW_EXTERNAL:-false}" <<< "$context_payload"; then
+        cleanup_code_access_snapshot
+        # Distinguish a disclosure-authorization failure from an ordinary
+        # provider failure: callers must not report a successful unenriched run.
+        CLAUDE_DISCLOSURE_GATE_FAILED=true
+        return 1
     fi
 
     local invoke_rc=0
@@ -10094,6 +10485,7 @@ RUN_LOCK_ACQUIRING=false
 RUN_LOCK_PENDING_SIGNAL=""
 RUN_LOCK_PENDING_EXIT_CODE=""
 cleanup_report_run_lock() {
+    cleanup_external_visibility_temp
     if ! cleanup_pr_summary_connection_temps; then
         echo "Error: PR-summary connection staging remains after cleanup." >&2
         return 1
@@ -10875,6 +11267,11 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                 fi
             fi
         else
+            CLAUDE_ANALYSIS_RC=$?
+            if [ "${CLAUDE_DISCLOSURE_GATE_FAILED:-false}" = true ]; then
+                echo "Error: External disclosure authorization could not be revalidated; enrichment was aborted." >&2
+                exit 1
+            fi
             echo "⚠️  Claude analysis failed. Continuing without enrichment."
         fi
     else

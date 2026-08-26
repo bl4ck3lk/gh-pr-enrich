@@ -156,6 +156,9 @@ JSON
 esac
 if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
     case "$*" in
+        *ExternalDisclosureVisibility*)
+            echo '{"data":{"repository":{"nameWithOwner":"o/r","visibility":"PUBLIC"},"nodes":[]}}'
+            ;;
         *closingIssuesReferences*)
             echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
             ;;
@@ -417,6 +420,37 @@ for INVALID_SNAPSHOT_TTL in nope 999999999999999999999999999999; do
 done
 rm -f "$NATIVE_REPORT/analysis-context.json"
 rmdir "$NATIVE_REPORT"
+
+# The shipped test dispatcher is part of the executable surface. Directly
+# invoking the external analyzer must therefore enforce the same disclosure
+# gate as the normal --enrich flow instead of depending on CLI mode state.
+PRIVATE_DIRECT_CONTEXT="$TEST_OUTPUT_DIR/private-direct-context.json"
+PRIVATE_DIRECT_CLAUDE_LOG="$TEST_OUTPUT_DIR/private-direct-claude.txt"
+jq '.pr.repository = "o/r" | del(.coverage.context_fingerprint)' \
+    "$CONTEXT" > "$PRIVATE_DIRECT_CONTEXT.tmp"
+PRIVATE_DIRECT_FINGERPRINT=$("$GH_PR_ENRICH" --test-call \
+    analysis_context_fingerprint "$PRIVATE_DIRECT_CONTEXT.tmp")
+jq --arg fingerprint "$PRIVATE_DIRECT_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$PRIVATE_DIRECT_CONTEXT.tmp" > "$PRIVATE_DIRECT_CONTEXT"
+rm "$PRIVATE_DIRECT_CONTEXT.tmp"
+rc=0
+PRIVATE_DIRECT_OUT=$(cd "$CODE_ACCESS_REPO" && env \
+    REPOSITORY_VISIBILITY=PRIVATE ALLOW_EXTERNAL=false \
+    CLAUDE_INVOKED_LOG="$PRIVATE_DIRECT_CLAUDE_LOG" \
+    PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call \
+    run_claude_analysis "$PRIVATE_DIRECT_CONTEXT" "$RESPONSE" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "direct analyzer dispatch enforces the external disclosure gate"
+assert_true "$([ ! -s "$PRIVATE_DIRECT_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "direct analyzer dispatch cannot disclose a private context implicitly"
+assert_contains "$PRIVATE_DIRECT_OUT" \
+    "External repository visibility sources are incomplete or inconsistent" \
+    "direct analyzer disclosure denial is explicit"
+
+# Remaining direct analyzer tests intentionally authorize their synthetic
+# fixture payloads. End-to-end CLI tests still initialize their own flag state.
+export ALLOW_EXTERNAL=true
 
 run_analysis_context() {
     local context_file="$1"

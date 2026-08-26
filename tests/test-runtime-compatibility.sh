@@ -20,6 +20,8 @@ LINKED_CONCURRENT_RELEASE=""
 CHILD_START_PID_FILE=""
 REPORT_WATCHDOG_CHILD_PID_FILE=""
 REPORT_WATCHDOG_PID_FILE=""
+VISIBILITY_SIGNAL_CHILD_PID_FILE=""
+VISIBILITY_SIGNAL_WATCHDOG_PID_FILE=""
 BLOCKED_HEAD_CHILD_PID_FILE=""
 BLOCKED_HEAD_DESCENDANT_PID_FILE=""
 PROVIDER_SIGNAL_CHILD_PID_FILE=""
@@ -57,7 +59,9 @@ cleanup() {
         fi
     fi
     for cleanup_pid_file in "$REPORT_WATCHDOG_CHILD_PID_FILE" \
-            "$REPORT_WATCHDOG_PID_FILE"; do
+            "$REPORT_WATCHDOG_PID_FILE" \
+            "$VISIBILITY_SIGNAL_CHILD_PID_FILE" \
+            "$VISIBILITY_SIGNAL_WATCHDOG_PID_FILE"; do
         [ -n "$cleanup_pid_file" ] && [ -f "$cleanup_pid_file" ] || continue
         cleanup_child_pid=$(cat "$cleanup_pid_file" 2>/dev/null || echo "")
         if [ -n "$cleanup_child_pid" ] && \
@@ -1233,10 +1237,40 @@ cat > "$STUB_DIR/gh" << 'STUB'
 #!/bin/bash
 case "$1 $2" in
     "repo view")
+        if [ -n "${PARENT_CAPTURE_SIGNAL_READY:-}" ]; then
+            printf '%s\n' "$$" > "$PARENT_CAPTURE_SIGNAL_CHILD_PID_FILE"
+            : > "$PARENT_CAPTURE_SIGNAL_READY"
+            trap '' TERM INT
+            while true; do sleep 0.05; done
+        fi
+        explicit_repository=false
+        source_repository="o/r"
+        case "${3:-}" in
+            ""|--*) ;;
+            *) explicit_repository=true; source_repository="$3" ;;
+        esac
+        if [ "$explicit_repository" = true ]; then
+            [ -z "${VISIBILITY_QUERY_LOG:-}" ] || \
+                printf '%s\n' "$source_repository" >> "$VISIBILITY_QUERY_LOG"
+            [ "${LIVE_VISIBILITY_QUERY_FAIL_REPO:-}" != "$source_repository" ] || \
+                exit 1
+        fi
+        case "$source_repository" in
+            o/r)
+                source_visibility="${REPO_VISIBILITY:-PUBLIC}"
+                [ "$explicit_repository" != true ] || \
+                    source_visibility="${LIVE_REPO_VISIBILITY:-$source_visibility}"
+                ;;
+            intent/issues)
+                source_visibility="${LIVE_LINKED_ISSUE_VISIBILITY:-${LINKED_ISSUE_VISIBILITY:-PUBLIC}}"
+                ;;
+            *) source_visibility="UNKNOWN" ;;
+        esac
         case "$*" in
-            *nameWithOwner,visibility*) printf '{"nameWithOwner":"o/r","visibility":"%s"}\n' "${REPO_VISIBILITY:-PUBLIC}" ;;
-            *visibility*) echo "${REPO_VISIBILITY:-PUBLIC}" ;;
-            *) echo "o/r" ;;
+            *nameWithOwner,visibility*) printf '{"nameWithOwner":"%s","visibility":"%s"}\n' \
+                "$source_repository" "$source_visibility" ;;
+            *visibility*) echo "$source_visibility" ;;
+            *) echo "$source_repository" ;;
         esac
         exit 0
         ;;
@@ -1266,8 +1300,41 @@ JSON
         exit 0
         ;;
 esac
+if [ "$1" = "api" ] && [ -n "${PARENT_CAPTURE_STATE_SIGNAL_READY:-}" ]; then
+    printf '%s\n' "$$" > "$PARENT_CAPTURE_STATE_SIGNAL_CHILD_PID_FILE"
+    : > "$PARENT_CAPTURE_STATE_SIGNAL_READY"
+    trap '' TERM INT
+    while true; do sleep 0.05; done
+fi
 if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
     case "$*" in
+        *ExternalDisclosureVisibility*)
+            [ -z "${VISIBILITY_QUERY_ARGS_LOG:-}" ] || \
+                printf '%s\n' "$*" > "$VISIBILITY_QUERY_ARGS_LOG"
+            if [ -n "${VISIBILITY_SIGNAL_READY:-}" ]; then
+                printf '%s\n' "$$" > "$VISIBILITY_SIGNAL_CHILD_PID_FILE"
+                : > "$VISIBILITY_SIGNAL_READY"
+                trap '' TERM INT
+                /bin/sleep 0.2
+                kill -"$VISIBILITY_SIGNAL" "$PPID"
+                while true; do sleep 0.05; done
+            fi
+            [ "${LIVE_VISIBILITY_QUERY_FAIL_REPO:-}" != "o/r" ] || exit 1
+            [ "${LIVE_VISIBILITY_QUERY_FAIL_REPO:-}" != "intent/issues" ] || exit 1
+            [ -z "${VISIBILITY_QUERY_LOG:-}" ] || printf 'o/r\n' >> "$VISIBILITY_QUERY_LOG"
+            if [ -n "${LINKED_ISSUE_VISIBILITY:-}" ]; then
+                live_linked_repository="${LIVE_LINKED_ISSUE_REPOSITORY:-intent/issues}"
+                live_linked_visibility="${LIVE_LINKED_ISSUE_VISIBILITY:-$LINKED_ISSUE_VISIBILITY}"
+                [ -z "${VISIBILITY_QUERY_LOG:-}" ] || \
+                    printf '%s\n' "$live_linked_repository" >> "$VISIBILITY_QUERY_LOG"
+                printf '{"data":{"repository":{"nameWithOwner":"o/r","visibility":"%s"},"nodes":[{"id":"ISSUE_linked","repository":{"nameWithOwner":"%s","visibility":"%s"}}]}}\n' \
+                    "${LIVE_REPO_VISIBILITY:-${REPO_VISIBILITY:-PUBLIC}}" \
+                    "$live_linked_repository" "$live_linked_visibility"
+            else
+                printf '{"data":{"repository":{"nameWithOwner":"o/r","visibility":"%s"},"nodes":[]}}\n' \
+                    "${LIVE_REPO_VISIBILITY:-${REPO_VISIBILITY:-PUBLIC}}"
+            fi
+            ;;
         *closingIssuesReferences*)
             if [ -n "${LINKED_ISSUE_VISIBILITY:-}" ]; then
                 printf '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"ISSUE_linked","number":42,"title":"linked intent","body":"linked repository secret","url":"https://github.com/intent/issues/42","repository":{"nameWithOwner":"intent/issues","visibility":"%s"}}]}}}}}\n' \
@@ -1289,6 +1356,7 @@ cat > "$STUB_DIR/claude" << 'STUB'
 #!/bin/bash
 echo invoked >> "$CLAUDE_INVOKED_LOG"
 cat > /dev/null
+[ -z "${CLAUDE_STUB_EXIT_CODE:-}" ] || exit "$CLAUDE_STUB_EXIT_CODE"
 jq -nc '
   ["logic_error","boundary_condition","concurrency","error_handling","resource_lifecycle","security","secrets_exposure","data_integrity","api_contract","performance","test_gap","observability","maintainability","documentation","build_ci","dependency_risk"] as $categories
   | {structured_output:{issue_categories:[],
@@ -1315,6 +1383,153 @@ cat << 'JSON'
 JSON
 STUB
 chmod +x "$STUB_DIR/semgrep"
+
+# Startup and watch-mode repository discovery happen before a report lease
+# exists. A signal sent only to the advertised CLI PID must still terminate the
+# parent-owned capture supervisor and its TERM-ignoring GitHub request.
+for PARENT_CAPTURE_MODE in main watch; do
+    case "$PARENT_CAPTURE_MODE" in
+        main)
+            PARENT_CAPTURE_SIGNAL=TERM
+            PARENT_CAPTURE_EXPECTED_RC=143
+            PARENT_CAPTURE_ARGS=(1 --output-dir \
+                "$TEST_OUTPUT_DIR/parent-capture-main-report")
+            ;;
+        watch)
+            PARENT_CAPTURE_SIGNAL=TERM
+            PARENT_CAPTURE_EXPECTED_RC=143
+            PARENT_CAPTURE_ARGS=(watch 1 --interval 1)
+            ;;
+    esac
+    PARENT_CAPTURE_CASE_DIR="$TEST_OUTPUT_DIR/parent-capture-$PARENT_CAPTURE_MODE"
+    PARENT_CAPTURE_READY="$PARENT_CAPTURE_CASE_DIR/ready"
+    PARENT_CAPTURE_CHILD_PID_FILE="$PARENT_CAPTURE_CASE_DIR/child-pid"
+    PARENT_CAPTURE_SUPERVISOR_PID_FILE="$PARENT_CAPTURE_CASE_DIR/supervisor-pid"
+    PARENT_CAPTURE_OUT="$PARENT_CAPTURE_CASE_DIR/output.txt"
+    PARENT_CAPTURE_TMP="$PARENT_CAPTURE_CASE_DIR/tmp"
+    mkdir -p "$PARENT_CAPTURE_TMP"
+    env PATH="$STUB_DIR:$PATH" TMPDIR="$PARENT_CAPTURE_TMP" \
+        GH_PR_ENRICH_GITHUB_TIMEOUT=20 \
+        GH_PR_ENRICH_DEBUG_PARENT_CAPTURE_PID_FILE="$PARENT_CAPTURE_SUPERVISOR_PID_FILE" \
+        PARENT_CAPTURE_SIGNAL_READY="$PARENT_CAPTURE_READY" \
+        PARENT_CAPTURE_SIGNAL_CHILD_PID_FILE="$PARENT_CAPTURE_CHILD_PID_FILE" \
+        "$GH_PR_ENRICH" "${PARENT_CAPTURE_ARGS[@]}" \
+        > "$PARENT_CAPTURE_OUT" 2>&1 &
+    PARENT_CAPTURE_CLI_PID=$!
+    for (( _capture_wait=0; _capture_wait < 100; _capture_wait++ )); do
+        [ ! -e "$PARENT_CAPTURE_READY" ] || break
+        sleep 0.05
+    done
+    kill -"$PARENT_CAPTURE_SIGNAL" "$PARENT_CAPTURE_CLI_PID" 2>/dev/null || true
+    rc=0
+    wait "$PARENT_CAPTURE_CLI_PID" || rc=$?
+    assert_true "$([ -e "$PARENT_CAPTURE_READY" ] && echo 0 || echo 1)" \
+        "$PARENT_CAPTURE_MODE startup cancellation fixture reaches repository discovery"
+    assert_eq "$PARENT_CAPTURE_EXPECTED_RC" "$rc" \
+        "$PARENT_CAPTURE_SIGNAL sent to the $PARENT_CAPTURE_MODE CLI PID preserves conventional status"
+    PARENT_CAPTURE_CHILD_PID=$(cat \
+        "$PARENT_CAPTURE_CHILD_PID_FILE" 2>/dev/null || echo "")
+    PARENT_CAPTURE_SUPERVISOR_PID=$(tail -1 \
+        "$PARENT_CAPTURE_SUPERVISOR_PID_FILE" 2>/dev/null || echo "")
+    assert_process_reaped "$PARENT_CAPTURE_CHILD_PID" \
+        "$PARENT_CAPTURE_MODE startup cancellation reaps the GitHub request"
+    assert_process_reaped "$PARENT_CAPTURE_SUPERVISOR_PID" \
+        "$PARENT_CAPTURE_MODE startup cancellation reaps the capture supervisor"
+    PARENT_CAPTURE_RESIDUE=$(find "$PARENT_CAPTURE_TMP" \
+        \( -name 'gh-pr-enrich-prelock-output.*' -o \
+           -name 'gh-pr-enrich-parent-capture.*' \) -print -quit)
+    assert_true "$([ -z "$PARENT_CAPTURE_RESIDUE" ] && echo 0 || echo 1)" \
+        "$PARENT_CAPTURE_MODE startup cancellation removes capture staging"
+done
+
+PARENT_CAPTURE_STOPPED_DIR="$TEST_OUTPUT_DIR/parent-capture-stopped-supervisor"
+PARENT_CAPTURE_STOPPED_READY="$PARENT_CAPTURE_STOPPED_DIR/ready"
+PARENT_CAPTURE_STOPPED_CHILD_PID_FILE="$PARENT_CAPTURE_STOPPED_DIR/child-pid"
+PARENT_CAPTURE_STOPPED_SUPERVISOR_PID_FILE="$PARENT_CAPTURE_STOPPED_DIR/supervisor-pid"
+PARENT_CAPTURE_STOPPED_OUT="$PARENT_CAPTURE_STOPPED_DIR/output.txt"
+PARENT_CAPTURE_STOPPED_TMP="$PARENT_CAPTURE_STOPPED_DIR/tmp"
+mkdir -p "$PARENT_CAPTURE_STOPPED_TMP"
+env PATH="$STUB_DIR:$PATH" TMPDIR="$PARENT_CAPTURE_STOPPED_TMP" \
+    GH_PR_ENRICH_GITHUB_TIMEOUT=20 \
+    GH_PR_ENRICH_DEBUG_PARENT_CAPTURE_PID_FILE="$PARENT_CAPTURE_STOPPED_SUPERVISOR_PID_FILE" \
+    PARENT_CAPTURE_SIGNAL_READY="$PARENT_CAPTURE_STOPPED_READY" \
+    PARENT_CAPTURE_SIGNAL_CHILD_PID_FILE="$PARENT_CAPTURE_STOPPED_CHILD_PID_FILE" \
+    "$GH_PR_ENRICH" 1 --output-dir \
+        "$TEST_OUTPUT_DIR/parent-capture-stopped-report" \
+    > "$PARENT_CAPTURE_STOPPED_OUT" 2>&1 &
+PARENT_CAPTURE_STOPPED_CLI_PID=$!
+for (( _capture_wait=0; _capture_wait < 100; _capture_wait++ )); do
+    [ -e "$PARENT_CAPTURE_STOPPED_READY" ] && \
+        find "$PARENT_CAPTURE_STOPPED_TMP" -name active-child \
+            -print -quit | grep -q . && break
+    sleep 0.05
+done
+PARENT_CAPTURE_STOPPED_SUPERVISOR_PID=$(tail -1 \
+    "$PARENT_CAPTURE_STOPPED_SUPERVISOR_PID_FILE" 2>/dev/null || echo "")
+[ -z "$PARENT_CAPTURE_STOPPED_SUPERVISOR_PID" ] || \
+    kill -STOP -- "-$PARENT_CAPTURE_STOPPED_SUPERVISOR_PID" 2>/dev/null || true
+kill -TERM "$PARENT_CAPTURE_STOPPED_CLI_PID" 2>/dev/null || true
+rc=0
+wait "$PARENT_CAPTURE_STOPPED_CLI_PID" || rc=$?
+assert_true "$([ -e "$PARENT_CAPTURE_STOPPED_READY" ] && echo 0 || echo 1)" \
+    "stopped-supervisor fixture reaches the nested GitHub request"
+assert_eq "143" "$rc" \
+    "TERM with a stopped capture supervisor preserves conventional status"
+PARENT_CAPTURE_STOPPED_CHILD_PID=$(cat \
+    "$PARENT_CAPTURE_STOPPED_CHILD_PID_FILE" 2>/dev/null || echo "")
+assert_true "$([ -n "$PARENT_CAPTURE_STOPPED_CHILD_PID" ] && \
+    ! kill -0 "$PARENT_CAPTURE_STOPPED_CHILD_PID" 2>/dev/null && echo 0 || echo 1)" \
+    "stopped-supervisor fallback reaps the independent GitHub request before return"
+assert_true "$([ -n "$PARENT_CAPTURE_STOPPED_SUPERVISOR_PID" ] && \
+    ! kill -0 "$PARENT_CAPTURE_STOPPED_SUPERVISOR_PID" 2>/dev/null && echo 0 || echo 1)" \
+    "stopped-supervisor fallback reaps the capture supervisor before return"
+PARENT_CAPTURE_STOPPED_RESIDUE=$(find "$PARENT_CAPTURE_STOPPED_TMP" \
+    \( -name 'gh-pr-enrich-prelock-output.*' -o \
+       -name 'gh-pr-enrich-parent-capture.*' \) -print -quit)
+assert_true "$([ -z "$PARENT_CAPTURE_STOPPED_RESIDUE" ] && echo 0 || echo 1)" \
+    "stopped-supervisor fallback removes every capture staging artifact"
+
+PARENT_CAPTURE_STATE_DIR="$TEST_OUTPUT_DIR/parent-capture-watch-state"
+PARENT_CAPTURE_STATE_READY="$PARENT_CAPTURE_STATE_DIR/ready"
+PARENT_CAPTURE_STATE_CHILD_PID_FILE="$PARENT_CAPTURE_STATE_DIR/child-pid"
+PARENT_CAPTURE_STATE_SUPERVISOR_PID_FILE="$PARENT_CAPTURE_STATE_DIR/supervisor-pids"
+PARENT_CAPTURE_STATE_OUT="$PARENT_CAPTURE_STATE_DIR/output.txt"
+PARENT_CAPTURE_STATE_TMP="$PARENT_CAPTURE_STATE_DIR/tmp"
+mkdir -p "$PARENT_CAPTURE_STATE_TMP"
+env PATH="$STUB_DIR:$PATH" TMPDIR="$PARENT_CAPTURE_STATE_TMP" \
+    GH_PR_ENRICH_GITHUB_TIMEOUT=20 \
+    GH_PR_ENRICH_DEBUG_PARENT_CAPTURE_PID_FILE="$PARENT_CAPTURE_STATE_SUPERVISOR_PID_FILE" \
+    PARENT_CAPTURE_STATE_SIGNAL_READY="$PARENT_CAPTURE_STATE_READY" \
+    PARENT_CAPTURE_STATE_SIGNAL_CHILD_PID_FILE="$PARENT_CAPTURE_STATE_CHILD_PID_FILE" \
+    "$GH_PR_ENRICH" watch 1 --interval 1 \
+    > "$PARENT_CAPTURE_STATE_OUT" 2>&1 &
+PARENT_CAPTURE_STATE_CLI_PID=$!
+for (( _capture_wait=0; _capture_wait < 100; _capture_wait++ )); do
+    [ ! -e "$PARENT_CAPTURE_STATE_READY" ] || break
+    sleep 0.05
+done
+kill -TERM "$PARENT_CAPTURE_STATE_CLI_PID" 2>/dev/null || true
+rc=0
+wait "$PARENT_CAPTURE_STATE_CLI_PID" || rc=$?
+assert_true "$([ -e "$PARENT_CAPTURE_STATE_READY" ] && echo 0 || echo 1)" \
+    "watch-state cancellation fixture reaches a nested GitHub request"
+assert_eq "143" "$rc" \
+    "TERM during initial watch-state capture preserves conventional status"
+PARENT_CAPTURE_STATE_CHILD_PID=$(cat \
+    "$PARENT_CAPTURE_STATE_CHILD_PID_FILE" 2>/dev/null || echo "")
+PARENT_CAPTURE_STATE_SUPERVISOR_PID=$(tail -1 \
+    "$PARENT_CAPTURE_STATE_SUPERVISOR_PID_FILE" 2>/dev/null || echo "")
+assert_true "$([ -n "$PARENT_CAPTURE_STATE_CHILD_PID" ] && \
+    ! kill -0 "$PARENT_CAPTURE_STATE_CHILD_PID" 2>/dev/null && echo 0 || echo 1)" \
+    "watch-state cancellation reaps the nested GitHub request before the CLI returns"
+assert_true "$([ -n "$PARENT_CAPTURE_STATE_SUPERVISOR_PID" ] && \
+    ! kill -0 "$PARENT_CAPTURE_STATE_SUPERVISOR_PID" 2>/dev/null && echo 0 || echo 1)" \
+    "watch-state cancellation reaps the capture supervisor before the CLI returns"
+PARENT_CAPTURE_STATE_RESIDUE=$(find "$PARENT_CAPTURE_STATE_TMP" \
+    \( -name 'gh-pr-enrich-prelock-output.*' -o \
+       -name 'gh-pr-enrich-parent-capture.*' \) -print -quit)
+assert_true "$([ -z "$PARENT_CAPTURE_STATE_RESIDUE" ] && echo 0 || echo 1)" \
+    "watch-state cancellation removes capture staging"
 
 # Collection and all downstream consumers form one report-directory
 # transaction. A second run may resolve repository metadata, but it must not
@@ -1553,6 +1768,7 @@ STUB
 cat > "$CHILD_START_BASH_ENV" << 'STUB'
 __gh_pr_enrich_child_start_debug() {
     if [ "$BASH_COMMAND" = 'command_pid=$!' ] && \
+       [ -d "$CHILD_START_REPORT/.selected-analysis.lock" ] && \
        [ ! -e "$CHILD_START_HOOK_MARKER" ]; then
         : > "$CHILD_START_HOOK_MARKER"
         for (( _child_start_wait=0; _child_start_wait < 200; _child_start_wait++ )); do
@@ -1569,6 +1785,7 @@ chmod +x "$CHILD_START_STUBS/gh"
 env PATH="$CHILD_START_STUBS:$STUB_DIR:$PATH" \
     BASH_ENV="$CHILD_START_BASH_ENV" \
     CHILD_START_BASE_GH="$STUB_DIR/gh" \
+    CHILD_START_REPORT="$CHILD_START_REPORT" \
     CHILD_START_PID_FILE="$CHILD_START_PID_FILE" \
     CHILD_START_HOOK_MARKER="$CHILD_START_HOOK_MARKER" \
     "$GH_PR_ENRICH" 1 --output-dir "$CHILD_START_REPORT" \
@@ -1622,6 +1839,7 @@ STUB
 cat > "$REPORT_WATCHDOG_BASH_ENV" << 'STUB'
 __gh_pr_enrich_report_watchdog_debug() {
     if [ "$BASH_COMMAND" = 'REPORT_RUN_WATCHDOG_PID=$!' ] && \
+       [ -d "$REPORT_WATCHDOG_REPORT/.selected-analysis.lock" ] && \
        [ ! -e "$REPORT_WATCHDOG_MARKER" ]; then
         printf '%s\n' "$!" > "$REPORT_WATCHDOG_PID_FILE"
         : > "$REPORT_WATCHDOG_MARKER"
@@ -1636,6 +1854,7 @@ rc=0
 env PATH="$REPORT_WATCHDOG_STUBS:$STUB_DIR:$PATH" \
     BASH_ENV="$REPORT_WATCHDOG_BASH_ENV" \
     REPORT_WATCHDOG_BASE_GH="$STUB_DIR/gh" \
+    REPORT_WATCHDOG_REPORT="$REPORT_WATCHDOG_REPORT" \
     REPORT_WATCHDOG_CHILD_PID_FILE="$REPORT_WATCHDOG_CHILD_PID_FILE" \
     REPORT_WATCHDOG_PID_FILE="$REPORT_WATCHDOG_PID_FILE" \
     REPORT_WATCHDOG_MARKER="$REPORT_WATCHDOG_MARKER" \
@@ -1979,10 +2198,48 @@ assert_jq "$AUTHORIZED_LINKED_DIR/analysis-context.json" \
        .repository.visibility == "PRIVATE"' \
     "authorized private linked issue content and visibility reach the analyzer context"
 
+PUBLIC_PRIMARY_DIR="$TEST_OUTPUT_DIR/public-primary-external"
+PUBLIC_PRIMARY_CLAUDE_LOG="$TEST_OUTPUT_DIR/public-primary-claude-invoked.txt"
+PUBLIC_PRIMARY_QUERY_ARGS_LOG="$TEST_OUTPUT_DIR/public-primary-query-args.txt"
+env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PUBLIC \
+    VISIBILITY_QUERY_ARGS_LOG="$PUBLIC_PRIMARY_QUERY_ARGS_LOG" \
+    CLAUDE_INVOKED_LOG="$PUBLIC_PRIMARY_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich --output-dir "$PUBLIC_PRIMARY_DIR" \
+    >/dev/null 2>&1
+assert_true "$([ -s "$PUBLIC_PRIMARY_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "a public repository without linked issues reaches external Claude"
+assert_contains "$(cat "$PUBLIC_PRIMARY_QUERY_ARGS_LOG")" "nodes(ids: [])" \
+    "an empty linked-issue set is encoded as a valid literal GraphQL list"
+assert_not_contains "$(cat "$PUBLIC_PRIMARY_QUERY_ARGS_LOG")" "ids[]=" \
+    "an empty linked-issue set never emits an absent list variable"
+
+CLAUDE_78_DIR="$TEST_OUTPUT_DIR/claude-exit-78"
+CLAUDE_78_LOG="$TEST_OUTPUT_DIR/claude-exit-78-invoked.txt"
+rc=0
+CLAUDE_78_OUT=$(env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PUBLIC \
+    CLAUDE_STUB_EXIT_CODE=78 CLAUDE_INVOKED_LOG="$CLAUDE_78_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich --output-dir "$CLAUDE_78_DIR" \
+    2>&1) || rc=$?
+assert_eq "0" "$rc" \
+    "Claude exit 78 remains an ordinary soft-degraded analyzer failure" \
+    "$CLAUDE_78_OUT"
+assert_true "$([ -s "$CLAUDE_78_LOG" ] && echo 0 || echo 1)" \
+    "the exit-78 regression reaches Claude after a successful disclosure gate"
+assert_contains "$CLAUDE_78_OUT" \
+    "Claude analysis failed. Continuing without enrichment." \
+    "Claude exit 78 is reported as a provider failure"
+assert_not_contains "$CLAUDE_78_OUT" \
+    "External disclosure authorization could not be revalidated" \
+    "Claude exit 78 cannot masquerade as a disclosure denial"
+
 PUBLIC_LINKED_DIR="$TEST_OUTPUT_DIR/public-linked-external"
 PUBLIC_LINKED_CLAUDE_LOG="$TEST_OUTPUT_DIR/public-linked-claude-invoked.txt"
+PUBLIC_LINKED_VISIBILITY_LOG="$TEST_OUTPUT_DIR/public-linked-visibility-queries.txt"
+PUBLIC_LINKED_QUERY_ARGS_LOG="$TEST_OUTPUT_DIR/public-linked-query-args.txt"
 env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PUBLIC \
     LINKED_ISSUE_VISIBILITY=PUBLIC \
+    VISIBILITY_QUERY_LOG="$PUBLIC_LINKED_VISIBILITY_LOG" \
+    VISIBILITY_QUERY_ARGS_LOG="$PUBLIC_LINKED_QUERY_ARGS_LOG" \
     CLAUDE_INVOKED_LOG="$PUBLIC_LINKED_CLAUDE_LOG" \
     "$GH_PR_ENRICH" 1 --enrich --output-dir "$PUBLIC_LINKED_DIR" \
     >/dev/null 2>&1
@@ -1991,6 +2248,165 @@ assert_true "$([ -s "$PUBLIC_LINKED_CLAUDE_LOG" ] && echo 0 || echo 1)" \
 assert_jq "$PUBLIC_LINKED_DIR/analysis-context.json" \
     '.pr.linked_issues[0].repository.visibility == "PUBLIC"' \
     "public linked issue visibility is bound into the disclosed context"
+assert_eq $'intent/issues\no/r' \
+    "$(sort -u "$PUBLIC_LINKED_VISIBILITY_LOG")" \
+    "every repository contributing external content is revalidated before disclosure"
+assert_contains "$(cat "$PUBLIC_LINKED_QUERY_ARGS_LOG")" \
+    "ids[]=ISSUE_linked" \
+    "linked issue node IDs are passed with the documented GraphQL list syntax"
+
+PRIMARY_VISIBILITY_DRIFT_DIR="$TEST_OUTPUT_DIR/primary-visibility-drift"
+PRIMARY_VISIBILITY_DRIFT_CLAUDE_LOG="$TEST_OUTPUT_DIR/primary-visibility-drift-claude.txt"
+rc=0
+PRIMARY_VISIBILITY_DRIFT_OUT=$(env PATH="$STUB_DIR:$PATH" \
+    REPO_VISIBILITY=PUBLIC LIVE_REPO_VISIBILITY=PRIVATE \
+    CLAUDE_INVOKED_LOG="$PRIMARY_VISIBILITY_DRIFT_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich --output-dir "$PRIMARY_VISIBILITY_DRIFT_DIR" \
+    2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a public-to-private primary repository change aborts enrichment"
+assert_true "$([ ! -s "$PRIMARY_VISIBILITY_DRIFT_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "primary repository visibility drift is blocked before external egress"
+assert_contains "$PRIMARY_VISIBILITY_DRIFT_OUT" \
+    "changed from PUBLIC to PRIVATE" \
+    "the primary visibility-drift diagnostic identifies both states"
+
+AUTHORIZED_VISIBILITY_DRIFT_DIR="$TEST_OUTPUT_DIR/authorized-visibility-drift"
+AUTHORIZED_VISIBILITY_DRIFT_CLAUDE_LOG="$TEST_OUTPUT_DIR/authorized-visibility-drift-claude.txt"
+rc=0
+AUTHORIZED_VISIBILITY_DRIFT_OUT=$(env PATH="$STUB_DIR:$PATH" \
+    REPO_VISIBILITY=PUBLIC LIVE_REPO_VISIBILITY=PRIVATE \
+    CLAUDE_INVOKED_LOG="$AUTHORIZED_VISIBILITY_DRIFT_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich --allow-external \
+    --output-dir "$AUTHORIZED_VISIBILITY_DRIFT_DIR" 2>&1) || rc=$?
+assert_eq "0" "$rc" \
+    "explicit disclosure authorization remains valid after a visibility change" \
+    "$AUTHORIZED_VISIBILITY_DRIFT_OUT"
+assert_true "$([ -s "$AUTHORIZED_VISIBILITY_DRIFT_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "an explicit override authorizes external egress independently of visibility"
+
+UNKNOWN_OVERRIDE_DIR="$TEST_OUTPUT_DIR/unknown-visibility-override"
+UNKNOWN_OVERRIDE_CLAUDE_LOG="$TEST_OUTPUT_DIR/unknown-visibility-override-claude.txt"
+rc=0
+UNKNOWN_OVERRIDE_OUT=$(env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=UNKNOWN \
+    CLAUDE_INVOKED_LOG="$UNKNOWN_OVERRIDE_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich --allow-external \
+    --output-dir "$UNKNOWN_OVERRIDE_DIR" 2>&1) || rc=$?
+assert_eq "0" "$rc" \
+    "explicit disclosure authorization remains valid when visibility is indeterminate" \
+    "$UNKNOWN_OVERRIDE_OUT"
+assert_true "$([ -s "$UNKNOWN_OVERRIDE_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "an explicit override authorizes an indeterminate repository without a cached-public dependency"
+
+LINKED_VISIBILITY_DRIFT_DIR="$TEST_OUTPUT_DIR/linked-visibility-drift"
+LINKED_VISIBILITY_DRIFT_CLAUDE_LOG="$TEST_OUTPUT_DIR/linked-visibility-drift-claude.txt"
+rc=0
+LINKED_VISIBILITY_DRIFT_OUT=$(env PATH="$STUB_DIR:$PATH" \
+    REPO_VISIBILITY=PUBLIC LINKED_ISSUE_VISIBILITY=PUBLIC \
+    LIVE_LINKED_ISSUE_VISIBILITY=PRIVATE \
+    CLAUDE_INVOKED_LOG="$LINKED_VISIBILITY_DRIFT_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich --output-dir "$LINKED_VISIBILITY_DRIFT_DIR" \
+    2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a public-to-private linked repository change aborts enrichment"
+assert_true "$([ ! -s "$LINKED_VISIBILITY_DRIFT_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "linked repository visibility drift is blocked before external egress"
+assert_contains "$LINKED_VISIBILITY_DRIFT_OUT" \
+    "Current linked issue repository visibility or identity could not be verified" \
+    "the linked visibility-drift diagnostic identifies the failed attestation"
+
+LINKED_TRANSFER_DIR="$TEST_OUTPUT_DIR/linked-repository-transfer"
+LINKED_TRANSFER_CLAUDE_LOG="$TEST_OUTPUT_DIR/linked-repository-transfer-claude.txt"
+rc=0
+LINKED_TRANSFER_OUT=$(env PATH="$STUB_DIR:$PATH" \
+    REPO_VISIBILITY=PUBLIC LINKED_ISSUE_VISIBILITY=PUBLIC \
+    LIVE_LINKED_ISSUE_REPOSITORY=intent/private \
+    LIVE_LINKED_ISSUE_VISIBILITY=PRIVATE \
+    CLAUDE_INVOKED_LOG="$LINKED_TRANSFER_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich --output-dir "$LINKED_TRANSFER_DIR" \
+    2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a linked issue transfer to a private repository aborts enrichment"
+assert_true "$([ ! -s "$LINKED_TRANSFER_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "linked issue node identity prevents a transfer from bypassing the disclosure gate"
+assert_contains "$LINKED_TRANSFER_OUT" \
+    "Current linked issue repository visibility or identity could not be verified" \
+    "the linked issue transfer reports a failed live attestation"
+
+UNVERIFIED_VISIBILITY_DIR="$TEST_OUTPUT_DIR/unverified-visibility"
+UNVERIFIED_VISIBILITY_CLAUDE_LOG="$TEST_OUTPUT_DIR/unverified-visibility-claude.txt"
+rc=0
+UNVERIFIED_VISIBILITY_OUT=$(env PATH="$STUB_DIR:$PATH" \
+    REPO_VISIBILITY=PUBLIC LIVE_VISIBILITY_QUERY_FAIL_REPO=o/r \
+    CLAUDE_INVOKED_LOG="$UNVERIFIED_VISIBILITY_CLAUDE_LOG" \
+    "$GH_PR_ENRICH" 1 --enrich --output-dir "$UNVERIFIED_VISIBILITY_DIR" \
+    2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "an unverifiable live repository visibility aborts enrichment"
+assert_true "$([ ! -s "$UNVERIFIED_VISIBILITY_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+    "a visibility lookup failure is blocked before external egress"
+assert_contains "$UNVERIFIED_VISIBILITY_OUT" \
+    "Current external repository visibility could not be verified" \
+    "the visibility lookup failure is reported at the disclosure boundary"
+
+VISIBILITY_SIGNAL_BASH_ENV="$TEST_OUTPUT_DIR/visibility-signal-bash-env"
+cat > "$VISIBILITY_SIGNAL_BASH_ENV" << 'STUB'
+__gh_pr_enrich_visibility_watchdog_debug() {
+    if [ "$BASH_COMMAND" = 'REPORT_RUN_WATCHDOG_PID=$!' ]; then
+        printf '%s\n' "$!" >> "$VISIBILITY_SIGNAL_WATCHDOG_PID_FILE"
+    fi
+}
+set -T
+trap '__gh_pr_enrich_visibility_watchdog_debug' DEBUG
+unset BASH_ENV
+STUB
+
+for VISIBILITY_SIGNAL in INT TERM; do
+    VISIBILITY_SIGNAL_DIR="$TEST_OUTPUT_DIR/visibility-signal-$VISIBILITY_SIGNAL"
+    VISIBILITY_SIGNAL_TMP="$VISIBILITY_SIGNAL_DIR/tmp"
+    VISIBILITY_SIGNAL_READY="$VISIBILITY_SIGNAL_DIR/request-ready"
+    VISIBILITY_SIGNAL_CHILD_PID_FILE="$VISIBILITY_SIGNAL_DIR/request.pid"
+    VISIBILITY_SIGNAL_WATCHDOG_PID_FILE="$VISIBILITY_SIGNAL_DIR/watchdog.pid"
+    VISIBILITY_SIGNAL_CLAUDE_LOG="$VISIBILITY_SIGNAL_DIR/claude.txt"
+    mkdir -p "$VISIBILITY_SIGNAL_TMP"
+    rc=0
+    env PATH="$STUB_DIR:$PATH" BASH_ENV="$VISIBILITY_SIGNAL_BASH_ENV" \
+        TMPDIR="$VISIBILITY_SIGNAL_TMP" REPO_VISIBILITY=PUBLIC \
+        GH_PR_ENRICH_CODE_ACCESS=false GH_PR_ENRICH_GITHUB_TIMEOUT=2 \
+        VISIBILITY_SIGNAL="$VISIBILITY_SIGNAL" \
+        VISIBILITY_SIGNAL_READY="$VISIBILITY_SIGNAL_READY" \
+        VISIBILITY_SIGNAL_CHILD_PID_FILE="$VISIBILITY_SIGNAL_CHILD_PID_FILE" \
+        VISIBILITY_SIGNAL_WATCHDOG_PID_FILE="$VISIBILITY_SIGNAL_WATCHDOG_PID_FILE" \
+        CLAUDE_INVOKED_LOG="$VISIBILITY_SIGNAL_CLAUDE_LOG" \
+        "$GH_PR_ENRICH" 1 --enrich --output-dir "$VISIBILITY_SIGNAL_DIR/report" \
+        >/dev/null 2>&1 || rc=$?
+    if [ "$VISIBILITY_SIGNAL" = INT ]; then
+        VISIBILITY_SIGNAL_EXPECTED_RC=130
+    else
+        VISIBILITY_SIGNAL_EXPECTED_RC=143
+    fi
+    assert_true "$([ -e "$VISIBILITY_SIGNAL_READY" ] && echo 0 || echo 1)" \
+        "$VISIBILITY_SIGNAL fixture reaches the final visibility request"
+    assert_eq "$VISIBILITY_SIGNAL_EXPECTED_RC" "$rc" \
+        "$VISIBILITY_SIGNAL during final visibility attestation preserves conventional status"
+    assert_true "$([ ! -s "$VISIBILITY_SIGNAL_CLAUDE_LOG" ] && echo 0 || echo 1)" \
+        "$VISIBILITY_SIGNAL during visibility attestation prevents external egress"
+    VISIBILITY_SIGNAL_CHILD_PID=$(cat "$VISIBILITY_SIGNAL_CHILD_PID_FILE" 2>/dev/null || echo "")
+    VISIBILITY_SIGNAL_WATCHDOG_PID=$(tail -1 \
+        "$VISIBILITY_SIGNAL_WATCHDOG_PID_FILE" 2>/dev/null || echo "")
+    assert_process_reaped "$VISIBILITY_SIGNAL_CHILD_PID" \
+        "$VISIBILITY_SIGNAL during visibility attestation reaps the GitHub request"
+    assert_process_reaped "$VISIBILITY_SIGNAL_WATCHDOG_PID" \
+        "$VISIBILITY_SIGNAL during visibility attestation reaps the request watchdog"
+    VISIBILITY_SIGNAL_RESIDUE=$(find "$VISIBILITY_SIGNAL_TMP" \
+        -name 'gh-pr-enrich-external-visibility.*' -print -quit)
+    assert_true "$([ -z "$VISIBILITY_SIGNAL_RESIDUE" ] && \
+        [ ! -e "$VISIBILITY_SIGNAL_DIR/report/.selected-analysis.lock" ] && \
+        echo 0 || echo 1)" \
+        "$VISIBILITY_SIGNAL cleans visibility staging and releases the report lock"
+    VISIBILITY_SIGNAL_CHILD_PID_FILE=""
+    VISIBILITY_SIGNAL_WATCHDOG_PID_FILE=""
+done
 
 SAST_WORKSPACE="$TEST_OUTPUT_DIR/sast-workspace"
 SAST_PREPARED="$SAST_WORKSPACE/reports"
