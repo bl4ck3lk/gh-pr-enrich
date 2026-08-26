@@ -29,6 +29,19 @@ mkdir -p "$TEST_OUTPUT_DIR" "$STUB_DIR"
 
 suite_start "gh pr-enrich analyzer invocation suite"
 
+# `kill -0` also succeeds for zombies. Treat those as exited so process-leak
+# assertions remain deterministic when the test container's PID 1 reaps slowly.
+process_is_active() {
+    local pid="${1:-}" process_state
+
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    process_state=$(/bin/ps -o stat= -p "$pid" 2>/dev/null) || return 0
+    process_state=${process_state//[[:space:]]/}
+    [ -n "$process_state" ] || return 0
+    [ "${process_state#Z}" = "$process_state" ]
+}
+
 # --- stubs ------------------------------------------------------------------
 cat > "$STUB_DIR/claude" << 'STUB'
 #!/bin/bash
@@ -364,10 +377,10 @@ env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
 assert_true "$([ ! -e "$NATIVE_SNAPSHOT_PATH" ] && echo 0 || echo 1)" \
     "native snapshot cleanup removes the leased private directory"
 for (( _attempt=0; _attempt < 100; _attempt++ )); do
-    ! kill -0 "$NATIVE_JANITOR_PID" 2>/dev/null && break
+    ! process_is_active "$NATIVE_JANITOR_PID" && break
     sleep 0.01
 done
-assert_true "$([ ! -e "$NATIVE_JANITOR_SIDECAR" ] && ! kill -0 "$NATIVE_JANITOR_PID" 2>/dev/null && echo 0 || echo 1)" \
+assert_true "$([ ! -e "$NATIVE_JANITOR_SIDECAR" ] && ! process_is_active "$NATIVE_JANITOR_PID" && echo 0 || echo 1)" \
     "explicit snapshot cleanup stops the recorded janitor and removes its sidecar"
 
 EXPIRING_SNAPSHOT_JSON=$(cd "$CODE_ACCESS_REPO" && \
@@ -386,10 +399,10 @@ done
 assert_true "$([ ! -e "$EXPIRING_SNAPSHOT_PATH" ] && echo 0 || echo 1)" \
     "the native snapshot janitor reaps an abandoned short lease"
 for (( _attempt=0; _attempt < 100; _attempt++ )); do
-    ! kill -0 "$EXPIRING_JANITOR_PID" 2>/dev/null && break
+    ! process_is_active "$EXPIRING_JANITOR_PID" && break
     sleep 0.01
 done
-assert_true "$([ ! -e "$EXPIRING_JANITOR_SIDECAR" ] && ! kill -0 "$EXPIRING_JANITOR_PID" 2>/dev/null && echo 0 || echo 1)" \
+assert_true "$([ ! -e "$EXPIRING_JANITOR_SIDECAR" ] && ! process_is_active "$EXPIRING_JANITOR_PID" && echo 0 || echo 1)" \
     "TTL expiry removes the lease sidecar and leaves no janitor process"
 for INVALID_SNAPSHOT_TTL in nope 999999999999999999999999999999; do
     BOUNDED_SNAPSHOT_JSON=$(cd "$CODE_ACCESS_REPO" && \
@@ -788,6 +801,8 @@ printf '%s\n' "$PWD" > "$SIGNAL_SNAPSHOT_PATH_LOG"
 printf '%s\n' "$$" > "$SIGNAL_CHILD_PID_LOG"
 cat > /dev/null
 trap '' TERM INT
+printf 'ready\n' > "$SIGNAL_READY_PATH"
+while [ ! -e "$SIGNAL_RELEASE_PATH" ]; do sleep 0.02; done
 kill -TERM "$GH_PR_ENRICH_CLEANUP_OWNER_PID"
 while true; do :; done
 STUB
@@ -796,20 +811,32 @@ SIGNAL_SNAPSHOT_PATH_LOG="$TEST_OUTPUT_DIR/signal-snapshot-path.txt"
 SIGNAL_SETTINGS_PATH_LOG="$TEST_OUTPUT_DIR/signal-settings-path.txt"
 SIGNAL_CHILD_PID_LOG="$TEST_OUTPUT_DIR/signal-child-pid.txt"
 SIGNAL_CONTEXT_COPY_LOG="$TEST_OUTPUT_DIR/signal-context-copy-path.txt"
+SIGNAL_READY_PATH="$TEST_OUTPUT_DIR/signal-ready"
+SIGNAL_RELEASE_PATH="$TEST_OUTPUT_DIR/signal-release"
 rm -f "$SIGNAL_SNAPSHOT_PATH_LOG" "$SIGNAL_SETTINGS_PATH_LOG" \
-    "$SIGNAL_CHILD_PID_LOG" "$SIGNAL_CONTEXT_COPY_LOG" "$RESPONSE"
+    "$SIGNAL_CHILD_PID_LOG" "$SIGNAL_CONTEXT_COPY_LOG" \
+    "$SIGNAL_READY_PATH" "$SIGNAL_RELEASE_PATH" "$RESPONSE"
 rc=0
-SIGNAL_STARTED_AT=$(date +%s)
 (cd "$CODE_ACCESS_REPO" && env \
     SIGNAL_SNAPSHOT_PATH_LOG="$SIGNAL_SNAPSHOT_PATH_LOG" \
     SIGNAL_SETTINGS_PATH_LOG="$SIGNAL_SETTINGS_PATH_LOG" \
     SIGNAL_CHILD_PID_LOG="$SIGNAL_CHILD_PID_LOG" \
+    SIGNAL_READY_PATH="$SIGNAL_READY_PATH" \
+    SIGNAL_RELEASE_PATH="$SIGNAL_RELEASE_PATH" \
     ANALYZER_CONTEXT_COPY_LOG="$SIGNAL_CONTEXT_COPY_LOG" \
     PS_CALLED_LOG="$PS_CALLED_LOG" \
     CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
     PATH="$SIGNAL_STUB_DIR:$PATH" \
     "$GH_PR_ENRICH" --test-call run_claude_analysis "$CONTEXT" "$RESPONSE" \
-    >/dev/null 2>&1) || rc=$?
+    >/dev/null 2>&1) &
+SIGNAL_RUNNER_PID=$!
+for (( _attempt=0; _attempt < 1000; _attempt++ )); do
+    [ -e "$SIGNAL_READY_PATH" ] && break
+    sleep 0.02
+done
+SIGNAL_STARTED_AT=$(date +%s)
+: > "$SIGNAL_RELEASE_PATH"
+wait "$SIGNAL_RUNNER_PID" || rc=$?
 SIGNAL_ELAPSED=$(( $(date +%s) - SIGNAL_STARTED_AT ))
 TERMINATED_SNAPSHOT=$(cat "$SIGNAL_SNAPSHOT_PATH_LOG" 2>/dev/null || echo "")
 TERMINATED_SETTINGS=$(cat "$SIGNAL_SETTINGS_PATH_LOG" 2>/dev/null || echo "")
@@ -1542,7 +1569,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     scanner_alive=false
     child_alive=false
     [ -z "$WATCHDOG_SEMGREP_PID" ] || ! kill -0 "$WATCHDOG_SEMGREP_PID" 2>/dev/null || scanner_alive=true
-    [ -z "$WATCHDOG_CHILD_PID" ] || ! kill -0 "$WATCHDOG_CHILD_PID" 2>/dev/null || child_alive=true
+    [ -z "$WATCHDOG_CHILD_PID" ] || ! process_is_active "$WATCHDOG_CHILD_PID" || child_alive=true
     [ "$scanner_alive" = true ] || [ "$child_alive" = true ] || break
     /bin/sleep 0.05
 done
@@ -1638,7 +1665,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     cancel_scanner_alive=false
     cancel_child_alive=false
     [ -z "$CANCEL_SCANNER_PID" ] || ! kill -0 "$CANCEL_SCANNER_PID" 2>/dev/null || cancel_scanner_alive=true
-    [ -z "$CANCEL_CHILD_PID" ] || ! kill -0 "$CANCEL_CHILD_PID" 2>/dev/null || cancel_child_alive=true
+    [ -z "$CANCEL_CHILD_PID" ] || ! process_is_active "$CANCEL_CHILD_PID" || cancel_child_alive=true
     [ "$cancel_scanner_alive" = true ] || [ "$cancel_child_alive" = true ] || break
     /bin/sleep 0.05
 done
@@ -1691,7 +1718,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     cancel_int_scanner_alive=false
     cancel_int_child_alive=false
     [ -z "$CANCEL_INT_SCANNER_PID" ] || ! kill -0 "$CANCEL_INT_SCANNER_PID" 2>/dev/null || cancel_int_scanner_alive=true
-    [ -z "$CANCEL_INT_CHILD_PID" ] || ! kill -0 "$CANCEL_INT_CHILD_PID" 2>/dev/null || cancel_int_child_alive=true
+    [ -z "$CANCEL_INT_CHILD_PID" ] || ! process_is_active "$CANCEL_INT_CHILD_PID" || cancel_int_child_alive=true
     [ "$cancel_int_scanner_alive" = true ] || [ "$cancel_int_child_alive" = true ] || break
     /bin/sleep 0.05
 done
@@ -1845,7 +1872,7 @@ FAST_WATCHDOG_PID_LOG="$TEST_OUTPUT_DIR/fast-semgrep-watchdog.pid"
 FAST_WATCHDOG_PID=$(cat "$FAST_WATCHDOG_PID_LOG" 2>/dev/null || echo "")
 assert_true "$([ -n "$FAST_WATCHDOG_PID" ] && echo 0 || echo 1)" \
     "a fast Semgrep run starts an owned timeout watcher"
-if [ -n "$FAST_WATCHDOG_PID" ] && kill -0 "$FAST_WATCHDOG_PID" 2>/dev/null; then
+if process_is_active "$FAST_WATCHDOG_PID"; then
     fail "a fast Semgrep run cancels and reaps its timeout watcher" \
         "watcher sleep process $FAST_WATCHDOG_PID is still alive"
 else
