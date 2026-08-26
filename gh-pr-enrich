@@ -937,17 +937,31 @@ verify_pr_head_unchanged() {
     local head_json_file
     CURRENT_HOSTED_HEAD=""
     HOSTED_HEAD_VERIFICATION_STATUS="unavailable"
-    head_json_file="$(mktemp "/tmp/gh-pr-enrich-hosted-head.XXXXXX")" || return 1
+    head_json_file="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-hosted-head.XXXXXX")" || return 1
     if [ -n "$repository" ]; then
-        if ! run_report_command gh pr view "$pr_number" --repo "$repository" \
+        if [ "${ADDRESS_COMMAND_MANAGEMENT_ENABLED:-false}" = true ]; then
+            run_address_hosted_command "$head_json_file" gh pr view \
+                "$pr_number" --repo "$repository" --json headRefOid || {
+                rm -f "$head_json_file"
+                return 1
+            }
+        elif ! run_report_command gh pr view "$pr_number" --repo "$repository" \
                 --json headRefOid > "$head_json_file" 2>/dev/null; then
             rm -f "$head_json_file"
             return 1
         fi
-    elif ! run_report_command gh pr view "$pr_number" --json headRefOid \
-            > "$head_json_file" 2>/dev/null; then
-        rm -f "$head_json_file"
-        return 1
+    else
+        if [ "${ADDRESS_COMMAND_MANAGEMENT_ENABLED:-false}" = true ]; then
+            run_address_hosted_command "$head_json_file" gh pr view \
+                "$pr_number" --json headRefOid || {
+                rm -f "$head_json_file"
+                return 1
+            }
+        elif ! run_report_command gh pr view "$pr_number" --json headRefOid \
+                > "$head_json_file" 2>/dev/null; then
+            rm -f "$head_json_file"
+            return 1
+        fi
     fi
     if ! head_json="$(cat "$head_json_file")"; then
         rm -f "$head_json_file"
@@ -994,8 +1008,12 @@ fetch_live_review_thread() {
         }
       }
     }'
-    if ! gh api graphql -F threadId="$thread_id" -f query="$query" \
-            > "$output_file" 2>/dev/null || \
+    if { [ "${ADDRESS_COMMAND_MANAGEMENT_ENABLED:-false}" = true ] && \
+         ! run_address_hosted_command "$output_file" gh api graphql \
+            -F threadId="$thread_id" -f query="$query"; } || \
+       { [ "${ADDRESS_COMMAND_MANAGEMENT_ENABLED:-false}" != true ] && \
+         ! gh api graphql -F threadId="$thread_id" -f query="$query" \
+            > "$output_file" 2>/dev/null; } || \
        ! jq -e '
             ((.errors // []) | length) == 0 and
             .data.node.__typename == "PullRequestReviewThread" and
@@ -1062,7 +1080,7 @@ validate_live_review_thread() {
     local thread_id="$2"
     local expected_resolved="$3"
     local live_file
-    live_file="$(mktemp "/tmp/gh-pr-enrich-live-thread.XXXXXX")" || return 1
+    live_file="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-live-thread.XXXXXX")" || return 1
     if ! fetch_live_review_thread "$thread_id" "$live_file" || \
        ! validate_live_review_thread_snapshot "$context_file" "$thread_id" \
             "$expected_resolved" "$live_file"; then
@@ -1072,31 +1090,277 @@ validate_live_review_thread() {
     rm -f "$live_file"
 }
 
+ADDRESS_MUTATION_CHILD_PID=""
+ADDRESS_MUTATION_CHILD_JOB_SPEC=""
+ADDRESS_MUTATION_CHILD_STARTING=false
+ADDRESS_MUTATION_CHILD_TERMINATING=false
+ADDRESS_MUTATION_RESULT_FILE=""
+ADDRESS_HOSTED_RESULT_FILE=""
+ADDRESS_HOSTED_CONTROL_DIR=""
+ADDRESS_COMMAND_MANAGEMENT_ENABLED=false
+ADDRESS_PENDING_SIGNAL_STATUS=""
+ADDRESS_BATCH_ACTIVE=false
+ADDRESS_BATCH_ROLLBACK_IN_PROGRESS=false
+ADDRESS_BATCH_CONTEXT_FILE=""
+ADDRESS_BATCH_RESOLVED_THREAD_IDS=()
+
+address_job_is_running() {
+    local job_spec="$1" running_pid
+    [ -n "$job_spec" ] || return 1
+    while IFS= read -r running_pid; do
+        [ -z "$running_pid" ] || return 0
+    done < <(jobs -pr "$job_spec" 2>/dev/null)
+    return 1
+}
+
+cleanup_address_hosted_control() {
+    local control_dir="${1:-$ADDRESS_HOSTED_CONTROL_DIR}"
+    [ -n "$control_dir" ] || return 0
+    rm -f "$control_dir/ack" "$control_dir/complete" \
+        "$control_dir/status" "$control_dir/status.tmp" 2>/dev/null || true
+    rmdir "$control_dir" 2>/dev/null || true
+    [ "$ADDRESS_HOSTED_CONTROL_DIR" != "$control_dir" ] || \
+        ADDRESS_HOSTED_CONTROL_DIR=""
+}
+
+signal_address_mutation_job() {
+    local signal_name="$1" job_spec="$2"
+    case "$signal_name" in
+        TERM|KILL) ;;
+        *) return 2 ;;
+    esac
+    # Hosted cleanup is allowed to target only the current owned Bash job.
+    # Numeric PIDs/PGIDs can be reused after a completed child is reaped.
+    [ "$job_spec" = "%+" ] || return 2
+    kill "-$signal_name" "$job_spec"
+}
+
+terminate_address_mutation_child() {
+    local termination_mode="${1:-graceful}"
+    local child_pid="$ADDRESS_MUTATION_CHILD_PID" attempt=0
+    local job_spec="$ADDRESS_MUTATION_CHILD_JOB_SPEC"
+    [ -n "$child_pid" ] || return 0
+    [ "$ADDRESS_MUTATION_CHILD_TERMINATING" != true ] || return 0
+    ADDRESS_MUTATION_CHILD_TERMINATING=true
+    # A captured Bash job spec remains bound to this owned job until wait. It
+    # cannot target a reused numeric PID or process-group identifier.
+    if [ "$termination_mode" = "graceful" ]; then
+        [ -z "$job_spec" ] || \
+            signal_address_mutation_job TERM "$job_spec" 2>/dev/null || true
+        while [ "$attempt" -lt 20 ]; do
+            address_job_is_running "$job_spec" || break
+            sleep 0.05
+            attempt=$((attempt + 1))
+        done
+    fi
+    [ -z "$job_spec" ] || \
+        signal_address_mutation_job KILL "$job_spec" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
+    set +m
+    cleanup_address_hosted_control
+    ADDRESS_MUTATION_CHILD_PID=""
+    ADDRESS_MUTATION_CHILD_JOB_SPEC=""
+    ADDRESS_MUTATION_CHILD_TERMINATING=false
+}
+
+handle_address_signal() {
+    local signal_name="$1"
+    case "$signal_name" in
+        INT) ADDRESS_PENDING_SIGNAL_STATUS=130 ;;
+        TERM) ADDRESS_PENDING_SIGNAL_STATUS=143 ;;
+    esac
+    # One signal establishes the final status. Ignore repeats while the owned
+    # request and any compensation are brought to a deterministic boundary.
+    trap '' INT TERM
+    # Reverse compensation owns hosted mutations too. Once it starts, defer
+    # signals until every safe reopen attempt has completed or timed out.
+    [ "$ADDRESS_BATCH_ROLLBACK_IN_PROGRESS" != true ] || return 0
+    [ "$ADDRESS_MUTATION_CHILD_STARTING" = true ] || \
+        [ "$ADDRESS_MUTATION_CHILD_TERMINATING" = true ] || \
+        terminate_address_mutation_child
+    if [ "$ADDRESS_MUTATION_CHILD_STARTING" != true ] && \
+       [ "$ADDRESS_MUTATION_CHILD_TERMINATING" != true ] && \
+       [ "$ADDRESS_BATCH_ROLLBACK_IN_PROGRESS" != true ]; then
+        exit "$ADDRESS_PENDING_SIGNAL_STATUS"
+    fi
+}
+
+run_address_hosted_command() {
+    local output_file="$1"
+    shift
+    local child_pid command_rc=0 timeout_seconds control_dir owner_pid
+    local timeout_attempt=0 timeout_limit status_value=""
+    ADDRESS_MUTATION_CHILD_STARTING=true
+    ADDRESS_HOSTED_RESULT_FILE="$output_file"
+    control_dir="$(mktemp -d \
+        "${TMPDIR:-/tmp}/gh-pr-enrich-hosted-control.XXXXXX")" || {
+        ADDRESS_MUTATION_CHILD_STARTING=false
+        return 1
+    }
+    ADDRESS_HOSTED_CONTROL_DIR="$control_dir"
+    owner_pid="$$"
+    set -m
+    (
+        supervisor_rc=0
+        trap ':' TERM INT
+        GH_PR_ENRICH_ADDRESS_OWNER_PID="$owner_pid" \
+            "$@" > "$output_file" 2>&1 || supervisor_rc=$?
+        if ! printf '%s\n' "$supervisor_rc" > "$control_dir/status.tmp" || \
+           ! mv "$control_dir/status.tmp" "$control_dir/status" || \
+           ! : > "$control_dir/complete"; then
+            supervisor_rc=125
+        fi
+        # Retain the owned job even if status publication fails. The parent
+        # always terminates and reaps this supervisor group after consuming a
+        # response or reaching its bounded timeout.
+        while :; do
+            kill -0 "$owner_pid" 2>/dev/null || exit "$supervisor_rc"
+            sleep 0.05
+        done
+    ) &
+    child_pid=$!
+    ADDRESS_MUTATION_CHILD_JOB_SPEC="%+"
+    ADDRESS_MUTATION_CHILD_PID="$child_pid"
+    timeout_seconds="$(positive_integer_or_default \
+        "${GH_PR_ENRICH_GITHUB_TIMEOUT:-}" 60 3600)"
+    ADDRESS_MUTATION_CHILD_STARTING=false
+    if [ -n "$ADDRESS_PENDING_SIGNAL_STATUS" ] && \
+       [ "$ADDRESS_BATCH_ROLLBACK_IN_PROGRESS" != true ]; then
+        terminate_address_mutation_child
+        exit "$ADDRESS_PENDING_SIGNAL_STATUS"
+    fi
+    timeout_limit=$((timeout_seconds * 5))
+    while [ ! -f "$control_dir/complete" ] && \
+          address_job_is_running "$ADDRESS_MUTATION_CHILD_JOB_SPEC" && \
+          [ "$timeout_attempt" -lt "$timeout_limit" ]; do
+        sleep 0.2
+        timeout_attempt=$((timeout_attempt + 1))
+    done
+    if [ ! -f "$control_dir/complete" ] && \
+       address_job_is_running "$ADDRESS_MUTATION_CHILD_JOB_SPEC"; then
+        terminate_address_mutation_child
+        echo "Error: GitHub request timed out after ${timeout_seconds}s" >&2
+        return 124
+    fi
+    if [ ! -f "$control_dir/complete" ] || \
+       [ ! -f "$control_dir/status" ]; then
+        terminate_address_mutation_child
+        echo "Error: Managed GitHub request supervisor failed" >&2
+        return 125
+    fi
+    status_value="$(cat "$control_dir/status" 2>/dev/null || echo invalid)"
+    [[ "$status_value" =~ ^[0-9]+$ ]] || {
+        terminate_address_mutation_child immediate
+        echo "Error: Managed GitHub request status is invalid" >&2
+        return 125
+    }
+    # Keep the supervisor job alive until the parent terminates the complete
+    # group. This closes both the final-wait signal race and descendant leaks
+    # after the direct hosted command exits.
+    terminate_address_mutation_child immediate
+    command_rc="$status_value"
+    if [ -n "$ADDRESS_PENDING_SIGNAL_STATUS" ] && \
+       [ "$ADDRESS_BATCH_ROLLBACK_IN_PROGRESS" = true ] && \
+       [ "$command_rc" -eq "$ADDRESS_PENDING_SIGNAL_STATUS" ]; then
+        command_rc=0
+    fi
+    if [ -n "$ADDRESS_PENDING_SIGNAL_STATUS" ] && \
+       [ "$ADDRESS_BATCH_ROLLBACK_IN_PROGRESS" != true ]; then
+        exit "$ADDRESS_PENDING_SIGNAL_STATUS"
+    fi
+    return "$command_rc"
+}
+
 unresolve_review_thread_and_verify() {
     local context_file="$1"
     local thread_id="$2"
-    local result
-    result="$(gh api graphql \
+    local result result_file mutation_rc=0
+    result_file="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-unresolve-result.XXXXXX")" || return 1
+    run_address_hosted_command "$result_file" gh api graphql \
         -F threadId="$thread_id" \
         -f query='mutation($threadId: ID!) {
             unresolveReviewThread(input: {threadId: $threadId}) {
                 thread { isResolved }
             }
-        }' 2>&1)" || return 1
+        }' || mutation_rc=$?
+    result="$(cat "$result_file")"
+    rm -f "$result_file"
+    [ "$mutation_rc" -eq 0 ] || return "$mutation_rc"
     echo "$result" | jq -e \
         '.data.unresolveReviewThread.thread.isResolved == false' \
         > /dev/null 2>&1 || return 1
     local live_file
-    live_file="$(mktemp "/tmp/gh-pr-enrich-reopened-thread.XXXXXX")" || return 1
+    live_file="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-reopened-thread.XXXXXX")" || return 1
     if ! fetch_live_review_thread "$thread_id" "$live_file" || \
-       ! jq -e --arg thread_id "$thread_id" '
-            .data.node.id == $thread_id and
-            .data.node.isResolved == false
-       ' "$live_file" > /dev/null 2>&1; then
+       ! validate_live_review_thread_snapshot \
+            "$context_file" "$thread_id" false "$live_file"; then
         rm -f "$live_file"
         return 1
     fi
     rm -f "$live_file"
+}
+
+compensate_address_thread_batch() {
+    local context_file="$1"
+    shift
+    local thread_ids=("$@")
+    local index thread_id live_file compensation_failed=0
+
+    # Roll back in reverse mutation order. Only reopen a thread when its full
+    # captured discussion identity is unchanged; reviewer-owned replies or edits
+    # make automatic compensation unsafe.
+    for ((index=${#thread_ids[@]} - 1; index >= 0; index--)); do
+        thread_id="${thread_ids[$index]}"
+        live_file="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-compensate-thread.XXXXXX")" || {
+            echo "  ❌ Could not inspect $thread_id for batch rollback. Manual reconciliation is required."
+            compensation_failed=1
+            continue
+        }
+        if ! fetch_live_review_thread "$thread_id" "$live_file" || \
+           ! live_review_thread_identity_matches_context \
+                "$context_file" "$thread_id" "$live_file"; then
+            rm -f "$live_file"
+            echo "  ❌ Reviewer-owned state changed for $thread_id; it was not reopened. Manual reconciliation is required."
+            compensation_failed=1
+            continue
+        fi
+        if jq -e --arg thread_id "$thread_id" '
+                .data.node.id == $thread_id and
+                .data.node.isResolved == false
+            ' "$live_file" > /dev/null 2>&1; then
+            rm -f "$live_file"
+            continue
+        fi
+        if ! jq -e --arg thread_id "$thread_id" '
+                .data.node.id == $thread_id and
+                .data.node.isResolved == true
+            ' "$live_file" > /dev/null 2>&1; then
+            rm -f "$live_file"
+            echo "  ❌ Resolution state for $thread_id is indeterminate. Manual reconciliation is required."
+            compensation_failed=1
+            continue
+        fi
+        rm -f "$live_file"
+        if unresolve_review_thread_and_verify "$context_file" "$thread_id"; then
+            echo "  ↩️  Batch rollback reopened $thread_id"
+        else
+            echo "  ❌ Batch rollback could not verify $thread_id reopened. Manual reconciliation is required."
+            compensation_failed=1
+        fi
+    done
+    [ "$compensation_failed" -eq 0 ]
+}
+
+rollback_active_address_thread_batch() {
+    local rollback_rc=0
+    [ "$ADDRESS_BATCH_ACTIVE" = true ] || return 0
+    ADDRESS_BATCH_ROLLBACK_IN_PROGRESS=true
+    compensate_address_thread_batch "$ADDRESS_BATCH_CONTEXT_FILE" \
+        "${ADDRESS_BATCH_RESOLVED_THREAD_IDS[@]}" || rollback_rc=$?
+    ADDRESS_BATCH_ACTIVE=false
+    ADDRESS_BATCH_RESOLVED_THREAD_IDS=()
+    ADDRESS_BATCH_ROLLBACK_IN_PROGRESS=false
+    return "$rollback_rc"
 }
 
 SELECTED_ANALYSIS_LOCK_DIR=""
@@ -4723,9 +4987,17 @@ if [ "$1" = "uninstall-skill" ]; then
         local skill_target="$1"
         CAPTURED_UNINSTALL_PRESENT=false
         CAPTURED_UNINSTALL_PAYLOAD=""
+        CAPTURED_UNINSTALL_IDENTITY=""
         if [ -L "$skill_target" ]; then
             CAPTURED_UNINSTALL_PAYLOAD="$(readlink "$skill_target")" || {
                 echo "Error: Could not inspect symlink $skill_target"
+                return 1
+            }
+            CAPTURED_UNINSTALL_IDENTITY="$(
+                stat -c '%d:%i' "$skill_target" 2>/dev/null ||
+                    stat -f '%d:%i' "$skill_target" 2>/dev/null
+            )" || {
+                echo "Error: Could not identify symlink $skill_target"
                 return 1
             }
             CAPTURED_UNINSTALL_PRESENT=true
@@ -4735,51 +5007,235 @@ if [ "$1" = "uninstall-skill" ]; then
         fi
     }
 
-    remove_captured_skill() {
-        local runtime_label="$1" skill_target="$2" was_present="$3" payload="$4"
-        local current_payload
+    uninstall_recovery_path() {
+        local claim_path="$1" reference_path="$2"
+        if [ -L "$claim_path" ] || [ -e "$claim_path" ]; then
+            printf '%s\n' "$claim_path"
+        elif [ -L "$reference_path" ] || [ -e "$reference_path" ]; then
+            printf '%s\n' "$reference_path"
+        fi
+    }
+
+    restore_uninstall_claim() {
+        local runtime_label="$1" skill_target="$2" claim_path="$3"
+        local reference_path="$4" claim_dir="$5"
+        local restore_source="" skill_parent reference_dir recovery_path
+        [ -n "$claim_path" ] || [ -n "$reference_path" ] || return 0
+        if [ -L "$skill_target" ] || [ -e "$skill_target" ]; then
+            recovery_path="$(uninstall_recovery_path \
+                "$claim_path" "$reference_path")"
+            echo "Error: Could not restore $runtime_label registration because $skill_target was replaced concurrently; the displaced registration remains at ${recovery_path:-an unknown private recovery path}"
+            return 1
+        fi
+        if [ -L "$claim_path" ] || [ -f "$claim_path" ]; then
+            restore_source="$claim_path"
+        elif [ -L "$reference_path" ] || [ -f "$reference_path" ]; then
+            restore_source="$reference_path"
+        elif [ -d "$claim_path" ]; then
+            echo "Error: A concurrently claimed $runtime_label directory is preserved at $claim_path; restore it manually after verifying $skill_target is absent"
+            return 1
+        else
+            echo "Error: Could not restore $runtime_label registration; no owned claim remains"
+            return 1
+        fi
+        skill_parent="$(dirname "$skill_target")"
+        # Every private restore source retains the exact public basename. Link
+        # into the parent directory so a concurrently created file or directory
+        # at skill_target produces EEXIST instead of receiving a nested link.
+        if ! ln -P "$restore_source" "$skill_parent" 2>/dev/null; then
+            recovery_path="$(uninstall_recovery_path \
+                "$claim_path" "$reference_path")"
+            echo "Error: Could not restore $runtime_label registration at $skill_target; the displaced registration remains at ${recovery_path:-an unknown private recovery path}"
+            return 1
+        fi
+        if { [ -L "$claim_path" ] || [ -f "$claim_path" ]; } && \
+           ! rm "$claim_path" 2>/dev/null; then
+            echo "Error: Restored $runtime_label registration, but its private claim remains at $claim_path"
+            return 1
+        fi
+        if { [ -L "$reference_path" ] || [ -f "$reference_path" ]; } && \
+           ! rm "$reference_path" 2>/dev/null; then
+            echo "Error: Restored $runtime_label registration, but its private reference remains at $reference_path"
+            return 1
+        fi
+        reference_dir="$(dirname "$reference_path")"
+        if [ "$reference_dir" != "$claim_dir" ] && \
+           [ -d "$reference_dir" ] && \
+           ! rmdir "$reference_dir" 2>/dev/null; then
+            echo "Error: Restored $runtime_label registration, but its private reference directory remains at $reference_dir"
+            return 1
+        fi
+        if [ -d "$claim_dir" ] && ! rmdir "$claim_dir" 2>/dev/null; then
+            echo "Error: Restored $runtime_label registration, but its private claim directory remains at $claim_dir"
+            return 1
+        fi
+        echo "↩️  Restored $runtime_label skill registration after uninstall failure"
+    }
+
+    claim_captured_skill() {
+        local runtime_label="$1" skill_target="$2" was_present="$3"
+        local payload="$4" identity="$5"
+        local skill_parent claim_dir claim_path reference_dir reference_path
+        local claimed_payload claimed_identity
+        CAPTURED_UNINSTALL_CLAIM_DIR=""
+        CAPTURED_UNINSTALL_CLAIM_PATH=""
+        CAPTURED_UNINSTALL_REFERENCE=""
         if [ "$was_present" != true ]; then
             echo "ℹ️  $runtime_label skill not installed at $skill_target"
             return 0
         fi
-        if [ ! -L "$skill_target" ]; then
-            echo "Error: $skill_target changed after uninstall preflight; leaving it untouched"
-            return 1
-        fi
-        current_payload="$(readlink "$skill_target")" || {
-            echo "Error: Could not re-check symlink $skill_target"
+        skill_parent="$(dirname "$skill_target")"
+        claim_dir="$(mktemp -d \
+            "$skill_parent/.gh-pr-enrich-uninstall.XXXXXX")" || {
+            echo "Error: Could not create a private $runtime_label uninstall claim"
             return 1
         }
-        if [ "$current_payload" != "$payload" ]; then
-            echo "Error: $skill_target changed after uninstall preflight; leaving it untouched"
+        claim_path="$claim_dir/gh-pr-enrich"
+        reference_dir="$claim_dir/reference"
+        reference_path="$reference_dir/gh-pr-enrich"
+        CAPTURED_UNINSTALL_CLAIM_DIR="$claim_dir"
+        CAPTURED_UNINSTALL_CLAIM_PATH="$claim_path"
+        CAPTURED_UNINSTALL_REFERENCE="$reference_path"
+
+        # Atomically detach the public name before inspecting it. A concurrent
+        # replacement after this move owns the public path and is never removed.
+        if ! mv "$skill_target" "$claim_path" 2>/dev/null; then
+            if [ ! -L "$claim_path" ] && [ ! -e "$claim_path" ]; then
+                echo "Error: $skill_target changed after uninstall preflight; leaving it untouched"
+                rmdir "$claim_dir" 2>/dev/null || true
+                CAPTURED_UNINSTALL_CLAIM_DIR=""
+                CAPTURED_UNINSTALL_CLAIM_PATH=""
+                CAPTURED_UNINSTALL_REFERENCE=""
+                return 1
+            fi
+            echo "Error: $runtime_label uninstall claim reported failure after detaching the registration; recovering the claim"
+        fi
+
+        if [ ! -L "$claim_path" ]; then
+            echo "Error: $skill_target was replaced concurrently by a non-symlink"
+            restore_uninstall_claim "$runtime_label" "$skill_target" \
+                "$claim_path" "$reference_path" "$claim_dir" || true
             return 1
         fi
-        rm "$skill_target" 2>/dev/null || {
-            echo "Error: Could not remove $skill_target"
+        claimed_payload="$(readlink "$claim_path")" || {
+            echo "Error: Could not inspect the claimed $runtime_label registration; preserved at $claim_path"
             return 1
         }
-        echo "✅ $runtime_label skill uninstalled"
+        claimed_identity="$(
+            stat -c '%d:%i' "$claim_path" 2>/dev/null ||
+                stat -f '%d:%i' "$claim_path" 2>/dev/null
+        )" || {
+            echo "Error: Could not identify the claimed $runtime_label registration; preserved at $claim_path"
+            return 1
+        }
+        if [ "$claimed_payload" != "$payload" ] || \
+           [ "$claimed_identity" != "$identity" ]; then
+            if restore_uninstall_claim "$runtime_label" "$skill_target" \
+                    "$claim_path" "$reference_path" "$claim_dir"; then
+                CAPTURED_UNINSTALL_CLAIM_DIR=""
+                CAPTURED_UNINSTALL_CLAIM_PATH=""
+                CAPTURED_UNINSTALL_REFERENCE=""
+                echo "Error: $skill_target changed after uninstall preflight; restored it unchanged"
+            else
+                echo "Error: $skill_target changed after uninstall preflight; preserved at $claim_path"
+            fi
+            return 1
+        fi
+
+        # Keep an exact hard-link reference to the claimed symlink inode until
+        # every selected runtime has committed. This permits an identity-exact
+        # rollback if a later claim or removal fails.
+        if ! mkdir "$reference_dir" 2>/dev/null || \
+           ! ln -P "$claim_path" "$reference_dir" 2>/dev/null; then
+            echo "Error: Could not retain the private $runtime_label uninstall claim"
+            restore_uninstall_claim "$runtime_label" "$skill_target" \
+                "$claim_path" "$reference_path" "$claim_dir" || true
+            return 1
+        fi
     }
 
-    restore_removed_skill() {
-        local runtime_label="$1" skill_target="$2" payload="$3"
-        if [ -e "$skill_target" ] || [ -L "$skill_target" ]; then
-            echo "Error: Could not restore $runtime_label registration because $skill_target was replaced concurrently"
-            return 1
+    remove_uninstall_claim() {
+        local runtime_label="$1" claim_path="$2"
+        [ -z "$claim_path" ] || [ ! -L "$claim_path" ] || \
+            rm "$claim_path" 2>/dev/null || {
+                echo "Error: Could not remove the claimed $runtime_label registration"
+                return 1
+            }
+    }
+
+    cleanup_uninstall_reference() {
+        local runtime_label="$1" reference_path="$2" claim_dir="$3"
+        local reference_dir
+        [ -z "$reference_path" ] || [ ! -L "$reference_path" ] || \
+            rm "$reference_path" 2>/dev/null || {
+                echo "Error: Could not remove the private $runtime_label uninstall reference at $reference_path"
+                return 1
+            }
+        reference_dir="$(dirname "$reference_path")"
+        [ -z "$reference_path" ] || [ "$reference_dir" = "$claim_dir" ] || \
+            [ ! -d "$reference_dir" ] || rmdir "$reference_dir" 2>/dev/null || {
+                echo "Error: Could not remove the private $runtime_label uninstall reference directory at $reference_dir"
+                return 1
+            }
+        [ -z "$claim_dir" ] || [ ! -d "$claim_dir" ] || \
+            rmdir "$claim_dir" 2>/dev/null || {
+                echo "Error: Could not remove the private $runtime_label uninstall directory at $claim_dir"
+                return 1
+            }
+    }
+
+    record_uninstall_signal() {
+        case "$1" in
+            INT) UNINSTALL_TRANSACTION_SIGNAL_STATUS=130 ;;
+            TERM) UNINSTALL_TRANSACTION_SIGNAL_STATUS=143 ;;
+        esac
+    }
+
+    cleanup_uninstall_transaction_on_exit() {
+        local exit_status="$1"
+        trap - EXIT
+        trap '' INT TERM
+        if [ "$UNINSTALL_TRANSACTION_ACTIVE" = true ]; then
+            if [ "$UNINSTALL_TRANSACTION_COMMITTED" = true ]; then
+                cleanup_uninstall_reference "Codex" \
+                    "$CODEX_UNINSTALL_REFERENCE" \
+                    "$CODEX_UNINSTALL_CLAIM_DIR" || true
+                cleanup_uninstall_reference "Claude" \
+                    "$CLAUDE_UNINSTALL_REFERENCE" \
+                    "$CLAUDE_UNINSTALL_CLAIM_DIR" || true
+            else
+                restore_uninstall_claim "Claude" "$CLAUDE_SKILL_TARGET" \
+                    "$CLAUDE_UNINSTALL_CLAIM_PATH" \
+                    "$CLAUDE_UNINSTALL_REFERENCE" \
+                    "$CLAUDE_UNINSTALL_CLAIM_DIR" || true
+                restore_uninstall_claim "Codex" "$CODEX_SKILL_TARGET" \
+                    "$CODEX_UNINSTALL_CLAIM_PATH" \
+                    "$CODEX_UNINSTALL_REFERENCE" \
+                    "$CODEX_UNINSTALL_CLAIM_DIR" || true
+            fi
         fi
-        if ! ln -s "$payload" "$skill_target" 2>/dev/null; then
-            echo "Error: Could not restore $runtime_label registration at $skill_target"
-            return 1
-        fi
-        echo "↩️  Restored $runtime_label skill registration after uninstall failure"
+        [ -z "$UNINSTALL_TRANSACTION_SIGNAL_STATUS" ] || \
+            exit_status="$UNINSTALL_TRANSACTION_SIGNAL_STATUS"
+        exit "$exit_status"
     }
 
     CODEX_SKILL_TARGET="$HOME/.codex/skills/gh-pr-enrich"
     CLAUDE_SKILL_TARGET="$HOME/.claude/skills/gh-pr-enrich"
     CODEX_UNINSTALL_PRESENT=false
     CODEX_UNINSTALL_PAYLOAD=""
+    CODEX_UNINSTALL_IDENTITY=""
+    CODEX_UNINSTALL_CLAIM_DIR=""
+    CODEX_UNINSTALL_CLAIM_PATH=""
+    CODEX_UNINSTALL_REFERENCE=""
     CLAUDE_UNINSTALL_PRESENT=false
     CLAUDE_UNINSTALL_PAYLOAD=""
+    CLAUDE_UNINSTALL_IDENTITY=""
+    CLAUDE_UNINSTALL_CLAIM_DIR=""
+    CLAUDE_UNINSTALL_CLAIM_PATH=""
+    CLAUDE_UNINSTALL_REFERENCE=""
+    UNINSTALL_TRANSACTION_ACTIVE=false
+    UNINSTALL_TRANSACTION_COMMITTED=false
+    UNINSTALL_TRANSACTION_SIGNAL_STATUS=""
 
     # Capture both selected registrations before removing either. Any symlink,
     # including a stale or broken one, remains removable; non-symlink entries
@@ -4788,30 +5244,69 @@ if [ "$1" = "uninstall-skill" ]; then
         capture_skill_uninstall "$CODEX_SKILL_TARGET" || exit 1
         CODEX_UNINSTALL_PRESENT="$CAPTURED_UNINSTALL_PRESENT"
         CODEX_UNINSTALL_PAYLOAD="$CAPTURED_UNINSTALL_PAYLOAD"
+        CODEX_UNINSTALL_IDENTITY="$CAPTURED_UNINSTALL_IDENTITY"
     fi
     if [ "$SKILL_RUNTIME" = "claude" ] || [ "$SKILL_RUNTIME" = "both" ]; then
         capture_skill_uninstall "$CLAUDE_SKILL_TARGET" || exit 1
         CLAUDE_UNINSTALL_PRESENT="$CAPTURED_UNINSTALL_PRESENT"
         CLAUDE_UNINSTALL_PAYLOAD="$CAPTURED_UNINSTALL_PAYLOAD"
+        CLAUDE_UNINSTALL_IDENTITY="$CAPTURED_UNINSTALL_IDENTITY"
     fi
 
-    CODEX_UNINSTALL_REMOVED=false
+    UNINSTALL_TRANSACTION_ACTIVE=true
+    trap 'record_uninstall_signal INT' INT
+    trap 'record_uninstall_signal TERM' TERM
+    trap 'cleanup_uninstall_transaction_on_exit $?' EXIT
+
     if [ "$SKILL_RUNTIME" = "codex" ] || [ "$SKILL_RUNTIME" = "both" ]; then
-        if ! remove_captured_skill "Codex" "$CODEX_SKILL_TARGET" \
-            "$CODEX_UNINSTALL_PRESENT" "$CODEX_UNINSTALL_PAYLOAD"; then
+        if ! claim_captured_skill "Codex" "$CODEX_SKILL_TARGET" \
+                "$CODEX_UNINSTALL_PRESENT" "$CODEX_UNINSTALL_PAYLOAD" \
+                "$CODEX_UNINSTALL_IDENTITY"; then
             exit 1
         fi
-        [ "$CODEX_UNINSTALL_PRESENT" != true ] || CODEX_UNINSTALL_REMOVED=true
+        CODEX_UNINSTALL_CLAIM_DIR="$CAPTURED_UNINSTALL_CLAIM_DIR"
+        CODEX_UNINSTALL_CLAIM_PATH="$CAPTURED_UNINSTALL_CLAIM_PATH"
+        CODEX_UNINSTALL_REFERENCE="$CAPTURED_UNINSTALL_REFERENCE"
+        [ -z "$UNINSTALL_TRANSACTION_SIGNAL_STATUS" ] || \
+            exit "$UNINSTALL_TRANSACTION_SIGNAL_STATUS"
     fi
     if [ "$SKILL_RUNTIME" = "claude" ] || [ "$SKILL_RUNTIME" = "both" ]; then
-        if ! remove_captured_skill "Claude" "$CLAUDE_SKILL_TARGET" \
-            "$CLAUDE_UNINSTALL_PRESENT" "$CLAUDE_UNINSTALL_PAYLOAD"; then
-            if [ "$CODEX_UNINSTALL_REMOVED" = true ]; then
-                restore_removed_skill "Codex" "$CODEX_SKILL_TARGET" \
-                    "$CODEX_UNINSTALL_PAYLOAD" || true
-            fi
+        if ! claim_captured_skill "Claude" "$CLAUDE_SKILL_TARGET" \
+                "$CLAUDE_UNINSTALL_PRESENT" "$CLAUDE_UNINSTALL_PAYLOAD" \
+                "$CLAUDE_UNINSTALL_IDENTITY"; then
             exit 1
         fi
+        CLAUDE_UNINSTALL_CLAIM_DIR="$CAPTURED_UNINSTALL_CLAIM_DIR"
+        CLAUDE_UNINSTALL_CLAIM_PATH="$CAPTURED_UNINSTALL_CLAIM_PATH"
+        CLAUDE_UNINSTALL_REFERENCE="$CAPTURED_UNINSTALL_REFERENCE"
+        [ -z "$UNINSTALL_TRANSACTION_SIGNAL_STATUS" ] || \
+            exit "$UNINSTALL_TRANSACTION_SIGNAL_STATUS"
+    fi
+
+    [ -z "$UNINSTALL_TRANSACTION_SIGNAL_STATUS" ] || \
+        exit "$UNINSTALL_TRANSACTION_SIGNAL_STATUS"
+    remove_uninstall_claim "Codex" "$CODEX_UNINSTALL_CLAIM_PATH" || exit 1
+    [ -z "$UNINSTALL_TRANSACTION_SIGNAL_STATUS" ] || \
+        exit "$UNINSTALL_TRANSACTION_SIGNAL_STATUS"
+    remove_uninstall_claim "Claude" "$CLAUDE_UNINSTALL_CLAIM_PATH" || exit 1
+    [ -z "$UNINSTALL_TRANSACTION_SIGNAL_STATUS" ] || \
+        exit "$UNINSTALL_TRANSACTION_SIGNAL_STATUS"
+
+    # Both public registrations are now intentionally absent. References are
+    # cleanup-only from this point; signal rollback must not reinstall them.
+    UNINSTALL_TRANSACTION_COMMITTED=true
+    cleanup_uninstall_reference "Codex" "$CODEX_UNINSTALL_REFERENCE" \
+        "$CODEX_UNINSTALL_CLAIM_DIR" || exit 1
+    cleanup_uninstall_reference "Claude" "$CLAUDE_UNINSTALL_REFERENCE" \
+        "$CLAUDE_UNINSTALL_CLAIM_DIR" || exit 1
+    UNINSTALL_TRANSACTION_ACTIVE=false
+    if [ "$CODEX_UNINSTALL_PRESENT" = true ] && \
+       { [ "$SKILL_RUNTIME" = "codex" ] || [ "$SKILL_RUNTIME" = "both" ]; }; then
+        echo "✅ Codex skill uninstalled"
+    fi
+    if [ "$CLAUDE_UNINSTALL_PRESENT" = true ] && \
+       { [ "$SKILL_RUNTIME" = "claude" ] || [ "$SKILL_RUNTIME" = "both" ]; }; then
+        echo "✅ Claude skill uninstalled"
     fi
     exit 0
 fi
@@ -5097,6 +5592,7 @@ fi
 # Handle address subcommand - interactive mode to work through issues
 if [ "$1" = "address" ]; then
     shift
+    ADDRESS_COMMAND_MANAGEMENT_ENABLED=true
     if [ $# -eq 0 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
         echo "Usage: gh pr-enrich address <PR_NUMBER>"
         echo ""
@@ -5130,15 +5626,30 @@ if [ "$1" = "address" ]; then
 
     ADDRESS_LIVE_ANALYSIS_FILE="$ANALYSIS_FILE"
     ADDRESS_LIVE_CONTEXT_FILE="$ANALYSIS_DIR/analysis-context.json"
-    ADDRESS_FROZEN_ANALYSIS="$(mktemp "/tmp/gh-pr-enrich-address-analysis.XXXXXX")" || exit 1
-    ADDRESS_FROZEN_CONTEXT="$(mktemp "/tmp/gh-pr-enrich-address-context.XXXXXX")" || {
+    ADDRESS_FROZEN_ANALYSIS="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-address-analysis.XXXXXX")" || exit 1
+    ADDRESS_FROZEN_CONTEXT="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-address-context.XXXXXX")" || {
         rm -f "$ADDRESS_FROZEN_ANALYSIS"
         exit 1
     }
     cleanup_address_analysis() {
+        local exit_status=$?
+        trap - EXIT
+        trap '' INT TERM
+        terminate_address_mutation_child
+        cleanup_address_hosted_control
+        rollback_active_address_thread_batch || true
+        [ -z "$ADDRESS_MUTATION_RESULT_FILE" ] || \
+            rm -f "$ADDRESS_MUTATION_RESULT_FILE"
+        [ -z "$ADDRESS_HOSTED_RESULT_FILE" ] || \
+            rm -f "$ADDRESS_HOSTED_RESULT_FILE"
         rm -f "$ADDRESS_FROZEN_ANALYSIS" "$ADDRESS_FROZEN_CONTEXT"
+        [ -z "$ADDRESS_PENDING_SIGNAL_STATUS" ] || \
+            exit_status="$ADDRESS_PENDING_SIGNAL_STATUS"
+        exit "$exit_status"
     }
     trap cleanup_address_analysis EXIT
+    trap 'handle_address_signal INT' INT
+    trap 'handle_address_signal TERM' TERM
     ADDRESS_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
     ADDRESS_ANALYSIS_MODE="$(workspace_file_mode "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
     ADDRESS_CONTEXT_DIGEST="$(sha256_file "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
@@ -5284,14 +5795,27 @@ if [ "$1" = "address" ]; then
                         echo "  ❌ Legacy analysis cannot authorize hosted thread mutations. Re-run and select a current analysis."
                         RESOLVE_FAILED=1
                     else
+                        THREAD_IDS_TO_RESOLVE=()
                         for TID in $THREAD_ARRAY; do
-                            # Validate and re-check the hosted revision immediately
-                            # before every mutation, including later IDs in a batch.
                             if [[ ! "$TID" =~ ^PRRT_[A-Za-z0-9_-]+$ ]]; then
-                                echo "  ⚠️  Invalid thread ID format: $TID"
-                                ((RESOLVE_FAILED++))
-                                continue
+                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                echo "  ❌ Invalid thread ID format: $TID"
+                                exit 1
                             fi
+                            for EXISTING_TID in "${THREAD_IDS_TO_RESOLVE[@]}"; do
+                                if [ "$EXISTING_TID" = "$TID" ]; then
+                                    invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                    echo "  ❌ Duplicate thread ID in one task: $TID"
+                                    exit 1
+                                fi
+                            done
+                            THREAD_IDS_TO_RESOLVE+=("$TID")
+                        done
+
+                        # Validate the complete task batch before resolving any
+                        # thread. Per-thread checks are repeated below to close
+                        # the remaining preflight-to-mutation window.
+                        for TID in "${THREAD_IDS_TO_RESOLVE[@]}"; do
                             LIVE_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
                             LIVE_ANALYSIS_MODE="$(workspace_file_mode "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
                             LIVE_CONTEXT_DIGEST="$(sha256_file "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
@@ -5328,15 +5852,75 @@ if [ "$1" = "address" ]; then
                                 fi
                                 exit 1
                             fi
+                        done
+
+                        ADDRESS_BATCH_CONTEXT_FILE="$ADDRESS_CONTEXT_FILE"
+                        ADDRESS_BATCH_RESOLVED_THREAD_IDS=()
+                        ADDRESS_BATCH_ACTIVE=true
+                        for TID in "${THREAD_IDS_TO_RESOLVE[@]}"; do
+                            # Revalidate immediately before every mutation. If a
+                            # later thread changes, compensate every earlier
+                            # resolution that still has captured discussion state.
+                            LIVE_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+                            LIVE_ANALYSIS_MODE="$(workspace_file_mode "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+                            LIVE_CONTEXT_DIGEST="$(sha256_file "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
+                            LIVE_CONTEXT_MODE="$(workspace_file_mode "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
+                            if [ -z "$LIVE_ANALYSIS_DIGEST" ] || \
+                               [ "$LIVE_ANALYSIS_DIGEST" != "$ADDRESS_ANALYSIS_DIGEST" ] || \
+                               [ "$LIVE_ANALYSIS_MODE" != "$ADDRESS_ANALYSIS_MODE" ] || \
+                               [ "$LIVE_CONTEXT_DIGEST" != "$ADDRESS_CONTEXT_DIGEST" ] || \
+                               [ "$LIVE_CONTEXT_MODE" != "$ADDRESS_CONTEXT_MODE" ] || \
+                               ! validate_address_selection_pair "$ANALYSIS_DIR" \
+                                    "$ANALYSIS_FILE" "$ADDRESS_LIVE_ANALYSIS_FILE" \
+                                    "$ADDRESS_CONTEXT_FILE" "$ADDRESS_LIVE_CONTEXT_FILE"; then
+                                rollback_active_address_thread_batch || true
+                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                echo "  ❌ Selected analysis or thread provenance changed. Re-run before resolving threads."
+                                exit 1
+                            fi
+                            if ! validate_live_review_thread \
+                                    "$ADDRESS_CONTEXT_FILE" "$TID" false; then
+                                rollback_active_address_thread_batch || true
+                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                echo "  ❌ Live review discussion changed or could not be fetched completely. Re-run before resolving threads."
+                                exit 1
+                            fi
+                            if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
+                                    "$ADDRESS_CONTEXT_HEAD" "$ADDRESS_CONTEXT_REPOSITORY"; then
+                                rollback_active_address_thread_batch || true
+                                invalidate_on_confirmed_hosted_head_mismatch \
+                                    "$ANALYSIS_DIR" || true
+                                if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
+                                    echo "  ❌ Hosted PR head changed since analysis (expected $ADDRESS_CONTEXT_HEAD, found $CURRENT_HOSTED_HEAD). Re-run before resolving threads."
+                                else
+                                    echo "  ❌ Hosted PR head could not be revalidated; prior batch resolutions were rolled back where safe."
+                                fi
+                                exit 1
+                            fi
                             RESULT=""
+                            MUTATION_RESULT_FILE="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-resolve-result.XXXXXX")" || {
+                                rollback_active_address_thread_batch || true
+                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                echo "  ❌ Could not stage the resolution response for $TID."
+                                exit 1
+                            }
+                            ADDRESS_MUTATION_RESULT_FILE="$MUTATION_RESULT_FILE"
                             MUTATION_RC=0
-                            RESULT=$(gh api graphql \
+                            # Track the attempted mutation before launching it:
+                            # cancellation or transport failure can still race
+                            # with a successfully applied hosted mutation.
+                            ADDRESS_BATCH_RESOLVED_THREAD_IDS+=("$TID")
+                            run_address_hosted_command "$MUTATION_RESULT_FILE" \
+                                gh api graphql \
                                 -F threadId="$TID" \
                                 -f query='mutation($threadId: ID!) {
                                     resolveReviewThread(input: {threadId: $threadId}) {
                                         thread { isResolved }
                                     }
-                                }' 2>&1) || MUTATION_RC=$?
+                                }' || MUTATION_RC=$?
+                            RESULT="$(cat "$MUTATION_RESULT_FILE")"
+                            rm -f "$MUTATION_RESULT_FILE"
+                            ADDRESS_MUTATION_RESULT_FILE=""
                             MUTATION_RESPONSE_RESOLVED=false
                             if [ "$MUTATION_RC" -eq 0 ] && \
                                echo "$RESULT" | jq -e \
@@ -5344,18 +5928,23 @@ if [ "$1" = "address" ]; then
                                     > /dev/null 2>&1; then
                                 MUTATION_RESPONSE_RESOLVED=true
                             fi
-
                             # A transport failure or malformed response may still
                             # have applied the mutation. Resolve the ambiguity from
                             # the live captured discussion before deciding whether
                             # compensation or success is possible.
                             if [ "$MUTATION_RESPONSE_RESOLVED" != true ]; then
-                                AMBIGUOUS_LIVE_FILE="$(mktemp "/tmp/gh-pr-enrich-ambiguous-thread.XXXXXX")" || exit 1
+                                AMBIGUOUS_LIVE_FILE="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-ambiguous-thread.XXXXXX")" || {
+                                    rollback_active_address_thread_batch || true
+                                    invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                    echo "  ❌ Could not inspect the ambiguous resolution for $TID. Manual reconciliation is required."
+                                    exit 1
+                                }
                                 if ! fetch_live_review_thread "$TID" "$AMBIGUOUS_LIVE_FILE" || \
                                    ! validate_live_review_thread_snapshot \
                                         "$ADDRESS_CONTEXT_FILE" "$TID" true \
                                         "$AMBIGUOUS_LIVE_FILE"; then
                                     rm -f "$AMBIGUOUS_LIVE_FILE"
+                                    rollback_active_address_thread_batch || true
                                     invalidate_selected_analysis "$ANALYSIS_DIR" || true
                                     echo "  ❌ Resolution result for $TID is ambiguous; live state could not prove the captured discussion resolved. Manual reconciliation is required."
                                     exit 1
@@ -5381,7 +5970,12 @@ if [ "$1" = "address" ]; then
 
                             POST_THREAD_IDENTITY_VALID=false
                             POST_THREAD_RESOLVED=false
-                            POST_LIVE_FILE="$(mktemp "/tmp/gh-pr-enrich-post-thread.XXXXXX")" || exit 1
+                            POST_LIVE_FILE="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-post-thread.XXXXXX")" || {
+                                rollback_active_address_thread_batch || true
+                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                echo "  ❌ Could not verify $TID after resolution. Manual reconciliation is required."
+                                exit 1
+                            }
                             if fetch_live_review_thread "$TID" "$POST_LIVE_FILE"; then
                                 if live_review_thread_identity_matches_context \
                                         "$ADDRESS_CONTEXT_FILE" "$TID" \
@@ -5407,25 +6001,26 @@ if [ "$1" = "address" ]; then
                             fi
 
                             if [ "$POST_THREAD_IDENTITY_VALID" != true ]; then
+                                rollback_active_address_thread_batch || true
                                 invalidate_selected_analysis "$ANALYSIS_DIR" || true
                                 echo "  ❌ Live review discussion changed during resolution; the thread was not reopened because reviewer-owned state changed. Manual reconciliation is required."
                                 exit 1
                             fi
                             if [ "$POST_THREAD_RESOLVED" != true ]; then
+                                rollback_active_address_thread_batch || true
                                 invalidate_selected_analysis "$ANALYSIS_DIR" || true
                                 echo "  ❌ Resolution state for $TID changed unexpectedly. Manual reconciliation is required."
                                 exit 1
                             fi
                             if [ "$POST_LOCAL_VALID" != true ] || \
                                [ "$POST_HEAD_VALID" != true ]; then
-                                if unresolve_review_thread_and_verify \
-                                        "$ADDRESS_CONTEXT_FILE" "$TID"; then
+                                if rollback_active_address_thread_batch; then
                                     if [ "$POST_LOCAL_VALID" != true ] || \
                                        [ "$POST_HEAD_STATUS" = "mismatch" ]; then
                                         invalidate_selected_analysis "$ANALYSIS_DIR" || true
-                                        echo "  ❌ State changed during resolution; reopened $TID and invalidated the analysis."
+                                        echo "  ❌ State changed during resolution; reopened the task thread batch and invalidated the analysis."
                                     else
-                                        echo "  ❌ Hosted PR head could not be revalidated after resolution; reopened $TID and preserved the selected analysis."
+                                        echo "  ❌ Hosted PR head could not be revalidated after resolution; reopened the task thread batch and preserved the selected analysis."
                                     fi
                                 else
                                     if [ "$POST_LOCAL_VALID" != true ] || \
@@ -5436,6 +6031,59 @@ if [ "$1" = "address" ]; then
                                 fi
                                 exit 1
                             fi
+                        done
+                        BATCH_COMMIT_FAILURE=""
+                        for TID in "${ADDRESS_BATCH_RESOLVED_THREAD_IDS[@]}"; do
+                            LIVE_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+                            LIVE_ANALYSIS_MODE="$(workspace_file_mode "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
+                            LIVE_CONTEXT_DIGEST="$(sha256_file "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
+                            LIVE_CONTEXT_MODE="$(workspace_file_mode "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
+                            if [ -z "$LIVE_ANALYSIS_DIGEST" ] || \
+                               [ "$LIVE_ANALYSIS_DIGEST" != "$ADDRESS_ANALYSIS_DIGEST" ] || \
+                               [ "$LIVE_ANALYSIS_MODE" != "$ADDRESS_ANALYSIS_MODE" ] || \
+                               [ "$LIVE_CONTEXT_DIGEST" != "$ADDRESS_CONTEXT_DIGEST" ] || \
+                               [ "$LIVE_CONTEXT_MODE" != "$ADDRESS_CONTEXT_MODE" ] || \
+                               ! validate_address_selection_pair "$ANALYSIS_DIR" \
+                                    "$ANALYSIS_FILE" "$ADDRESS_LIVE_ANALYSIS_FILE" \
+                                    "$ADDRESS_CONTEXT_FILE" "$ADDRESS_LIVE_CONTEXT_FILE"; then
+                                BATCH_COMMIT_FAILURE="local_state_changed"
+                                break
+                            fi
+                            if ! validate_live_review_thread \
+                                    "$ADDRESS_CONTEXT_FILE" "$TID" true; then
+                                BATCH_COMMIT_FAILURE="discussion_changed"
+                                break
+                            fi
+                            if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
+                                    "$ADDRESS_CONTEXT_HEAD" \
+                                    "$ADDRESS_CONTEXT_REPOSITORY"; then
+                                if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
+                                    BATCH_COMMIT_FAILURE="head_mismatch"
+                                else
+                                    BATCH_COMMIT_FAILURE="head_unavailable"
+                                fi
+                                break
+                            fi
+                        done
+                        if [ -n "$BATCH_COMMIT_FAILURE" ]; then
+                            BATCH_ROLLBACK_SUCCEEDED=true
+                            rollback_active_address_thread_batch || \
+                                BATCH_ROLLBACK_SUCCEEDED=false
+                            if [ "$BATCH_COMMIT_FAILURE" = "head_unavailable" ]; then
+                                if [ "$BATCH_ROLLBACK_SUCCEEDED" = true ]; then
+                                    echo "  ❌ Hosted PR head could not be revalidated before batch commit; reopened the task thread batch and preserved the selected analysis."
+                                else
+                                    echo "  ❌ Hosted PR head could not be revalidated and the task thread batch could not be verified reopened. Manual intervention is required."
+                                fi
+                            else
+                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                echo "  ❌ Task thread state changed before batch commit. Re-run before resolving threads."
+                            fi
+                            exit 1
+                        fi
+                        ADDRESS_BATCH_ACTIVE=false
+                        ADDRESS_BATCH_RESOLVED_THREAD_IDS=()
+                        for TID in "${THREAD_IDS_TO_RESOLVE[@]}"; do
                             echo "  ✅ Resolved: $TID"
                         done
                     fi
@@ -9045,7 +9693,7 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes"
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in

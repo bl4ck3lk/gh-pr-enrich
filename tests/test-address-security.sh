@@ -18,6 +18,24 @@ OPENED_LOG="$TEST_OUTPUT_DIR/opened-urls.txt"
 # shellcheck source=lib/assert.sh
 source "$SCRIPT_DIR/lib/assert.sh"
 
+wait_for_recorded_process_exit() {
+    local pid_file="$1" attempt=0 pid=""
+    while [ "$attempt" -lt 100 ]; do
+        [ ! -s "$pid_file" ] || break
+        sleep 0.05
+        attempt=$((attempt + 1))
+    done
+    [ -s "$pid_file" ] || return 1
+    pid="$(cat "$pid_file")"
+    attempt=0
+    while [ "$attempt" -lt 100 ]; do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.05
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
 cleanup() { rm -rf "$TEST_OUTPUT_DIR"; }
 trap cleanup EXIT
 cleanup
@@ -39,10 +57,22 @@ cat > "$STUB_DIR/gh" << 'STUB'
 #!/bin/bash
 case "$1 $2" in
     "pr view")
+        if [ -n "${GH_HEAD_FETCH_COUNT_FILE:-}" ]; then
+            head_fetch_count=0
+            [ ! -f "$GH_HEAD_FETCH_COUNT_FILE" ] || \
+                head_fetch_count="$(cat "$GH_HEAD_FETCH_COUNT_FILE")"
+            head_fetch_count=$((head_fetch_count + 1))
+            printf '%s\n' "$head_fetch_count" > "$GH_HEAD_FETCH_COUNT_FILE"
+            if [ "${GH_HEAD_MODE:-}" = "unavailable_at_commit" ] && \
+               [ "$head_fetch_count" -ge 7 ]; then
+                exit 1
+            fi
+        fi
         if [ -n "${GH_WORKSPACE_MUTATION:-}" ]; then
             printf 'changed during hosted verification\n' >> "$GH_WORKSPACE_MUTATION"
             echo '{"headRefOid":"captured-head"}'
-        elif [ "${GH_HEAD_MODE:-}" = "captured" ]; then
+        elif [ "${GH_HEAD_MODE:-}" = "captured" ] || \
+             [ "${GH_HEAD_MODE:-}" = "unavailable_at_commit" ]; then
             echo '{"headRefOid":"captured-head"}'
         elif [ "${GH_HEAD_MODE:-}" = "advance_after_mutation" ] && \
            [ ! -s "$GH_MUTATIONS_LOG" ]; then
@@ -55,22 +85,93 @@ case "$1 $2" in
     "api graphql")
         case "$*" in
             *"unresolveReviewThread"*)
+                unresolved_thread_id=""
                 for arg in "$@"; do
                     case "$arg" in
                         threadId=*)
+                            unresolved_thread_id="${arg#threadId=}"
                             printf 'unresolve:%s\n' "${arg#threadId=}" >> "$GH_MUTATIONS_LOG"
                             ;;
                     esac
                 done
+                if [ -n "${GH_SIGNAL_DURING_UNRESOLVE_THREAD:-}" ] && \
+                   [ "$unresolved_thread_id" = "$GH_SIGNAL_DURING_UNRESOLVE_THREAD" ]; then
+                    address_owner_pid="${GH_PR_ENRICH_ADDRESS_OWNER_PID:-$PPID}"
+                    [ -z "${GH_SIGNAL_CHILD_PID_FILE:-}" ] || \
+                        printf '%s\n' "$$" > "$GH_SIGNAL_CHILD_PID_FILE"
+                    kill -s "${GH_SIGNAL_DURING_UNRESOLVE_SIGNAL:-TERM}" \
+                        "$address_owner_pid"
+                    sleep 0.1
+                    [ "${GH_REPEAT_UNRESOLVE_SIGNAL:-false}" != true ] || \
+                        kill -s "${GH_SIGNAL_DURING_UNRESOLVE_SIGNAL:-TERM}" \
+                            "$address_owner_pid"
+                    sleep 0.2
+                fi
                 echo '{"data":{"unresolveReviewThread":{"thread":{"isResolved":false}}}}'
                 exit 0
                 ;;
             *"resolveReviewThread"*)
+                resolved_thread_id=""
                 for arg in "$@"; do
                     case "$arg" in
-                        threadId=*) printf '%s\n' "$arg" >> "$GH_MUTATIONS_LOG" ;;
+                        threadId=*)
+                            resolved_thread_id="${arg#threadId=}"
+                            ;;
                     esac
                 done
+                if [ -n "${GH_BLOCK_BEFORE_RESOLVE_THREAD:-}" ] && \
+                   [ "$resolved_thread_id" = "$GH_BLOCK_BEFORE_RESOLVE_THREAD" ]; then
+                    [ -z "${GH_SIGNAL_CHILD_PID_FILE:-}" ] || \
+                        printf '%s\n' "$$" > "$GH_SIGNAL_CHILD_PID_FILE"
+                    (
+                        trap '' TERM INT
+                        while :; do sleep 1; done
+                    ) &
+                    signal_descendant_pid=$!
+                    [ -z "${GH_SIGNAL_DESCENDANT_PID_FILE:-}" ] || \
+                        printf '%s\n' "$signal_descendant_pid" \
+                            > "$GH_SIGNAL_DESCENDANT_PID_FILE"
+                    trap '' TERM INT
+                    while :; do sleep 1; done
+                fi
+                printf 'threadId=%s\n' "$resolved_thread_id" \
+                    >> "$GH_MUTATIONS_LOG"
+                [ -z "${GH_WRAPPER_PID_FILE:-}" ] || \
+                    printf '%s\n' "${GH_PR_ENRICH_ADDRESS_OWNER_PID:-$PPID}" \
+                        > "$GH_WRAPPER_PID_FILE"
+                if [ "${GH_SIGNAL_AFTER_RESOLVE_EXIT:-false}" = true ]; then
+                    direct_pid="$$"
+                    address_owner_pid="${GH_PR_ENRICH_ADDRESS_OWNER_PID:-$PPID}"
+                    (
+                        trap '' TERM INT
+                        while kill -0 "$direct_pid" 2>/dev/null; do sleep 0.01; done
+                        [ -z "${GH_AFTER_EXIT_MARKER:-}" ] || \
+                            : > "$GH_AFTER_EXIT_MARKER"
+                        kill -TERM "$address_owner_pid"
+                        while :; do sleep 1; done
+                    ) &
+                    after_exit_pid=$!
+                    [ -z "${GH_AFTER_EXIT_PID_FILE:-}" ] || \
+                        printf '%s\n' "$after_exit_pid" > "$GH_AFTER_EXIT_PID_FILE"
+                fi
+                if [ -n "${GH_SIGNAL_DURING_RESOLVE_THREAD:-}" ] && \
+                   [ "$resolved_thread_id" = "$GH_SIGNAL_DURING_RESOLVE_THREAD" ]; then
+                    [ -z "${GH_SIGNAL_CHILD_PID_FILE:-}" ] || \
+                        printf '%s\n' "$$" > "$GH_SIGNAL_CHILD_PID_FILE"
+                    (
+                        trap '' TERM INT
+                        while :; do sleep 1; done
+                    ) &
+                    signal_descendant_pid=$!
+                    [ -z "${GH_SIGNAL_DESCENDANT_PID_FILE:-}" ] || \
+                        printf '%s\n' "$signal_descendant_pid" \
+                            > "$GH_SIGNAL_DESCENDANT_PID_FILE"
+                    kill -s "${GH_SIGNAL_DURING_RESOLVE_SIGNAL:-TERM}" \
+                        "${GH_PR_ENRICH_ADDRESS_OWNER_PID:-$PPID}"
+                    [ "${GH_DIRECT_ACCEPTS_SIGNAL:-false}" = true ] || \
+                        trap '' TERM INT
+                    while :; do sleep 1; done
+                fi
                 if [ "${GH_RESOLVE_MODE:-}" = "applied_nonzero" ]; then
                     echo 'transport failed after apply' >&2
                     exit 1
@@ -91,6 +192,33 @@ case "$1 $2" in
                 comments='[]'
                 has_next_page=false
                 [ "${GH_LIVE_INCOMPLETE:-}" != true ] || has_next_page=true
+                if [ "$thread_id" = "PRRT_second" ] && \
+                   [ -n "${GH_THREAD_FETCH_COUNT_FILE:-}" ]; then
+                    fetch_count=0
+                    [ ! -f "$GH_THREAD_FETCH_COUNT_FILE" ] || \
+                        fetch_count="$(cat "$GH_THREAD_FETCH_COUNT_FILE")"
+                    fetch_count=$((fetch_count + 1))
+                    printf '%s\n' "$fetch_count" > "$GH_THREAD_FETCH_COUNT_FILE"
+                    if [ "${GH_SECOND_THREAD_MODE:-}" = "preflight_incomplete" ]; then
+                        has_next_page=true
+                    elif [ "${GH_SECOND_THREAD_MODE:-}" = "drift_after_preflight" ] && \
+                         [ "$fetch_count" -ge 2 ]; then
+                        comments='[{"id":"PRRC_second_reply","databaseId":3,"author":{"login":"reviewer"},"createdAt":"2026-01-03T00:00:00Z","lastEditedAt":null,"url":"https://github.com/o/r/pull/999#discussion_r3"}]'
+                    fi
+                fi
+                if [ "$thread_id" = "PRRT_first" ] && \
+                   [ -n "${GH_FIRST_THREAD_FETCH_COUNT_FILE:-}" ]; then
+                    first_fetch_count=0
+                    [ ! -f "$GH_FIRST_THREAD_FETCH_COUNT_FILE" ] || \
+                        first_fetch_count="$(cat "$GH_FIRST_THREAD_FETCH_COUNT_FILE")"
+                    first_fetch_count=$((first_fetch_count + 1))
+                    printf '%s\n' "$first_fetch_count" \
+                        > "$GH_FIRST_THREAD_FETCH_COUNT_FILE"
+                    if [ "${GH_FIRST_THREAD_MODE:-}" = "drift_at_commit" ] && \
+                       [ "$first_fetch_count" -ge 4 ]; then
+                        comments='[{"id":"PRRC_first_reply","databaseId":4,"author":{"login":"reviewer"},"createdAt":"2026-01-04T00:00:00Z","lastEditedAt":null,"url":"https://github.com/o/r/pull/999#discussion_r4"}]'
+                    fi
+                fi
                 if [ -n "${GH_MUTATIONS_LOG:-}" ] && \
                    grep -q "^threadId=$thread_id$" "$GH_MUTATIONS_LOG" 2>/dev/null && \
                    ! grep -q "^unresolve:$thread_id$" "$GH_MUTATIONS_LOG" 2>/dev/null; then
@@ -484,6 +612,406 @@ assert_eq "2" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
     "a head race sends one resolve and one compensating unresolve mutation"
 assert_not_contains "$(cat "$MUTATION_LOG")" "PRRT_second" \
     "a head race blocks all later thread mutations"
+
+# Every thread in a task is preflighted before the first hosted mutation. A
+# later thread that is already incomplete cannot leave an earlier one resolved.
+SECOND_THREAD_FETCH_COUNT="$TEST_OUTPUT_DIR/second-thread-fetch-count"
+cp "$STALE_BATCH_TEMPLATE" "$STALE_MUTATION_REPORT/analysis.json"
+jq '.task_list[0].task = "BATCH PREFLIGHT TASK"
+    | .task_list[0].thread_ids = ["PRRT_first","PRRT_second"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
+: > "$MUTATION_LOG"
+rm -f "$SECOND_THREAD_FETCH_COUNT"
+set +e
+BATCH_PREFLIGHT_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_SECOND_THREAD_MODE=preflight_incomplete \
+    GH_THREAD_FETCH_COUNT_FILE="$SECOND_THREAD_FETCH_COUNT" \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1))
+BATCH_PREFLIGHT_RC=$?
+set -e
+assert_true "$([ "$BATCH_PREFLIGHT_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "a failed complete batch preflight exits nonzero"
+assert_contains "$BATCH_PREFLIGHT_OUT" "could not be fetched completely" \
+    "a changed later thread fails the complete batch preflight"
+assert_eq "" "$(cat "$MUTATION_LOG")" \
+    "a failed complete batch preflight sends no resolution mutation"
+assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "a failed complete batch preflight invalidates the selected artifact"
+
+# Revalidation still runs after preflight. If a later thread gains a reply only
+# after the first resolves, the owned earlier resolution is safely reopened.
+cp "$STALE_BATCH_TEMPLATE" "$STALE_MUTATION_REPORT/analysis.json"
+jq '.task_list[0].task = "BATCH REVALIDATION TASK"
+    | .task_list[0].thread_ids = ["PRRT_first","PRRT_second"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
+: > "$MUTATION_LOG"
+rm -f "$SECOND_THREAD_FETCH_COUNT"
+set +e
+BATCH_REVALIDATION_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_SECOND_THREAD_MODE=drift_after_preflight \
+    GH_THREAD_FETCH_COUNT_FILE="$SECOND_THREAD_FETCH_COUNT" \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1))
+BATCH_REVALIDATION_RC=$?
+set -e
+assert_true "$([ "$BATCH_REVALIDATION_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "later-thread drift exits nonzero after compensation"
+assert_contains "$BATCH_REVALIDATION_OUT" "Batch rollback reopened PRRT_first" \
+    "later-thread drift compensates the earlier resolution"
+assert_not_contains "$BATCH_REVALIDATION_OUT" "Resolved: PRRT_first" \
+    "batch success is not reported before every thread commits"
+assert_eq "2" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
+    "later-thread drift sends one resolve and one compensating unresolve"
+assert_not_contains "$(cat "$MUTATION_LOG")" "threadId=PRRT_second" \
+    "later-thread drift blocks its resolution mutation"
+assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "later-thread drift invalidates the selected artifact"
+
+# A thread that passed its own postcheck can still drift while later mutations
+# run. The final batch guard checks every thread again before reporting success.
+FIRST_THREAD_FETCH_COUNT="$TEST_OUTPUT_DIR/first-thread-fetch-count"
+cp "$STALE_BATCH_TEMPLATE" "$STALE_MUTATION_REPORT/analysis.json"
+jq '.task_list[0].task = "BATCH COMMIT TASK"
+    | .task_list[0].thread_ids = ["PRRT_first","PRRT_second"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
+: > "$MUTATION_LOG"
+rm -f "$FIRST_THREAD_FETCH_COUNT"
+set +e
+BATCH_COMMIT_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_FIRST_THREAD_MODE=drift_at_commit \
+    GH_FIRST_THREAD_FETCH_COUNT_FILE="$FIRST_THREAD_FETCH_COUNT" \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1))
+BATCH_COMMIT_RC=$?
+set -e
+assert_true "$([ "$BATCH_COMMIT_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "final batch drift exits nonzero after compensation"
+assert_contains "$BATCH_COMMIT_OUT" "changed before batch commit" \
+    "the final batch guard rejects drift in an earlier thread"
+assert_contains "$BATCH_COMMIT_OUT" "Reviewer-owned state changed for PRRT_first" \
+    "batch rollback preserves a new reply on the earlier thread"
+assert_contains "$BATCH_COMMIT_OUT" "Batch rollback reopened PRRT_second" \
+    "batch rollback reopens the unchanged later thread"
+assert_not_contains "$BATCH_COMMIT_OUT" "Resolved: PRRT_first" \
+    "final batch drift is not reported as successful resolution"
+assert_eq "3" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
+    "final batch drift resolves both threads and reopens only the unchanged one"
+assert_not_contains "$(cat "$MUTATION_LOG")" "unresolve:PRRT_first" \
+    "final batch rollback does not overwrite new reviewer state"
+assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "final batch drift invalidates the selected artifact"
+
+# Successful batches defer their user-visible completion until every thread has
+# passed its post-mutation validation.
+cp "$STALE_BATCH_TEMPLATE" "$STALE_MUTATION_REPORT/analysis.json"
+jq '.task_list[0].task = "BATCH SUCCESS TASK"
+    | .task_list[0].thread_ids = ["PRRT_first","PRRT_second"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
+: > "$MUTATION_LOG"
+BATCH_SUCCESS_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_MUTATIONS_LOG="$MUTATION_LOG" \
+    PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" address 999 2>&1) || true)
+assert_contains "$BATCH_SUCCESS_OUT" "Resolved: PRRT_first" \
+    "a complete batch reports its first thread resolved"
+assert_contains "$BATCH_SUCCESS_OUT" "Resolved: PRRT_second" \
+    "a complete batch reports its second thread resolved"
+assert_eq "2" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
+    "a complete two-thread batch sends exactly two resolve mutations"
+assert_not_contains "$(cat "$MUTATION_LOG")" "unresolve:" \
+    "a complete two-thread batch needs no compensation"
+
+# Address owns each hosted mutation and its descendants as a managed process
+# group. Both conventional cancellation signals reap the in-flight request,
+# compensate every possibly applied mutation, and remove private staging.
+for BATCH_SIGNAL_SPEC in TERM:143:true INT:130:false; do
+    IFS=: read -r BATCH_SIGNAL_NAME BATCH_SIGNAL_STATUS \
+        BATCH_DIRECT_ACCEPTS_SIGNAL <<< "$BATCH_SIGNAL_SPEC"
+    cp "$STALE_BATCH_TEMPLATE" "$STALE_MUTATION_REPORT/analysis.json"
+    jq '.task_list[0].task = "BATCH SIGNAL TASK"
+        | .task_list[0].thread_ids = ["PRRT_first","PRRT_second"]' \
+        "$STALE_MUTATION_REPORT/analysis.json" \
+        > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+    mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+        "$STALE_MUTATION_REPORT/analysis.json"
+    : > "$MUTATION_LOG"
+    BATCH_SIGNAL_DIR="$TEST_OUTPUT_DIR/batch-signal-${BATCH_SIGNAL_NAME}"
+    BATCH_SIGNAL_OUT_FILE="$BATCH_SIGNAL_DIR/output"
+    BATCH_SIGNAL_CHILD_PID_FILE="$BATCH_SIGNAL_DIR/child-pid"
+    BATCH_SIGNAL_DESCENDANT_PID_FILE="$BATCH_SIGNAL_DIR/descendant-pid"
+    BATCH_SIGNAL_TMPDIR="$BATCH_SIGNAL_DIR/tmp"
+    mkdir -p "$BATCH_SIGNAL_TMPDIR"
+    set +e
+    printf 'f' | (cd "$STALE_MUTATION_WS" && \
+        env GH_HEAD_MODE=captured \
+        GH_SIGNAL_DURING_RESOLVE_THREAD=PRRT_second \
+        GH_SIGNAL_DURING_RESOLVE_SIGNAL="$BATCH_SIGNAL_NAME" \
+        GH_DIRECT_ACCEPTS_SIGNAL="$BATCH_DIRECT_ACCEPTS_SIGNAL" \
+        GH_SIGNAL_CHILD_PID_FILE="$BATCH_SIGNAL_CHILD_PID_FILE" \
+        GH_SIGNAL_DESCENDANT_PID_FILE="$BATCH_SIGNAL_DESCENDANT_PID_FILE" \
+        GH_MUTATIONS_LOG="$MUTATION_LOG" \
+        TMPDIR="$BATCH_SIGNAL_TMPDIR" PATH="$STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" address 999 > "$BATCH_SIGNAL_OUT_FILE" 2>&1)
+    BATCH_SIGNAL_RC=$?
+    set -e
+    assert_eq "$BATCH_SIGNAL_STATUS" "$BATCH_SIGNAL_RC" \
+        "$BATCH_SIGNAL_NAME during a later batch resolution preserves the conventional status"
+    assert_contains "$(cat "$BATCH_SIGNAL_OUT_FILE")" \
+        "Batch rollback reopened PRRT_second" \
+        "$BATCH_SIGNAL_NAME compensates the possibly applied in-flight resolution"
+    assert_contains "$(cat "$BATCH_SIGNAL_OUT_FILE")" \
+        "Batch rollback reopened PRRT_first" \
+        "$BATCH_SIGNAL_NAME compensates the earlier completed resolution"
+    assert_eq "4" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
+        "$BATCH_SIGNAL_NAME sends two resolve attempts and two compensating unresolves"
+    assert_true "$(wait_for_recorded_process_exit \
+        "$BATCH_SIGNAL_CHILD_PID_FILE" && echo 0 || echo 1)" \
+        "$BATCH_SIGNAL_NAME reaps the direct hosted-mutation child"
+    assert_true "$(wait_for_recorded_process_exit \
+        "$BATCH_SIGNAL_DESCENDANT_PID_FILE" && echo 0 || echo 1)" \
+        "$BATCH_SIGNAL_NAME reaps a TERM-ignoring hosted-mutation descendant"
+    assert_eq "" "$(find "$BATCH_SIGNAL_TMPDIR" -mindepth 1 -print -quit)" \
+        "$BATCH_SIGNAL_NAME removes every private address staging file"
+done
+
+# The owned supervisor remains alive after the direct GitHub child completes.
+# A signal in that boundary must target only the stable supervisor job, reap its
+# lingering descendant, compensate the applied mutation, and preserve status.
+sleep 30 &
+NUMERIC_TARGET_SENTINEL_PID=$!
+set +e
+"$GH_PR_ENRICH" --test-call signal_address_mutation_job TERM \
+    "$NUMERIC_TARGET_SENTINEL_PID" > /dev/null 2>&1
+NUMERIC_TARGET_RC=$?
+set -e
+assert_true "$([ "$NUMERIC_TARGET_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "hosted cleanup rejects a numeric process target"
+assert_true "$(kill -0 "$NUMERIC_TARGET_SENTINEL_PID" 2>/dev/null && echo 0 || echo 1)" \
+    "numeric-target rejection leaves the unrelated process alive"
+kill "$NUMERIC_TARGET_SENTINEL_PID" 2>/dev/null || true
+wait "$NUMERIC_TARGET_SENTINEL_PID" 2>/dev/null || true
+
+cp "$STALE_BATCH_TEMPLATE" "$STALE_MUTATION_REPORT/analysis.json"
+jq '.task_list[0].task = "COMPLETED CHILD SIGNAL TASK"
+    | .task_list[0].thread_ids = ["PRRT_first"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
+: > "$MUTATION_LOG"
+COMPLETED_CHILD_SIGNAL_DIR="$TEST_OUTPUT_DIR/completed-child-signal"
+COMPLETED_CHILD_SIGNAL_TMPDIR="$COMPLETED_CHILD_SIGNAL_DIR/tmp"
+COMPLETED_CHILD_SIGNAL_MARKER="$COMPLETED_CHILD_SIGNAL_DIR/marker"
+COMPLETED_CHILD_SIGNAL_PID_FILE="$COMPLETED_CHILD_SIGNAL_DIR/descendant-pid"
+mkdir -p "$COMPLETED_CHILD_SIGNAL_TMPDIR"
+sleep 30 &
+UNRELATED_SENTINEL_PID=$!
+set +e
+COMPLETED_CHILD_SIGNAL_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_SIGNAL_AFTER_RESOLVE_EXIT=true \
+    GH_AFTER_EXIT_MARKER="$COMPLETED_CHILD_SIGNAL_MARKER" \
+    GH_AFTER_EXIT_PID_FILE="$COMPLETED_CHILD_SIGNAL_PID_FILE" \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" TMPDIR="$COMPLETED_CHILD_SIGNAL_TMPDIR" \
+    PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" address 999 2>&1))
+COMPLETED_CHILD_SIGNAL_RC=$?
+set -e
+assert_eq "143" "$COMPLETED_CHILD_SIGNAL_RC" \
+    "TERM after direct-child completion preserves the conventional status"
+assert_true "$([ -f "$COMPLETED_CHILD_SIGNAL_MARKER" ] && echo 0 || echo 1)" \
+    "the completed-child boundary signal fires after direct-child exit"
+assert_contains "$COMPLETED_CHILD_SIGNAL_OUT" \
+    "Batch rollback reopened PRRT_first" \
+    "TERM after direct-child completion compensates the applied mutation"
+assert_true "$(wait_for_recorded_process_exit \
+    "$COMPLETED_CHILD_SIGNAL_PID_FILE" && echo 0 || echo 1)" \
+    "the stable supervisor job reaps its lingering descendant"
+assert_true "$(kill -0 "$UNRELATED_SENTINEL_PID" 2>/dev/null && echo 0 || echo 1)" \
+    "completed-child cleanup never signals an unrelated process"
+kill "$UNRELATED_SENTINEL_PID" 2>/dev/null || true
+wait "$UNRELATED_SENTINEL_PID" 2>/dev/null || true
+assert_eq "" "$(find "$COMPLETED_CHILD_SIGNAL_TMPDIR" -mindepth 1 -print -quit)" \
+    "completed-child cleanup removes private staging"
+
+# A hosted request that stalls before applying its mutation is bounded by the
+# GitHub timeout, including TERM-ignoring descendants and private response data.
+cp "$STALE_BATCH_TEMPLATE" "$STALE_MUTATION_REPORT/analysis.json"
+jq '.task_list[0].task = "BATCH TIMEOUT TASK"
+    | .task_list[0].thread_ids = ["PRRT_first"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
+: > "$MUTATION_LOG"
+BATCH_TIMEOUT_DIR="$TEST_OUTPUT_DIR/batch-timeout"
+BATCH_TIMEOUT_TMPDIR="$BATCH_TIMEOUT_DIR/tmp"
+BATCH_TIMEOUT_CHILD_PID_FILE="$BATCH_TIMEOUT_DIR/child-pid"
+BATCH_TIMEOUT_DESCENDANT_PID_FILE="$BATCH_TIMEOUT_DIR/descendant-pid"
+mkdir -p "$BATCH_TIMEOUT_TMPDIR"
+set +e
+BATCH_TIMEOUT_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_BLOCK_BEFORE_RESOLVE_THREAD=PRRT_first \
+    GH_SIGNAL_CHILD_PID_FILE="$BATCH_TIMEOUT_CHILD_PID_FILE" \
+    GH_SIGNAL_DESCENDANT_PID_FILE="$BATCH_TIMEOUT_DESCENDANT_PID_FILE" \
+    GH_PR_ENRICH_GITHUB_TIMEOUT=1 GH_MUTATIONS_LOG="$MUTATION_LOG" \
+    TMPDIR="$BATCH_TIMEOUT_TMPDIR" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1))
+BATCH_TIMEOUT_RC=$?
+set -e
+assert_true "$([ "$BATCH_TIMEOUT_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "a stalled hosted mutation fails the address task"
+assert_contains "$BATCH_TIMEOUT_OUT" "GitHub request timed out after 1s" \
+    "a stalled hosted mutation reports its bounded timeout"
+assert_eq "" "$(cat "$MUTATION_LOG")" \
+    "a pre-application timeout records no completed mutation"
+assert_true "$(wait_for_recorded_process_exit \
+    "$BATCH_TIMEOUT_CHILD_PID_FILE" && echo 0 || echo 1)" \
+    "a hosted mutation timeout reaps its direct child"
+assert_true "$(wait_for_recorded_process_exit \
+    "$BATCH_TIMEOUT_DESCENDANT_PID_FILE" && echo 0 || echo 1)" \
+    "a hosted mutation timeout reaps TERM-ignoring descendants"
+assert_eq "" "$(find "$BATCH_TIMEOUT_TMPDIR" -mindepth 1 -print -quit)" \
+    "a hosted mutation timeout removes private address staging"
+
+# Cleanup ownership extends through caller-side response consumption. A signal
+# after the managed child exits but before its response is read must still reap
+# the staged file and compensate the possibly applied mutation.
+cp "$STALE_BATCH_TEMPLATE" "$STALE_MUTATION_REPORT/analysis.json"
+jq '.task_list[0].task = "RESPONSE CONSUMPTION SIGNAL TASK"
+    | .task_list[0].thread_ids = ["PRRT_first"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
+: > "$MUTATION_LOG"
+RESPONSE_SIGNAL_DIR="$TEST_OUTPUT_DIR/response-signal"
+RESPONSE_SIGNAL_TMPDIR="$RESPONSE_SIGNAL_DIR/tmp"
+RESPONSE_SIGNAL_STUBS="$RESPONSE_SIGNAL_DIR/stubs"
+RESPONSE_SIGNAL_WRAPPER_PID_FILE="$RESPONSE_SIGNAL_DIR/wrapper-pid"
+RESPONSE_SIGNAL_RESULT_PATH_FILE="$RESPONSE_SIGNAL_DIR/result-path"
+mkdir -p "$RESPONSE_SIGNAL_TMPDIR" "$RESPONSE_SIGNAL_STUBS"
+cat > "$RESPONSE_SIGNAL_STUBS/cat" << 'STUB'
+#!/bin/bash
+case "${1:-}" in
+    "$RESPONSE_SIGNAL_TMPDIR"/gh-pr-enrich-resolve-result.*)
+        printf '%s\n' "$1" > "$RESPONSE_SIGNAL_RESULT_PATH_FILE"
+        read -r wrapper_pid < "$RESPONSE_SIGNAL_WRAPPER_PID_FILE"
+        kill -TERM "$wrapper_pid"
+        sleep 0.1
+        ;;
+esac
+exec "$REAL_CAT" "$@"
+STUB
+chmod +x "$RESPONSE_SIGNAL_STUBS/cat"
+set +e
+RESPONSE_SIGNAL_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured \
+    GH_WRAPPER_PID_FILE="$RESPONSE_SIGNAL_WRAPPER_PID_FILE" \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" TMPDIR="$RESPONSE_SIGNAL_TMPDIR" \
+    RESPONSE_SIGNAL_TMPDIR="$RESPONSE_SIGNAL_TMPDIR" \
+    RESPONSE_SIGNAL_WRAPPER_PID_FILE="$RESPONSE_SIGNAL_WRAPPER_PID_FILE" \
+    RESPONSE_SIGNAL_RESULT_PATH_FILE="$RESPONSE_SIGNAL_RESULT_PATH_FILE" \
+    REAL_CAT="$(command -v cat)" \
+    PATH="$RESPONSE_SIGNAL_STUBS:$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1))
+RESPONSE_SIGNAL_RC=$?
+set -e
+assert_eq "143" "$RESPONSE_SIGNAL_RC" \
+    "TERM at response consumption preserves the conventional status"
+assert_contains "$RESPONSE_SIGNAL_OUT" "Batch rollback reopened PRRT_first" \
+    "TERM at response consumption compensates the applied mutation"
+assert_true "$([ -s "$RESPONSE_SIGNAL_RESULT_PATH_FILE" ] && \
+    [ ! -e "$(cat "$RESPONSE_SIGNAL_RESULT_PATH_FILE")" ] && echo 0 || echo 1)" \
+    "TERM at response consumption removes the exact staged response"
+assert_eq "" "$(find "$RESPONSE_SIGNAL_TMPDIR" -mindepth 1 -print -quit)" \
+    "TERM at response consumption removes all private staging"
+
+# A signal that arrives during compensation is deferred until the owned
+# unresolve request completes, then propagated with its conventional status.
+cp "$STALE_BATCH_TEMPLATE" "$STALE_MUTATION_REPORT/analysis.json"
+jq '.task_list[0].task = "BATCH ROLLBACK SIGNAL TASK"
+    | .task_list[0].thread_ids = ["PRRT_first","PRRT_second"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
+: > "$MUTATION_LOG"
+rm -f "$SECOND_THREAD_FETCH_COUNT"
+BATCH_ROLLBACK_SIGNAL_DIR="$TEST_OUTPUT_DIR/batch-rollback-signal"
+BATCH_ROLLBACK_SIGNAL_TMPDIR="$BATCH_ROLLBACK_SIGNAL_DIR/tmp"
+BATCH_ROLLBACK_SIGNAL_CHILD_PID_FILE="$BATCH_ROLLBACK_SIGNAL_DIR/child-pid"
+mkdir -p "$BATCH_ROLLBACK_SIGNAL_TMPDIR"
+set +e
+BATCH_ROLLBACK_SIGNAL_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_SECOND_THREAD_MODE=drift_after_preflight \
+    GH_THREAD_FETCH_COUNT_FILE="$SECOND_THREAD_FETCH_COUNT" \
+    GH_SIGNAL_DURING_UNRESOLVE_THREAD=PRRT_first \
+    GH_SIGNAL_DURING_UNRESOLVE_SIGNAL=TERM GH_REPEAT_UNRESOLVE_SIGNAL=true \
+    GH_SIGNAL_CHILD_PID_FILE="$BATCH_ROLLBACK_SIGNAL_CHILD_PID_FILE" \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" TMPDIR="$BATCH_ROLLBACK_SIGNAL_TMPDIR" \
+    PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1))
+BATCH_ROLLBACK_SIGNAL_RC=$?
+set -e
+assert_eq "143" "$BATCH_ROLLBACK_SIGNAL_RC" \
+    "TERM during compensation preserves the conventional status"
+assert_contains "$BATCH_ROLLBACK_SIGNAL_OUT" \
+    "Batch rollback reopened PRRT_first" \
+    "TERM during compensation completes the owned reopen"
+assert_eq "2" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
+    "TERM during compensation sends one resolve and one verified unresolve"
+assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "deferred compensation signals preserve subsequent invalidation"
+assert_true "$(wait_for_recorded_process_exit \
+    "$BATCH_ROLLBACK_SIGNAL_CHILD_PID_FILE" && echo 0 || echo 1)" \
+    "repeated TERM during compensation rejoins the owned mutation child"
+assert_eq "" "$(find "$BATCH_ROLLBACK_SIGNAL_TMPDIR" -mindepth 1 -print -quit)" \
+    "repeated TERM during compensation removes private staging"
+
+# Final hosted-head unavailability is not confirmed drift. After a safe batch
+# rollback, preserve the still-current selected analysis for an operator retry.
+cp "$STALE_BATCH_TEMPLATE" "$STALE_MUTATION_REPORT/analysis.json"
+jq '.task_list[0].task = "BATCH HEAD UNAVAILABLE TASK"
+    | .task_list[0].thread_ids = ["PRRT_first","PRRT_second"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
+: > "$MUTATION_LOG"
+HEAD_FETCH_COUNT_FILE="$TEST_OUTPUT_DIR/batch-head-fetch-count"
+rm -f "$HEAD_FETCH_COUNT_FILE"
+set +e
+BATCH_HEAD_UNAVAILABLE_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=unavailable_at_commit \
+    GH_HEAD_FETCH_COUNT_FILE="$HEAD_FETCH_COUNT_FILE" \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1))
+BATCH_HEAD_UNAVAILABLE_RC=$?
+set -e
+assert_true "$([ "$BATCH_HEAD_UNAVAILABLE_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "final hosted-head unavailability fails the batch"
+assert_contains "$BATCH_HEAD_UNAVAILABLE_OUT" \
+    "before batch commit; reopened the task thread batch and preserved the selected analysis" \
+    "final hosted-head unavailability reports preservation"
+assert_not_contains "$BATCH_HEAD_UNAVAILABLE_OUT" "Resolved: PRRT_" \
+    "final hosted-head unavailability reports no premature success"
+assert_eq "7" "$(cat "$HEAD_FETCH_COUNT_FILE")" \
+    "final hosted-head unavailability fires in the batch-commit phase"
+assert_true "$([ -f "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "final hosted-head unavailability preserves the selected artifact"
+assert_eq "4" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
+    "final hosted-head unavailability reopens both resolved threads"
 
 # The hosted-head read is itself a trust boundary. If the local tree changes
 # during that read, the final workspace check must reject the selected result
@@ -1480,7 +2008,7 @@ cat > "$FROZEN_MODE_STUBS/mktemp" << 'STUB'
 #!/bin/bash
 result="$("$REAL_MKTEMP" "$@")" || exit $?
 case "$1" in
-    /tmp/gh-pr-enrich-address-analysis.*|/tmp/gh-pr-enrich-address-context.*)
+    */gh-pr-enrich-address-analysis.*|*/gh-pr-enrich-address-context.*)
         printf '%s\t%s\n' "$1" "$result" >> "$FROZEN_MODE_LOG"
         ;;
 esac

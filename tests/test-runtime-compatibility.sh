@@ -182,7 +182,8 @@ mkdir -p "$TEST_HOME"
 assert_no_skill_install_residue() {
     local description="$1" residue="" skills_dir candidate
     for skills_dir in "$TEST_HOME/.codex/skills" "$TEST_HOME/.claude/skills"; do
-        for candidate in "$skills_dir"/.gh-pr-enrich-install.*; do
+        for candidate in "$skills_dir"/.gh-pr-enrich-install.* \
+            "$skills_dir"/.gh-pr-enrich-uninstall.*; do
             if [ -e "$candidate" ] || [ -L "$candidate" ]; then
                 residue="$candidate"
                 break 2
@@ -282,32 +283,281 @@ rm "$CLAUDE_SKILL"
 HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill --runtime codex >/dev/null
 
 # A failure while removing the second runtime rolls the first registration back
-# from its captured payload. The rollback uses ln's no-overwrite behavior, so a
-# concurrent replacement is never clobbered.
+# from its retained symlink inode. The rollback uses ln's no-overwrite behavior,
+# so a concurrent replacement is never clobbered.
 HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill >/dev/null
 CODEX_PAYLOAD_BEFORE=$(readlink "$CODEX_SKILL")
 CLAUDE_PAYLOAD_BEFORE=$(readlink "$CLAUDE_SKILL")
+CODEX_IDENTITY_BEFORE=$(stat -c '%d:%i' "$CODEX_SKILL" 2>/dev/null || \
+    stat -f '%d:%i' "$CODEX_SKILL")
 FAIL_RM_STUBS="$TEST_OUTPUT_DIR/failing-uninstall-rm"
+FAIL_RM_MARKER="$TEST_OUTPUT_DIR/failing-uninstall-rm.once"
 mkdir -p "$FAIL_RM_STUBS"
 cat > "$FAIL_RM_STUBS/rm" << 'STUB'
 #!/bin/bash
-if [ "$1" = "$FAIL_RM_TARGET" ]; then
-    exit 73
-fi
+case "$1" in
+    "$FAIL_RM_PARENT"/.gh-pr-enrich-uninstall.*/gh-pr-enrich)
+        if [ ! -e "$FAIL_RM_MARKER" ]; then
+            : > "$FAIL_RM_MARKER"
+            exit 73
+        fi
+        ;;
+esac
 exec /bin/rm "$@"
 STUB
 chmod +x "$FAIL_RM_STUBS/rm"
 rc=0
-env HOME="$TEST_HOME" FAIL_RM_TARGET="$CLAUDE_SKILL" \
+env HOME="$TEST_HOME" FAIL_RM_PARENT="$(dirname "$CLAUDE_SKILL")" \
+    FAIL_RM_MARKER="$FAIL_RM_MARKER" \
     PATH="$FAIL_RM_STUBS:$PATH" \
     "$GH_PR_ENRICH" uninstall-skill >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "a second-runtime removal failure fails the transactional uninstall"
 assert_eq "$CODEX_PAYLOAD_BEFORE" "$(readlink "$CODEX_SKILL")" \
     "a second-runtime removal failure restores the Codex symlink payload"
+assert_eq "$CODEX_IDENTITY_BEFORE" \
+    "$(stat -c '%d:%i' "$CODEX_SKILL" 2>/dev/null || stat -f '%d:%i' "$CODEX_SKILL")" \
+    "a second-runtime removal failure restores the exact Codex symlink inode"
 assert_eq "$CLAUDE_PAYLOAD_BEFORE" "$(readlink "$CLAUDE_SKILL")" \
     "a failed Claude removal preserves its captured symlink payload"
+assert_no_skill_install_residue \
+    "a failed two-runtime uninstall cleans its private claims"
 HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill >/dev/null
+
+# Replacement at the public-to-private claim boundary must never be deleted,
+# even when it has the same payload as the captured registration. The claimed
+# replacement is restored with its exact symlink inode and uninstall fails.
+UNINSTALL_RACE_STUBS="$TEST_OUTPUT_DIR/uninstall-race-stubs"
+UNINSTALL_RACE_IDENTITY="$TEST_OUTPUT_DIR/uninstall-race-identity"
+mkdir -p "$UNINSTALL_RACE_STUBS" "$TEST_OUTPUT_DIR/concurrent-skill-source"
+cat > "$UNINSTALL_RACE_STUBS/mv" << 'STUB'
+#!/bin/bash
+if [ "$1" = "$UNINSTALL_RACE_TARGET" ]; then
+    /bin/rm "$UNINSTALL_RACE_TARGET" || exit 74
+    /bin/ln -s "$UNINSTALL_RACE_PAYLOAD" "$UNINSTALL_RACE_TARGET" || exit 75
+    stat -c '%d:%i' "$UNINSTALL_RACE_TARGET" 2>/dev/null > "$UNINSTALL_RACE_IDENTITY" || \
+        stat -f '%d:%i' "$UNINSTALL_RACE_TARGET" > "$UNINSTALL_RACE_IDENTITY" || exit 76
+fi
+exec /bin/mv "$@"
+STUB
+chmod +x "$UNINSTALL_RACE_STUBS/mv"
+
+for UNINSTALL_RACE_KIND in different_payload same_payload; do
+    HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill --runtime codex >/dev/null
+    if [ "$UNINSTALL_RACE_KIND" = different_payload ]; then
+        UNINSTALL_RACE_PAYLOAD="$TEST_OUTPUT_DIR/concurrent-skill-source"
+    else
+        UNINSTALL_RACE_PAYLOAD="$(readlink "$CODEX_SKILL")"
+    fi
+    rm -f "$UNINSTALL_RACE_IDENTITY"
+    rc=0
+    env HOME="$TEST_HOME" UNINSTALL_RACE_TARGET="$CODEX_SKILL" \
+        UNINSTALL_RACE_PAYLOAD="$UNINSTALL_RACE_PAYLOAD" \
+        UNINSTALL_RACE_IDENTITY="$UNINSTALL_RACE_IDENTITY" \
+        PATH="$UNINSTALL_RACE_STUBS:$PATH" \
+        "$GH_PR_ENRICH" uninstall-skill --runtime codex \
+        >/dev/null 2>&1 || rc=$?
+    assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+        "$UNINSTALL_RACE_KIND claim-boundary replacement fails uninstall"
+    assert_eq "$UNINSTALL_RACE_PAYLOAD" "$(readlink "$CODEX_SKILL")" \
+        "$UNINSTALL_RACE_KIND claim-boundary replacement keeps its payload"
+    assert_eq "$(cat "$UNINSTALL_RACE_IDENTITY")" \
+        "$(stat -c '%d:%i' "$CODEX_SKILL" 2>/dev/null || stat -f '%d:%i' "$CODEX_SKILL")" \
+        "$UNINSTALL_RACE_KIND claim-boundary replacement keeps its exact inode"
+    assert_no_skill_install_residue \
+        "$UNINSTALL_RACE_KIND claim-boundary replacement cleans its private claim"
+    HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill --runtime codex >/dev/null
+done
+
+# A new public registration can appear after the captured symlink is correctly
+# claimed but before its private name is removed. Claim removal must touch only
+# the private inode and leave the concurrent public registration exact.
+UNINSTALL_REMOVE_RACE_STUBS="$TEST_OUTPUT_DIR/uninstall-remove-race-stubs"
+UNINSTALL_REMOVE_RACE_MARKER="$TEST_OUTPUT_DIR/uninstall-remove-race.once"
+UNINSTALL_REMOVE_RACE_IDENTITY="$TEST_OUTPUT_DIR/uninstall-remove-race-identity"
+UNINSTALL_REMOVE_RACE_PAYLOAD="$TEST_OUTPUT_DIR/concurrent-skill-source"
+mkdir -p "$UNINSTALL_REMOVE_RACE_STUBS"
+cat > "$UNINSTALL_REMOVE_RACE_STUBS/rm" << 'STUB'
+#!/bin/bash
+case "$1" in
+    "$UNINSTALL_REMOVE_RACE_PARENT"/.gh-pr-enrich-uninstall.*/gh-pr-enrich)
+        if [ ! -e "$UNINSTALL_REMOVE_RACE_MARKER" ]; then
+            : > "$UNINSTALL_REMOVE_RACE_MARKER"
+            /bin/ln -s "$UNINSTALL_REMOVE_RACE_PAYLOAD" \
+                "$UNINSTALL_REMOVE_RACE_TARGET" || exit 74
+            stat -c '%d:%i' "$UNINSTALL_REMOVE_RACE_TARGET" 2>/dev/null \
+                > "$UNINSTALL_REMOVE_RACE_IDENTITY" || \
+                stat -f '%d:%i' "$UNINSTALL_REMOVE_RACE_TARGET" \
+                    > "$UNINSTALL_REMOVE_RACE_IDENTITY" || exit 75
+        fi
+        ;;
+esac
+exec /bin/rm "$@"
+STUB
+chmod +x "$UNINSTALL_REMOVE_RACE_STUBS/rm"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill --runtime codex >/dev/null
+rm -f "$UNINSTALL_REMOVE_RACE_MARKER" "$UNINSTALL_REMOVE_RACE_IDENTITY"
+env HOME="$TEST_HOME" \
+    UNINSTALL_REMOVE_RACE_PARENT="$(dirname "$CODEX_SKILL")" \
+    UNINSTALL_REMOVE_RACE_TARGET="$CODEX_SKILL" \
+    UNINSTALL_REMOVE_RACE_PAYLOAD="$UNINSTALL_REMOVE_RACE_PAYLOAD" \
+    UNINSTALL_REMOVE_RACE_MARKER="$UNINSTALL_REMOVE_RACE_MARKER" \
+    UNINSTALL_REMOVE_RACE_IDENTITY="$UNINSTALL_REMOVE_RACE_IDENTITY" \
+    PATH="$UNINSTALL_REMOVE_RACE_STUBS:$PATH" \
+    "$GH_PR_ENRICH" uninstall-skill --runtime codex >/dev/null
+assert_eq "$UNINSTALL_REMOVE_RACE_PAYLOAD" "$(readlink "$CODEX_SKILL")" \
+    "claim removal preserves a concurrent public registration payload"
+assert_eq "$(cat "$UNINSTALL_REMOVE_RACE_IDENTITY")" \
+    "$(stat -c '%d:%i' "$CODEX_SKILL" 2>/dev/null || stat -f '%d:%i' "$CODEX_SKILL")" \
+    "claim removal preserves the exact concurrent public registration inode"
+assert_no_skill_install_residue \
+    "claim removal with a concurrent public registration cleans private residue"
+/bin/rm "$CODEX_SKILL"
+
+# A directory has no portable atomic create-if-absent restore primitive. If one
+# wins the public path at the claim boundary, preserve it privately and report
+# the exact recovery path instead of nesting it or deleting it.
+UNINSTALL_DIRECTORY_STUBS="$TEST_OUTPUT_DIR/uninstall-directory-stubs"
+mkdir -p "$UNINSTALL_DIRECTORY_STUBS"
+cat > "$UNINSTALL_DIRECTORY_STUBS/mv" << 'STUB'
+#!/bin/bash
+if [ "$1" = "$UNINSTALL_DIRECTORY_TARGET" ]; then
+    /bin/rm "$UNINSTALL_DIRECTORY_TARGET" || exit 74
+    /bin/mkdir "$UNINSTALL_DIRECTORY_TARGET" || exit 75
+    printf 'concurrent directory\n' > "$UNINSTALL_DIRECTORY_TARGET/marker"
+fi
+exec /bin/mv "$@"
+STUB
+chmod +x "$UNINSTALL_DIRECTORY_STUBS/mv"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill --runtime codex >/dev/null
+rc=0
+UNINSTALL_DIRECTORY_OUT=$(env HOME="$TEST_HOME" \
+    UNINSTALL_DIRECTORY_TARGET="$CODEX_SKILL" \
+    PATH="$UNINSTALL_DIRECTORY_STUBS:$PATH" \
+    "$GH_PR_ENRICH" uninstall-skill --runtime codex 2>&1) || rc=$?
+UNINSTALL_DIRECTORY_CLAIM=$(find "$(dirname "$CODEX_SKILL")" -maxdepth 1 \
+    -type d -name '.gh-pr-enrich-uninstall.*' -print -quit)
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a claim-boundary directory replacement fails uninstall"
+assert_true "$([ -n "$UNINSTALL_DIRECTORY_CLAIM" ] && \
+    [ -f "$UNINSTALL_DIRECTORY_CLAIM/gh-pr-enrich/marker" ] && echo 0 || echo 1)" \
+    "the concurrently claimed directory remains privately recoverable"
+assert_contains "$UNINSTALL_DIRECTORY_OUT" \
+    "$UNINSTALL_DIRECTORY_CLAIM/gh-pr-enrich" \
+    "directory claim failure reports the exact recovery path"
+assert_true "$([ ! -e "$CODEX_SKILL" ] && [ ! -L "$CODEX_SKILL" ] && echo 0 || echo 1)" \
+    "directory claim recovery never creates a nested public registration"
+/bin/rm -rf "$UNINSTALL_DIRECTORY_CLAIM"
+
+# A newer public directory can appear after a mismatched symlink is claimed but
+# before restoration. Exact-basename linking into the parent must fail without
+# nesting into or replacing that directory; the displaced symlink stays private.
+UNINSTALL_RESTORE_COLLISION_STUBS="$TEST_OUTPUT_DIR/uninstall-restore-collision-stubs"
+UNINSTALL_RESTORE_PAYLOAD="$TEST_OUTPUT_DIR/uninstall-restore-payload"
+mkdir -p "$UNINSTALL_RESTORE_COLLISION_STUBS" "$UNINSTALL_RESTORE_PAYLOAD"
+cat > "$UNINSTALL_RESTORE_COLLISION_STUBS/mv" << 'STUB'
+#!/bin/bash
+if [ "$1" = "$UNINSTALL_RESTORE_TARGET" ]; then
+    /bin/rm "$UNINSTALL_RESTORE_TARGET" || exit 74
+    /bin/ln -s "$UNINSTALL_RESTORE_PAYLOAD" "$UNINSTALL_RESTORE_TARGET" || exit 75
+fi
+exec /bin/mv "$@"
+STUB
+cat > "$UNINSTALL_RESTORE_COLLISION_STUBS/ln" << 'STUB'
+#!/bin/bash
+target="${!#}"
+source_index=$(( $# - 1 ))
+source_path="${!source_index}"
+case "$source_path" in
+    "$UNINSTALL_RESTORE_PARENT"/.gh-pr-enrich-uninstall.*/gh-pr-enrich)
+        if [ "$target" = "$UNINSTALL_RESTORE_PARENT" ]; then
+            /bin/mkdir "$UNINSTALL_RESTORE_TARGET" || exit 76
+            printf 'newer directory\n' > "$UNINSTALL_RESTORE_TARGET/marker"
+        fi
+        ;;
+esac
+exec /bin/ln "$@"
+STUB
+chmod +x "$UNINSTALL_RESTORE_COLLISION_STUBS/mv" \
+    "$UNINSTALL_RESTORE_COLLISION_STUBS/ln"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill --runtime codex >/dev/null
+rc=0
+UNINSTALL_RESTORE_OUT=$(env HOME="$TEST_HOME" \
+    UNINSTALL_RESTORE_TARGET="$CODEX_SKILL" \
+    UNINSTALL_RESTORE_PARENT="$(dirname "$CODEX_SKILL")" \
+    UNINSTALL_RESTORE_PAYLOAD="$UNINSTALL_RESTORE_PAYLOAD" \
+    PATH="$UNINSTALL_RESTORE_COLLISION_STUBS:$PATH" \
+    "$GH_PR_ENRICH" uninstall-skill --runtime codex 2>&1) || rc=$?
+UNINSTALL_RESTORE_CLAIM=$(find "$(dirname "$CODEX_SKILL")" -maxdepth 1 \
+    -type d -name '.gh-pr-enrich-uninstall.*' -print -quit)
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "a restore-boundary directory collision fails uninstall"
+assert_eq "newer directory" "$(cat "$CODEX_SKILL/marker")" \
+    "restore rollback preserves the newer public directory"
+assert_true "$([ ! -e "$CODEX_SKILL/gh-pr-enrich" ] && echo 0 || echo 1)" \
+    "restore rollback never nests a registration in the newer directory"
+assert_eq "$UNINSTALL_RESTORE_PAYLOAD" \
+    "$(readlink "$UNINSTALL_RESTORE_CLAIM/gh-pr-enrich")" \
+    "restore rollback preserves the displaced symlink in its private claim"
+assert_contains "$UNINSTALL_RESTORE_OUT" \
+    "$UNINSTALL_RESTORE_CLAIM/gh-pr-enrich" \
+    "restore collision reports the displaced symlink recovery path"
+/bin/rm -rf "$CODEX_SKILL" "$UNINSTALL_RESTORE_CLAIM"
+
+# Signals delivered by a removal child are observed after that child returns.
+# The transaction must recheck the pending signal before committing and restore
+# both exact registrations with the conventional status.
+UNINSTALL_SIGNAL_STUBS="$TEST_OUTPUT_DIR/uninstall-signal-stubs"
+mkdir -p "$UNINSTALL_SIGNAL_STUBS"
+cat > "$UNINSTALL_SIGNAL_STUBS/rm" << 'STUB'
+#!/bin/bash
+case "$1" in
+    "$UNINSTALL_SIGNAL_PARENT"/.gh-pr-enrich-uninstall.*/gh-pr-enrich)
+        if [ ! -e "$UNINSTALL_SIGNAL_MARKER" ]; then
+            /bin/rm "$@" || exit $?
+            : > "$UNINSTALL_SIGNAL_MARKER"
+            kill -"$UNINSTALL_SIGNAL_NAME" "$PPID"
+            exit 0
+        fi
+        ;;
+esac
+exec /bin/rm "$@"
+STUB
+chmod +x "$UNINSTALL_SIGNAL_STUBS/rm"
+
+for UNINSTALL_SIGNAL_CASE in TERM:codex:143 INT:claude:130; do
+    IFS=: read -r UNINSTALL_SIGNAL_NAME UNINSTALL_SIGNAL_RUNTIME \
+        UNINSTALL_SIGNAL_STATUS <<< "$UNINSTALL_SIGNAL_CASE"
+    HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill >/dev/null
+    CODEX_IDENTITY_BEFORE=$(stat -c '%d:%i' "$CODEX_SKILL" 2>/dev/null || \
+        stat -f '%d:%i' "$CODEX_SKILL")
+    CLAUDE_IDENTITY_BEFORE=$(stat -c '%d:%i' "$CLAUDE_SKILL" 2>/dev/null || \
+        stat -f '%d:%i' "$CLAUDE_SKILL")
+    if [ "$UNINSTALL_SIGNAL_RUNTIME" = codex ]; then
+        UNINSTALL_SIGNAL_PARENT="$(dirname "$CODEX_SKILL")"
+    else
+        UNINSTALL_SIGNAL_PARENT="$(dirname "$CLAUDE_SKILL")"
+    fi
+    UNINSTALL_SIGNAL_MARKER="$TEST_OUTPUT_DIR/uninstall-signal-$UNINSTALL_SIGNAL_RUNTIME"
+    rm -f "$UNINSTALL_SIGNAL_MARKER"
+    rc=0
+    env HOME="$TEST_HOME" UNINSTALL_SIGNAL_NAME="$UNINSTALL_SIGNAL_NAME" \
+        UNINSTALL_SIGNAL_PARENT="$UNINSTALL_SIGNAL_PARENT" \
+        UNINSTALL_SIGNAL_MARKER="$UNINSTALL_SIGNAL_MARKER" \
+        PATH="$UNINSTALL_SIGNAL_STUBS:$PATH" \
+        "$GH_PR_ENRICH" uninstall-skill >/dev/null 2>&1 || rc=$?
+    assert_eq "$UNINSTALL_SIGNAL_STATUS" "$rc" \
+        "$UNINSTALL_SIGNAL_NAME during $UNINSTALL_SIGNAL_RUNTIME claim removal preserves its status"
+    assert_eq "$CODEX_IDENTITY_BEFORE" \
+        "$(stat -c '%d:%i' "$CODEX_SKILL" 2>/dev/null || stat -f '%d:%i' "$CODEX_SKILL")" \
+        "$UNINSTALL_SIGNAL_NAME during claim removal restores the exact Codex registration"
+    assert_eq "$CLAUDE_IDENTITY_BEFORE" \
+        "$(stat -c '%d:%i' "$CLAUDE_SKILL" 2>/dev/null || stat -f '%d:%i' "$CLAUDE_SKILL")" \
+        "$UNINSTALL_SIGNAL_NAME during claim removal restores the exact Claude registration"
+    assert_no_skill_install_residue \
+        "$UNINSTALL_SIGNAL_NAME during claim removal cleans private claims"
+    HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill >/dev/null
+done
 
 # Uninstall has historically removed any symlink registration, including stale
 # and broken links. Atomic preflight must not tighten that public behavior.
