@@ -1246,33 +1246,42 @@ cleanup_report_run_temp_files() {
 }
 
 CURRENT_HOSTED_HEAD=""
+CURRENT_HOSTED_BASE=""
+CURRENT_HOSTED_BASE_REF=""
 HOSTED_HEAD_VERIFICATION_STATUS="unavailable"
 verify_pr_head_unchanged() {
     local pr_number="$1" expected_head="$2" repository="${3:-}" head_json
-    local head_json_file
+    local expected_base="${4:-}" expected_base_ref="${5:-}"
+    local head_json_file revision_fields="headRefOid"
     CURRENT_HOSTED_HEAD=""
+    CURRENT_HOSTED_BASE=""
+    CURRENT_HOSTED_BASE_REF=""
     HOSTED_HEAD_VERIFICATION_STATUS="unavailable"
+    if [ -n "$expected_base" ] || [ -n "$expected_base_ref" ]; then
+        [ -n "$expected_base" ] && [ -n "$expected_base_ref" ] || return 1
+        revision_fields="headRefOid,baseRefOid,baseRefName"
+    fi
     head_json_file="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-hosted-head.XXXXXX")" || return 1
     if [ -n "$repository" ]; then
         if [ "${ADDRESS_COMMAND_MANAGEMENT_ENABLED:-false}" = true ]; then
             run_address_hosted_command "$head_json_file" gh pr view \
-                "$pr_number" --repo "$repository" --json headRefOid || {
+                "$pr_number" --repo "$repository" --json "$revision_fields" || {
                 rm -f "$head_json_file"
                 return 1
             }
         elif ! run_report_command gh pr view "$pr_number" --repo "$repository" \
-                --json headRefOid > "$head_json_file" 2>/dev/null; then
+                --json "$revision_fields" > "$head_json_file" 2>/dev/null; then
             rm -f "$head_json_file"
             return 1
         fi
     else
         if [ "${ADDRESS_COMMAND_MANAGEMENT_ENABLED:-false}" = true ]; then
             run_address_hosted_command "$head_json_file" gh pr view \
-                "$pr_number" --json headRefOid || {
+                "$pr_number" --json "$revision_fields" || {
                 rm -f "$head_json_file"
                 return 1
             }
-        elif ! run_report_command gh pr view "$pr_number" --json headRefOid \
+        elif ! run_report_command gh pr view "$pr_number" --json "$revision_fields" \
                 > "$head_json_file" 2>/dev/null; then
             rm -f "$head_json_file"
             return 1
@@ -1284,8 +1293,18 @@ verify_pr_head_unchanged() {
     fi
     rm -f "$head_json_file"
     CURRENT_HOSTED_HEAD="$(printf '%s' "$head_json" | jq -r '.headRefOid // ""' 2>/dev/null || echo "")"
+    CURRENT_HOSTED_BASE="$(printf '%s' "$head_json" | jq -r '.baseRefOid // ""' 2>/dev/null || echo "")"
+    CURRENT_HOSTED_BASE_REF="$(printf '%s' "$head_json" | jq -r '.baseRefName // ""' 2>/dev/null || echo "")"
     [ -n "$expected_head" ] && [ -n "$CURRENT_HOSTED_HEAD" ] || return 1
-    if [ "$CURRENT_HOSTED_HEAD" = "$expected_head" ]; then
+    if [ -n "$expected_base" ] && \
+       { [ -z "$CURRENT_HOSTED_BASE" ] || \
+         [ -z "$CURRENT_HOSTED_BASE_REF" ]; }; then
+        return 1
+    fi
+    if [ "$CURRENT_HOSTED_HEAD" = "$expected_head" ] && \
+       { [ -z "$expected_base" ] || \
+         { [ "$CURRENT_HOSTED_BASE" = "$expected_base" ] && \
+           [ "$CURRENT_HOSTED_BASE_REF" = "$expected_base_ref" ]; }; }; then
         HOSTED_HEAD_VERIFICATION_STATUS="unchanged"
         return 0
     fi
@@ -2502,7 +2521,11 @@ is_generated_report_artifact() {
         claude-code-analysis.json|hybrid-analysis.json|analysis.md|codex-analysis.md|\
         claude-analysis.md|claude-code-analysis.md|hybrid-analysis.md|context-coverage.md|\
         combined-data.json|combined-data.tmp.json|comprehensive-report.md|\
-        claude-raw-response.json|claude-stderr.log|semgrep-stderr.log)
+        claude-raw-response.json|claude-stderr.log|semgrep-stderr.log|\
+        aggregated-data.json|cross-pr-patterns.json|hotspots.json|\
+        guiding-questions.json|improvement-tracking.json|summary.json|\
+        claude-meta-analysis.json|retrospective-report.md|\
+        retrospective-data.json|retrospective-data.tmp.json)
             return 0
             ;;
     esac
@@ -2859,7 +2882,8 @@ materialize_analysis_snapshot() {
     local context_file="$report_dir/analysis-context.json"
     local embedded_context_fingerprint current_context_fingerprint
     local expected_workspace_fingerprint current_workspace_fingerprint
-    local captured_pr_head snapshot_path result snapshot_source
+    local captured_pr_head captured_pr_base captured_pr_base_ref
+    local snapshot_path result snapshot_source
     local snapshot_ttl_seconds
     snapshot_ttl_seconds="$(positive_integer_or_default \
         "${GH_PR_ENRICH_SNAPSHOT_TTL_SECONDS:-3600}" 3600 86400)"
@@ -2884,7 +2908,10 @@ materialize_analysis_snapshot() {
         '.coverage.code_access.snapshot_source // "git_index"' "$context_file")"
     captured_pr_head="$(jq -r '.coverage.code_access.pr_head_sha // ""' \
         "$context_file")"
-    if [ -z "$captured_pr_head" ] || \
+    captured_pr_base="$(jq -r '.pr.base_sha // ""' "$context_file")"
+    captured_pr_base_ref="$(jq -r '.pr.base_ref_name // ""' "$context_file")"
+    if [ -z "$captured_pr_head" ] || [ -z "$captured_pr_base" ] || \
+       [ -z "$captured_pr_base_ref" ] || \
        ! create_code_access_snapshot "$report_dir" "$expected_workspace_fingerprint" \
             "$snapshot_source"; then
         echo "Error: Could not materialize a verified immutable analysis snapshot." >&2
@@ -2909,9 +2936,12 @@ materialize_analysis_snapshot() {
         --arg workspace_fingerprint "$expected_workspace_fingerprint" \
         --arg context_fingerprint "$current_context_fingerprint" \
         --arg pr_head_sha "$captured_pr_head" \
+        --arg pr_base_sha "$captured_pr_base" \
+        --arg pr_base_ref_name "$captured_pr_base_ref" \
         --argjson expires_in_seconds "$snapshot_ttl_seconds" \
         '{path:$path, workspace_fingerprint:$workspace_fingerprint,
           context_fingerprint:$context_fingerprint, pr_head_sha:$pr_head_sha,
+          pr_base_sha:$pr_base_sha, pr_base_ref_name:$pr_base_ref_name,
           expires_in_seconds:$expires_in_seconds}')" || {
         cleanup_code_access_snapshot
         return 1
@@ -3014,8 +3044,9 @@ validate_selected_provenance() {
     local analysis_file="$2"
     local context_file="${3:-$report_dir/analysis-context.json}"
     local context_fingerprint embedded_fingerprint
-    local context_repository context_pr context_head
-    local analysis_repository analysis_pr analysis_head analysis_fingerprint
+    local context_repository context_pr context_head context_base context_base_ref
+    local analysis_repository analysis_pr analysis_head analysis_base analysis_base_ref
+    local analysis_fingerprint
     local expected_workspace_fingerprint analysis_workspace_fingerprint
     if [ ! -f "$analysis_file" ] || [ ! -f "$context_file" ] || \
        [ -L "$analysis_file" ] || [ -L "$context_file" ] || \
@@ -3031,18 +3062,26 @@ validate_selected_provenance() {
     context_repository="$(jq -r '.pr.repository // ""' "$context_file")"
     context_pr="$(jq -r '.pr.number // ""' "$context_file")"
     context_head="$(jq -r '.coverage.code_access.pr_head_sha // ""' "$context_file")"
+    context_base="$(jq -r '.pr.base_sha // ""' "$context_file")"
+    context_base_ref="$(jq -r '.pr.base_ref_name // ""' "$context_file")"
     analysis_repository="$(jq -r '._metadata.repository // ""' "$analysis_file")"
     analysis_pr="$(jq -r '._metadata.pr_number // ""' "$analysis_file")"
     analysis_head="$(jq -r '._metadata.pr_head_sha // ""' "$analysis_file")"
+    analysis_base="$(jq -r '._metadata.pr_base_sha // ""' "$analysis_file")"
+    analysis_base_ref="$(jq -r '._metadata.pr_base_ref_name // ""' "$analysis_file")"
     analysis_fingerprint="$(jq -r '._metadata.context_fingerprint // ""' "$analysis_file")"
     expected_workspace_fingerprint="$(jq -r \
         '.coverage.code_access.workspace_fingerprint // ""' "$context_file")"
     analysis_workspace_fingerprint="$(jq -r \
         '._metadata.workspace_fingerprint // ""' "$analysis_file")"
     if [ -z "$context_fingerprint" ] || [ "$embedded_fingerprint" != "$context_fingerprint" ] || \
-       [ -z "$context_repository" ] || [ -z "$context_pr" ] || [ -z "$context_head" ] || \
+       [ -z "$context_repository" ] || [ -z "$context_pr" ] || \
+       [ -z "$context_head" ] || [ -z "$context_base" ] || \
+       [ -z "$context_base_ref" ] || \
        [ "$analysis_repository" != "$context_repository" ] || \
        [ "$analysis_pr" != "$context_pr" ] || [ "$analysis_head" != "$context_head" ] || \
+       [ "$analysis_base" != "$context_base" ] || \
+       [ "$analysis_base_ref" != "$context_base_ref" ] || \
        [ "$analysis_fingerprint" != "$context_fingerprint" ]; then
         return 1
     fi
@@ -3091,7 +3130,8 @@ select_analysis_file() (
     local report_dir="$1"
     local selection_mode="${2:-read-only}"
     local managed_read_snapshot_root="${3:-}"
-    local expected_head="" expected_fingerprint="" expected_repository=""
+    local expected_head="" expected_base="" expected_base_ref=""
+    local expected_fingerprint="" expected_repository=""
     local expected_pr_number="" has_current_context=false
     local selected_path="" reader_lock_dir="" reader_lock_token=""
     local reader_lock_owned=false
@@ -3185,6 +3225,10 @@ select_analysis_file() (
         has_current_context=true
         expected_head="$(jq -r '.coverage.code_access.pr_head_sha // ""' \
             "$selection_root/analysis-context.json" 2>/dev/null || echo "")"
+        expected_base="$(jq -r '.pr.base_sha // ""' \
+            "$selection_root/analysis-context.json" 2>/dev/null || echo "")"
+        expected_base_ref="$(jq -r '.pr.base_ref_name // ""' \
+            "$selection_root/analysis-context.json" 2>/dev/null || echo "")"
         expected_repository="$(jq -r '.pr.repository // ""' \
             "$selection_root/analysis-context.json" 2>/dev/null || echo "")"
         expected_pr_number="$(jq -r '.pr.number // ""' \
@@ -3198,10 +3242,17 @@ select_analysis_file() (
             return 1
         fi
         if [ -f "$selection_root/pr-summary.json" ]; then
-            local summary_head
+            local summary_head summary_base summary_base_ref
             summary_head="$(jq -r '.headRefOid // ""' \
                 "$selection_root/pr-summary.json" 2>/dev/null || echo "")"
-            if [ -n "$summary_head" ] && [ "$summary_head" != "$expected_head" ]; then
+            summary_base="$(jq -r '.baseRefOid // ""' \
+                "$selection_root/pr-summary.json" 2>/dev/null || echo "")"
+            summary_base_ref="$(jq -r '.baseRefName // ""' \
+                "$selection_root/pr-summary.json" 2>/dev/null || echo "")"
+            if [ -n "$summary_head" ] && \
+               { [ "$summary_head" != "$expected_head" ] || \
+                 [ "$summary_base" != "$expected_base" ] || \
+                 [ "$summary_base_ref" != "$expected_base_ref" ]; }; then
                 return 1
             fi
         fi
@@ -3220,7 +3271,8 @@ select_analysis_file() (
         # plant a metadata-less selected result for address/retrospective.
         [ "$selected_has_metadata" = true ] || return 1
         [ "$has_current_context" = true ] || return 1
-        [ -n "$expected_head" ] && [ -n "$expected_fingerprint" ] && \
+        [ -n "$expected_head" ] && [ -n "$expected_base" ] && \
+            [ -n "$expected_base_ref" ] && [ -n "$expected_fingerprint" ] && \
             [ -n "$expected_repository" ] && [ -n "$expected_pr_number" ] || return 1
         if [ -L "$report_dir/analysis.json" ] || \
            [ -L "$report_dir/analysis-context.json" ] || \
@@ -4085,6 +4137,14 @@ if [ "$1" = "retrospective" ]; then
     RETRO_SNAPSHOT_WORKER_GROUP_OWNED=false
     RETRO_SNAPSHOT_WORKER_STARTING=false
     RETRO_PENDING_SIGNAL_STATUS=""
+    RETRO_OUTPUT_LOCK_DIR=""
+    RETRO_OUTPUT_LOCK_TOKEN=""
+    RETRO_OUTPUT_LOCK_OWNED=false
+    RETRO_OUTPUT_LOCK_ACQUIRING=false
+    RETRO_RUN_DIR=""
+    RETRO_PUBLICATION_BACKUP_DIR=""
+    RETRO_PUBLICATION_ACTIVE=false
+    RETRO_PUBLICATION_STAGED_ARTIFACTS=()
     close_retrospective_snapshot_lease() {
         case "$RETRO_SNAPSHOT_LEASE_FD" in
             9) exec 9>&- ;;
@@ -4196,9 +4256,109 @@ if [ "$1" = "retrospective" ]; then
         echo "Error: Retrospective snapshot cleanup is incomplete; recovery path retained: $snapshot_root" >&2
         return 1
     }
+    rollback_retrospective_publication() {
+        local artifact source destination backup staged_artifact
+        local was_staged rollback_failed=false
+        local -a artifacts=(
+            aggregated-data.json cross-pr-patterns.json hotspots.json
+            guiding-questions.json improvement-tracking.json summary.json
+            retrospective-report.md retrospective-data.json
+            claude-context.json claude-raw-response.json
+            claude-meta-analysis.json
+        )
+        [ "$RETRO_PUBLICATION_ACTIVE" = true ] || return 0
+        [ -n "$RETRO_RUN_DIR" ] && \
+            [ -n "$RETRO_PUBLICATION_BACKUP_DIR" ] && \
+            [ -d "$RETRO_PUBLICATION_BACKUP_DIR" ] && \
+            [ ! -L "$RETRO_PUBLICATION_BACKUP_DIR" ] || return 1
+        for artifact in "${artifacts[@]}"; do
+            source="$RETRO_RUN_DIR/$artifact"
+            destination="$RETRO_OUTPUT_DIR/$artifact"
+            backup="$RETRO_PUBLICATION_BACKUP_DIR/$artifact"
+            was_staged=false
+            for staged_artifact in \
+                    "${RETRO_PUBLICATION_STAGED_ARTIFACTS[@]}"; do
+                if [ "$staged_artifact" = "$artifact" ]; then
+                    was_staged=true
+                    break
+                fi
+            done
+            if [ "$was_staged" = true ] && \
+               [ ! -e "$source" ] && [ ! -L "$source" ] && \
+               { [ -e "$destination" ] || [ -L "$destination" ]; }; then
+                [ -f "$destination" ] && [ ! -L "$destination" ] && \
+                    mv "$destination" "$source" || rollback_failed=true
+            fi
+            if [ -e "$backup" ] || [ -L "$backup" ]; then
+                if [ -e "$destination" ] || [ -L "$destination" ]; then
+                    rollback_failed=true
+                elif [ -f "$backup" ] && [ ! -L "$backup" ]; then
+                    mv "$backup" "$destination" || rollback_failed=true
+                else
+                    rollback_failed=true
+                fi
+            fi
+        done
+        [ "$rollback_failed" = false ] || return 1
+        rmdir "$RETRO_PUBLICATION_BACKUP_DIR" || return 1
+        RETRO_PUBLICATION_BACKUP_DIR=""
+        RETRO_PUBLICATION_ACTIVE=false
+        RETRO_PUBLICATION_STAGED_ARTIFACTS=()
+    }
+    cleanup_retrospective_run_dir() {
+        local run_dir="$RETRO_RUN_DIR" run_parent run_name entry
+        [ -n "$run_dir" ] || return 0
+        rollback_retrospective_publication || return 1
+        run_parent="$(canonicalize_path "$(dirname "$run_dir")")" || return 1
+        run_name="$(basename "$run_dir")"
+        [ "$run_parent" = "$(canonicalize_path "$RETRO_OUTPUT_DIR")" ] && \
+            [[ "$run_name" =~ ^\.retrospective-run\.[A-Za-z0-9]{6}$ ]] && \
+            [ -d "$run_dir" ] && [ ! -L "$run_dir" ] || return 1
+        entry="$(find "$run_dir" -mindepth 1 -maxdepth 1 ! -type f \
+            -print -quit 2>/dev/null || echo find-failed)"
+        [ -z "$entry" ] || return 1
+        rm -f "$run_dir"/aggregated-data.json \
+            "$run_dir"/cross-pr-patterns.json \
+            "$run_dir"/hotspots.json \
+            "$run_dir"/guiding-questions.json \
+            "$run_dir"/improvement-tracking.json \
+            "$run_dir"/summary.json \
+            "$run_dir"/claude-context.json \
+            "$run_dir"/claude-raw-response.json \
+            "$run_dir"/claude-meta-analysis.json \
+            "$run_dir"/retrospective-report.md \
+            "$run_dir"/retrospective-data.json \
+            "$run_dir"/retrospective-data.tmp.json || return 1
+        entry="$(find "$run_dir" -mindepth 1 -maxdepth 1 \
+            -print -quit 2>/dev/null || echo find-failed)"
+        [ -z "$entry" ] && rmdir "$run_dir" || return 1
+        RETRO_RUN_DIR=""
+    }
+    release_retrospective_output_lock() {
+        [ "$RETRO_OUTPUT_LOCK_OWNED" = true ] || return 0
+        if ! release_selected_analysis_lock \
+                "$RETRO_OUTPUT_LOCK_DIR" "$RETRO_OUTPUT_LOCK_TOKEN"; then
+            echo "Error: Retrospective output lock remains after cleanup: $RETRO_OUTPUT_LOCK_DIR" >&2
+            return 1
+        fi
+        RETRO_OUTPUT_LOCK_DIR=""
+        RETRO_OUTPUT_LOCK_TOKEN=""
+        RETRO_OUTPUT_LOCK_OWNED=false
+        SELECTED_ANALYSIS_LOCK_DIR=""
+        SELECTED_ANALYSIS_LOCK_TOKEN=""
+        SELECTED_ANALYSIS_LOCK_OWNED=false
+    }
+    cleanup_retrospective_run() {
+        local cleanup_failed=false
+        cleanup_retrospective_snapshots || cleanup_failed=true
+        cleanup_retrospective_run_dir || cleanup_failed=true
+        release_retrospective_output_lock || cleanup_failed=true
+        [ "$cleanup_failed" = false ]
+    }
     terminate_retrospective() {
         local signal_status="$1"
-        if [ "$RETRO_SNAPSHOT_WORKER_STARTING" = true ]; then
+        if [ "$RETRO_SNAPSHOT_WORKER_STARTING" = true ] || \
+           [ "$RETRO_OUTPUT_LOCK_ACQUIRING" = true ]; then
             [ -n "$RETRO_PENDING_SIGNAL_STATUS" ] || \
                 RETRO_PENDING_SIGNAL_STATUS="$signal_status"
             return 0
@@ -4206,7 +4366,7 @@ if [ "$1" = "retrospective" ]; then
         # An explicit signal trap interrupts Bash's synchronous wait for a
         # snapshot-copy child. The child has already closed the lease writer,
         # so cleanup can revoke the shared root without waiting for that copy.
-        cleanup_retrospective_snapshots || true
+        cleanup_retrospective_run || true
         trap - EXIT HUP INT TERM
         exit "$signal_status"
     }
@@ -4223,7 +4383,7 @@ if [ "$1" = "retrospective" ]; then
         rm -rf "$snapshot_dir"
         [ ! -e "$snapshot_dir" ]
     }
-    trap cleanup_retrospective_snapshots EXIT
+    trap cleanup_retrospective_run EXIT
     trap 'terminate_retrospective 129' HUP
     trap 'terminate_retrospective 130' INT
     trap 'terminate_retrospective 143' TERM
@@ -4671,50 +4831,56 @@ RETRO_HELP
     # Args: PR_REPORTS array (global)
     # Output: Aggregated JSON to stdout
     aggregate_pr_data() {
+        local combined_stream report pr_dir summary_file
+        combined_stream="$(mktemp \
+            "$RETRO_SNAPSHOT_ROOT/.aggregate-stream.XXXXXX")" || return 1
         if [ ${#PR_REPORTS[@]} -eq 0 ]; then
             echo '{"prs": [], "total_prs": 0}'
+            rm -f "$combined_stream"
             return
         fi
 
-        # Combine all analysis files with PR metadata
-        local combined="[]"
+        # Stream one compact record per line. Report bodies never become argv
+        # values, so corpus size is bounded by disk rather than ARG_MAX.
         for report in "${PR_REPORTS[@]}"; do
-            local pr_dir
             pr_dir=$(dirname "$report")
-            local summary_file="$pr_dir/pr-summary.json"
-
-            local pr_meta="{}"
+            summary_file="$pr_dir/pr-summary.json"
             if [ -f "$summary_file" ]; then
-                pr_meta=$(jq -c '{
-                    number: .number,
-                    title: .title,
-                    author: .author.login,
-                    created_at: .createdAt,
-                    files: [.files[].path]
-                }' "$summary_file" 2>/dev/null || echo '{}')
+                jq -c --slurpfile summary "$summary_file" '
+                    . + {pr_meta: (($summary[0] // {}) | {
+                        number: .number,
+                        title: .title,
+                        author: .author.login,
+                        created_at: .createdAt,
+                        files: [(.files // [])[].path]
+                    })}
+                ' "$report" >> "$combined_stream" || {
+                    rm -f "$combined_stream"
+                    return 1
+                }
+            else
+                jq -c '. + {pr_meta: {}}' "$report" \
+                    >> "$combined_stream" || {
+                    rm -f "$combined_stream"
+                    return 1
+                }
             fi
-
-            # Merge analysis with metadata
-            local pr_data
-            pr_data=$(jq -c --argjson meta "$pr_meta" '. + {pr_meta: $meta}' "$report" 2>/dev/null)
-
-            combined=$(echo "$combined" | jq -c --argjson pr "$pr_data" '. + [$pr]')
         done
 
-        # Output aggregated structure
-        jq -n --argjson prs "$combined" '{
-            prs: $prs,
-            total_prs: ($prs | length)
-        }'
+        local aggregate_rc
+        jq -s '{prs: ., total_prs: length}' "$combined_stream"
+        aggregate_rc=$?
+        rm -f "$combined_stream"
+        return "$aggregate_rc"
     }
 
     # Calculate cross-PR patterns (issues that repeat across PRs)
     # Args: $1 - aggregated data JSON
     # Output: Patterns JSON to stdout
     calculate_cross_pr_patterns() {
-        local aggregated="$1"
+        local aggregated_file="$1"
 
-        echo "$aggregated" | jq '
+        jq '
             # Extract all systemic issues with PR context
             [.prs[] |
                 .pr_meta.number as $pr_num |
@@ -4746,16 +4912,16 @@ RETRO_HELP
             }) |
             # Sort by occurrences descending
             sort_by(-.occurrences)
-        '
+        ' "$aggregated_file"
     }
 
     # Calculate issue/task category hotspots
     # Args: $1 - aggregated data JSON
     # Output: Hotspots JSON to stdout
     calculate_category_hotspots() {
-        local aggregated="$1"
+        local aggregated_file="$1"
 
-        echo "$aggregated" | jq '
+        jq '
             # Collect all issue-category and task-category references across PRs.
             # Group on the taxonomy category, not the free-text finding name:
             # "Missing error handling in parse" and "Swallowed exception in sync"
@@ -4790,18 +4956,22 @@ RETRO_HELP
                 severities: (sort_by(.severity) | group_by(.severity) | map({severity: .[0].severity, count: length}))
             }) |
             sort_by(-.issue_count)
-        '
+        ' "$aggregated_file"
     }
 
     # Generate guiding questions from patterns
     # Args: $1 - patterns JSON, $2 - hotspots JSON
     # Output: Questions checklist to stdout
     generate_guiding_questions() {
-        local patterns="$1"
-        local hotspots="$2"
+        local patterns_file="$1"
+        local hotspots_file="$2"
 
         # Combine patterns and hotspots to generate questions
-        jq -n --argjson patterns "$patterns" --argjson hotspots "$hotspots" '
+        jq -n --slurpfile patterns_doc "$patterns_file" \
+            --slurpfile hotspots_doc "$hotspots_file" '
+        ($patterns_doc[0] // []) as $patterns
+        | ($hotspots_doc[0] // []) as $hotspots
+        |
         {
             before_implementation: [
                 ($patterns[] | select(.occurrences >= 2) |
@@ -4829,9 +4999,9 @@ RETRO_HELP
     # Args: $1 - aggregated data JSON
     # Output: Tracking JSON to stdout
     generate_improvement_tracking() {
-        local aggregated="$1"
+        local aggregated_file="$1"
 
-        echo "$aggregated" | jq '
+        jq '
             # Count process improvements suggested
             {
                 suggestions_made: [.prs[] | (.process_improvements // []) | length] | add,
@@ -4843,21 +5013,25 @@ RETRO_HELP
                 ),
                 pr_template_suggestions: [.prs[] | (.pr_template_suggestions // []) | length] | add
             }
-        '
+        ' "$aggregated_file"
     }
 
     # Generate team retrospective summary
     # Args: $1 - aggregated data, $2 - patterns, $3 - hotspots
     # Output: Summary JSON to stdout
     generate_retro_summary() {
-        local aggregated="$1"
-        local patterns="$2"
-        local hotspots="$3"
+        local aggregated_file="$1"
+        local patterns_file="$2"
+        local hotspots_file="$3"
 
         jq -n \
-            --argjson agg "$aggregated" \
-            --argjson patterns "$patterns" \
-            --argjson hotspots "$hotspots" '
+            --slurpfile aggregated_doc "$aggregated_file" \
+            --slurpfile patterns_doc "$patterns_file" \
+            --slurpfile hotspots_doc "$hotspots_file" '
+        ($aggregated_doc[0] // {prs: [], total_prs: 0}) as $agg
+        | ($patterns_doc[0] // []) as $patterns
+        | ($hotspots_doc[0] // []) as $hotspots
+        |
         {
             overview: {
                 total_prs_analyzed: $agg.total_prs,
@@ -5010,11 +5184,11 @@ $context_payload
 
     # Generate markdown report from retrospective data
     generate_retrospective_markdown() {
-        local summary="$1"
-        local patterns="$2"
-        local hotspots="$3"
-        local questions="$4"
-        local tracking="$5"
+        local summary_file="$1"
+        local patterns_file="$2"
+        local hotspots_file="$3"
+        local questions_file="$4"
+        local tracking_file="$5"
         local claude_analysis="${6:-}"
 
         local timestamp
@@ -5027,27 +5201,27 @@ $context_payload
 
 ## Overview
 
-$(echo "$summary" | jq -r '
+$(jq -r '
 "- **PRs Analyzed:** \(.overview.total_prs_analyzed)
 - **Total Issues Found:** \(.overview.total_issues // 0)
 - **Total Tasks Generated:** \(.overview.total_tasks // 0)
 - **Recurring Patterns:** \(.overview.total_patterns)"
-')
+' "$summary_file")
 
 ## Top Issue Categories
 
-$(echo "$summary" | jq -r '
+$(jq -r '
 if (.top_issue_categories | length) == 0 then
     "_No issue categories found._"
 else
     .top_issue_categories[] |
     "- **\(.name)** (\(.count) occurrences)"
 end
-')
+' "$summary_file")
 
 ## Cross-PR Systemic Patterns
 
-$(echo "$patterns" | jq -r '
+$(jq -r '
 if length == 0 then
     "_No recurring patterns identified._"
 else
@@ -5060,55 +5234,55 @@ else
 **Prevention Strategy:** \(.prevention_strategy // "N/A")
 "
 end
-')
+' "$patterns_file")
 
 ## Component Hotspots
 
-$(echo "$hotspots" | jq -r '
+$(jq -r '
 if length == 0 then
     "_No hotspots identified._"
 else
     .[:10][] |
     "- **\(.category)** - \(.issue_count) issues across \(.prs | length) PRs"
 end
-')
+' "$hotspots_file")
 
 ## Guiding Questions Checklist
 
 ### Before Implementation
-$(echo "$questions" | jq -r '
+$(jq -r '
 if (.before_implementation | length) == 0 then
     "_No questions generated._"
 else
     .before_implementation[] | "- [ ] \(.)"
 end
-')
+' "$questions_file")
 
 ### Before Review
-$(echo "$questions" | jq -r '
+$(jq -r '
 if (.before_review | length) == 0 then
     "_No questions generated._"
 else
     .before_review[] | "- [ ] \(.)"
 end
-')
+' "$questions_file")
 
 ### After Review
-$(echo "$questions" | jq -r '.after_review[] | "- [ ] \(.)"')
+$(jq -r '.after_review[] | "- [ ] \(.)"' "$questions_file")
 
 ## Improvement Tracking
 
-$(echo "$tracking" | jq -r '
+$(jq -r '
 "- **Total Suggestions Made:** \(.suggestions_made // 0)
 - **PR Template Suggestions:** \(.pr_template_suggestions // 0)
 
 ### By Category
 " + (if (.by_category | length) == 0 then "_None_" else (.by_category[] | "- \(.category): \(.count)") | . end)
-')
+' "$tracking_file")
 
 ## Recommended Actions
 
-$(echo "$summary" | jq -r '
+$(jq -r '
 if (.recommended_actions | length) == 0 then
     "_No recommended actions._"
 else
@@ -5118,7 +5292,7 @@ else
 **Addresses PRs:** \(.addresses_prs | map("#\(.)") | join(", "))
 "
 end
-')
+' "$summary_file")
 EOF
 
         # Add Claude meta-analysis if available
@@ -5170,8 +5344,8 @@ FOOTER
     # Generate special format outputs
     generate_format_output() {
         local format="$1"
-        local questions="$2"
-        local summary="$3"
+        local questions_file="$2"
+        local summary_file="$3"
         local claude_analysis="${4:-}"
 
         case "$format" in
@@ -5184,10 +5358,10 @@ FOOTER
 ### Common Patterns to Avoid
 
 CLAUDE_MD_HEADER
-                echo "$summary" | jq -r '
+                jq -r '
                     .recurring_patterns[:5][] |
                     "- **\(.pattern)**: \(.prevention_strategy // "Address proactively")"
-                '
+                ' "$summary_file"
 
                 if [ -n "$claude_analysis" ] && [ -f "$claude_analysis" ]; then
                     echo ""
@@ -5203,12 +5377,12 @@ CLAUDE_MD_HEADER
 <!-- Add these items to your PR template -->
 
 PR_TEMPLATE_HEADER
-                echo "$questions" | jq -r '
+                jq -r '
                     "### Before Submitting\n" +
                     (.before_implementation | map("- [ ] " + .) | join("\n")) +
                     "\n\n### Before Requesting Review\n" +
                     (.before_review | map("- [ ] " + .) | join("\n"))
-                '
+                ' "$questions_file"
 
                 if [ -n "$claude_analysis" ] && [ -f "$claude_analysis" ]; then
                     echo ""
@@ -5224,14 +5398,14 @@ PR_TEMPLATE_HEADER
 <!-- Standalone checklist derived from PR review patterns -->
 
 CHECKLIST_HEADER
-                echo "$questions" | jq -r '
+                jq -r '
                     "## Planning Phase\n" +
                     (.before_implementation | map("- [ ] " + .) | join("\n")) +
                     "\n\n## Implementation Phase\n" +
                     (.before_review | map("- [ ] " + .) | join("\n")) +
                     "\n\n## Review Phase\n" +
                     (.after_review | map("- [ ] " + .) | join("\n"))
-                '
+                ' "$questions_file"
 
                 if [ -n "$claude_analysis" ] && [ -f "$claude_analysis" ]; then
                     echo ""
@@ -5247,6 +5421,86 @@ CHECKLIST_HEADER
                 fi
                 ;;
         esac
+    }
+
+    publish_retrospective_run() {
+        local artifact source destination backup desired_mode
+        local -a required_artifacts=(
+            aggregated-data.json cross-pr-patterns.json hotspots.json
+            guiding-questions.json improvement-tracking.json summary.json
+            retrospective-report.md retrospective-data.json
+        )
+        local -a optional_artifacts=(
+            claude-context.json claude-raw-response.json
+            claude-meta-analysis.json
+        )
+        for artifact in "${required_artifacts[@]}"; do
+            source="$RETRO_RUN_DIR/$artifact"
+            [ -f "$source" ] && [ ! -L "$source" ] || return 1
+            case "$artifact" in
+                *.json) jq -e . "$source" > /dev/null 2>&1 || return 1 ;;
+            esac
+        done
+        RETRO_PUBLICATION_STAGED_ARTIFACTS=()
+        for artifact in "${required_artifacts[@]}" \
+                "${optional_artifacts[@]}"; do
+            destination="$RETRO_OUTPUT_DIR/$artifact"
+            if [ -e "$destination" ] || [ -L "$destination" ]; then
+                [ -f "$destination" ] && [ ! -L "$destination" ] && \
+                    ! path_is_git_tracked "$destination" || return 1
+            fi
+            source="$RETRO_RUN_DIR/$artifact"
+            if [ -f "$source" ] && [ ! -L "$source" ]; then
+                RETRO_PUBLICATION_STAGED_ARTIFACTS+=("$artifact")
+                desired_mode=600
+                if [ -f "$destination" ] && [ ! -L "$destination" ]; then
+                    desired_mode="$(workspace_file_mode "$destination")" || return 1
+                fi
+                [[ "$desired_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+                chmod "$desired_mode" "$source" || return 1
+            fi
+        done
+
+        RETRO_PUBLICATION_BACKUP_DIR="$RETRO_RUN_DIR/.publication-backup"
+        mkdir "$RETRO_PUBLICATION_BACKUP_DIR" || return 1
+        chmod 700 "$RETRO_PUBLICATION_BACKUP_DIR" || return 1
+        RETRO_PUBLICATION_ACTIVE=true
+
+        # Quarantine the complete old generation before publishing any new
+        # artifact. Signal and failure cleanup restore it transactionally.
+        for artifact in "${required_artifacts[@]}" \
+                "${optional_artifacts[@]}"; do
+            destination="$RETRO_OUTPUT_DIR/$artifact"
+            backup="$RETRO_PUBLICATION_BACKUP_DIR/$artifact"
+            if [ -e "$destination" ] || [ -L "$destination" ]; then
+                mv "$destination" "$backup" || {
+                    rollback_retrospective_publication || true
+                    return 1
+                }
+            fi
+        done
+        for artifact in "${required_artifacts[@]}" \
+                "${optional_artifacts[@]}"; do
+            source="$RETRO_RUN_DIR/$artifact"
+            destination="$RETRO_OUTPUT_DIR/$artifact"
+            if [ -f "$source" ] && [ ! -L "$source" ]; then
+                mv "$source" "$destination" || {
+                    rollback_retrospective_publication || true
+                    return 1
+                }
+            elif [ -e "$source" ] || [ -L "$source" ]; then
+                rollback_retrospective_publication || true
+                return 1
+            fi
+        done
+
+        RETRO_PUBLICATION_ACTIVE=false
+        rm -f "$RETRO_PUBLICATION_BACKUP_DIR"/* || return 1
+        rmdir "$RETRO_PUBLICATION_BACKUP_DIR" || return 1
+        RETRO_PUBLICATION_BACKUP_DIR=""
+        RETRO_PUBLICATION_STAGED_ARTIFACTS=()
+        rmdir "$RETRO_RUN_DIR" || return 1
+        RETRO_RUN_DIR=""
     }
 
     # ============================================================================
@@ -5273,6 +5527,35 @@ CHECKLIST_HEADER
         retro_log "Filtering PRs since: $RETRO_SINCE"
     fi
 
+    # One output directory is one retrospective publication transaction. Fail
+    # closed before discovery so concurrent runs cannot mix fixed artifacts or
+    # follow branch-planted output symlinks.
+    if path_has_symlink_component "$RETRO_OUTPUT_DIR"; then
+        echo "Error: Retrospective output path contains a symbolic-link component: $RETRO_OUTPUT_DIR" >&2
+        exit 1
+    fi
+    mkdir -p "$RETRO_OUTPUT_DIR" || exit 1
+    RETRO_OUTPUT_LOCK_ACQUIRING=true
+    if ! acquire_selected_analysis_lock "$RETRO_OUTPUT_DIR"; then
+        RETRO_OUTPUT_LOCK_ACQUIRING=false
+        if [ -n "$RETRO_PENDING_SIGNAL_STATUS" ]; then
+            terminate_retrospective "$RETRO_PENDING_SIGNAL_STATUS"
+        fi
+        echo "Error: Another retrospective writer is active for $RETRO_OUTPUT_DIR." >&2
+        exit 1
+    fi
+    RETRO_OUTPUT_LOCK_DIR="$SELECTED_ANALYSIS_LOCK_DIR"
+    RETRO_OUTPUT_LOCK_TOKEN="$SELECTED_ANALYSIS_LOCK_TOKEN"
+    RETRO_OUTPUT_LOCK_OWNED="$SELECTED_ANALYSIS_LOCK_OWNED"
+    RETRO_OUTPUT_LOCK_ACQUIRING=false
+    if [ -n "$RETRO_PENDING_SIGNAL_STATUS" ]; then
+        terminate_retrospective "$RETRO_PENDING_SIGNAL_STATUS"
+    fi
+    validate_output_directory_for_writes "$RETRO_OUTPUT_DIR" || exit 1
+    RETRO_RUN_DIR="$(mktemp -d \
+        "$RETRO_OUTPUT_DIR/.retrospective-run.XXXXXX")" || exit 1
+    chmod 700 "$RETRO_RUN_DIR" || exit 1
+
     # One bounded lease owns every immutable report snapshot in this run. This
     # avoids a polling janitor per archived PR while preserving crash cleanup.
     if ! start_retrospective_snapshot_lease; then
@@ -5298,9 +5581,6 @@ CHECKLIST_HEADER
         retro_log "Use --min-prs to lower the threshold, or generate more PR reports."
         retro_log "Continuing with available data..."
     fi
-
-    # Create output directory
-    mkdir -p "$RETRO_OUTPUT_DIR"
 
     TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
 
@@ -5330,38 +5610,39 @@ CHECKLIST_HEADER
     fi
     RETRO_SNAPSHOT_WORKER_PID=""
     RETRO_SNAPSHOT_WORKER_GROUP_OWNED=false
-    AGGREGATED="$(cat "$AGGREGATION_OUTPUT")"
-    rm -f "$AGGREGATION_OUTPUT"
+    mv "$AGGREGATION_OUTPUT" "$RETRO_RUN_DIR/aggregated-data.json" || exit 1
     if ! cleanup_retrospective_snapshots; then
         exit 1
     fi
     PR_REPORTS=()
-    echo "$AGGREGATED" > "$RETRO_OUTPUT_DIR/aggregated-data.json"
 
     # Calculate patterns
     retro_log "Calculating cross-PR patterns..."
-    PATTERNS=$(calculate_cross_pr_patterns "$AGGREGATED")
-    echo "$PATTERNS" > "$RETRO_OUTPUT_DIR/cross-pr-patterns.json"
+    calculate_cross_pr_patterns "$RETRO_RUN_DIR/aggregated-data.json" \
+        > "$RETRO_RUN_DIR/cross-pr-patterns.json" || exit 1
 
     # Calculate hotspots
     retro_log "Calculating hotspots..."
-    HOTSPOTS=$(calculate_category_hotspots "$AGGREGATED")
-    echo "$HOTSPOTS" > "$RETRO_OUTPUT_DIR/hotspots.json"
+    calculate_category_hotspots "$RETRO_RUN_DIR/aggregated-data.json" \
+        > "$RETRO_RUN_DIR/hotspots.json" || exit 1
 
     # Generate guiding questions
     retro_log "Generating guiding questions..."
-    QUESTIONS=$(generate_guiding_questions "$PATTERNS" "$HOTSPOTS")
-    echo "$QUESTIONS" > "$RETRO_OUTPUT_DIR/guiding-questions.json"
+    generate_guiding_questions "$RETRO_RUN_DIR/cross-pr-patterns.json" \
+        "$RETRO_RUN_DIR/hotspots.json" \
+        > "$RETRO_RUN_DIR/guiding-questions.json" || exit 1
 
     # Generate improvement tracking
     retro_log "Generating improvement tracking..."
-    TRACKING=$(generate_improvement_tracking "$AGGREGATED")
-    echo "$TRACKING" > "$RETRO_OUTPUT_DIR/improvement-tracking.json"
+    generate_improvement_tracking "$RETRO_RUN_DIR/aggregated-data.json" \
+        > "$RETRO_RUN_DIR/improvement-tracking.json" || exit 1
 
     # Generate summary
     retro_log "Generating summary..."
-    SUMMARY=$(generate_retro_summary "$AGGREGATED" "$PATTERNS" "$HOTSPOTS")
-    echo "$SUMMARY" > "$RETRO_OUTPUT_DIR/summary.json"
+    generate_retro_summary "$RETRO_RUN_DIR/aggregated-data.json" \
+        "$RETRO_RUN_DIR/cross-pr-patterns.json" \
+        "$RETRO_RUN_DIR/hotspots.json" \
+        > "$RETRO_RUN_DIR/summary.json" || exit 1
 
     # Optional Claude enrichment
     CLAUDE_ANALYSIS_FILE=""
@@ -5370,23 +5651,23 @@ CHECKLIST_HEADER
 
         # Build context for Claude
         jq -n \
-            --argjson summary "$SUMMARY" \
-            --argjson patterns "$PATTERNS" \
-            --argjson hotspots "$HOTSPOTS" \
-            --argjson tracking "$TRACKING" \
+            --slurpfile summary_doc "$RETRO_RUN_DIR/summary.json" \
+            --slurpfile patterns_doc "$RETRO_RUN_DIR/cross-pr-patterns.json" \
+            --slurpfile hotspots_doc "$RETRO_RUN_DIR/hotspots.json" \
+            --slurpfile tracking_doc "$RETRO_RUN_DIR/improvement-tracking.json" \
             '{
-                summary: $summary,
-                patterns: $patterns,
-                hotspots: $hotspots,
-                tracking: $tracking
-            }' > "$RETRO_OUTPUT_DIR/claude-context.json"
+                summary: $summary_doc[0],
+                patterns: $patterns_doc[0],
+                hotspots: $hotspots_doc[0],
+                tracking: $tracking_doc[0]
+            }' > "$RETRO_RUN_DIR/claude-context.json"
 
-        if run_retrospective_claude_analysis "$RETRO_OUTPUT_DIR/claude-context.json" "$RETRO_OUTPUT_DIR/claude-raw-response.json"; then
+        if run_retrospective_claude_analysis "$RETRO_RUN_DIR/claude-context.json" "$RETRO_RUN_DIR/claude-raw-response.json"; then
             retro_log "✅ Claude meta-analysis complete"
 
-            if jq -e '.structured_output' "$RETRO_OUTPUT_DIR/claude-raw-response.json" > /dev/null 2>&1; then
-                jq '.structured_output' "$RETRO_OUTPUT_DIR/claude-raw-response.json" > "$RETRO_OUTPUT_DIR/claude-meta-analysis.json"
-                CLAUDE_ANALYSIS_FILE="$RETRO_OUTPUT_DIR/claude-meta-analysis.json"
+            if jq -e '.structured_output' "$RETRO_RUN_DIR/claude-raw-response.json" > /dev/null 2>&1; then
+                jq '.structured_output' "$RETRO_RUN_DIR/claude-raw-response.json" > "$RETRO_RUN_DIR/claude-meta-analysis.json"
+                CLAUDE_ANALYSIS_FILE="$RETRO_RUN_DIR/claude-meta-analysis.json"
             else
                 retro_log "⚠️  Claude returned no structured retrospective output; keeping only the raw diagnostic envelope."
             fi
@@ -5397,16 +5678,20 @@ CHECKLIST_HEADER
 
     # Generate markdown report
     retro_log "Generating markdown report..."
-    generate_retrospective_markdown "$SUMMARY" "$PATTERNS" "$HOTSPOTS" "$QUESTIONS" "$TRACKING" "$CLAUDE_ANALYSIS_FILE" \
-        > "$RETRO_OUTPUT_DIR/retrospective-report.md"
+    generate_retrospective_markdown "$RETRO_RUN_DIR/summary.json" \
+        "$RETRO_RUN_DIR/cross-pr-patterns.json" \
+        "$RETRO_RUN_DIR/hotspots.json" \
+        "$RETRO_RUN_DIR/guiding-questions.json" \
+        "$RETRO_RUN_DIR/improvement-tracking.json" "$CLAUDE_ANALYSIS_FILE" \
+        > "$RETRO_RUN_DIR/retrospective-report.md" || exit 1
 
     # Generate combined JSON
     jq -n \
-        --argjson summary "$SUMMARY" \
-        --argjson patterns "$PATTERNS" \
-        --argjson hotspots "$HOTSPOTS" \
-        --argjson questions "$QUESTIONS" \
-        --argjson tracking "$TRACKING" \
+        --slurpfile summary_doc "$RETRO_RUN_DIR/summary.json" \
+        --slurpfile patterns_doc "$RETRO_RUN_DIR/cross-pr-patterns.json" \
+        --slurpfile hotspots_doc "$RETRO_RUN_DIR/hotspots.json" \
+        --slurpfile questions_doc "$RETRO_RUN_DIR/guiding-questions.json" \
+        --slurpfile tracking_doc "$RETRO_RUN_DIR/improvement-tracking.json" \
         --arg timestamp "$TIMESTAMP" \
         --arg version "$VERSION" \
         '{
@@ -5414,19 +5699,31 @@ CHECKLIST_HEADER
                 generated_at: $timestamp,
                 version: $version
             },
-            summary: $summary,
-            cross_pr_patterns: $patterns,
-            hotspots: $hotspots,
-            guiding_questions: $questions,
-            improvement_tracking: $tracking
-        }' > "$RETRO_OUTPUT_DIR/retrospective-data.json"
+            summary: $summary_doc[0],
+            cross_pr_patterns: $patterns_doc[0],
+            hotspots: $hotspots_doc[0],
+            guiding_questions: $questions_doc[0],
+            improvement_tracking: $tracking_doc[0]
+        }' > "$RETRO_RUN_DIR/retrospective-data.json" || exit 1
 
     # Add Claude analysis to combined JSON if available
     if [ -n "$CLAUDE_ANALYSIS_FILE" ] && [ -f "$CLAUDE_ANALYSIS_FILE" ]; then
-        jq --argjson claude "$(cat "$CLAUDE_ANALYSIS_FILE")" \
-            '. + {claude_meta_analysis: $claude}' \
-            "$RETRO_OUTPUT_DIR/retrospective-data.json" > "$RETRO_OUTPUT_DIR/retrospective-data.tmp.json" && \
-            mv "$RETRO_OUTPUT_DIR/retrospective-data.tmp.json" "$RETRO_OUTPUT_DIR/retrospective-data.json"
+        jq --slurpfile claude "$CLAUDE_ANALYSIS_FILE" \
+            '. + {claude_meta_analysis: $claude[0]}' \
+            "$RETRO_RUN_DIR/retrospective-data.json" \
+            > "$RETRO_RUN_DIR/retrospective-data.tmp.json" && \
+            mv "$RETRO_RUN_DIR/retrospective-data.tmp.json" \
+                "$RETRO_RUN_DIR/retrospective-data.json" || exit 1
+    fi
+
+    if ! publish_retrospective_run; then
+        echo "Error: Retrospective artifacts could not be published safely." >&2
+        exit 1
+    fi
+    if [ -f "$RETRO_OUTPUT_DIR/claude-meta-analysis.json" ]; then
+        CLAUDE_ANALYSIS_FILE="$RETRO_OUTPUT_DIR/claude-meta-analysis.json"
+    else
+        CLAUDE_ANALYSIS_FILE=""
     fi
 
     # Handle special format output
@@ -5434,7 +5731,9 @@ CHECKLIST_HEADER
         echo ""
         echo "=== ${RETRO_FORMAT} output ==="
         echo ""
-        generate_format_output "$RETRO_FORMAT" "$QUESTIONS" "$SUMMARY" "$CLAUDE_ANALYSIS_FILE"
+        generate_format_output "$RETRO_FORMAT" \
+            "$RETRO_OUTPUT_DIR/guiding-questions.json" \
+            "$RETRO_OUTPUT_DIR/summary.json" "$CLAUDE_ANALYSIS_FILE"
         exit 0
     fi
 
@@ -5456,8 +5755,10 @@ CHECKLIST_HEADER
             fi
             echo ""
             echo "Quick stats:"
-            echo "$SUMMARY" | jq -r '"  PRs analyzed: \(.overview.total_prs_analyzed)"'
-            echo "$PATTERNS" | jq -r '"  Recurring patterns: \(length)"'
+            jq -r '"  PRs analyzed: \(.overview.total_prs_analyzed)"' \
+                "$RETRO_OUTPUT_DIR/summary.json"
+            jq -r '"  Recurring patterns: \(length)"' \
+                "$RETRO_OUTPUT_DIR/cross-pr-patterns.json"
             ;;
     esac
 
@@ -6329,16 +6630,23 @@ if [ "$1" = "address" ]; then
     ADDRESS_CONTEXT_PR=""
     ADDRESS_CONTEXT_REPOSITORY=""
     ADDRESS_CONTEXT_HEAD=""
+    ADDRESS_CONTEXT_BASE=""
+    ADDRESS_CONTEXT_BASE_REF=""
     if [ "$(basename "$ADDRESS_LIVE_ANALYSIS_FILE")" = "analysis.json" ] && \
        [ -f "$ADDRESS_CONTEXT_FILE" ]; then
         ADDRESS_CONTEXT_PR="$(jq -r '.pr.number // ""' "$ADDRESS_CONTEXT_FILE")"
         ADDRESS_CONTEXT_REPOSITORY="$(jq -r '.pr.repository // ""' "$ADDRESS_CONTEXT_FILE")"
         ADDRESS_CONTEXT_HEAD="$(jq -r '.coverage.code_access.pr_head_sha // ""' "$ADDRESS_CONTEXT_FILE")"
+        ADDRESS_CONTEXT_BASE="$(jq -r '.pr.base_sha // ""' "$ADDRESS_CONTEXT_FILE")"
+        ADDRESS_CONTEXT_BASE_REF="$(jq -r '.pr.base_ref_name // ""' "$ADDRESS_CONTEXT_FILE")"
         if [ "$ADDRESS_CONTEXT_PR" != "$ADDRESS_PR" ]; then
             echo "Error: Selected analysis belongs to PR #${ADDRESS_CONTEXT_PR:-unknown}, not PR #$ADDRESS_PR"
             exit 1
         fi
-        if [ -n "$ADDRESS_CONTEXT_REPOSITORY" ] && [ -n "$ADDRESS_CONTEXT_HEAD" ]; then
+        if [ -n "$ADDRESS_CONTEXT_REPOSITORY" ] && \
+           [ -n "$ADDRESS_CONTEXT_HEAD" ] && \
+           [ -n "$ADDRESS_CONTEXT_BASE" ] && \
+           [ -n "$ADDRESS_CONTEXT_BASE_REF" ]; then
             ADDRESS_CURRENT_PROVENANCE=true
         fi
     fi
@@ -6353,6 +6661,18 @@ if [ "$1" = "address" ]; then
             echo "Error: GitHub PR or linked-issue intent changed before tasks could be displayed. Re-run the analysis."
         else
             echo "Error: GitHub PR or linked-issue intent could not be revalidated; tasks were not displayed and the selected analysis was preserved."
+        fi
+        exit 1
+    fi
+    if [ "$ADDRESS_CURRENT_PROVENANCE" = true ] && \
+       ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
+            "$ADDRESS_CONTEXT_HEAD" "$ADDRESS_CONTEXT_REPOSITORY" \
+            "$ADDRESS_CONTEXT_BASE" "$ADDRESS_CONTEXT_BASE_REF"; then
+        invalidate_on_confirmed_hosted_head_mismatch "$ANALYSIS_DIR" || true
+        if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
+            echo "Error: Hosted PR revision changed before tasks could be displayed. Re-run the analysis."
+        else
+            echo "Error: Hosted PR revision could not be revalidated; tasks were not displayed and the selected analysis was preserved."
         fi
         exit 1
     fi
@@ -6503,13 +6823,14 @@ if [ "$1" = "address" ]; then
                             # the mutation; all local and discussion checks have
                             # already succeeded against the captured context.
                             if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
-                                    "$ADDRESS_CONTEXT_HEAD" "$ADDRESS_CONTEXT_REPOSITORY"; then
+                                    "$ADDRESS_CONTEXT_HEAD" "$ADDRESS_CONTEXT_REPOSITORY" \
+                                    "$ADDRESS_CONTEXT_BASE" "$ADDRESS_CONTEXT_BASE_REF"; then
                                 invalidate_on_confirmed_hosted_head_mismatch \
                                     "$ANALYSIS_DIR" || true
                                 if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
-                                    echo "  ❌ Hosted PR head changed since analysis (expected $ADDRESS_CONTEXT_HEAD, found $CURRENT_HOSTED_HEAD). Re-run before resolving threads."
+                                    echo "  ❌ Hosted PR revision changed since analysis. Re-run before resolving threads."
                                 else
-                                    echo "  ❌ Hosted PR head could not be revalidated; no thread mutation was sent and the selected analysis was preserved."
+                                    echo "  ❌ Hosted PR revision could not be revalidated; no thread mutation was sent and the selected analysis was preserved."
                                 fi
                                 exit 1
                             fi
@@ -6561,14 +6882,15 @@ if [ "$1" = "address" ]; then
                                 exit 1
                             fi
                             if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
-                                    "$ADDRESS_CONTEXT_HEAD" "$ADDRESS_CONTEXT_REPOSITORY"; then
+                                    "$ADDRESS_CONTEXT_HEAD" "$ADDRESS_CONTEXT_REPOSITORY" \
+                                    "$ADDRESS_CONTEXT_BASE" "$ADDRESS_CONTEXT_BASE_REF"; then
                                 rollback_active_address_thread_batch || true
                                 invalidate_on_confirmed_hosted_head_mismatch \
                                     "$ANALYSIS_DIR" || true
                                 if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
-                                    echo "  ❌ Hosted PR head changed since analysis (expected $ADDRESS_CONTEXT_HEAD, found $CURRENT_HOSTED_HEAD). Re-run before resolving threads."
+                                    echo "  ❌ Hosted PR revision changed since analysis. Re-run before resolving threads."
                                 else
-                                    echo "  ❌ Hosted PR head could not be revalidated; any attempted thread resolutions were left unchanged for manual reconciliation."
+                                    echo "  ❌ Hosted PR revision could not be revalidated; any attempted thread resolutions were left unchanged for manual reconciliation."
                                 fi
                                 exit 1
                             fi
@@ -6677,7 +6999,9 @@ if [ "$1" = "address" ]; then
                             POST_HEAD_VALID=true
                             if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
                                     "$ADDRESS_CONTEXT_HEAD" \
-                                    "$ADDRESS_CONTEXT_REPOSITORY"; then
+                                    "$ADDRESS_CONTEXT_REPOSITORY" \
+                                    "$ADDRESS_CONTEXT_BASE" \
+                                    "$ADDRESS_CONTEXT_BASE_REF"; then
                                 POST_HEAD_VALID=false
                             fi
 
@@ -6735,7 +7059,9 @@ if [ "$1" = "address" ]; then
                             fi
                             if ! verify_pr_head_unchanged "$ADDRESS_CONTEXT_PR" \
                                     "$ADDRESS_CONTEXT_HEAD" \
-                                    "$ADDRESS_CONTEXT_REPOSITORY"; then
+                                    "$ADDRESS_CONTEXT_REPOSITORY" \
+                                    "$ADDRESS_CONTEXT_BASE" \
+                                    "$ADDRESS_CONTEXT_BASE_REF"; then
                                 if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
                                     BATCH_COMMIT_FAILURE="head_mismatch"
                                 else
@@ -8097,9 +8423,14 @@ verify_analysis_checks_unchanged() {
 HOSTED_ATTESTATION_COMPONENT=""
 verify_analysis_partial_hosted_attestation() {
     local context_file="$1" component="$2"
-    local expected_head repository pr_number first_head expected_intent
+    local expected_head expected_base expected_base_ref repository pr_number
+    local first_head first_base first_base_ref expected_intent
     HOSTED_ATTESTATION_COMPONENT="head"
     expected_head="$(jq -r '.pr.head_sha // .coverage.code_access.pr_head_sha // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    expected_base="$(jq -r '.pr.base_sha // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    expected_base_ref="$(jq -r '.pr.base_ref_name // ""' \
         "$context_file" 2>/dev/null || echo "")"
     repository="$(jq -r '.pr.repository // ""' \
         "$context_file" 2>/dev/null || echo "")"
@@ -8107,14 +8438,18 @@ verify_analysis_partial_hosted_attestation() {
         "$context_file" 2>/dev/null || echo "")"
     expected_intent="$(jq -r '.coverage.intent.fingerprint // ""' \
         "$context_file" 2>/dev/null || echo "")"
-    [ -n "$expected_head" ] && [ -n "$repository" ] && \
+    [ -n "$expected_head" ] && [ -n "$expected_base" ] && \
+        [ -n "$expected_base_ref" ] && [ -n "$repository" ] && \
         [ -n "$pr_number" ] || return 1
     case "$component" in
         discussion|checks|intent) ;;
         *) return 1 ;;
     esac
-    verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
+    verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" \
+        "$expected_base" "$expected_base_ref" || return 1
     first_head="$CURRENT_HOSTED_HEAD"
+    first_base="$CURRENT_HOSTED_BASE"
+    first_base_ref="$CURRENT_HOSTED_BASE_REF"
     HOSTED_ATTESTATION_COMPONENT="$component"
     case "$component" in
         discussion) verify_analysis_discussion_unchanged "$context_file" || return 1 ;;
@@ -8133,8 +8468,11 @@ verify_analysis_partial_hosted_attestation() {
         verify_analysis_intent_unchanged "$context_file" || return 1
     fi
     HOSTED_ATTESTATION_COMPONENT="head"
-    verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
-    [ "$CURRENT_HOSTED_HEAD" = "$first_head" ] || {
+    verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" \
+        "$expected_base" "$expected_base_ref" || return 1
+    [ "$CURRENT_HOSTED_HEAD" = "$first_head" ] && \
+        [ "$CURRENT_HOSTED_BASE" = "$first_base" ] && \
+        [ "$CURRENT_HOSTED_BASE_REF" = "$first_base_ref" ] || {
         HOSTED_HEAD_VERIFICATION_STATUS="mismatch"
         return 1
     }
@@ -8143,10 +8481,15 @@ verify_analysis_partial_hosted_attestation() {
 
 verify_analysis_hosted_attestation() {
     local context_file="$1"
-    local expected_head repository pr_number first_head expected_discussion expected_checks
+    local expected_head expected_base expected_base_ref repository pr_number
+    local first_head first_base first_base_ref expected_discussion expected_checks
     local expected_intent
     HOSTED_ATTESTATION_COMPONENT="head"
     expected_head="$(jq -r '.pr.head_sha // .coverage.code_access.pr_head_sha // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    expected_base="$(jq -r '.pr.base_sha // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    expected_base_ref="$(jq -r '.pr.base_ref_name // ""' \
         "$context_file" 2>/dev/null || echo "")"
     repository="$(jq -r '.pr.repository // ""' \
         "$context_file" 2>/dev/null || echo "")"
@@ -8158,11 +8501,15 @@ verify_analysis_hosted_attestation() {
         "$context_file" 2>/dev/null || echo "")"
     expected_intent="$(jq -r '.coverage.intent.fingerprint // ""' \
         "$context_file" 2>/dev/null || echo "")"
-    [ -n "$expected_head" ] && [ -n "$repository" ] && \
+    [ -n "$expected_head" ] && [ -n "$expected_base" ] && \
+        [ -n "$expected_base_ref" ] && [ -n "$repository" ] && \
         [ -n "$pr_number" ] && [ -n "$expected_discussion" ] && \
         [ -n "$expected_checks" ] || return 1
-    verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
+    verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" \
+        "$expected_base" "$expected_base_ref" || return 1
     first_head="$CURRENT_HOSTED_HEAD"
+    first_base="$CURRENT_HOSTED_BASE"
+    first_base_ref="$CURRENT_HOSTED_BASE_REF"
     HOSTED_ATTESTATION_COMPONENT="checks"
     verify_analysis_checks_unchanged "$context_file" || return 1
     HOSTED_ATTESTATION_COMPONENT="discussion"
@@ -8180,8 +8527,11 @@ verify_analysis_hosted_attestation() {
         verify_analysis_intent_unchanged "$context_file" || return 1
     fi
     HOSTED_ATTESTATION_COMPONENT="head"
-    verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" || return 1
-    [ "$CURRENT_HOSTED_HEAD" = "$first_head" ] || {
+    verify_pr_head_unchanged "$pr_number" "$expected_head" "$repository" \
+        "$expected_base" "$expected_base_ref" || return 1
+    [ "$CURRENT_HOSTED_HEAD" = "$first_head" ] && \
+        [ "$CURRENT_HOSTED_BASE" = "$first_base" ] && \
+        [ "$CURRENT_HOSTED_BASE_REF" = "$first_base_ref" ] || {
         HOSTED_HEAD_VERIFICATION_STATUS="mismatch"
         return 1
     }
@@ -8899,8 +9249,10 @@ build_analysis_context() (
     # Whether reading the working tree is meaningful depends on the revision it
     # holds, so the decision is made here and recorded in the context the
     # analyzer receives.
-    local pr_head_sha
+    local pr_head_sha pr_base_sha pr_base_ref_name
     pr_head_sha="$(jq -r '.headRefOid // ""' "$output_dir/pr-summary.json" 2>/dev/null || echo "")"
+    pr_base_sha="$(jq -r '.baseRefOid // ""' "$output_dir/pr-summary.json" 2>/dev/null || echo "")"
+    pr_base_ref_name="$(jq -r '.baseRefName // ""' "$output_dir/pr-summary.json" 2>/dev/null || echo "")"
     local local_head=""
     if command -v git > /dev/null 2>&1; then
         local_head="$(git rev-parse HEAD 2>/dev/null || echo "")"
@@ -9028,6 +9380,8 @@ build_analysis_context() (
         --argjson with_sast "$with_sast" \
         --argjson limit "$truncate_at" \
         --arg pr_head_sha "$pr_head_sha" \
+        --arg pr_base_sha "$pr_base_sha" \
+        --arg pr_base_ref_name "$pr_base_ref_name" \
         --arg local_head "$local_head" \
         --arg access_state "$access_state" \
         --arg access_reason "$access_reason" \
@@ -9064,6 +9418,9 @@ build_analysis_context() (
                 repository: $repository,
                 repository_id: $repository_id,
                 number: ($pr.number // null),
+                head_sha: (if $pr_head_sha == "" then null else $pr_head_sha end),
+                base_sha: (if $pr_base_sha == "" then null else $pr_base_sha end),
+                base_ref_name: (if $pr_base_ref_name == "" then null else $pr_base_ref_name end),
                 title: $pr.title,
                 body: trunc($pr.body // "No description"),
                 author: ($pr.author.login // "unknown"),
@@ -10071,6 +10428,8 @@ resolve_code_access() {
 }
 
 CLAUDE_CAPTURED_PR_HEAD=""
+CLAUDE_CAPTURED_PR_BASE=""
+CLAUDE_CAPTURED_PR_BASE_REF=""
 CLAUDE_CAPTURED_CONTEXT_FINGERPRINT=""
 CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT=""
 CLAUDE_DISCLOSURE_GATE_FAILED=false
@@ -10231,6 +10590,8 @@ run_claude_analysis() {
     local analysis_output_file="$output_file"
     local context_dir
     CLAUDE_CAPTURED_PR_HEAD=""
+    CLAUDE_CAPTURED_PR_BASE=""
+    CLAUDE_CAPTURED_PR_BASE_REF=""
     CLAUDE_CAPTURED_CONTEXT_FINGERPRINT=""
     CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT=""
     CLAUDE_DISCLOSURE_GATE_FAILED=false
@@ -10282,13 +10643,18 @@ run_claude_analysis() {
         return 1
     fi
 
-    local context_access_state access_reason captured_pr_head snapshot_source
+    local context_access_state access_reason captured_pr_head captured_pr_base
+    local captured_pr_base_ref snapshot_source
     local captured_context_fingerprint embedded_context_fingerprint
     context_access_state="$(jq -r '.coverage.code_access.state // "disabled"' \
         "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "disabled")"
     access_reason="$(jq -r '.coverage.code_access.reason // ""' \
         "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
     captured_pr_head="$(jq -r '.coverage.code_access.pr_head_sha // ""' \
+        "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
+    captured_pr_base="$(jq -r '.pr.base_sha // ""' \
+        "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
+    captured_pr_base_ref="$(jq -r '.pr.base_ref_name // ""' \
         "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
     snapshot_source="$(jq -r \
         '.coverage.code_access.snapshot_source // "git_index"' \
@@ -10297,7 +10663,9 @@ run_claude_analysis() {
         "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
     captured_context_fingerprint="$(analysis_context_fingerprint \
         "$ANALYZER_CONTEXT_FILE" 2>/dev/null || echo "")"
-    if [ -z "$captured_pr_head" ] || [ -z "$captured_context_fingerprint" ] || \
+    if [ -z "$captured_pr_head" ] || [ -z "$captured_pr_base" ] || \
+       [ -z "$captured_pr_base_ref" ] || \
+       [ -z "$captured_context_fingerprint" ] || \
        [ "$embedded_context_fingerprint" != "$captured_context_fingerprint" ]; then
         cleanup_code_access_snapshot
         echo "Error: Analysis context identity is missing or invalid before Claude analysis." >&2
@@ -10390,14 +10758,21 @@ $context_payload"
     cleanup_code_access_snapshot
     [ "$invoke_rc" -eq 0 ] || return "$invoke_rc"
 
-    local current_pr_head current_embedded_fingerprint current_context_fingerprint
+    local current_pr_head current_pr_base current_pr_base_ref
+    local current_embedded_fingerprint current_context_fingerprint
     current_pr_head="$(jq -r '.coverage.code_access.pr_head_sha // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    current_pr_base="$(jq -r '.pr.base_sha // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    current_pr_base_ref="$(jq -r '.pr.base_ref_name // ""' \
         "$context_file" 2>/dev/null || echo "")"
     current_embedded_fingerprint="$(jq -r '.coverage.context_fingerprint // ""' \
         "$context_file" 2>/dev/null || echo "")"
     current_context_fingerprint="$(analysis_context_fingerprint \
         "$context_file" 2>/dev/null || echo "")"
     if [ "$current_pr_head" != "$captured_pr_head" ] || \
+       [ "$current_pr_base" != "$captured_pr_base" ] || \
+       [ "$current_pr_base_ref" != "$captured_pr_base_ref" ] || \
        [ "$current_embedded_fingerprint" != "$captured_context_fingerprint" ] || \
        [ "$current_context_fingerprint" != "$captured_context_fingerprint" ]; then
         rm -f "$analysis_output_file"
@@ -10412,6 +10787,8 @@ $context_payload"
     fi
 
     CLAUDE_CAPTURED_PR_HEAD="$captured_pr_head"
+    CLAUDE_CAPTURED_PR_BASE="$captured_pr_base"
+    CLAUDE_CAPTURED_PR_BASE_REF="$captured_pr_base_ref"
     CLAUDE_CAPTURED_CONTEXT_FINGERPRINT="$captured_context_fingerprint"
     if [ "$code_access" = "true" ]; then
         CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT="$expected_workspace_fingerprint"
@@ -10426,11 +10803,14 @@ write_claude_analysis_artifact() {
     local output_file="$2"
     local visibility="${3:-UNKNOWN}"
     local pr_head_sha="${4:-}"
-    local context_fingerprint="${5:-}"
-    local workspace_fingerprint="${6:-}"
+    local pr_base_sha="${5:-}"
+    local pr_base_ref_name="${6:-}"
+    local context_fingerprint="${7:-}"
+    local workspace_fingerprint="${8:-}"
     local provider="claude"
     local model="${GH_PR_ENRICH_MODEL:-sonnet}"
-    if [ -z "$pr_head_sha" ] || [ -z "$context_fingerprint" ]; then
+    if [ -z "$pr_head_sha" ] || [ -z "$pr_base_sha" ] || \
+       [ -z "$pr_base_ref_name" ] || [ -z "$context_fingerprint" ]; then
         echo "Error: Claude analysis provenance was not captured before invocation." >&2
         return 1
     fi
@@ -10443,6 +10823,8 @@ write_claude_analysis_artifact() {
         --arg visibility "$visibility" \
         --arg pr_number "${PR_NUMBER:-}" \
         --arg pr_head_sha "$pr_head_sha" \
+        --arg pr_base_sha "$pr_base_sha" \
+        --arg pr_base_ref_name "$pr_base_ref_name" \
         --arg context_fingerprint "$context_fingerprint" \
         --arg workspace_fingerprint "$workspace_fingerprint" \
         --arg generated_at "${TIMESTAMP:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}" \
@@ -10455,6 +10837,8 @@ write_claude_analysis_artifact() {
                 repository_visibility: $visibility,
                 pr_number: ($pr_number | tonumber?),
                 pr_head_sha: (if $pr_head_sha == "" then null else $pr_head_sha end),
+                pr_base_sha: (if $pr_base_sha == "" then null else $pr_base_sha end),
+                pr_base_ref_name: (if $pr_base_ref_name == "" then null else $pr_base_ref_name end),
                 context_fingerprint: (if $context_fingerprint == "" then null else $context_fingerprint end),
                 workspace_fingerprint: (if $workspace_fingerprint == "" then null else $workspace_fingerprint end),
                 generated_at: $generated_at,
@@ -10791,12 +11175,21 @@ _select_analysis_artifact() (
         return 1
     fi
 
-    local context_head source_head context_fingerprint embedded_fingerprint source_fingerprint
+    local context_head source_head context_base source_base
+    local context_base_ref source_base_ref
+    local context_fingerprint embedded_fingerprint source_fingerprint
     local context_pr_number context_repository source_pr_number source_repository
     context_head="$(jq -r '.coverage.code_access.pr_head_sha // ""' "$context_file")"
     source_head="$(jq -r '._metadata.pr_head_sha // ""' "$source_file")"
-    if [ -z "$context_head" ] || [ "$source_head" != "$context_head" ]; then
-        echo "Error: Selected analysis PR head '$source_head' does not match context PR head '$context_head'." >&2
+    context_base="$(jq -r '.pr.base_sha // ""' "$context_file")"
+    source_base="$(jq -r '._metadata.pr_base_sha // ""' "$source_file")"
+    context_base_ref="$(jq -r '.pr.base_ref_name // ""' "$context_file")"
+    source_base_ref="$(jq -r '._metadata.pr_base_ref_name // ""' "$source_file")"
+    if [ -z "$context_head" ] || [ -z "$context_base" ] || \
+       [ -z "$context_base_ref" ] || [ "$source_head" != "$context_head" ] || \
+       [ "$source_base" != "$context_base" ] || \
+       [ "$source_base_ref" != "$context_base_ref" ]; then
+        echo "Error: Selected analysis PR revision does not match the fingerprinted context." >&2
         return 1
     fi
     embedded_fingerprint="$(jq -r '.coverage.context_fingerprint // ""' "$context_file")"
@@ -10822,12 +11215,13 @@ _select_analysis_artifact() (
         echo "Error: Selected analysis repository or PR number does not match the fingerprinted context." >&2
         return 1
     fi
-    if ! verify_pr_head_unchanged "$context_pr_number" "$context_head" "$context_repository"; then
+    if ! verify_pr_head_unchanged "$context_pr_number" "$context_head" \
+            "$context_repository" "$context_base" "$context_base_ref"; then
         if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
-            echo "Error: Hosted PR head changed before selection (expected $context_head, found $CURRENT_HOSTED_HEAD); stale selected artifacts will be invalidated. Rebuild the analysis context." >&2
+            echo "Error: Hosted PR revision changed before selection; stale selected artifacts will be invalidated. Rebuild the analysis context." >&2
             return 42
         else
-            echo "Error: Hosted PR head could not be revalidated before selection; prior selected artifacts were preserved." >&2
+            echo "Error: Hosted PR revision could not be revalidated before selection; prior selected artifacts were preserved." >&2
         fi
         return 1
     fi
@@ -10985,16 +11379,16 @@ _select_analysis_artifact() (
         return 1
     fi
     if ! verify_pr_head_unchanged "$context_pr_number" "$context_head" \
-            "$context_repository"; then
+            "$context_repository" "$context_base" "$context_base_ref"; then
         case "$selected_writer_signal" in
             INT) return 130 ;;
             TERM) return 143 ;;
         esac
         invalidate_on_confirmed_hosted_head_mismatch "$report_dir" || return 1
         if [ "$HOSTED_HEAD_VERIFICATION_STATUS" = "mismatch" ]; then
-            echo "Error: Hosted PR head changed during selection; no selected artifacts were published (expected $context_head, found $CURRENT_HOSTED_HEAD). Rebuild the analysis context." >&2
+            echo "Error: Hosted PR revision changed during selection; no selected artifacts were published. Rebuild the analysis context." >&2
         else
-            echo "Error: Hosted PR head could not be revalidated during selection; prior selected artifacts were preserved." >&2
+            echo "Error: Hosted PR revision could not be revalidated during selection; prior selected artifacts were preserved." >&2
         fi
         return 1
     fi
@@ -11854,9 +12248,12 @@ if [ "$REFRESH_EXISTING_ANALYSIS" = true ] || [ "$PREPARE_ANALYSIS" = true ] || 
         collect_sast_findings "$OUTPUT_DIR"
     fi
     CAPTURED_PR_HEAD=$(jq -r '.headRefOid // ""' "$OUTPUT_DIR/pr-summary.json")
-    if ! verify_pr_head_unchanged "$PR_NUMBER" "$CAPTURED_PR_HEAD"; then
+    CAPTURED_PR_BASE=$(jq -r '.baseRefOid // ""' "$OUTPUT_DIR/pr-summary.json")
+    CAPTURED_PR_BASE_REF=$(jq -r '.baseRefName // ""' "$OUTPUT_DIR/pr-summary.json")
+    if ! verify_pr_head_unchanged "$PR_NUMBER" "$CAPTURED_PR_HEAD" "" \
+            "$CAPTURED_PR_BASE" "$CAPTURED_PR_BASE_REF"; then
         invalidate_on_confirmed_hosted_head_mismatch "$OUTPUT_DIR"
-        echo "Error: PR head changed or could not be revalidated while analysis inputs were collected." >&2
+        echo "Error: PR head or base changed or could not be revalidated while analysis inputs were collected." >&2
         [ -z "$CURRENT_HOSTED_HEAD" ] || \
             echo "Expected $CAPTURED_PR_HEAD, now $CURRENT_HOSTED_HEAD. Re-run to collect one coherent snapshot." >&2
         exit 1
@@ -11983,6 +12380,8 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                     "$PROVIDER_SOURCE_DIR/claude-analysis.raw.json" \
                     "$PROVIDER_SOURCE_DIR/claude-analysis.json" \
                     "$REPOSITORY_VISIBILITY" "$CLAUDE_CAPTURED_PR_HEAD" \
+                    "$CLAUDE_CAPTURED_PR_BASE" \
+                    "$CLAUDE_CAPTURED_PR_BASE_REF" \
                     "$CLAUDE_CAPTURED_CONTEXT_FINGERPRINT" \
                     "$CLAUDE_CAPTURED_WORKSPACE_FINGERPRINT" || exit 1
                 rm -f "$PROVIDER_SOURCE_DIR/claude-analysis.raw.json"

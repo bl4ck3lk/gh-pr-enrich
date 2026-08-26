@@ -1289,6 +1289,7 @@ case "$1 $2" in
  "url":"https://github.com/o/r/pull/1","createdAt":"2026-01-01T00:00:00Z",
  "updatedAt":"2026-01-01T00:00:00Z","mergeable":"MERGEABLE","isDraft":false,
  "additions":1,"deletions":0,"changedFiles":1,"headRefOid":"${PR_HEAD_OID:-abc123}",
+ "baseRefOid":"${PR_BASE_OID:-base123}","baseRefName":"${PR_BASE_REF_NAME:-main}",
  "files":[{"path":"gh-pr-enrich","additions":1,"deletions":0}],"commits":[],
  "labels":[],"assignees":[],"reviews":[]}
 JSON
@@ -2054,6 +2055,18 @@ PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call verify_pr_head_unchanged \
     1 wrong-head >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "hosted head revalidation detects a PR push during input collection"
+rc=0
+env PATH="$STUB_DIR:$PATH" PR_BASE_OID=retargeted-base \
+    "$GH_PR_ENRICH" --test-call verify_pr_head_unchanged \
+        1 abc123 "" base123 main >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "hosted revision revalidation detects a same-head base advance"
+rc=0
+env PATH="$STUB_DIR:$PATH" PR_BASE_REF_NAME=release \
+    "$GH_PR_ENRICH" --test-call verify_pr_head_unchanged \
+        1 abc123 "" base123 main >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "hosted revision revalidation detects a same-commit base retarget"
 
 SYMLINK_OUTPUT="$TEST_OUTPUT_DIR/symlink-output"
 mkdir -p "$SYMLINK_OUTPUT"
@@ -2910,6 +2923,9 @@ if [ "$1 $2" = "pr view" ] && [ -e "$PROVIDER_HEAD_MARKER" ]; then
     count=$((count + 1))
     printf '%s\n' "$count" > "$PROVIDER_HEAD_COUNT"
     if [ "$count" -ge 2 ]; then
+        if [ "${PROVIDER_DRIFT_BASE_ONLY:-false}" = true ]; then
+            PR_BASE_OID=new-hosted-base exec "$PROVIDER_HEAD_BASE_GH" "$@"
+        fi
         PR_HEAD_OID=new-hosted-head exec "$PROVIDER_HEAD_BASE_GH" "$@"
     fi
 fi
@@ -2937,6 +2953,28 @@ assert_true "$([ ! -e "$PROVIDER_HEAD_DIR/claude-analysis.json" ] && \
     "second-head attestation drift publishes no provider or selected analysis"
 assert_no_selection_transaction_residue "$PROVIDER_HEAD_DIR" \
     "second-head attestation drift cleans every publication transaction"
+
+PROVIDER_BASE_DIR="$TEST_OUTPUT_DIR/provider-attestation-base-drift"
+PROVIDER_BASE_MARKER="$TEST_OUTPUT_DIR/provider-attestation-base-staged"
+PROVIDER_BASE_COUNT="$TEST_OUTPUT_DIR/provider-attestation-base-count"
+rc=0
+PROVIDER_BASE_OUT=$(env PATH="$PROVIDER_HEAD_STUBS:$STUB_DIR:$PATH" \
+    REPO_VISIBILITY=PRIVATE GH_PR_ENRICH_CODE_ACCESS=false \
+    CLAUDE_INVOKED_LOG="$CLAUDE_LOG" PROVIDER_DRIFT_BASE_ONLY=true \
+    PROVIDER_HEAD_REPORT="$PROVIDER_BASE_DIR" \
+    PROVIDER_HEAD_MARKER="$PROVIDER_BASE_MARKER" \
+    PROVIDER_HEAD_COUNT="$PROVIDER_BASE_COUNT" \
+    PROVIDER_HEAD_REAL_CP="$(command -v cp)" \
+    PROVIDER_HEAD_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" 1 --enrich --allow-external \
+    --output-dir "$PROVIDER_BASE_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ "$(cat "$PROVIDER_BASE_COUNT" \
+    2>/dev/null || echo 0)" -eq 2 ] && echo 0 || echo 1)" \
+    "provider attestation rejects a same-head base advance on its second revision read" \
+    "$PROVIDER_BASE_OUT"
+assert_true "$([ ! -e "$PROVIDER_BASE_DIR/claude-analysis.json" ] && \
+    [ ! -e "$PROVIDER_BASE_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "second-revision base drift publishes no provider or selected analysis"
 
 # TERM sent to the top-level CLI while the provider's hosted attestation is
 # blocked must reach the managed provider transaction and its active API
@@ -3255,6 +3293,8 @@ PROVENANCE_DIR="$TEST_OUTPUT_DIR/provenance-race"
 mkdir -p "$PROVENANCE_DIR"
 cp "$AUTHORIZED_DIR/pr-summary.json" "$PROVENANCE_DIR/pr-summary.json"
 CAPTURED_HEAD=$(jq -r '.coverage.code_access.pr_head_sha' "$AUTHORIZED_DIR/analysis-context.json")
+CAPTURED_BASE=$(jq -r '.pr.base_sha' "$AUTHORIZED_DIR/analysis-context.json")
+CAPTURED_BASE_REF=$(jq -r '.pr.base_ref_name' "$AUTHORIZED_DIR/analysis-context.json")
 CAPTURED_FINGERPRINT=$(jq -r '.coverage.context_fingerprint' "$AUTHORIZED_DIR/analysis-context.json")
 jq 'del(._metadata)' "$AUTHORIZED_DIR/claude-analysis.json" > "$PROVENANCE_DIR/raw-analysis.json"
 jq 'del(.coverage.context_fingerprint)
@@ -3267,9 +3307,13 @@ jq --arg fingerprint "$REFRESHED_FINGERPRINT" \
     "$PROVENANCE_DIR/context.tmp.json" > "$PROVENANCE_DIR/analysis-context.json"
 env REPO=o/r PR_NUMBER=1 "$GH_PR_ENRICH" --test-call write_claude_analysis_artifact \
     "$PROVENANCE_DIR/raw-analysis.json" "$PROVENANCE_DIR/claude-analysis.json" \
-    PRIVATE "$CAPTURED_HEAD" "$CAPTURED_FINGERPRINT"
+    PRIVATE "$CAPTURED_HEAD" "$CAPTURED_BASE" "$CAPTURED_BASE_REF" \
+    "$CAPTURED_FINGERPRINT"
 assert_jq "$PROVENANCE_DIR/claude-analysis.json" \
-    "._metadata.pr_head_sha == \"$CAPTURED_HEAD\" and ._metadata.context_fingerprint == \"$CAPTURED_FINGERPRINT\"" \
+    "._metadata.pr_head_sha == \"$CAPTURED_HEAD\" and
+     ._metadata.pr_base_sha == \"$CAPTURED_BASE\" and
+     ._metadata.pr_base_ref_name == \"$CAPTURED_BASE_REF\" and
+     ._metadata.context_fingerprint == \"$CAPTURED_FINGERPRINT\"" \
     "artifact provenance uses captured values instead of rereading refreshed context"
 rc=0
 PROVENANCE_RACE_OUT=$(PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" select-analysis \
@@ -3992,7 +4036,7 @@ assert_true "$([ "$rc" -ne 0 ] && [ -e "$LATE_HEAD_MARKER" ] && echo 0 || echo 1
     "$LATE_HEAD_OUT"
 assert_eq $'abc123\nnew-hosted-head' "$(cat "$LATE_HEAD_LOG")" \
     "selection checks the hosted head before and immediately after staging"
-assert_contains "$LATE_HEAD_OUT" "Hosted PR head changed during selection" \
+assert_contains "$LATE_HEAD_OUT" "Hosted PR revision changed during selection" \
     "late hosted-head rejection identifies the prepublication boundary"
 assert_true "$([ ! -e "$SELECTION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
     "late hosted-head drift invalidates stale selected artifacts"
@@ -4347,6 +4391,10 @@ STUB
 cat > "$UNAVAILABLE_HEAD_STUBS/gh" << 'STUB'
 #!/bin/bash
 if [ "$1 $2" = "pr view" ] && [ -e "$UNAVAILABLE_HEAD_MARKER" ]; then
+    if [ "${INCOMPLETE_REVISION_RESPONSE:-}" = true ]; then
+        printf '%s\n' '{"headRefOid":"abc123"}'
+        exit 0
+    fi
     exit 91
 fi
 exec "$UNAVAILABLE_HEAD_BASE_GH" "$@"
@@ -4369,6 +4417,29 @@ assert_selection_views_match "$SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
     "hosted-head lookup failure preserves every prior selected view"
 assert_no_selection_transaction_residue "$SELECTION_REPORT" \
     "hosted-head lookup failure leaves no transaction residue"
+
+# A syntactically valid response that omits requested base identity is also
+# unavailable, not a confirmed mismatch. It must preserve prior selected views.
+rm -f "$UNAVAILABLE_HEAD_MARKER"
+rc=0
+INCOMPLETE_REVISION_OUT=$(cd "$SELECTION_REPO" && \
+    env PATH="$UNAVAILABLE_HEAD_STUBS:$PATH" \
+    INCOMPLETE_REVISION_RESPONSE=true \
+    UNAVAILABLE_HEAD_REPORT="$SELECTION_REPORT" \
+    UNAVAILABLE_HEAD_MARKER="$UNAVAILABLE_HEAD_MARKER" \
+    UNAVAILABLE_HEAD_REAL_CP="$(command -v cp)" \
+    UNAVAILABLE_HEAD_BASE_GH="$STUB_DIR/gh" \
+    "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/hybrid-analysis.json" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && [ -e "$UNAVAILABLE_HEAD_MARKER" ] && echo 0 || echo 1)" \
+    "an incomplete successful revision response rejects selection"
+assert_contains "$INCOMPLETE_REVISION_OUT" \
+    "could not be revalidated during selection" \
+    "an incomplete revision response remains unavailable"
+assert_selection_views_match "$SELECTION_REPORT" "$FINAL_BOUNDARY_BACKUP" \
+    "an incomplete revision response preserves every prior selected view"
+assert_no_selection_transaction_residue "$SELECTION_REPORT" \
+    "an incomplete revision response leaves no transaction residue"
 
 # Direct writes into the private staging directory are outside the cooperative
 # writer protocol. Bind every staged file by exact set, mode, and digest before
@@ -4853,13 +4924,25 @@ HOSTED_HEAD_OUT=$(PR_HEAD_OID="new-hosted-head" "$GH_PR_ENRICH" select-analysis 
     "$AUTHORIZED_DIR" "$HYBRID_SOURCE" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "select-analysis rejects a result after the hosted PR head advances"
-assert_contains "$HOSTED_HEAD_OUT" "Hosted PR head changed" \
+assert_contains "$HOSTED_HEAD_OUT" "Hosted PR revision changed" \
     "the selection error identifies the hosted revision race"
 assert_true "$([ ! -e "$AUTHORIZED_DIR/analysis.json" ] && echo 0 || echo 1)" \
     "a hosted revision race invalidates the stale selected artifact"
 assert_eq "do not overwrite" "$(cat "$TEST_OUTPUT_DIR/selection-temp-target.json")" \
     "selection invalidation never follows a planted fixed-name temp symlink"
 rm "$AUTHORIZED_DIR/combined-data.tmp.json"
+"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$HYBRID_SOURCE" >/dev/null
+
+rc=0
+HOSTED_BASE_OUT=$(PR_BASE_OID="new-hosted-base" \
+    "$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+        "$HYBRID_SOURCE" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "select-analysis rejects a result after a same-head base advance"
+assert_contains "$HOSTED_BASE_OUT" "Hosted PR revision changed" \
+    "the selection error identifies the hosted base race"
+assert_true "$([ ! -e "$AUTHORIZED_DIR/analysis.json" ] && echo 0 || echo 1)" \
+    "a hosted base race invalidates the stale selected artifact"
 "$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$HYBRID_SOURCE" >/dev/null
 
 MISSING_INTENT_DIR="$TEST_OUTPUT_DIR/missing-intent-context"
@@ -4909,8 +4992,19 @@ rc=0
 MISMATCH_OUT=$("$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$MISMATCH_SOURCE" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "select-analysis rejects a result for a different PR head"
-assert_contains "$MISMATCH_OUT" "PR head" \
+assert_contains "$MISMATCH_OUT" "PR revision" \
     "the selection error names the revision mismatch"
+
+BASE_MISMATCH_SOURCE="$AUTHORIZED_DIR/base-mismatched-analysis.json"
+jq '._metadata.pr_base_sha = "wrong-base"' "$HYBRID_SOURCE" \
+    > "$BASE_MISMATCH_SOURCE"
+rc=0
+BASE_MISMATCH_OUT=$("$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" \
+    "$BASE_MISMATCH_SOURCE" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "select-analysis rejects a result for a different PR base"
+assert_contains "$BASE_MISMATCH_OUT" "PR revision" \
+    "the base provenance mismatch identifies the PR revision"
 
 INCOMPLETE_SOURCE="$AUTHORIZED_DIR/incomplete-analysis.json"
 jq 'del(.systemic_issues)' "$HYBRID_SOURCE" > "$INCOMPLETE_SOURCE"

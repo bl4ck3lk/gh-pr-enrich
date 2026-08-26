@@ -508,6 +508,9 @@ cat > "$CTX_DIR/pr-summary.json" << 'EOF'
   "title": "Add retry logic",
   "body": "Fixes #42",
   "author": {"login": "dev"},
+  "headRefOid": "context-head",
+  "baseRefOid": "context-base",
+  "baseRefName": "main",
   "files": [{"path": "src/retry.js"}],
   "commits": [
     {"oid": "abc123def456", "messageHeadline": "Add retry with backoff", "messageBody": "Caps at 5 attempts."},
@@ -611,6 +614,17 @@ assert_jq_eq "$CTX" '[.issue_comments[] | select(.body | contains("Coverage repo
 
 # Coverage block
 assert_jq "$CTX" '.coverage != null' "context records a coverage block"
+assert_jq "$CTX" \
+    '.pr.head_sha == "context-head" and .pr.base_sha == "context-base" and .pr.base_ref_name == "main"' \
+    "context fingerprints the exact PR head and base identity"
+CONTEXT_REVISION_FINGERPRINT=$("$GH_PR_ENRICH" --test-call \
+    analysis_context_fingerprint "$CTX")
+jq '.pr.base_sha = "retargeted-base"' "$CTX" \
+    > "$TEST_OUTPUT_DIR/retargeted-context.json"
+RETARGETED_CONTEXT_FINGERPRINT=$("$GH_PR_ENRICH" --test-call \
+    analysis_context_fingerprint "$TEST_OUTPUT_DIR/retargeted-context.json")
+assert_true "$([ "$CONTEXT_REVISION_FINGERPRINT" != "$RETARGETED_CONTEXT_FINGERPRINT" ] && echo 0 || echo 1)" \
+    "changing only the PR base changes the context fingerprint"
 assert_jq_eq "$CTX" '.coverage.issue_comments.total' "6" "coverage records total issue comments"
 assert_jq_eq "$CTX" '.coverage.issue_comments.superseded_bot_duplicates' "2" \
     "coverage records how many bot duplicates were dropped"
@@ -1048,6 +1062,9 @@ raw = "".join(d["content"] for d in file_diffs)
     "title": "Large change",
     "body": "x" * 20000,
     "author": {"login": "dev"},
+    "headRefOid": "large-head",
+    "baseRefOid": "large-base",
+    "baseRefName": "main",
     "files": [{"path": "src/f%d.js" % i} for i in range(60)],
     "commits": [{"oid": "%040d" % i,
                  "messageHeadline": "commit %d" % i,

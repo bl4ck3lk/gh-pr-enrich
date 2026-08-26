@@ -61,6 +61,8 @@ case "$1 $2" in
         exit 0
         ;;
     "pr view")
+        hosted_base_oid="${GH_BASE_OID:-captured-base}"
+        hosted_base_ref="${GH_BASE_REF_NAME:-main}"
         if [ -n "${GH_HEAD_FETCH_COUNT_FILE:-}" ]; then
             head_fetch_count=0
             [ ! -f "$GH_HEAD_FETCH_COUNT_FILE" ] || \
@@ -68,21 +70,25 @@ case "$1 $2" in
             head_fetch_count=$((head_fetch_count + 1))
             printf '%s\n' "$head_fetch_count" > "$GH_HEAD_FETCH_COUNT_FILE"
             if [ "${GH_HEAD_MODE:-}" = "unavailable_at_commit" ] && \
-               [ "$head_fetch_count" -ge 7 ]; then
+               [ "$head_fetch_count" -ge 8 ]; then
                 exit 1
             fi
         fi
         if [ -n "${GH_WORKSPACE_MUTATION:-}" ]; then
             printf 'changed during hosted verification\n' >> "$GH_WORKSPACE_MUTATION"
-            echo '{"headRefOid":"captured-head"}'
+            printf '{"headRefOid":"captured-head","baseRefOid":"%s","baseRefName":"%s"}\n' "$hosted_base_oid" "$hosted_base_ref"
         elif [ "${GH_HEAD_MODE:-}" = "captured" ] || \
              [ "${GH_HEAD_MODE:-}" = "unavailable_at_commit" ]; then
-            echo '{"headRefOid":"captured-head"}'
+            printf '{"headRefOid":"captured-head","baseRefOid":"%s","baseRefName":"%s"}\n' "$hosted_base_oid" "$hosted_base_ref"
         elif [ "${GH_HEAD_MODE:-}" = "advance_after_mutation" ] && \
            [ ! -s "$GH_MUTATIONS_LOG" ]; then
-            echo '{"headRefOid":"captured-head"}'
+            printf '{"headRefOid":"captured-head","baseRefOid":"%s","baseRefName":"%s"}\n' "$hosted_base_oid" "$hosted_base_ref"
         else
-            echo '{"headRefOid":"new-hosted-head"}'
+            hosted_head="captured-head"
+            case "${GH_HEAD_MODE:-}" in
+                advanced|advance_after_mutation) hosted_head="new-hosted-head" ;;
+            esac
+            printf '{"headRefOid":"%s","baseRefOid":"%s","baseRefName":"%s"}\n' "$hosted_head" "$hosted_base_oid" "$hosted_base_ref"
         fi
         exit 0
         ;;
@@ -471,7 +477,8 @@ write_current_selection() {
 
     jq -n --argjson tids "$thread_ids" --arg inspected_sha "$inspected_sha" \
         --arg intent_fingerprint "$intent_fingerprint" '{
-        pr: {repository:"o/r", number:999,
+        pr: {repository:"o/r", number:999, base_sha:"captured-base",
+            base_ref_name:"main",
             title:"Fixture PR",body:"captured intent"},
         unresolved_threads: [$tids[] | {thread_id:.,comments_complete:true,comment_identity:[]}],
         coverage: {intent:{fingerprint:$intent_fingerprint},
@@ -493,7 +500,8 @@ write_current_selection() {
     jq --arg fingerprint "$context_fingerprint" \
         --arg workspace_fingerprint "$workspace_fingerprint" '. + {_metadata:{
         provider:"claude", repository:"o/r", pr_number:999,
-        pr_head_sha:"captured-head", context_fingerprint:$fingerprint,
+        pr_head_sha:"captured-head", pr_base_sha:"captured-base",
+        pr_base_ref_name:"main", context_fingerprint:$fingerprint,
         workspace_fingerprint:$workspace_fingerprint
     }}' "$report_dir/analysis.json" > "$report_dir/analysis.json.tmp"
     mv "$report_dir/analysis.json.tmp" "$report_dir/analysis.json"
@@ -860,6 +868,32 @@ assert_not_contains "$STARTUP_INTENT_UNAVAILABLE_OUT" "Found 1 tasks" \
 assert_true "$([ -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
     "unavailable startup intent preserves the selected artifact"
 
+restore_stale_selection
+BASE_RETARGET_OUT=$(printf 'q' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_BASE_OID=retargeted-base \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1) || true)
+assert_contains "$BASE_RETARGET_OUT" \
+    "Hosted PR revision changed before tasks could be displayed" \
+    "address rejects a same-head base retarget before displaying tasks"
+assert_eq "" "$(cat "$MUTATION_LOG")" \
+    "a same-head base retarget sends no resolution mutation"
+assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "confirmed base retarget invalidates the selected artifact"
+
+restore_stale_selection
+BASE_NAME_RETARGET_OUT=$(printf 'q' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_BASE_REF_NAME=release \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1) || true)
+assert_contains "$BASE_NAME_RETARGET_OUT" \
+    "Hosted PR revision changed before tasks could be displayed" \
+    "address rejects a base-name retarget at the same commit"
+assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "confirmed base-name retarget invalidates the selected artifact"
+
+restore_stale_selection
+
 LATE_INTENT_COUNT_FILE="$TEST_OUTPUT_DIR/late-intent-count"
 rm -f "$LATE_INTENT_COUNT_FILE"
 LATE_INTENT_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
@@ -949,9 +983,10 @@ assert_eq "" "$(find "$INCOMPLETE_STAGE_DIR" -mindepth 1 -maxdepth 1 -print)" \
 restore_stale_selection
 : > "$MUTATION_LOG"
 STALE_MUTATION_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
-    env GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    env GH_HEAD_MODE=advanced GH_MUTATIONS_LOG="$MUTATION_LOG" \
+    PATH="$STUB_DIR:$PATH" \
     "$GH_PR_ENRICH" address 999 2>&1) || true)
-assert_contains "$STALE_MUTATION_OUT" "Hosted PR head changed" \
+assert_contains "$STALE_MUTATION_OUT" "Hosted PR revision changed" \
     "address refuses hosted mutation after the PR head advances"
 assert_eq "" "$(cat "$MUTATION_LOG")" \
     "a stale selected analysis sends no thread-resolution mutation"
@@ -1558,7 +1593,7 @@ assert_contains "$BATCH_HEAD_UNAVAILABLE_OUT" \
     "final hosted-head unavailability reports forward-only reconciliation"
 assert_not_contains "$BATCH_HEAD_UNAVAILABLE_OUT" "Resolved: PRRT_" \
     "final hosted-head unavailability reports no premature success"
-assert_eq "7" "$(cat "$HEAD_FETCH_COUNT_FILE")" \
+assert_eq "8" "$(cat "$HEAD_FETCH_COUNT_FILE")" \
     "final hosted-head unavailability fires in the batch-commit phase"
 assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
     "final hosted-head unavailability invalidates the selected artifact"
@@ -1587,7 +1622,8 @@ LOCAL_INTENT_FINGERPRINT="$(write_fixture_intent_inputs \
     "$LOCAL_MUTATION_REPORT")"
 jq -n --arg workspace_fingerprint "$LOCAL_WORKSPACE_FINGERPRINT" \
     --arg intent_fingerprint "$LOCAL_INTENT_FINGERPRINT" \
-    '{pr:{repository:"o/r",number:999,
+    '{pr:{repository:"o/r",number:999,base_sha:"captured-base",
+        base_ref_name:"main",
         title:"Fixture PR",body:"captured intent"},
     unresolved_threads:[{thread_id:"PRRT_local",comments_complete:true,
         comment_identity:[]}],coverage:{
@@ -1609,7 +1645,8 @@ jq -n --arg fingerprint "$LOCAL_CONTEXT_FINGERPRINT" \
         finding_ids:["local-mutation"],thread_ids:["PRRT_local"],file:"base.txt",line:1,
         suggested_fix:"fix",verification:"test"}],
     _metadata:{provider:"codex",repository:"o/r",pr_number:999,
-        pr_head_sha:"captured-head",context_fingerprint:$fingerprint,
+        pr_head_sha:"captured-head",pr_base_sha:"captured-base",
+        pr_base_ref_name:"main",context_fingerprint:$fingerprint,
         workspace_fingerprint:$workspace_fingerprint}
 }' > "$LOCAL_MUTATION_REPORT/analysis.json"
 cat > "$LOCAL_MUTATION_REPORT/comprehensive-report.md" << 'EOF'

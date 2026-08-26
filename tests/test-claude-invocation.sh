@@ -154,6 +154,7 @@ case "$1 $2" in
  "url":"https://github.com/o/r/pull/1","createdAt":"2026-01-01T00:00:00Z",
  "updatedAt":"2026-01-01T00:00:00Z","mergeable":"MERGEABLE","isDraft":false,
  "additions":1,"deletions":0,"changedFiles":1,"headRefOid":"abc123",
+ "baseRefOid":"base123","baseRefName":"main",
  "files":[{"path":"a.js","additions":1,"deletions":0}],"commits":[],
  "labels":[],"assignees":[],"reviews":[]}
 JSON
@@ -287,7 +288,7 @@ for HIDDEN_INDEX_MODE in assume-unchanged skip-worktree; do
     mkdir -p "$HIDDEN_REPORT"
     jq -n --arg sha "$HEAD_SHA" \
         --arg workspace_fingerprint "$HIDDEN_INDEX_FINGERPRINT" '{
-        pr: {title: "hidden tracked fixture"}, unresolved_threads: [], issue_comments: [],
+        pr: {title: "hidden tracked fixture", base_sha: "base123", base_ref_name: "main"}, unresolved_threads: [], issue_comments: [],
         coverage: {code_access: {
             state: "enabled", reason: "automatic exact-head fixture",
             pr_head_sha: $sha, inspected_sha: $sha, revision_matches: true,
@@ -336,7 +337,7 @@ done
 WORKSPACE_FINGERPRINT=$(cd "$CODE_ACCESS_REPO" && \
     "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$TEST_OUTPUT_DIR")
 jq -n --arg sha "$HEAD_SHA" --arg workspace_fingerprint "$WORKSPACE_FINGERPRINT" '{
-    pr: {title: "t"}, unresolved_threads: [], issue_comments: [],
+    pr: {title: "t", base_sha: "base123", base_ref_name: "main"}, unresolved_threads: [], issue_comments: [],
     coverage: {code_access: {
         state: "enabled", reason: "fixture",
         pr_head_sha: $sha, inspected_sha: $sha, revision_matches: true,
@@ -374,6 +375,10 @@ NATIVE_SNAPSHOT_PATH=$(printf '%s' "$NATIVE_SNAPSHOT_JSON" | jq -r '.path')
 assert_eq "$WORKSPACE_FINGERPRINT" \
     "$(printf '%s' "$NATIVE_SNAPSHOT_JSON" | jq -r '.workspace_fingerprint')" \
     "native snapshot materialization reports the validated workspace fingerprint"
+assert_jq_eq <(printf '%s\n' "$NATIVE_SNAPSHOT_JSON") '.pr_base_sha' \
+    "base123" "native snapshot materialization reports the captured base SHA"
+assert_jq_eq <(printf '%s\n' "$NATIVE_SNAPSHOT_JSON") '.pr_base_ref_name' \
+    "main" "native snapshot materialization reports the captured base ref"
 assert_eq "clean" "$(cat "$NATIVE_SNAPSHOT_PATH/tracked.txt")" \
     "native snapshot materialization copies the bound repository bytes"
 NATIVE_SNAPSHOT_MODE=$("$GH_PR_ENRICH" --test-call workspace_file_mode \
@@ -551,7 +556,7 @@ assert_true "$([ ! -e "$FILTERED_CLEAN_LOG" ] && echo 0 || echo 1)" \
     "automatic fingerprinting never invokes a working-tree clean filter"
 jq -n --arg sha "$FILTERED_HEAD" \
     --arg workspace_fingerprint "$FILTERED_WORKSPACE_FINGERPRINT" '{
-    pr: {title: "filtered fixture"}, unresolved_threads: [], issue_comments: [],
+    pr: {title: "filtered fixture", base_sha: "base123", base_ref_name: "main"}, unresolved_threads: [], issue_comments: [],
     coverage: {code_access: {
         state: "enabled", reason: "automatic clean exact-head fixture",
         pr_head_sha: $sha, inspected_sha: $sha, revision_matches: true,
@@ -1122,7 +1127,7 @@ assert_not_contains "$INVOKER_FN" '> "$output_file" 2>/dev/null' \
 # a second call site written differently would otherwise slip past this guard.
 claude_calls=$(grep -v '^[[:space:]]*#' "$GH_PR_ENRICH" \
     | grep -E '(^|[|&;( ])claude([[:space:]]|$)' \
-    | grep -vE 'command -v claude|--argjson claude|Optional:' \
+    | grep -vE 'command -v claude|--(argjson|slurpfile) claude|Optional:' \
     | wc -l | tr -d ' ')
 assert_eq "1" "$claude_calls" "the Claude CLI is invoked from exactly one place"
 assert_contains "$(sed -n '/^run_claude_analysis() {/,/^}/p' "$GH_PR_ENRICH")" 'invoke_claude' \
@@ -1306,7 +1311,7 @@ REV_DIR="$TEST_OUTPUT_DIR/revision"
 mkdir -p "$REV_DIR"
 cat > "$REV_DIR/pr-summary.json" << EOF
 {"number": 5, "title": "t", "body": "b", "author": {"login": "u"}, "files": [],
- "headRefOid": "$LOCAL_HEAD"}
+ "headRefOid": "$LOCAL_HEAD", "baseRefOid": "base123", "baseRefName": "main"}
 EOF
 echo '[]' > "$REV_DIR/unresolved-threads.json"
 echo '[]' > "$REV_DIR/issue-comments.json"

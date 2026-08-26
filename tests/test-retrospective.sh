@@ -874,10 +874,10 @@ test_provider_neutral_analysis_is_discovered() {
     local fingerprint
     mkdir -p "$report_root"
     cp "$FIXTURES_DIR/pr-1/pr-summary.json" "$report_root/pr-summary.json"
-    jq '.headRefOid = "fixture-head"' "$report_root/pr-summary.json" \
+    jq '.headRefOid = "fixture-head" | .baseRefOid = "fixture-base" | .baseRefName = "main"' "$report_root/pr-summary.json" \
         > "$report_root/pr-summary.tmp.json"
     mv "$report_root/pr-summary.tmp.json" "$report_root/pr-summary.json"
-    jq -n '{pr:{repository:"o/r",number:1},
+    jq -n '{pr:{repository:"o/r",number:1,base_sha:"fixture-base",base_ref_name:"main"},
         unresolved_threads:[{thread_id:"PRRT_test1"}],
         coverage:{code_access:{state:"enabled",pr_head_sha:"fixture-head",
             workspace_fingerprint:"sha256:historical-workspace"}}}' \
@@ -890,7 +890,8 @@ test_provider_neutral_analysis_is_discovered() {
         --arg workspace_fingerprint "sha256:historical-workspace" '
         . + {_metadata:{
         provider:"codex", repository:"o/r", pr_number:1,
-        pr_head_sha:"fixture-head", context_fingerprint:$fingerprint,
+        pr_head_sha:"fixture-head", pr_base_sha:"fixture-base",
+        pr_base_ref_name:"main", context_fingerprint:$fingerprint,
         workspace_fingerprint:$workspace_fingerprint,
         generated_at:"2026-01-01T00:00:00Z",
         analyzers:[{provider:"codex",role:"orchestrator"}]
@@ -937,6 +938,187 @@ EOF
     fi
 }
 
+test_large_corpus_is_streamed() {
+    local reports="$TEST_OUTPUT_DIR/large-corpus"
+    local output="$TEST_OUTPUT_DIR/large-corpus-out"
+    local payload="$TEST_OUTPUT_DIR/large-payload.txt"
+    local pr
+    mkdir -p "$reports"
+    dd if=/dev/zero bs=70000 count=1 2>/dev/null | tr '\0' x > "$payload"
+    for pr in 1 2 3; do
+        cp -R "$FIXTURES_DIR/pr-$pr" "$reports/pr-$pr"
+        jq --rawfile payload "$payload" '.large_payload = $payload' \
+            "$reports/pr-$pr/claude-analysis.json" \
+            > "$reports/pr-$pr/claude-analysis.tmp.json"
+        mv "$reports/pr-$pr/claude-analysis.tmp.json" \
+            "$reports/pr-$pr/claude-analysis.json"
+    done
+    "$GH_PR_ENRICH" retrospective --reports-dir "$reports" \
+        --output-dir "$output" --min-prs 1 >/dev/null 2>&1
+    assert_jq "$output/aggregated-data.json" \
+        '.total_prs == 3 and all(.prs[]; (.large_payload | length) == 70000)' \
+        "retrospective streams a corpus larger than per-argument limits"
+}
+
+test_output_symlink_is_rejected() {
+    local output="$TEST_OUTPUT_DIR/symlink-output"
+    local sentinel="$TEST_OUTPUT_DIR/retrospective-sentinel.txt"
+    local run_output rc=0
+    mkdir -p "$output"
+    printf 'do not overwrite\n' > "$sentinel"
+    ln -s "$sentinel" "$output/summary.json"
+    run_output=$("$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+        --output-dir "$output" --min-prs 1 2>&1) || rc=$?
+    assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+        "retrospective rejects a pre-planted output symlink"
+    assert_eq "do not overwrite" "$(cat "$sentinel")" \
+        "rejected retrospective symlink leaves its target unchanged"
+    assert_contains "$run_output" "symbolic link" \
+        "retrospective symlink failure identifies the unsafe output"
+}
+
+test_concurrent_output_writers_are_serialized() {
+    local stubs="$TEST_OUTPUT_DIR/output-lock-stubs"
+    local output="$TEST_OUTPUT_DIR/output-lock-out"
+    local ready="$TEST_OUTPUT_DIR/output-lock-ready"
+    local release="$TEST_OUTPUT_DIR/output-lock-release"
+    local owner_log="$TEST_OUTPUT_DIR/output-lock-owner.log"
+    local contender_log="$TEST_OUTPUT_DIR/output-lock-contender.log"
+    local real_cp owner_pid contender_rc=0 wait_attempt=0 residue
+    real_cp=$(command -v cp)
+    mkdir -p "$stubs"
+    cat > "$stubs/cp" << 'STUB'
+#!/bin/bash
+previous=""
+for argument in "$@"; do previous="$argument"; done
+case "$previous" in
+    */report.*/pr-1/*)
+        : > "$RETRO_OUTPUT_LOCK_READY"
+        while [ ! -e "$RETRO_OUTPUT_LOCK_RELEASE" ]; do sleep 0.01; done
+        ;;
+esac
+exec "$REAL_CP" "$@"
+STUB
+    chmod +x "$stubs/cp"
+    env PATH="$stubs:$PATH" REAL_CP="$real_cp" \
+        RETRO_OUTPUT_LOCK_READY="$ready" \
+        RETRO_OUTPUT_LOCK_RELEASE="$release" \
+        "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+            --output-dir "$output" --min-prs 1 > "$owner_log" 2>&1 &
+    owner_pid=$!
+    while [ ! -e "$ready" ] && [ "$wait_attempt" -lt 200 ]; do
+        sleep 0.01
+        wait_attempt=$((wait_attempt + 1))
+    done
+    "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+        --output-dir "$output" --min-prs 1 > "$contender_log" 2>&1 || \
+        contender_rc=$?
+    assert_true "$([ "$contender_rc" -ne 0 ] && echo 0 || echo 1)" \
+        "a concurrent retrospective writer is rejected"
+    assert_contains "$(cat "$contender_log")" \
+        "Another retrospective writer is active" \
+        "concurrent retrospective output identifies the active writer"
+    : > "$release"
+    wait "$owner_pid"
+    residue=$(find "$output" -maxdepth 1 \
+        \( -name '.selected-analysis.lock' -o \
+           -name '.retrospective-run.*' \) -print -quit)
+    assert_true "$([ -z "$residue" ] && echo 0 || echo 1)" \
+        "successful retrospective publication releases its lock and staging"
+}
+
+test_publication_rolls_back_and_preserves_modes() {
+    local output="$TEST_OUTPUT_DIR/publication-transaction-out"
+    local backup="$TEST_OUTPUT_DIR/publication-transaction-backup"
+    local stubs="$TEST_OUTPUT_DIR/publication-transaction-stubs"
+    local run_log="$TEST_OUTPUT_DIR/publication-transaction.log"
+    local artifact rc=0 unchanged=true residue mode
+    local -a artifacts=(
+        aggregated-data.json cross-pr-patterns.json hotspots.json
+        guiding-questions.json improvement-tracking.json summary.json
+        retrospective-report.md retrospective-data.json
+    )
+
+    "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+        --output-dir "$output" --min-prs 1 >/dev/null 2>&1
+    mkdir -p "$backup" "$stubs"
+    for artifact in "${artifacts[@]}"; do
+        cp "$output/$artifact" "$backup/$artifact"
+    done
+    cat > "$stubs/mv" << 'STUB'
+#!/bin/bash
+source_path=""
+destination_path=""
+source_parent=""
+source_parent_name=""
+source_grandparent=""
+for argument in "$@"; do
+    source_path="$destination_path"
+    destination_path="$argument"
+done
+source_parent="${source_path%/*}"
+source_parent_name="${source_parent##*/}"
+source_grandparent="${source_parent%/*}"
+if [ "${RETRO_FAIL_PHASE:-publish}" = "quarantine" ] && \
+   [ "$source_path" = "$RETRO_FAIL_OUTPUT/aggregated-data.json" ] && \
+   [[ "$destination_path" == "$RETRO_FAIL_OUTPUT"/.retrospective-run.*/.publication-backup/aggregated-data.json ]]; then
+    exit 74
+fi
+if [ "${RETRO_FAIL_PHASE:-publish}" = "publish" ] && \
+   [ "$source_grandparent" = "$RETRO_FAIL_OUTPUT" ] && \
+   [[ "$source_parent_name" == .retrospective-run.* ]] && \
+   [ "${source_path##*/}" = "hotspots.json" ] && \
+   [ "$destination_path" = "$RETRO_FAIL_OUTPUT/hotspots.json" ]; then
+    exit 73
+fi
+exec "$REAL_MV" "$@"
+STUB
+    chmod +x "$stubs/mv"
+    env PATH="$stubs:$PATH" REAL_MV="$(command -v mv)" \
+        RETRO_FAIL_PHASE=publish \
+        RETRO_FAIL_OUTPUT="$output" \
+        "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+            --output-dir "$output" --min-prs 1 > "$run_log" 2>&1 || rc=$?
+    assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+        "a mid-publication rename failure fails the retrospective"
+    for artifact in "${artifacts[@]}"; do
+        cmp -s "$output/$artifact" "$backup/$artifact" || unchanged=false
+    done
+    assert_true "$([ "$unchanged" = true ] && echo 0 || echo 1)" \
+        "a mid-publication failure restores the complete prior generation"
+    residue=$(find "$output" -maxdepth 1 \
+        \( -name '.selected-analysis.lock' -o \
+           -name '.retrospective-run.*' \) -print -quit)
+    assert_true "$([ -z "$residue" ] && echo 0 || echo 1)" \
+        "publication rollback releases its lock and private staging"
+
+    printf '%s\n' '{"sentinel":"prior optional analysis"}' \
+        > "$output/claude-meta-analysis.json"
+    rc=0
+    env PATH="$stubs:$PATH" REAL_MV="$(command -v mv)" \
+        RETRO_FAIL_PHASE=quarantine RETRO_FAIL_OUTPUT="$output" \
+        "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+            --output-dir "$output" --min-prs 1 > "$run_log" 2>&1 || rc=$?
+    assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+        "an early quarantine failure fails the retrospective"
+    assert_jq "$output/claude-meta-analysis.json" \
+        '.sentinel == "prior optional analysis"' \
+        "early rollback preserves an untouched prior optional artifact"
+    residue=$(find "$output" -maxdepth 1 \
+        \( -name '.selected-analysis.lock' -o \
+           -name '.retrospective-run.*' \) -print -quit)
+    assert_true "$([ -z "$residue" ] && echo 0 || echo 1)" \
+        "early quarantine rollback releases its lock and private staging"
+
+    chmod 600 "$output/summary.json"
+    "$GH_PR_ENRICH" retrospective --reports-dir "$FIXTURES_DIR" \
+        --output-dir "$output" --min-prs 1 >/dev/null 2>&1
+    mode=$("$GH_PR_ENRICH" --test-call workspace_file_mode \
+        "$output/summary.json")
+    assert_eq "600" "$mode" \
+        "retrospective replacement preserves a restrictive artifact mode"
+}
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -972,6 +1154,10 @@ test_legacy_reports_are_reported_not_mixed_in
 test_improvement_tracking
 test_provider_neutral_analysis_is_discovered
 test_current_rejected_source_is_not_aggregated
+test_large_corpus_is_streamed
+test_output_symlink_is_rejected
+test_concurrent_output_writers_are_serialized
+test_publication_rolls_back_and_preserves_modes
 
 # Summary
 trap cleanup EXIT

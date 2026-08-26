@@ -48,7 +48,7 @@ gh pr-enrich <SUBCOMMAND> [ARGS]
 |------------|-------------|
 | `install-skill [--runtime codex\|claude\|both]` | Install one canonical skill under `${CODEX_HOME:-$HOME/.codex}/skills/` and/or `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/` (default: both) |
 | `uninstall-skill [--runtime codex\|claude\|both]` | Remove selected runtime registrations |
-| `select-analysis <REPORT_DIR> <SOURCE_JSON>` | Recheck the hosted PR head, promote a Codex, Claude, or hybrid result, and refresh all selected views |
+| `select-analysis <REPORT_DIR> <SOURCE_JSON>` | Recheck the hosted PR head/base, promote a Codex, Claude, or hybrid result, and refresh all selected views |
 | `resolve <ID...>` | Resolve one or more review threads by GraphQL ID |
 | `watch <PR>` | Monitor a PR for new comments (`--interval MIN`, `--enrich`, `--notify`) |
 | `address <PR>` | Work through selected issues and recheck the hosted head before resolving threads; legacy reports are read-only |

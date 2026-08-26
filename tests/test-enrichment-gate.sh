@@ -122,6 +122,7 @@ run_scenario() {
  "url": "https://github.com/o/r/pull/1", "createdAt": "2026-01-01T00:00:00Z",
  "updatedAt": "2026-01-01T00:00:00Z", "mergeable": "MERGEABLE", "isDraft": false,
  "headRefOid": "abc123",
+ "baseRefOid": "base123", "baseRefName": "main",
  "additions": 1, "deletions": 0, "changedFiles": 1, "files": [{"path": "a.js", "additions": 1, "deletions": 0}],
  "commits": [], "labels": [], "assignees": [], "reviews": []}
 EOF
@@ -214,7 +215,7 @@ chmod +x "$WATCH_STUB_DIR/sleep"
 cat > "$WATCH_STUB_DIR/gh" << 'STUB'
 #!/bin/bash
 poll=$(cat "$WATCH_POLL_FILE" 2>/dev/null || echo 0)
-summary='{"number":1,"title":"t","body":"b","author":{"login":"u"},"state":"OPEN","url":"https://github.com/o/r/pull/1","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","mergeable":"MERGEABLE","isDraft":false,"headRefOid":"abc123","additions":1,"deletions":0,"changedFiles":1,"files":[{"path":"a.js","additions":1,"deletions":0}],"commits":[],"labels":[],"assignees":[],"reviews":[]}'
+summary='{"number":1,"title":"t","body":"b","author":{"login":"u"},"state":"OPEN","url":"https://github.com/o/r/pull/1","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","mergeable":"MERGEABLE","isDraft":false,"headRefOid":"abc123","baseRefOid":"base123","baseRefName":"main","additions":1,"deletions":0,"changedFiles":1,"files":[{"path":"a.js","additions":1,"deletions":0}],"commits":[],"labels":[],"assignees":[],"reviews":[]}'
 case "$1 $2" in
     "repo view")
         case "$*" in
