@@ -39,6 +39,9 @@ Each finding is verified, categorized, rated and anchored:
 }
 ```
 
+Each `PRRT_...` thread ID may appear in only one task. Combine all remediation
+for a shared review thread into that task so hosted resolution occurs only once.
+
 **Verdict** — what verification concluded:
 - `confirmed` — the defect was traced in the code
 - `plausible` — consistent with the visible evidence, but the deciding code was not reachable
@@ -98,13 +101,14 @@ One entry per category, so an unswept axis is visible:
 
 #### 2. Systemic Issues
 
-Patterns that appear across multiple comments:
+Patterns supported by at least two confirmed findings:
 
 ```json
 {
   "systemic_issues": [
     {
       "pattern": "Incomplete Error Handling Pattern",
+      "finding_ids": ["missing-error-context", "silent-catch"],
       "evidence": [
         "Thread PRRT_xxx: missing error context",
         "Thread PRRT_yyy: silent failure in catch block"
@@ -114,6 +118,9 @@ Patterns that appear across multiple comments:
   ]
 }
 ```
+
+Every pattern must link only to confirmed findings. Plausible and refuted
+claims cannot affect retrospective patterns or recommended actions.
 
 **Use these to:**
 - Identify root causes vs symptoms

@@ -551,10 +551,10 @@ test_pattern_detection() {
     local pattern_occurrences
     pattern_occurrences=$(jq '[.cross_pr_patterns[] | select(.pattern | test("error handling"; "i"))] | .[0].occurrences' "$TEST_OUTPUT_DIR/retro/retrospective-data.json")
 
-    if [ "$pattern_occurrences" -eq 3 ]; then
-        pass "Detects recurring pattern across 3 PRs"
+    if [ "$pattern_occurrences" -eq 2 ]; then
+        pass "Detects recurring pattern across 2 PRs with confirmed linkage"
     else
-        fail "Detects recurring pattern across 3 PRs" "Got occurrences: $pattern_occurrences"
+        fail "Detects recurring pattern across 2 PRs with confirmed linkage" "Got occurrences: $pattern_occurrences"
     fi
 }
 
@@ -743,12 +743,17 @@ EOF
     cat > "$report_dir/claude-analysis.json" << 'EOF'
 {
   "issue_categories": [
-    {"name":"Confirmed issue","category":"error_handling","severity":"high","verdict":"confirmed"},
-    {"name":"Plausible issue","category":"test_gap","severity":"medium","verdict":"plausible"},
-    {"name":"Refuted issue","category":"error_handling","severity":"critical","verdict":"refuted"},
-    {"name":"Refuted-only issue","category":"security","severity":"critical","verdict":"refuted"}
+    {"finding_id":"confirmed-issue","name":"Confirmed issue","category":"error_handling","severity":"high","verdict":"confirmed"},
+    {"finding_id":"plausible-issue","name":"Plausible issue","category":"test_gap","severity":"medium","verdict":"plausible"},
+    {"finding_id":"refuted-issue","name":"Refuted issue","category":"error_handling","severity":"critical","verdict":"refuted"},
+    {"finding_id":"refuted-only-issue","name":"Refuted-only issue","category":"security","severity":"critical","verdict":"refuted"}
   ],
-  "systemic_issues": [],
+  "systemic_issues": [
+    {"pattern":"Confirmed systemic pattern","finding_ids":["confirmed-issue"],"evidence":["confirmed"],"recommendation":"keep"},
+    {"pattern":"Plausible systemic pattern","finding_ids":["plausible-issue"],"evidence":["plausible"],"recommendation":"exclude"},
+    {"pattern":"Refuted systemic pattern","finding_ids":["refuted-issue"],"evidence":["refuted"],"recommendation":"exclude"},
+    {"pattern":"Mixed-verdict systemic pattern","finding_ids":["confirmed-issue","plausible-issue"],"evidence":["mixed"],"recommendation":"mixed-exclude"}
+  ],
   "adjacent_problems": [],
   "task_list": [{"priority":"low","task":"Task remains aggregated"}],
   "process_improvements": [],
@@ -781,6 +786,14 @@ EOF
     assert_jq "$output_dir/retrospective-data.json" \
         '[.guiding_questions.before_implementation[] | select(contains("security") or contains("test_gap"))] | length == 0' \
         "retrospective guiding questions exclude unconfirmed categories"
+    assert_jq "$output_dir/retrospective-data.json" \
+        '([.cross_pr_patterns[].pattern] | index("Plausible systemic pattern") == null) and
+         ([.cross_pr_patterns[].pattern] | index("Refuted systemic pattern") == null) and
+         ([.cross_pr_patterns[].pattern] | index("Mixed-verdict systemic pattern") == null)' \
+        "retrospective patterns require every linked finding to be confirmed"
+    assert_jq "$output_dir/retrospective-data.json" \
+        '[.summary.recommended_actions[].action] | index("mixed-exclude") == null' \
+        "mixed-verdict systemic recommendations are excluded"
     assert_jq_eq "$output_dir/retrospective-data.json" \
         '.summary.overview.total_tasks' "1" \
         "retrospective verdict filtering leaves task aggregation unchanged"

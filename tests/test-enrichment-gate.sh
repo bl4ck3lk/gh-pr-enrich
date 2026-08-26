@@ -317,6 +317,20 @@ fi
 if [ "$1" = "api" ] && [ "$2" = "--paginate" ]; then
     watch_projection=false
     case "$*" in *"--jq"*) watch_projection=true ;; esac
+    if [ "${WATCH_STALL_BASE:-false}" = true ] && [ "$poll" -gt 0 ]; then
+        case "$3" in
+            *issues/*/comments*)
+                printf '%s\n' "$$" >> "$WATCH_STALL_CHILD_PIDS"
+                (
+                    trap '' TERM INT
+                    while true; do sleep 1; done
+                ) &
+                printf '%s\n' "$!" >> "$WATCH_STALL_DESCENDANT_PIDS"
+                trap '' TERM INT
+                while true; do sleep 1; done
+                ;;
+        esac
+    fi
     if [ "$watch_projection" = true ] && [ -n "${WATCH_PROJECTION_LOG:-}" ]; then
         printf '%s\n' "$*" >> "$WATCH_PROJECTION_LOG"
         [ -z "${WATCH_LARGE_BODY_FILE:-}" ] || \
@@ -620,6 +634,45 @@ assert_contains "$PERSISTENT_FAILURE_OUT" "API request failed (attempt 3/3)" \
     "watch retries snapshot failures through the configured maximum"
 assert_contains "$PERSISTENT_FAILURE_OUT" "Too many consecutive failures" \
     "watch exits only after the configured consecutive-failure limit"
+
+# A stalled request must count as a failed poll instead of trapping the watch
+# loop inside one gh process forever. Every timed-out process-group member is
+# reaped before the three-failure policy exits.
+WATCH_STALL_CHILD_PIDS="$WATCH_CASE/stalled-watch-children.txt"
+WATCH_STALL_DESCENDANT_PIDS="$WATCH_CASE/stalled-watch-descendants.txt"
+printf '0\n' > "$WATCH_POLL_FILE"
+printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"
+: > "$WATCH_STALL_CHILD_PIDS"
+: > "$WATCH_STALL_DESCENDANT_PIDS"
+set +e
+STALLED_WATCH_OUT=$(
+    cd "$WATCH_WORK_DIR" && \
+    env WATCH_STALL_BASE=true WATCH_POLL_FILE="$WATCH_POLL_FILE" \
+        WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" WATCH_SLEEP_LIMIT=3 \
+        WATCH_STALL_CHILD_PIDS="$WATCH_STALL_CHILD_PIDS" \
+        WATCH_STALL_DESCENDANT_PIDS="$WATCH_STALL_DESCENDANT_PIDS" \
+        GH_PR_ENRICH_GITHUB_TIMEOUT=1 PATH="$WATCH_STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" watch 1 --interval 1 2>&1
+)
+STALLED_WATCH_RC=$?
+set -e
+assert_true "$([ "$STALLED_WATCH_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "stalled watch requests reach the consecutive-failure exit"
+assert_contains "$STALLED_WATCH_OUT" "API request failed (attempt 3/3)" \
+    "each stalled request becomes one failed watch poll"
+assert_contains "$STALLED_WATCH_OUT" "Too many consecutive failures" \
+    "stalled requests cannot bypass the bounded retry policy"
+STALLED_WATCH_REAPED=true
+while IFS= read -r stalled_pid; do
+    [ -z "$stalled_pid" ] || ! kill -0 "$stalled_pid" 2>/dev/null || \
+        STALLED_WATCH_REAPED=false
+done < "$WATCH_STALL_CHILD_PIDS"
+while IFS= read -r stalled_pid; do
+    [ -z "$stalled_pid" ] || ! kill -0 "$stalled_pid" 2>/dev/null || \
+        STALLED_WATCH_REAPED=false
+done < "$WATCH_STALL_DESCENDANT_PIDS"
+assert_true "$([ "$STALLED_WATCH_REAPED" = true ] && echo 0 || echo 1)" \
+    "watch request timeouts reap direct children and descendants"
 
 printf '0\n' > "$WATCH_POLL_FILE"
 printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"

@@ -12,7 +12,7 @@ A GitHub CLI extension for comprehensive PR context and evidence-driven analysis
 - 🧩 **Provider-neutral context**: Builds one revision-bound snapshot and schema for Codex, Claude, or another analyzer
 - 🤖 **Codex native-subagent analysis**: The included skill splits review lenses across current-session Codex subagents and keeps the root agent responsible for synthesis
 - 🧠 **External Claude analysis** (optional): Runs a separate read-only verification pass with explicit private-data disclosure controls
-- 🔬 **Static Analysis Pre-pass** (optional): `--sast` runs semgrep over the changed files so the analysis starts from deterministic findings
+- 🔬 **Static Analysis Pre-pass** (optional): `--sast` runs semgrep over the changed files so the analysis starts from normalized rule matches that still require verification
 - 🔧 **Thread Resolution**: Resolve comment threads directly from CLI
 - 👀 **Watch Mode**: Monitor PRs for new comments with auto-analysis
 - 🎯 **Interactive Mode**: Work through issues one by one with guided fixing
@@ -192,9 +192,9 @@ The result is a verification pass, not a summary:
 - **Issue Categories**: Each finding carries a unique `finding_id`, a `verdict` (`confirmed` / `plausible` / `refuted`), a `confidence`, and `evidence` naming the file and line that was inspected
 - **Disputed Comments**: Reviewer or bot claims that were checked and found wrong, identified by an exact captured thread ID or comment URL
 - **Category Coverage**: An explicit verdict for each of the 16 categories, so "not checked" never looks like "clean"
-- **Systemic Issues**: Patterns behind several findings, with the evidence that links them
+- **Systemic Issues**: Patterns linked by at least two unique `finding_ids` to confirmed findings, with the evidence that connects them
 - **Adjacent Problems**: Related areas, flagged with whether the analyzer actually searched them
-- **Task List**: Prioritized actions mapped by `finding_ids` only to confirmed findings, each with `file`, `line`, `suggested_fix` and a `verification` command
+- **Task List**: Prioritized actions mapped by `finding_ids` only to confirmed findings, each with `file`, `line`, `suggested_fix` and a `verification` command; each hosted review thread belongs to at most one task
 - **Process Improvements**: Automation, documentation, and review-process suggestions to prevent recurrence
 - **PR Template Suggestions**: Checklist items that would catch these issues before review
 
@@ -219,13 +219,16 @@ The list is closed, and the analysis must return a verdict for every one of them
 
 - [Claude CLI](https://claude.ai/code) must be installed and authenticated
 - Private/internal/unknown-visibility repositories require separate explicit user authorization and `--allow-external`.
-- The analyzer is restricted to **read-only** tools (Read, Grep, Glob). It never runs commands and never edits files. Use `--no-code-access` to withhold even that.
-- Claude uses a non-interactive permission mode, bypasses plugins, and does not persist the analysis session.
+- The analyzer is restricted to snapshot-scoped **Read** access. It cannot run commands, search arbitrary filesystem paths, or edit files. Use `--no-code-access` to withhold even that.
+- Claude uses safe mode and a non-interactive permission mode, disables auto memory, explicitly denies MCP tools, and does not load repository instructions, skills, hooks, plugins, or persistent analysis sessions.
 - Automatic access is granted only when the working tree is clean, contains no
   ignored files, and is exactly at the PR head. Dirty, ahead, and unrelated
   checkouts are denied because repository tools could expose local-only files or
   verify the wrong revision. Run `gh pr checkout <N>` first. `--code-access` is
   an explicit override that exposes the current workspace despite those checks.
+- Immutable code snapshots currently support tracked regular files only.
+  Repositories containing tracked symlinks, gitlinks/submodules, or other
+  non-regular index entries run without repository code access.
 - Every selected result is bound to a recomputed SHA-256 digest of the analysis
   context. Failed comment, thread, check, or linked-issue fetches remain visible
   in coverage and prevent publication of a clean selected verdict.
@@ -358,7 +361,7 @@ This extension includes one canonical skill for Codex and Claude Code. It prepar
 gh pr-enrich install-skill
 ```
 
-This registers the same source at `~/.codex/skills/gh-pr-enrich` and `~/.claude/skills/gh-pr-enrich`. Use `--runtime codex` or `--runtime claude` to install only one.
+This registers the same source under `${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-enrich` and `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/gh-pr-enrich`. Use `--runtime codex` or `--runtime claude` to install only one.
 
 To uninstall:
 ```bash

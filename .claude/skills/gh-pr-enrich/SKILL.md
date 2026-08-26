@@ -142,10 +142,9 @@ gh pr-enrich "$PR_NUMBER" --enrich --allow-external --diff --sast
 
 The CLI materializes the verified tree privately, grants `Read(./**)` only for
 that snapshot, and denies the original checkout through isolated Claude
-settings. `Grep` and `Glob` remain subject to the same Read rules. It disables
-all tools when code access is unavailable, uses a non-interactive permission
-mode, captures stderr, bypasses plugins, and does not persist the Claude
-session.
+settings. It disables all tools when code access is unavailable, uses a
+non-interactive permission mode, captures stderr, bypasses plugins, and does
+not persist the Claude session.
 
 ## Synthesize Codex and Claude
 

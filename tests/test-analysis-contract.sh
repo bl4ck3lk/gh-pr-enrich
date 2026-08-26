@@ -75,6 +75,19 @@ assert_contains "$PROMPT_TEXT" "verify" "prompt instructs verification against t
 assert_contains "$PROMPT_TEXT" "refuted" "prompt allows refuting a reviewer claim"
 assert_contains "$PROMPT_TEXT" "exact URL supplied in the context" \
     "prompt identifies non-thread disputes with captured URLs"
+SI='.properties.systemic_issues.items'
+assert_jq "$SCHEMA_FILE" "$SI.required | index(\"finding_ids\") != null" \
+    "every systemic pattern requires confirmed finding linkage"
+assert_jq "$SCHEMA_FILE" \
+    "$SI.properties.finding_ids.minItems == 2 and $SI.properties.finding_ids.uniqueItems == true" \
+    "systemic patterns require at least two unique finding links"
+assert_jq "$SCHEMA_FILE" \
+    "$SI.properties.evidence.minItems == 1 and $SI.properties.evidence.items.minLength == 1" \
+    "systemic patterns require non-empty linking evidence"
+assert_contains "$PROMPT_TEXT" "Never derive a systemic" \
+    "prompt excludes plausible and refuted claims from systemic patterns"
+assert_contains "$PROMPT_TEXT" "at least" \
+    "prompt requires multiple confirmed findings for a systemic pattern"
 
 # ---------------------------------------------------------------------------
 # 2. Closed taxonomy + forced coverage
@@ -268,6 +281,7 @@ cat > "$ODD" << 'EOF'
   "systemic_issues": [
     {
       "pattern": "Inconsistent error handling",
+      "finding_ids": ["odd-shape-fixture"],
       "evidence": [
         {"file": "src/a.js", "line": 10, "detail": "empty catch"},
         "Thread PRRT_zzz: swallowed error"

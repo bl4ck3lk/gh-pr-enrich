@@ -21,6 +21,28 @@
       "thread_ids": [
         "PRRT_test2"
       ]
+    },
+    {
+      "finding_id": "missing-sync-error-context",
+      "name": "Missing sync error context",
+      "category": "error_handling",
+      "verdict": "confirmed",
+      "confidence": "high",
+      "severity": "medium",
+      "impact": "moderate",
+      "likelihood": "possible",
+      "severity_rationale": "Operators cannot identify which sync failed when the exception is swallowed.",
+      "description": "syncAll() discards the operation context with the exception.",
+      "evidence": [
+        {
+          "file": "src/sync.js",
+          "line": 91,
+          "detail": "catch block has no operation metadata"
+        }
+      ],
+      "thread_ids": [
+        "PRRT_test2"
+      ]
     }
   ],
   "category_coverage": [
@@ -44,6 +66,10 @@
   "systemic_issues": [
     {
       "pattern": "Inconsistent error handling",
+      "finding_ids": [
+        "swallowed-sync-exception",
+        "missing-sync-error-context"
+      ],
       "evidence": [
         "Thread PRRT_test2: silent catch block"
       ],

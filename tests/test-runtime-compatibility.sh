@@ -18,6 +18,8 @@ COLLECTION_ACQUIRE_RELEASE=""
 COLLECTION_SIGNAL_RM_RELEASE=""
 LINKED_CONCURRENT_RELEASE=""
 CHILD_START_PID_FILE=""
+REPORT_WATCHDOG_CHILD_PID_FILE=""
+REPORT_WATCHDOG_PID_FILE=""
 BLOCKED_HEAD_CHILD_PID_FILE=""
 BLOCKED_HEAD_DESCENDANT_PID_FILE=""
 PROVIDER_SIGNAL_CHILD_PID_FILE=""
@@ -54,6 +56,15 @@ cleanup() {
             kill -KILL "$cleanup_child_pid" 2>/dev/null || true
         fi
     fi
+    for cleanup_pid_file in "$REPORT_WATCHDOG_CHILD_PID_FILE" \
+            "$REPORT_WATCHDOG_PID_FILE"; do
+        [ -n "$cleanup_pid_file" ] && [ -f "$cleanup_pid_file" ] || continue
+        cleanup_child_pid=$(cat "$cleanup_pid_file" 2>/dev/null || echo "")
+        if [ -n "$cleanup_child_pid" ] && \
+           kill -0 "$cleanup_child_pid" 2>/dev/null; then
+            kill -KILL "$cleanup_child_pid" 2>/dev/null || true
+        fi
+    done
     for cleanup_pid_file in "$BLOCKED_HEAD_CHILD_PID_FILE" \
             "$BLOCKED_HEAD_DESCENDANT_PID_FILE" \
             "$PROVIDER_SIGNAL_CHILD_PID_FILE" \
@@ -201,6 +212,7 @@ for planted_candidate in "$TEST_HOME/.codex/skills"/.gh-pr-enrich-install.*; do
     [ "$planted_candidate" != "$PLANTED_INSTALL_RESIDUE" ] || \
         planted_residue_detected=true
 done
+
 assert_true "$([ "$planted_residue_detected" = true ] && echo 0 || echo 1)" \
     "the portable residue scan detects a planted transaction directory"
 rmdir "$PLANTED_INSTALL_RESIDUE"
@@ -218,6 +230,26 @@ assert_eq "$(cd "$CLAUDE_SKILL" && pwd -P)" "$(cd "$CODEX_SKILL" && pwd -P)" \
     "both runtimes use one canonical skill source"
 
 HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill >/dev/null
+
+CONFIGURED_HOME="$TEST_OUTPUT_DIR/configured-home"
+CONFIGURED_CODEX_ROOT="$TEST_OUTPUT_DIR/configured-codex"
+CONFIGURED_CLAUDE_ROOT="$TEST_OUTPUT_DIR/configured-claude"
+mkdir -p "$CONFIGURED_HOME"
+env HOME="$CONFIGURED_HOME" CODEX_HOME="$CONFIGURED_CODEX_ROOT" \
+    CLAUDE_CONFIG_DIR="$CONFIGURED_CLAUDE_ROOT" \
+    "$GH_PR_ENRICH" install-skill >/dev/null
+assert_true "$([ -L "$CONFIGURED_CODEX_ROOT/skills/gh-pr-enrich" ] && \
+    [ -L "$CONFIGURED_CLAUDE_ROOT/skills/gh-pr-enrich" ] && echo 0 || echo 1)" \
+    "the installer honors configured Codex and Claude homes"
+assert_true "$([ ! -e "$CONFIGURED_HOME/.codex/skills/gh-pr-enrich" ] && \
+    [ ! -e "$CONFIGURED_HOME/.claude/skills/gh-pr-enrich" ] && echo 0 || echo 1)" \
+    "configured runtime homes do not publish fallback HOME registrations"
+env HOME="$CONFIGURED_HOME" CODEX_HOME="$CONFIGURED_CODEX_ROOT" \
+    CLAUDE_CONFIG_DIR="$CONFIGURED_CLAUDE_ROOT" \
+    "$GH_PR_ENRICH" uninstall-skill >/dev/null
+assert_true "$([ ! -e "$CONFIGURED_CODEX_ROOT/skills/gh-pr-enrich" ] && \
+    [ ! -e "$CONFIGURED_CLAUDE_ROOT/skills/gh-pr-enrich" ] && echo 0 || echo 1)" \
+    "the uninstaller honors configured Codex and Claude homes"
 
 # A pending signal while validating an existing Codex registration must stop
 # before the transaction publishes a missing Claude registration.
@@ -322,6 +354,76 @@ assert_eq "$CLAUDE_PAYLOAD_BEFORE" "$(readlink "$CLAUDE_SKILL")" \
     "a failed Claude removal preserves its captured symlink payload"
 assert_no_skill_install_residue \
     "a failed two-runtime uninstall cleans its private claims"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill >/dev/null
+
+# A rename wrapper can report failure after the exact registration has already
+# moved into the private claim. Treat that response as ambiguous: restore the
+# original inode and fail instead of committing an apparently successful move.
+HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill --runtime codex >/dev/null
+AMBIGUOUS_UNINSTALL_MV_STUBS="$TEST_OUTPUT_DIR/ambiguous-uninstall-mv"
+AMBIGUOUS_UNINSTALL_IDENTITY=$(stat -c '%d:%i' "$CODEX_SKILL" 2>/dev/null || \
+    stat -f '%d:%i' "$CODEX_SKILL")
+mkdir -p "$AMBIGUOUS_UNINSTALL_MV_STUBS"
+cat > "$AMBIGUOUS_UNINSTALL_MV_STUBS/mv" << 'STUB'
+#!/bin/bash
+if [ "$1" = "$AMBIGUOUS_UNINSTALL_TARGET" ]; then
+    /bin/mv "$@" || exit $?
+    exit 73
+fi
+exec /bin/mv "$@"
+STUB
+chmod +x "$AMBIGUOUS_UNINSTALL_MV_STUBS/mv"
+rc=0
+env HOME="$TEST_HOME" AMBIGUOUS_UNINSTALL_TARGET="$CODEX_SKILL" \
+    PATH="$AMBIGUOUS_UNINSTALL_MV_STUBS:$PATH" \
+    "$GH_PR_ENRICH" uninstall-skill --runtime codex >/dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "an ambiguous successful claim still fails uninstall"
+assert_eq "$AMBIGUOUS_UNINSTALL_IDENTITY" \
+    "$(stat -c '%d:%i' "$CODEX_SKILL" 2>/dev/null || stat -f '%d:%i' "$CODEX_SKILL")" \
+    "an ambiguous successful claim restores the exact public registration"
+assert_no_skill_install_residue \
+    "an ambiguous successful claim cleans every private reference"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill --runtime codex >/dev/null
+
+# Cancellation can arrive while the first runtime's preflight hard link is
+# being created. No public claim has started, so cleanup removes only private
+# references and preserves both exact public registrations.
+HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill >/dev/null
+PREFLIGHT_SIGNAL_STUBS="$TEST_OUTPUT_DIR/uninstall-preflight-signal"
+PREFLIGHT_SIGNAL_MARKER="$TEST_OUTPUT_DIR/uninstall-preflight-signal.once"
+CODEX_IDENTITY_BEFORE=$(stat -c '%d:%i' "$CODEX_SKILL" 2>/dev/null || \
+    stat -f '%d:%i' "$CODEX_SKILL")
+CLAUDE_IDENTITY_BEFORE=$(stat -c '%d:%i' "$CLAUDE_SKILL" 2>/dev/null || \
+    stat -f '%d:%i' "$CLAUDE_SKILL")
+mkdir -p "$PREFLIGHT_SIGNAL_STUBS"
+cat > "$PREFLIGHT_SIGNAL_STUBS/ln" << 'STUB'
+#!/bin/bash
+if [ "$1" = -P ] && [ "$2" = "$PREFLIGHT_SIGNAL_TARGET" ] && \
+   [ ! -e "$PREFLIGHT_SIGNAL_MARKER" ]; then
+    /bin/ln "$@" || exit $?
+    : > "$PREFLIGHT_SIGNAL_MARKER"
+    kill -TERM "$PPID"
+    exit 0
+fi
+exec /bin/ln "$@"
+STUB
+chmod +x "$PREFLIGHT_SIGNAL_STUBS/ln"
+rc=0
+env HOME="$TEST_HOME" PREFLIGHT_SIGNAL_TARGET="$CODEX_SKILL" \
+    PREFLIGHT_SIGNAL_MARKER="$PREFLIGHT_SIGNAL_MARKER" \
+    PATH="$PREFLIGHT_SIGNAL_STUBS:$PATH" \
+    "$GH_PR_ENRICH" uninstall-skill >/dev/null 2>&1 || rc=$?
+assert_eq "143" "$rc" \
+    "TERM during uninstall preflight reference creation preserves its status"
+assert_eq "$CODEX_IDENTITY_BEFORE" \
+    "$(stat -c '%d:%i' "$CODEX_SKILL" 2>/dev/null || stat -f '%d:%i' "$CODEX_SKILL")" \
+    "preflight cancellation preserves the exact Codex registration"
+assert_eq "$CLAUDE_IDENTITY_BEFORE" \
+    "$(stat -c '%d:%i' "$CLAUDE_SKILL" 2>/dev/null || stat -f '%d:%i' "$CLAUDE_SKILL")" \
+    "preflight cancellation preserves the exact Claude registration"
+assert_no_skill_install_residue \
+    "preflight cancellation cleans every private reference"
 HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill >/dev/null
 
 # Replacement at the public-to-private claim boundary must never be deleted,
@@ -558,6 +660,46 @@ for UNINSTALL_SIGNAL_CASE in TERM:codex:143 INT:claude:130; do
         "$UNINSTALL_SIGNAL_NAME during claim removal cleans private claims"
     HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill >/dev/null
 done
+
+# A DEBUG hook makes the last pre-commit boundary deterministic by signaling
+# immediately before the committed flag is assigned. The post-assignment guard
+# must turn the transaction back into rollback mode, restore both exact public
+# registrations, and preserve the conventional signal status.
+UNINSTALL_COMMIT_SIGNAL_BASH_ENV="$TEST_OUTPUT_DIR/uninstall-commit-signal-bash-env"
+UNINSTALL_COMMIT_SIGNAL_MARKER="$TEST_OUTPUT_DIR/uninstall-commit-signal-fired"
+cat > "$UNINSTALL_COMMIT_SIGNAL_BASH_ENV" << 'STUB'
+__gh_pr_enrich_uninstall_commit_debug() {
+    if [ "$BASH_COMMAND" = 'UNINSTALL_TRANSACTION_COMMITTED=true' ] && \
+       [ ! -e "$UNINSTALL_COMMIT_SIGNAL_MARKER" ]; then
+        : > "$UNINSTALL_COMMIT_SIGNAL_MARKER"
+        kill -TERM "$$"
+    fi
+}
+set -T
+trap '__gh_pr_enrich_uninstall_commit_debug' DEBUG
+STUB
+HOME="$TEST_HOME" "$GH_PR_ENRICH" install-skill >/dev/null
+CODEX_IDENTITY_BEFORE=$(stat -c '%d:%i' "$CODEX_SKILL" 2>/dev/null || \
+    stat -f '%d:%i' "$CODEX_SKILL")
+CLAUDE_IDENTITY_BEFORE=$(stat -c '%d:%i' "$CLAUDE_SKILL" 2>/dev/null || \
+    stat -f '%d:%i' "$CLAUDE_SKILL")
+rc=0
+env HOME="$TEST_HOME" BASH_ENV="$UNINSTALL_COMMIT_SIGNAL_BASH_ENV" \
+    UNINSTALL_COMMIT_SIGNAL_MARKER="$UNINSTALL_COMMIT_SIGNAL_MARKER" \
+    "$GH_PR_ENRICH" uninstall-skill >/dev/null 2>&1 || rc=$?
+assert_true "$([ -e "$UNINSTALL_COMMIT_SIGNAL_MARKER" ] && echo 0 || echo 1)" \
+    "the uninstall commit-boundary regression reaches the final assignment"
+assert_eq "143" "$rc" \
+    "TERM at the final uninstall commit boundary preserves its status"
+assert_eq "$CODEX_IDENTITY_BEFORE" \
+    "$(stat -c '%d:%i' "$CODEX_SKILL" 2>/dev/null || stat -f '%d:%i' "$CODEX_SKILL")" \
+    "commit-boundary cancellation restores the exact Codex registration"
+assert_eq "$CLAUDE_IDENTITY_BEFORE" \
+    "$(stat -c '%d:%i' "$CLAUDE_SKILL" 2>/dev/null || stat -f '%d:%i' "$CLAUDE_SKILL")" \
+    "commit-boundary cancellation restores the exact Claude registration"
+assert_no_skill_install_residue \
+    "commit-boundary cancellation cleans every private reference"
+HOME="$TEST_HOME" "$GH_PR_ENRICH" uninstall-skill >/dev/null
 
 # Uninstall has historically removed any symlink registration, including stale
 # and broken links. Atomic preflight must not tighten that public behavior.
@@ -1120,7 +1262,7 @@ JSON
         ;;
     "pr checks") echo '[]'; exit 0 ;;
     "pr diff")
-        printf 'diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -0,0 +1 @@\n+const x = 1;\n'
+        printf 'diff --git a/gh-pr-enrich b/gh-pr-enrich\n--- a/gh-pr-enrich\n+++ b/gh-pr-enrich\n@@ -0,0 +1 @@\n+example\n'
         exit 0
         ;;
 esac
@@ -1457,6 +1599,64 @@ assert_true "$([ "$CHILD_START_REAPED" = true ] && \
     "child-start cancellation reaps the writer and releases its report lock"
 rm -f "$CHILD_START_PID_FILE"
 CHILD_START_PID_FILE=""
+
+# The request watchdog has its own fork-to-PID-publication boundary. A signal
+# at that exact DEBUG hook must wait for the watchdog PID, then reap both the
+# GitHub child and watchdog before releasing the report lease.
+REPORT_WATCHDOG_STUBS="$TEST_OUTPUT_DIR/report-watchdog-stubs"
+REPORT_WATCHDOG_REPORT="$TEST_OUTPUT_DIR/report-watchdog-report"
+REPORT_WATCHDOG_CHILD_PID_FILE="$TEST_OUTPUT_DIR/report-watchdog-child.pid"
+REPORT_WATCHDOG_PID_FILE="$TEST_OUTPUT_DIR/report-watchdog.pid"
+REPORT_WATCHDOG_BASH_ENV="$TEST_OUTPUT_DIR/report-watchdog-bash-env"
+REPORT_WATCHDOG_MARKER="$TEST_OUTPUT_DIR/report-watchdog-hook-fired"
+mkdir -p "$REPORT_WATCHDOG_STUBS"
+cat > "$REPORT_WATCHDOG_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr view" ]; then
+    printf '%s\n' "$$" > "$REPORT_WATCHDOG_CHILD_PID_FILE"
+    trap '' TERM INT
+    while true; do sleep 0.05; done
+fi
+exec "$REPORT_WATCHDOG_BASE_GH" "$@"
+STUB
+cat > "$REPORT_WATCHDOG_BASH_ENV" << 'STUB'
+__gh_pr_enrich_report_watchdog_debug() {
+    if [ "$BASH_COMMAND" = 'REPORT_RUN_WATCHDOG_PID=$!' ] && \
+       [ ! -e "$REPORT_WATCHDOG_MARKER" ]; then
+        printf '%s\n' "$!" > "$REPORT_WATCHDOG_PID_FILE"
+        : > "$REPORT_WATCHDOG_MARKER"
+        kill -TERM "$$"
+    fi
+}
+set -T
+trap '__gh_pr_enrich_report_watchdog_debug' DEBUG
+STUB
+chmod +x "$REPORT_WATCHDOG_STUBS/gh"
+rc=0
+env PATH="$REPORT_WATCHDOG_STUBS:$STUB_DIR:$PATH" \
+    BASH_ENV="$REPORT_WATCHDOG_BASH_ENV" \
+    REPORT_WATCHDOG_BASE_GH="$STUB_DIR/gh" \
+    REPORT_WATCHDOG_CHILD_PID_FILE="$REPORT_WATCHDOG_CHILD_PID_FILE" \
+    REPORT_WATCHDOG_PID_FILE="$REPORT_WATCHDOG_PID_FILE" \
+    REPORT_WATCHDOG_MARKER="$REPORT_WATCHDOG_MARKER" \
+    GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
+    "$GH_PR_ENRICH" 1 --output-dir "$REPORT_WATCHDOG_REPORT" \
+    >/dev/null 2>&1 || rc=$?
+assert_true "$([ -e "$REPORT_WATCHDOG_MARKER" ] && echo 0 || echo 1)" \
+    "the report watchdog regression signals at the PID-publication boundary"
+assert_eq "143" "$rc" \
+    "a signal during report watchdog publication is deferred then honored"
+REPORT_WATCHDOG_CHILD_PID=$(cat "$REPORT_WATCHDOG_CHILD_PID_FILE")
+REPORT_WATCHDOG_PID=$(cat "$REPORT_WATCHDOG_PID_FILE")
+assert_process_reaped "$REPORT_WATCHDOG_CHILD_PID" \
+    "watchdog-publication cancellation reaps the GitHub child"
+assert_process_reaped "$REPORT_WATCHDOG_PID" \
+    "watchdog-publication cancellation reaps the timeout watcher"
+assert_true "$([ ! -e "$REPORT_WATCHDOG_REPORT/.selected-analysis.lock" ] && \
+    echo 0 || echo 1)" \
+    "watchdog-publication cancellation releases the report lease"
+REPORT_WATCHDOG_CHILD_PID_FILE=""
+REPORT_WATCHDOG_PID_FILE=""
 
 # A rejected contender owns no cleanup authority. It must leave the active
 # owner's random linked-pagination staging intact until that owner resumes.
@@ -2701,13 +2901,14 @@ cp "$AUTHORIZED_DIR/pr-summary.json" "$SELECTION_REPORT/pr-summary.json"
 cp "$NO_CODE_CONFIRMED_SOURCE" "$SELECTION_SOURCE_BASE"
 SELECTION_WORKSPACE_FINGERPRINT=$(cd "$SELECTION_REPO" && \
     "$GH_PR_ENRICH" --test-call \
-        code_access_workspace_fingerprint "$SELECTION_REPORT")
+        code_access_workspace_fingerprint "$SELECTION_REPORT" "" working_tree)
 jq --arg inspected_sha "$SELECTION_HEAD" --arg workspace_fingerprint "$SELECTION_WORKSPACE_FINGERPRINT" '
     del(.coverage.context_fingerprint)
     | .coverage.code_access.state = "enabled"
     | .coverage.code_access.reason = "explicit fixture override"
     | .coverage.code_access.inspected_sha = $inspected_sha
     | .coverage.code_access.revision_matches = false
+    | .coverage.code_access.snapshot_source = "working_tree"
     | .coverage.code_access.workspace_fingerprint = $workspace_fingerprint
     | .unresolved_threads += [{thread_id:"PRRT_other",comments_complete:true,
         comment_identity:[]}]
@@ -2913,6 +3114,84 @@ for UNVERIFIED_TASK_VERDICT in plausible refuted; do
         "selection rejects tasks mapped to $UNVERIFIED_TASK_VERDICT findings"
 done
 
+MISSING_SYSTEMIC_LINK="$SELECTION_REPORT/missing-systemic-link.json"
+jq '.systemic_issues = [{pattern:"fixture",evidence:["fixture"],
+        recommendation:"fixture"}]' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$MISSING_SYSTEMIC_LINK"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$MISSING_SYSTEMIC_LINK" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects systemic patterns without finding linkage"
+
+SINGLE_SYSTEMIC_LINK="$SELECTION_REPORT/single-systemic-link.json"
+jq '.systemic_issues = [{pattern:"fixture",
+        finding_ids:[.issue_categories[0].finding_id],
+        evidence:["fixture"],recommendation:"fixture"}]' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$SINGLE_SYSTEMIC_LINK"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$SINGLE_SYSTEMIC_LINK" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects a one-finding systemic label"
+
+EMPTY_SYSTEMIC_EVIDENCE="$SELECTION_REPORT/empty-systemic-evidence.json"
+jq '.issue_categories += [(.issue_categories[0]
+        | .finding_id = "second-confirmed-finding")]
+    | .systemic_issues = [{pattern:"fixture",
+        finding_ids:[.issue_categories[0].finding_id,
+            .issue_categories[1].finding_id],
+        evidence:[],recommendation:"fixture"}]' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$EMPTY_SYSTEMIC_EVIDENCE"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$EMPTY_SYSTEMIC_EVIDENCE" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects systemic patterns without linking evidence"
+
+for UNVERIFIED_SYSTEMIC_VERDICT in plausible refuted; do
+    UNVERIFIED_SYSTEMIC_SOURCE="$SELECTION_REPORT/$UNVERIFIED_SYSTEMIC_VERDICT-systemic.json"
+    jq --arg verdict "$UNVERIFIED_SYSTEMIC_VERDICT" '
+        .issue_categories[0].verdict = $verdict
+        | .issue_categories += [(.issue_categories[0]
+            | .finding_id = "second-unverified-finding")]
+        | .task_list = []
+        | .systemic_issues = [{pattern:"fixture",
+            finding_ids:[.issue_categories[0].finding_id,
+                .issue_categories[1].finding_id],
+            evidence:["fixture"],recommendation:"fixture"}]
+    ' "$SELECTION_REPORT/hybrid-analysis.json" > "$UNVERIFIED_SYSTEMIC_SOURCE"
+    rc=0
+    (cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$UNVERIFIED_SYSTEMIC_SOURCE" >/dev/null 2>&1) || rc=$?
+    assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+        "selection rejects systemic patterns mapped to $UNVERIFIED_SYSTEMIC_VERDICT findings"
+done
+
+MIXED_SYSTEMIC_SOURCE="$SELECTION_REPORT/mixed-verdict-systemic.json"
+jq '.issue_categories += [(.issue_categories[0]
+        | .finding_id = "plausible-systemic-finding"
+        | .verdict = "plausible")]
+    | .systemic_issues = [{pattern:"fixture",
+        finding_ids:[.issue_categories[0].finding_id,
+            .issue_categories[1].finding_id],
+        evidence:["fixture"],recommendation:"fixture"}]' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$MIXED_SYSTEMIC_SOURCE"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$MIXED_SYSTEMIC_SOURCE" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects systemic patterns mixing confirmed and plausible links"
+
+DUPLICATE_TASK_THREAD="$SELECTION_REPORT/duplicate-task-thread.json"
+jq '.task_list += [(.task_list[0] | .task = "Second task for same thread")]' \
+    "$SELECTION_REPORT/hybrid-analysis.json" > "$DUPLICATE_TASK_THREAD"
+rc=0
+(cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+    "$DUPLICATE_TASK_THREAD" >/dev/null 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "selection rejects one hosted thread assigned to multiple tasks"
+
 MISMATCHED_TASK_THREAD="$SELECTION_REPORT/mismatched-task-thread.json"
 jq '.task_list[0].thread_ids = ["PRRT_other"]' \
     "$SELECTION_REPORT/hybrid-analysis.json" > "$MISMATCHED_TASK_THREAD"
@@ -2938,6 +3217,11 @@ rm -f "$MISSING_TASK_LINK" "$UNKNOWN_TASK_LINK" \
     "$DUPLICATE_TASK_LINK" "$EMPTY_TASK_LINK" \
     "$SELECTION_REPORT/plausible-task.json" \
     "$SELECTION_REPORT/refuted-task.json" \
+    "$MISSING_SYSTEMIC_LINK" \
+    "$SELECTION_REPORT/plausible-systemic.json" \
+    "$SELECTION_REPORT/refuted-systemic.json" \
+    "$SINGLE_SYSTEMIC_LINK" "$EMPTY_SYSTEMIC_EVIDENCE" \
+    "$MIXED_SYSTEMIC_SOURCE" "$DUPLICATE_TASK_THREAD" \
     "$MISMATCHED_TASK_THREAD" "$UNKNOWN_TASK_THREAD"
 
 # Rendering can outlive the initial head/workspace checks. Mutate the tracked

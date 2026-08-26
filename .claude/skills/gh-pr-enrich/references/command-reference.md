@@ -46,7 +46,7 @@ gh pr-enrich <SUBCOMMAND> [ARGS]
 
 | Subcommand | Description |
 |------------|-------------|
-| `install-skill [--runtime codex\|claude\|both]` | Install one canonical skill into `~/.codex/skills/` and/or `~/.claude/skills/` (default: both) |
+| `install-skill [--runtime codex\|claude\|both]` | Install one canonical skill under `${CODEX_HOME:-$HOME/.codex}/skills/` and/or `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/` (default: both) |
 | `uninstall-skill [--runtime codex\|claude\|both]` | Remove selected runtime registrations |
 | `select-analysis <REPORT_DIR> <SOURCE_JSON>` | Recheck the hosted PR head, promote a Codex, Claude, or hybrid result, and refresh all selected views |
 | `resolve <ID...>` | Resolve one or more review threads by GraphQL ID |
@@ -65,7 +65,7 @@ gh pr-enrich <SUBCOMMAND> [ARGS]
 | `--enrich` | Run external Claude analysis on unresolved threads and issue comments |
 | `--allow-external` | Authorize external Claude disclosure for private/internal/unknown visibility |
 | `--diff` | Fetch code diffs and include them in provider-neutral context; implies preparation |
-| `--sast` | Run a semgrep pre-pass on changed files; findings enter the analysis as deterministic ground truth |
+| `--sast` | Run a semgrep pre-pass on changed files; rule matches enter the analysis as evidence to verify |
 | `--no-code-access` | Deny the analyzer repository access (sandboxed runs). Findings can then only be `plausible` |
 | `--code-access` | Read the working tree even when it is not at the PR head. Findings may cite code this PR does not contain |
 | `--model NAME` | Model for the analysis (default: `sonnet`) |
@@ -87,6 +87,8 @@ gh pr-enrich <SUBCOMMAND> [ARGS]
 Automatic access also requires a clean tree with no ignored files. Generated
 report artifacts are excluded only after their directory is checked against the
 closed output allowlist; tracked changes inside an output directory still deny
+access. Tracked symlinks, gitlinks/submodules, and other non-regular index
+entries are not materialized; repositories containing them run without code
 access.
 
 `--code-access` (or `GH_PR_ENRICH_CODE_ACCESS=true`) overrides every denial above,

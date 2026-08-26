@@ -155,6 +155,8 @@ Each task_list entry must carry:
   issue_categories findings. Give every finding a unique non-empty finding_id.
   Never create a task for a plausible or refuted claim. Every task thread_id
   must also belong to one of its mapped confirmed findings.
+  A PRRT thread_id may appear in only one task. Consolidate all work for one
+  review thread into that task so address mode cannot resolve it prematurely.
 - file and line: where the change goes. Use the real path from the repository.
   For a task with no single site (a decision, a discussion, a follow-up), use
   file "n/a" and line 0.
@@ -175,8 +177,10 @@ checked to false so the caller knows to investigate it themselves.
 
 ## Also report
 
-- systemic_issues: patterns behind several findings, with the evidence that links
-  them and a recommendation that addresses the root cause.
+- systemic_issues: patterns behind several confirmed findings. Include at least
+  two exact finding_ids for every pattern, plus non-empty evidence that links them
+  and a recommendation that addresses the root cause. Never derive a systemic
+  pattern from plausible or refuted findings.
 - process_improvements: the lint rule, test, CI check or doc that would have
   caught these before review.
 - pr_template_suggestions: the checklist item that would have prompted the author

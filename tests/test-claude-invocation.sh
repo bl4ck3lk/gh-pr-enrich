@@ -2,7 +2,7 @@
 # Tests for how the analyzer is invoked and what it is allowed to do.
 #
 # Covers:
-#   - the analyzer can read the repository (Read/Grep/Glob) so it verifies
+#   - the analyzer can read only the immutable repository snapshot so it verifies
 #     claims against code instead of paraphrasing the diff
 #   - the model is configurable rather than hardcoded
 #   - the timeout matches the work being asked for
@@ -36,6 +36,8 @@ cat > "$STUB_DIR/claude" << 'STUB'
 printf '%s\n' "$@" > "$CLAUDE_ARG_LOG"
 [ -z "${CLAUDE_TIMEOUT_LOG:-}" ] || \
     printf '%s' "$GH_PR_ENRICH_ANALYZER_TIMEOUT_SECONDS" > "$CLAUDE_TIMEOUT_LOG"
+[ -z "${CLAUDE_MEMORY_ENV_LOG:-}" ] || \
+    printf '%s' "${CLAUDE_CODE_DISABLE_AUTO_MEMORY:-}" > "$CLAUDE_MEMORY_ENV_LOG"
 previous=""
 for argument in "$@"; do
     if [ "$previous" = "--settings" ]; then
@@ -44,6 +46,8 @@ for argument in "$@"; do
     fi
     previous="$argument"
 done
+[ -z "${CLAUDE_SNAPSHOT_READ_LOG:-}" ] || \
+    cat "${CLAUDE_SNAPSHOT_READ_PATH:-./secret.txt}" > "$CLAUDE_SNAPSHOT_READ_LOG"
 cat > /dev/null
 [ -z "${CLAUDE_STUB_DELAY:-}" ] || /bin/sleep "$CLAUDE_STUB_DELAY"
 echo "stub claude stderr line" >&2
@@ -207,6 +211,10 @@ rm "$CODE_ACCESS_REPO/.env"
 
 ln -s tracked.txt "$CODE_ACCESS_REPO/tracked-link"
 git -C "$CODE_ACCESS_REPO" add tracked-link
+TRACKED_LINK_ACCESS=$(cd "$CODE_ACCESS_REPO" && \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "$HEAD_SHA" "$TEST_OUTPUT_DIR")
+assert_contains "$TRACKED_LINK_ACCESS" "disabled: tracked symlinks" \
+    "tracked symlink repositories report the immutable-snapshot limitation"
 rc=0
 (cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
     code_access_workspace_fingerprint "$TEST_OUTPUT_DIR" >/dev/null 2>&1) || rc=$?
@@ -227,24 +235,80 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "nested repositories fail closed instead of hashing only their directory entry"
 rm -rf "$NESTED_REPO"
 
-git -C "$CODE_ACCESS_REPO" update-index --skip-worktree tracked.txt
-SKIP_WORKTREE_BASE=$(cd "$CODE_ACCESS_REPO" && \
-    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$TEST_OUTPUT_DIR")
-echo hidden-from-git-diff > "$CODE_ACCESS_REPO/tracked.txt"
-SKIP_WORKTREE_CHANGED=$(cd "$CODE_ACCESS_REPO" && \
-    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$TEST_OUTPUT_DIR")
-assert_true "$([ "$SKIP_WORKTREE_BASE" != "$SKIP_WORKTREE_CHANGED" ] && echo 0 || echo 1)" \
-    "skip-worktree cannot hide changed tracked bytes from the workspace fingerprint"
-cp "$CODE_ACCESS_REPO/tracked.txt" "$TEST_OUTPUT_DIR/tracked-before-missing.txt"
-rm "$CODE_ACCESS_REPO/tracked.txt"
-rc=0
-(cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
-    code_access_workspace_fingerprint "$TEST_OUTPUT_DIR" >/dev/null 2>&1) || rc=$?
-assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
-    "a missing skip-worktree path disables code access instead of omitting tracked code"
-cp "$TEST_OUTPUT_DIR/tracked-before-missing.txt" "$CODE_ACCESS_REPO/tracked.txt"
-git -C "$CODE_ACCESS_REPO" update-index --no-skip-worktree tracked.txt
-git -C "$CODE_ACCESS_REPO" checkout -- tracked.txt
+for HIDDEN_INDEX_MODE in assume-unchanged skip-worktree; do
+    case "$HIDDEN_INDEX_MODE" in
+        assume-unchanged)
+            git -C "$CODE_ACCESS_REPO" update-index --assume-unchanged tracked.txt
+            ;;
+        skip-worktree)
+            git -C "$CODE_ACCESS_REPO" update-index --skip-worktree tracked.txt
+            ;;
+    esac
+    printf 'PRIVATE_%s\n' "$HIDDEN_INDEX_MODE" > "$CODE_ACCESS_REPO/tracked.txt"
+    assert_eq "" "$(git -C "$CODE_ACCESS_REPO" status --porcelain)" \
+        "$HIDDEN_INDEX_MODE suppresses the modified tracked path from Git status"
+    HIDDEN_ACCESS=$(cd "$CODE_ACCESS_REPO" && \
+        "$GH_PR_ENRICH" --test-call resolve_code_access "$HEAD_SHA" "$TEST_OUTPUT_DIR")
+    assert_contains "$HIDDEN_ACCESS" "enabled:" \
+        "automatic exact-head access remains available with $HIDDEN_INDEX_MODE metadata"
+    HIDDEN_INDEX_FINGERPRINT=$(cd "$CODE_ACCESS_REPO" && \
+        "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint \
+            "$TEST_OUTPUT_DIR" "" git_index)
+    HIDDEN_WORKTREE_FINGERPRINT=$(cd "$CODE_ACCESS_REPO" && \
+        "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint \
+            "$TEST_OUTPUT_DIR" "" working_tree)
+    assert_true "$([ "$HIDDEN_INDEX_FINGERPRINT" != "$HIDDEN_WORKTREE_FINGERPRINT" ] && echo 0 || echo 1)" \
+        "automatic and explicit fingerprints distinguish hidden $HIDDEN_INDEX_MODE bytes"
+
+    HIDDEN_REPORT="$CODE_ACCESS_REPO/hidden-$HIDDEN_INDEX_MODE-report"
+    mkdir -p "$HIDDEN_REPORT"
+    jq -n --arg sha "$HEAD_SHA" \
+        --arg workspace_fingerprint "$HIDDEN_INDEX_FINGERPRINT" '{
+        pr: {title: "hidden tracked fixture"}, unresolved_threads: [], issue_comments: [],
+        coverage: {code_access: {
+            state: "enabled", reason: "automatic exact-head fixture",
+            pr_head_sha: $sha, inspected_sha: $sha, revision_matches: true,
+            snapshot_source: "git_index",
+            workspace_fingerprint: $workspace_fingerprint
+        }}
+    }' > "$HIDDEN_REPORT/context.tmp"
+    HIDDEN_CONTEXT_FINGERPRINT=$(
+        "$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+            "$HIDDEN_REPORT/context.tmp")
+    jq --arg fingerprint "$HIDDEN_CONTEXT_FINGERPRINT" \
+        '.coverage.context_fingerprint = $fingerprint' \
+        "$HIDDEN_REPORT/context.tmp" > "$HIDDEN_REPORT/analysis-context.json"
+    rm "$HIDDEN_REPORT/context.tmp"
+    HIDDEN_SNAPSHOT_JSON=$(cd "$CODE_ACCESS_REPO" && \
+        env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" materialize-analysis-snapshot "$HIDDEN_REPORT")
+    HIDDEN_SNAPSHOT_PATH=$(printf '%s' "$HIDDEN_SNAPSHOT_JSON" | jq -r '.path')
+    assert_eq "clean" "$(cat "$HIDDEN_SNAPSHOT_PATH/tracked.txt")" \
+        "automatic snapshots never disclose $HIDDEN_INDEX_MODE working-tree bytes"
+    env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" cleanup-analysis-snapshot "$HIDDEN_SNAPSHOT_PATH"
+    rm "$HIDDEN_REPORT/analysis-context.json"
+    rmdir "$HIDDEN_REPORT"
+
+    case "$HIDDEN_INDEX_MODE" in
+        assume-unchanged)
+            git -C "$CODE_ACCESS_REPO" update-index --no-assume-unchanged tracked.txt
+            ;;
+        skip-worktree)
+            cp "$CODE_ACCESS_REPO/tracked.txt" "$TEST_OUTPUT_DIR/tracked-before-missing.txt"
+            rm "$CODE_ACCESS_REPO/tracked.txt"
+            rc=0
+            (cd "$CODE_ACCESS_REPO" && "$GH_PR_ENRICH" --test-call \
+                code_access_workspace_fingerprint "$TEST_OUTPUT_DIR" "" git_index \
+                >/dev/null 2>&1) || rc=$?
+            assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+                "a missing skip-worktree path disables code access instead of omitting tracked code"
+            cp "$TEST_OUTPUT_DIR/tracked-before-missing.txt" "$CODE_ACCESS_REPO/tracked.txt"
+            git -C "$CODE_ACCESS_REPO" update-index --no-skip-worktree tracked.txt
+            ;;
+    esac
+    git -C "$CODE_ACCESS_REPO" checkout -- tracked.txt
+done
 
 WORKSPACE_FINGERPRINT=$(cd "$CODE_ACCESS_REPO" && \
     "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$TEST_OUTPUT_DIR")
@@ -253,6 +317,7 @@ jq -n --arg sha "$HEAD_SHA" --arg workspace_fingerprint "$WORKSPACE_FINGERPRINT"
     coverage: {code_access: {
         state: "enabled", reason: "fixture",
         pr_head_sha: $sha, inspected_sha: $sha, revision_matches: true,
+        snapshot_source: "git_index",
         workspace_fingerprint: $workspace_fingerprint
     }}
 }' > "$CONTEXT.tmp"
@@ -260,6 +325,20 @@ CONTEXT_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint "
 jq --arg fingerprint "$CONTEXT_FINGERPRINT" '.coverage.context_fingerprint = $fingerprint' \
     "$CONTEXT.tmp" > "$CONTEXT"
 rm "$CONTEXT.tmp"
+WORKTREE_CONTEXT="$TEST_OUTPUT_DIR/working-tree-context.json"
+WORKTREE_FINGERPRINT=$(cd "$CODE_ACCESS_REPO" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint \
+        "$TEST_OUTPUT_DIR" "" working_tree)
+jq --arg workspace_fingerprint "$WORKTREE_FINGERPRINT" '
+    .coverage.code_access.snapshot_source = "working_tree"
+    | .coverage.code_access.workspace_fingerprint = $workspace_fingerprint
+    | del(.coverage.context_fingerprint)' "$CONTEXT" > "$WORKTREE_CONTEXT.tmp"
+WORKTREE_CONTEXT_FINGERPRINT=$(
+    "$GH_PR_ENRICH" --test-call analysis_context_fingerprint "$WORKTREE_CONTEXT.tmp")
+jq --arg fingerprint "$WORKTREE_CONTEXT_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$WORKTREE_CONTEXT.tmp" > "$WORKTREE_CONTEXT"
+rm "$WORKTREE_CONTEXT.tmp"
 RESPONSE="$TEST_OUTPUT_DIR/response.json"
 
 NATIVE_REPORT="$CODE_ACCESS_REPO/report"
@@ -333,6 +412,7 @@ run_analysis_context() {
         ANALYZER_CONTEXT_COPY_LOG="$TEST_OUTPUT_DIR/context-copy-paths.txt" \
         CLAUDE_SETTINGS_LOG="$TEST_OUTPUT_DIR/claude-settings.json" \
         CLAUDE_SETTINGS_PATH_LOG="$TEST_OUTPUT_DIR/claude-settings-path.txt" \
+        CLAUDE_MEMORY_ENV_LOG="$TEST_OUTPUT_DIR/claude-memory-env.txt" \
         CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
         PATH="$STUB_DIR:$PATH" "$@" \
         "$GH_PR_ENRICH" --test-call run_claude_analysis "$context_file" "$RESPONSE" >/dev/null 2>&1) || true
@@ -342,6 +422,116 @@ run_analysis() {
     run_analysis_context "$CONTEXT" "$@"
 }
 
+# A clean/smudge filter can leave Git's index holding safe public bytes while
+# the checkout contains decrypted local plaintext. A clean status and matching
+# HEAD therefore authorize only the captured index objects, never the transformed
+# working-tree bytes, unless the workspace is actually dirty and explicitly
+# overridden.
+FILTERED_REPO="$TEST_OUTPUT_DIR/filtered-code-access-repo"
+FILTERED_REPORT="$FILTERED_REPO/report"
+FILTERED_CONTEXT="$FILTERED_REPORT/analysis-context.json"
+FILTERED_RESPONSE="$TEST_OUTPUT_DIR/filtered-response.json"
+FILTERED_READ_LOG="$TEST_OUTPUT_DIR/filtered-snapshot-read.txt"
+FILTERED_CLEAN_LOG="$TEST_OUTPUT_DIR/filtered-clean-invocation.txt"
+mkdir -p "$FILTERED_REPO" "$FILTERED_REPORT"
+(
+    cd "$FILTERED_REPO"
+    git init -q .
+    git config user.email t@t
+    git config user.name t
+    git config filter.snapshot-secret.clean "sed 's/^PLAINTEXT_SECRET$/SEALED/'"
+    git config filter.snapshot-secret.smudge "sed 's/^SEALED$/PLAINTEXT_SECRET/'"
+    printf 'secret.txt filter=snapshot-secret\n' > .gitattributes
+    printf 'PLAINTEXT_SECRET\n' > secret.txt
+    git add .gitattributes secret.txt
+    git commit -qm init
+)
+FILTERED_HEAD=$(git -C "$FILTERED_REPO" rev-parse HEAD)
+assert_eq "" "$(git -C "$FILTERED_REPO" status --porcelain)" \
+    "a transformed checkout remains Git-clean at the captured PR head"
+assert_eq "SEALED" "$(git -C "$FILTERED_REPO" show HEAD:secret.txt)" \
+    "the captured Git blob contains only the safe indexed bytes"
+assert_eq "PLAINTEXT_SECRET" "$(cat "$FILTERED_REPO/secret.txt")" \
+    "the smudge filter exposes different local plaintext in the checkout"
+git -C "$FILTERED_REPO" config filter.snapshot-secret.clean \
+    "sh -c 'printf called > \"$FILTERED_CLEAN_LOG\"; sed \"s/^PLAINTEXT_SECRET$/SEALED/\"'"
+FILTERED_WORKSPACE_FINGERPRINT=$(cd "$FILTERED_REPO" && \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$FILTERED_REPORT")
+assert_true "$([ ! -e "$FILTERED_CLEAN_LOG" ] && echo 0 || echo 1)" \
+    "automatic fingerprinting never invokes a working-tree clean filter"
+jq -n --arg sha "$FILTERED_HEAD" \
+    --arg workspace_fingerprint "$FILTERED_WORKSPACE_FINGERPRINT" '{
+    pr: {title: "filtered fixture"}, unresolved_threads: [], issue_comments: [],
+    coverage: {code_access: {
+        state: "enabled", reason: "automatic clean exact-head fixture",
+        pr_head_sha: $sha, inspected_sha: $sha, revision_matches: true,
+        snapshot_source: "git_index",
+        workspace_fingerprint: $workspace_fingerprint
+    }}
+}' > "$FILTERED_CONTEXT.tmp"
+FILTERED_CONTEXT_FINGERPRINT=$(
+    "$GH_PR_ENRICH" --test-call analysis_context_fingerprint "$FILTERED_CONTEXT.tmp")
+jq --arg fingerprint "$FILTERED_CONTEXT_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$FILTERED_CONTEXT.tmp" > "$FILTERED_CONTEXT"
+rm "$FILTERED_CONTEXT.tmp"
+(
+    cd "$FILTERED_REPO"
+    env CLAUDE_ARG_LOG="$ARG_LOG" \
+        CLAUDE_SETTINGS_LOG="$TEST_OUTPUT_DIR/filtered-claude-settings.json" \
+        CLAUDE_SETTINGS_PATH_LOG="$TEST_OUTPUT_DIR/filtered-claude-settings-path.txt" \
+        CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/filtered-timeout.txt" \
+        CLAUDE_SNAPSHOT_READ_LOG="$FILTERED_READ_LOG" \
+        PATH="$STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" --test-call run_claude_analysis \
+            "$FILTERED_CONTEXT" "$FILTERED_RESPONSE" >/dev/null 2>&1
+)
+assert_eq "SEALED" "$(cat "$FILTERED_READ_LOG" 2>/dev/null || echo "")" \
+    "automatic external snapshots materialize indexed bytes instead of smudged plaintext"
+assert_true "$([ ! -e "$FILTERED_CLEAN_LOG" ] && echo 0 || echo 1)" \
+    "automatic snapshot validation never invokes a working-tree clean filter"
+
+FILTERED_EXPLICIT_CONTEXT="$FILTERED_CONTEXT"
+FILTERED_EXPLICIT_READ_LOG="$TEST_OUTPUT_DIR/filtered-explicit-snapshot-read.txt"
+FILTERED_EXPLICIT_WORKSPACE_FINGERPRINT=$(cd "$FILTERED_REPO" && \
+    GH_PR_ENRICH_CODE_ACCESS=true \
+    "$GH_PR_ENRICH" --test-call code_access_workspace_fingerprint "$FILTERED_REPORT")
+jq --arg workspace_fingerprint "$FILTERED_EXPLICIT_WORKSPACE_FINGERPRINT" \
+    '.coverage.code_access.workspace_fingerprint = $workspace_fingerprint
+     | .coverage.code_access.snapshot_source = "working_tree"
+     | .coverage.code_access.reason = "explicit filtered-worktree fixture"
+     | del(.coverage.context_fingerprint)' \
+    "$FILTERED_CONTEXT" > "$FILTERED_EXPLICIT_CONTEXT.tmp"
+FILTERED_EXPLICIT_CONTEXT_FINGERPRINT=$(
+    "$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+        "$FILTERED_EXPLICIT_CONTEXT.tmp")
+jq --arg fingerprint "$FILTERED_EXPLICIT_CONTEXT_FINGERPRINT" \
+    '.coverage.context_fingerprint = $fingerprint' \
+    "$FILTERED_EXPLICIT_CONTEXT.tmp" > "$FILTERED_EXPLICIT_CONTEXT"
+rm "$FILTERED_EXPLICIT_CONTEXT.tmp"
+(
+    cd "$FILTERED_REPO"
+    env GH_PR_ENRICH_CODE_ACCESS=true CLAUDE_ARG_LOG="$ARG_LOG" \
+        CLAUDE_SETTINGS_LOG="$TEST_OUTPUT_DIR/filtered-explicit-claude-settings.json" \
+        CLAUDE_SETTINGS_PATH_LOG="$TEST_OUTPUT_DIR/filtered-explicit-claude-settings-path.txt" \
+        CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/filtered-explicit-timeout.txt" \
+        CLAUDE_SNAPSHOT_READ_LOG="$FILTERED_EXPLICIT_READ_LOG" \
+        PATH="$STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" --test-call run_claude_analysis \
+            "$FILTERED_EXPLICIT_CONTEXT" "$FILTERED_RESPONSE" >/dev/null 2>&1
+)
+assert_eq "PLAINTEXT_SECRET" \
+    "$(cat "$FILTERED_EXPLICIT_READ_LOG" 2>/dev/null || echo "")" \
+    "explicit code access includes the operator-authorized smudged working-tree bytes"
+FILTERED_NATIVE_SNAPSHOT_JSON=$(cd "$FILTERED_REPO" && \
+    env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" materialize-analysis-snapshot "$FILTERED_REPORT")
+FILTERED_NATIVE_SNAPSHOT_PATH=$(printf '%s' "$FILTERED_NATIVE_SNAPSHOT_JSON" | jq -r '.path')
+assert_eq "PLAINTEXT_SECRET" "$(cat "$FILTERED_NATIVE_SNAPSHOT_PATH/secret.txt")" \
+    "fresh native materialization reconstructs the persisted explicit working-tree grant"
+env PS_CALLED_LOG="$PS_CALLED_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" cleanup-analysis-snapshot "$FILTERED_NATIVE_SNAPSHOT_PATH"
+
 # ---------------------------------------------------------------------------
 # Code access
 # ---------------------------------------------------------------------------
@@ -350,8 +540,8 @@ ARGS=$(cat "$ARG_LOG" 2>/dev/null || echo "")
 
 assert_contains "$ARGS" "--allowedTools" "analyzer is granted tools by default"
 assert_contains "$ARGS" "Read(./**)" "analyzer read access is scoped to the snapshot"
-assert_contains "$ARGS" "Grep" "analyzer may grep the repository"
-assert_contains "$ARGS" "Glob" "analyzer may glob the repository"
+assert_not_contains "$ARGS" "Grep" "analyzer cannot grep arbitrary filesystem paths"
+assert_not_contains "$ARGS" "Glob" "analyzer cannot glob arbitrary filesystem paths"
 assert_not_contains "$ARGS" "Bash" "analyzer is not granted Bash"
 assert_not_contains "$ARGS" "Write" "analyzer is not granted Write"
 assert_not_contains "$ARGS" "Edit" "analyzer is not granted Edit"
@@ -360,12 +550,20 @@ assert_contains "$ARGS" "--tools" "the available Claude tools are explicitly res
 assert_contains "$ARGS" "--permission-mode" "Claude cannot pause for permission prompts"
 assert_contains "$ARGS" "dontAsk" "Claude uses the non-interactive permission mode"
 assert_contains "$ARGS" "--no-session-persistence" "Claude analysis does not persist a session"
+assert_contains "$ARGS" "--safe-mode" \
+    "Claude disables repository instructions, hooks, plugins, skills, and MCP"
+assert_contains "$ARGS" "--disallowedTools" \
+    "Claude explicitly denies every MCP tool in addition to safe mode"
+assert_contains "$ARGS" "mcp__*" \
+    "Claude's MCP deny rule covers every MCP server namespace"
+assert_eq "1" "$(cat "$TEST_OUTPUT_DIR/claude-memory-env.txt")" \
+    "Claude auto memory is disabled for untrusted PR analysis"
 TOOLS_ARGS=$(awk '/^--tools$/{capture=1;next} /^--allowedTools$/{capture=0} capture' "$ARG_LOG")
 ALLOWED_ARGS=$(awk '/^--allowedTools$/{capture=1;next} /^--settings$/{capture=0} capture' "$ARG_LOG")
-assert_eq $'Read\nGrep\nGlob' "$TOOLS_ARGS" \
-    "Claude --tools receives only bare built-in tool names"
-assert_eq $'Read(./**)\nGrep\nGlob' "$ALLOWED_ARGS" \
-    "Claude --allowedTools scopes Read to the immutable snapshot"
+assert_eq 'Read' "$TOOLS_ARGS" \
+    "Claude --tools exposes only the built-in Read tool"
+assert_eq 'Read(./**)' "$ALLOWED_ARGS" \
+    "Claude --allowedTools scopes every file read to the immutable snapshot"
 EXPECTED_DENY="Read(//${CODE_ACCESS_REPO#/}/**)"
 rc=0
 jq -e --arg expected "$EXPECTED_DENY" \
@@ -405,7 +603,8 @@ echo pre-run-mutation >> "$CODE_ACCESS_REPO/tracked.txt"
 rc=0
 PRE_RUN_MISMATCH=$(cd "$CODE_ACCESS_REPO" && env CLAUDE_ARG_LOG="$ARG_LOG" \
     CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" PATH="$STUB_DIR:$PATH" \
-    "$GH_PR_ENRICH" --test-call run_claude_analysis "$CONTEXT" "$RESPONSE" 2>&1) || rc=$?
+    "$GH_PR_ENRICH" --test-call run_claude_analysis \
+        "$WORKTREE_CONTEXT" "$RESPONSE" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "an enabled context fails closed when code access is withheld before the run"
 assert_contains "$PRE_RUN_MISMATCH" "no longer matches the fingerprinted context" \
@@ -539,7 +738,8 @@ rm -f "$RESPONSE"
 rc=0
 DURING_RUN_MISMATCH=$(cd "$CODE_ACCESS_REPO" && env MUTATION_TARGET="$CODE_ACCESS_REPO/tracked.txt" \
     CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" PATH="$MUTATION_STUB_DIR:$PATH" \
-    "$GH_PR_ENRICH" --test-call run_claude_analysis "$CONTEXT" "$RESPONSE" 2>&1) || rc=$?
+    "$GH_PR_ENRICH" --test-call run_claude_analysis \
+        "$WORKTREE_CONTEXT" "$RESPONSE" 2>&1) || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "an analyzer response is rejected when the workspace changes during the run"
 assert_contains "$DURING_RUN_MISMATCH" "workspace changed during Claude analysis" \
@@ -634,6 +834,84 @@ assert_true "$([ -n "$TERMINATED_CHILD" ] && ! kill -0 "$TERMINATED_CHILD" 2>/de
     "TERM reaps the analyzer descendant without leaking a child process"
 assert_eq "" "$(cat "$PS_CALLED_LOG")" \
     "analyzer cancellation and janitor cleanup do not require process-table discovery"
+
+# Both background jobs have a fork-to-PID-publication boundary. A DEBUG hook
+# delivers TERM immediately before each assignment so cleanup must defer until
+# the exact owned PID is available, then terminate and reap it.
+ANALYZER_GAP_STUB_DIR="$TEST_OUTPUT_DIR/analyzer-gap-stubs"
+ANALYZER_GAP_BASH_ENV="$TEST_OUTPUT_DIR/analyzer-gap-bash-env"
+mkdir -p "$ANALYZER_GAP_STUB_DIR"
+cat > "$ANALYZER_GAP_STUB_DIR/claude" << 'STUB'
+#!/bin/bash
+cat > /dev/null
+trap '' TERM INT
+while true; do sleep 0.05; done
+STUB
+cat > "$ANALYZER_GAP_BASH_ENV" << 'STUB'
+__gh_pr_enrich_analyzer_gap_debug() {
+    if [ "$BASH_COMMAND" = 'ANALYZER_HEARTBEAT_PID=$!' ]; then
+        printf '%s\n' "$!" > "$ANALYZER_GAP_HEARTBEAT_PID_FILE"
+    fi
+    if [ "$BASH_COMMAND" = "$ANALYZER_GAP_TARGET" ] && \
+       [ ! -e "$ANALYZER_GAP_MARKER" ]; then
+        printf '%s\n' "$!" > "$ANALYZER_GAP_TARGET_PID_FILE"
+        : > "$ANALYZER_GAP_MARKER"
+        kill -TERM "$$"
+    fi
+}
+set -T
+trap '__gh_pr_enrich_analyzer_gap_debug' DEBUG
+STUB
+chmod +x "$ANALYZER_GAP_STUB_DIR/claude"
+
+for ANALYZER_GAP_KIND in heartbeat heartbeat-sleep child claude-child \
+        timeout-watcher timeout-sleep; do
+    ANALYZER_GAP_MARKER="$TEST_OUTPUT_DIR/analyzer-$ANALYZER_GAP_KIND-gap-fired"
+    ANALYZER_GAP_TARGET_PID_FILE="$TEST_OUTPUT_DIR/analyzer-$ANALYZER_GAP_KIND-target.pid"
+    ANALYZER_GAP_HEARTBEAT_PID_FILE="$TEST_OUTPUT_DIR/analyzer-$ANALYZER_GAP_KIND-heartbeat.pid"
+    case "$ANALYZER_GAP_KIND" in
+        heartbeat) ANALYZER_GAP_TARGET='ANALYZER_HEARTBEAT_PID=$!' ;;
+        heartbeat-sleep) ANALYZER_GAP_TARGET='heartbeat_sleep_pid=$!' ;;
+        child) ANALYZER_GAP_TARGET='ANALYZER_CHILD_PID=$!' ;;
+        claude-child) ANALYZER_GAP_TARGET='claude_pid=$!' ;;
+        timeout-watcher) ANALYZER_GAP_TARGET='timeout_watcher_pid=$!' ;;
+        timeout-sleep) ANALYZER_GAP_TARGET='watcher_sleep_pid=$!' ;;
+    esac
+    rm -f "$ANALYZER_GAP_MARKER" "$ANALYZER_GAP_TARGET_PID_FILE" \
+        "$ANALYZER_GAP_HEARTBEAT_PID_FILE" "$RESPONSE"
+    rc=0
+    (cd "$CODE_ACCESS_REPO" && env \
+        BASH_ENV="$ANALYZER_GAP_BASH_ENV" \
+        ANALYZER_GAP_TARGET="$ANALYZER_GAP_TARGET" \
+        ANALYZER_GAP_MARKER="$ANALYZER_GAP_MARKER" \
+        ANALYZER_GAP_TARGET_PID_FILE="$ANALYZER_GAP_TARGET_PID_FILE" \
+        ANALYZER_GAP_HEARTBEAT_PID_FILE="$ANALYZER_GAP_HEARTBEAT_PID_FILE" \
+        CLAUDE_TIMEOUT_LOG="$TEST_OUTPUT_DIR/timeout.txt" \
+        PATH="$ANALYZER_GAP_STUB_DIR:$STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" --test-call run_claude_analysis \
+            "$CONTEXT" "$RESPONSE" >/dev/null 2>&1) || rc=$?
+    assert_true "$([ -e "$ANALYZER_GAP_MARKER" ] && echo 0 || echo 1)" \
+        "$ANALYZER_GAP_KIND launch-gap fixture reaches PID publication"
+    assert_eq "143" "$rc" \
+        "$ANALYZER_GAP_KIND launch-gap cancellation preserves TERM status"
+    ANALYZER_GAP_TARGET_PID=$(cat "$ANALYZER_GAP_TARGET_PID_FILE")
+    for (( _attempt=0; _attempt < 100; _attempt++ )); do
+        ! kill -0 "$ANALYZER_GAP_TARGET_PID" 2>/dev/null && break
+        sleep 0.02
+    done
+    assert_true "$(! kill -0 "$ANALYZER_GAP_TARGET_PID" 2>/dev/null && echo 0 || echo 1)" \
+        "$ANALYZER_GAP_KIND launch-gap cancellation reaps its target"
+    ANALYZER_GAP_HEARTBEAT_PID=$(cat \
+        "$ANALYZER_GAP_HEARTBEAT_PID_FILE" 2>/dev/null || echo "")
+    for (( _attempt=0; _attempt < 100; _attempt++ )); do
+        [ -z "$ANALYZER_GAP_HEARTBEAT_PID" ] || \
+            ! kill -0 "$ANALYZER_GAP_HEARTBEAT_PID" 2>/dev/null && break
+        sleep 0.02
+    done
+    assert_true "$([ -z "$ANALYZER_GAP_HEARTBEAT_PID" ] || \
+        ! kill -0 "$ANALYZER_GAP_HEARTBEAT_PID" 2>/dev/null && echo 0 || echo 1)" \
+        "$ANALYZER_GAP_KIND launch-gap cancellation leaves no heartbeat"
+done
 
 RACE_CONTEXT="$TEST_OUTPUT_DIR/race-context.json"
 cp "$CONTEXT" "$RACE_CONTEXT"
@@ -915,6 +1193,9 @@ assert_jq "$REV_DIR/claude-context.json" '.coverage.code_access.revision_matches
 assert_jq "$REV_DIR/claude-context.json" \
     '(.coverage.code_access.workspace_fingerprint // "") | startswith("sha256:")' \
     "coverage fingerprints the exact workspace granted to the analyzer"
+assert_jq "$REV_DIR/claude-context.json" \
+    '.coverage.code_access.snapshot_source == "git_index"' \
+    "coverage persists the automatic indexed-blob snapshot source"
 
 # ---------------------------------------------------------------------------
 # Failure paths must be diagnosable, and must not leak shell internals
@@ -1680,5 +1961,83 @@ assert_jq_eq "$FORGED_DIFF_DIR/pr-diff.json" '.file_diffs | length' "1" \
     "patch content containing diff --git cannot fabricate another changed file"
 assert_jq "$FORGED_DIFF_DIR/diff-status.json" '.status == "completed"' \
     "line-anchored diff parsing preserves valid one-file coverage"
+
+# Git quotes paths containing whitespace, quotes, backslashes, and non-ASCII
+# bytes in unified diff headers. File identity comes from Git's own parser and
+# must match the exact PR summary path set before coverage is called complete.
+QUOTED_DIFF_DIR="$TEST_OUTPUT_DIR/quoted-diff-paths"
+QUOTED_DIFF_REPO="$QUOTED_DIFF_DIR/repo"
+QUOTED_DIFF_STUBS="$QUOTED_DIFF_DIR/stubs"
+QUOTED_DIFF_FIXTURE="$QUOTED_DIFF_DIR/fixture.diff"
+mkdir -p "$QUOTED_DIFF_REPO/docs" "$QUOTED_DIFF_STUBS"
+git -C "$QUOTED_DIFF_REPO" init -q
+git -C "$QUOTED_DIFF_REPO" config user.email t@t
+git -C "$QUOTED_DIFF_REPO" config user.name t
+QUOTED_PATH_SPACE='docs/plan file.md'
+QUOTED_PATH_TAB=$'docs/tab\tfile.md'
+QUOTED_PATH_QUOTE='docs/quote"file.md'
+QUOTED_PATH_BACKSLASH='docs/back\slash.md'
+QUOTED_PATH_UNICODE='docs/résumé.md'
+for path in "$QUOTED_PATH_SPACE" "$QUOTED_PATH_TAB" "$QUOTED_PATH_QUOTE" \
+        "$QUOTED_PATH_BACKSLASH" "$QUOTED_PATH_UNICODE"; do
+    printf 'before\n' > "$QUOTED_DIFF_REPO/$path"
+done
+git -C "$QUOTED_DIFF_REPO" add docs
+git -C "$QUOTED_DIFF_REPO" -c commit.gpgsign=false commit -qm fixture
+for path in "$QUOTED_PATH_SPACE" "$QUOTED_PATH_TAB" "$QUOTED_PATH_QUOTE" \
+        "$QUOTED_PATH_BACKSLASH" "$QUOTED_PATH_UNICODE"; do
+    printf 'after\n' > "$QUOTED_DIFF_REPO/$path"
+done
+git -C "$QUOTED_DIFF_REPO" -c core.quotePath=true --no-pager diff --no-color \
+    > "$QUOTED_DIFF_FIXTURE"
+cat > "$QUOTED_DIFF_STUBS/gh" << 'STUB'
+#!/bin/bash
+if [ "$1 $2" = "pr diff" ]; then
+    cat "$QUOTED_DIFF_FIXTURE"
+    exit 0
+fi
+exit 1
+STUB
+chmod +x "$QUOTED_DIFF_STUBS/gh"
+jq -n --arg a "$QUOTED_PATH_SPACE" --arg b "$QUOTED_PATH_TAB" \
+    --arg c "$QUOTED_PATH_QUOTE" --arg d "$QUOTED_PATH_BACKSLASH" \
+    --arg e "$QUOTED_PATH_UNICODE" \
+    '{changedFiles:5,files:[$a,$b,$c,$d,$e] | map({path:.})}' \
+    > "$QUOTED_DIFF_DIR/pr-summary.json"
+PATH="$QUOTED_DIFF_STUBS:$PATH" QUOTED_DIFF_FIXTURE="$QUOTED_DIFF_FIXTURE" \
+    "$GH_PR_ENRICH" --test-call fetch_pr_diff "$QUOTED_DIFF_DIR" 1 \
+    >/dev/null 2>&1 || true
+assert_jq "$QUOTED_DIFF_DIR/diff-status.json" '.status == "completed"' \
+    "Git-quoted diff paths retain complete coverage"
+assert_true "$(jq -e -s '
+    ([.[0].file_diffs[].file] | sort) == ([.[1].files[].path] | sort)
+' "$QUOTED_DIFF_DIR/pr-diff.json" "$QUOTED_DIFF_DIR/pr-summary.json" \
+    >/dev/null 2>&1 && echo 0 || echo 1)" \
+    "structured diff paths exactly match spaces, tabs, quotes, backslashes, and non-ASCII names"
+
+MISMATCHED_DIFF_DIR="$TEST_OUTPUT_DIR/mismatched-diff-paths"
+mkdir -p "$MISMATCHED_DIFF_DIR"
+jq --arg wrong 'docs/a-different-file.md' \
+    '.files[0].path = $wrong' "$QUOTED_DIFF_DIR/pr-summary.json" \
+    > "$MISMATCHED_DIFF_DIR/pr-summary.json"
+PATH="$QUOTED_DIFF_STUBS:$PATH" QUOTED_DIFF_FIXTURE="$QUOTED_DIFF_FIXTURE" \
+    "$GH_PR_ENRICH" --test-call fetch_pr_diff "$MISMATCHED_DIFF_DIR" 1 \
+    >/dev/null 2>&1 || true
+assert_jq "$MISMATCHED_DIFF_DIR/diff-status.json" \
+    '.status == "failed" and
+     .reason == "Normalized diff paths do not match the PR summary paths"' \
+    "equal-count diff coverage rejects a different exact path set"
+
+DUPLICATE_DIFF_DIR="$TEST_OUTPUT_DIR/duplicate-summary-diff-paths"
+mkdir -p "$DUPLICATE_DIFF_DIR"
+jq '.files[1].path = .files[0].path' "$QUOTED_DIFF_DIR/pr-summary.json" \
+    > "$DUPLICATE_DIFF_DIR/pr-summary.json"
+PATH="$QUOTED_DIFF_STUBS:$PATH" QUOTED_DIFF_FIXTURE="$QUOTED_DIFF_FIXTURE" \
+    "$GH_PR_ENRICH" --test-call fetch_pr_diff "$DUPLICATE_DIFF_DIR" 1 \
+    >/dev/null 2>&1 || true
+assert_jq "$DUPLICATE_DIFF_DIR/diff-status.json" \
+    '.status == "failed" and
+     .reason == "Normalized diff paths do not match the PR summary paths"' \
+    "duplicate summary paths cannot satisfy exact diff coverage by count"
 
 suite_end

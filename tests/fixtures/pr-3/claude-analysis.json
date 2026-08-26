@@ -44,6 +44,9 @@
   "systemic_issues": [
     {
       "pattern": "Inconsistent error handling",
+      "finding_ids": [
+        "unbounded-report-query"
+      ],
       "evidence": [
         "Thread PRRT_test4: unhandled rejection"
       ],

@@ -21,6 +21,28 @@
       "thread_ids": [
         "PRRT_test1"
       ]
+    },
+    {
+      "finding_id": "missing-api-timeout-handling",
+      "name": "Missing timeout handling in API calls",
+      "category": "error_handling",
+      "verdict": "confirmed",
+      "confidence": "high",
+      "severity": "high",
+      "impact": "moderate",
+      "likelihood": "likely",
+      "severity_rationale": "A stalled upstream can hold the request open until infrastructure termination.",
+      "description": "fetchUser() has no bounded timeout path.",
+      "evidence": [
+        {
+          "file": "src/api.js",
+          "line": 22,
+          "detail": "fetch call has no abort signal"
+        }
+      ],
+      "thread_ids": [
+        "PRRT_test1"
+      ]
     }
   ],
   "category_coverage": [
@@ -44,6 +66,10 @@
   "systemic_issues": [
     {
       "pattern": "Inconsistent error handling",
+      "finding_ids": [
+        "missing-api-error-handling",
+        "missing-api-timeout-handling"
+      ],
       "evidence": [
         "Thread PRRT_test1: missing try/catch"
       ],
