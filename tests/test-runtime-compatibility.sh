@@ -1341,7 +1341,10 @@ if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
                 : > "$VISIBILITY_SIGNAL_READY"
                 trap '' TERM INT
                 /bin/sleep 0.2
-                kill -"$VISIBILITY_SIGNAL" "$PPID"
+                visibility_signal_owner=$(cat \
+                    "$VISIBILITY_SIGNAL_OWNER_PID_FILE" 2>/dev/null || echo "")
+                [ -n "$visibility_signal_owner" ] || exit 1
+                kill -"$VISIBILITY_SIGNAL" "$visibility_signal_owner"
                 while true; do sleep 0.05; done
             fi
             [ "${LIVE_VISIBILITY_QUERY_FAIL_REPO:-}" != "o/r" ] || exit 1
@@ -2545,6 +2548,7 @@ cat > "$VISIBILITY_SIGNAL_BASH_ENV" << 'STUB'
 __gh_pr_enrich_visibility_watchdog_debug() {
     if [ "$BASH_COMMAND" = 'REPORT_RUN_WATCHDOG_PID=$!' ]; then
         printf '%s\n' "$!" >> "$VISIBILITY_SIGNAL_WATCHDOG_PID_FILE"
+        printf '%s\n' "${BASHPID:-$$}" > "$VISIBILITY_SIGNAL_OWNER_PID_FILE"
     fi
 }
 set -T
@@ -2558,6 +2562,7 @@ for VISIBILITY_SIGNAL in INT TERM; do
     VISIBILITY_SIGNAL_READY="$VISIBILITY_SIGNAL_DIR/request-ready"
     VISIBILITY_SIGNAL_CHILD_PID_FILE="$VISIBILITY_SIGNAL_DIR/request.pid"
     VISIBILITY_SIGNAL_WATCHDOG_PID_FILE="$VISIBILITY_SIGNAL_DIR/watchdog.pid"
+    VISIBILITY_SIGNAL_OWNER_PID_FILE="$VISIBILITY_SIGNAL_DIR/owner.pid"
     VISIBILITY_SIGNAL_CLAUDE_LOG="$VISIBILITY_SIGNAL_DIR/claude.txt"
     mkdir -p "$VISIBILITY_SIGNAL_TMP"
     rc=0
@@ -2569,6 +2574,7 @@ for VISIBILITY_SIGNAL in INT TERM; do
         VISIBILITY_SIGNAL_READY="$VISIBILITY_SIGNAL_READY" \
         VISIBILITY_SIGNAL_CHILD_PID_FILE="$VISIBILITY_SIGNAL_CHILD_PID_FILE" \
         VISIBILITY_SIGNAL_WATCHDOG_PID_FILE="$VISIBILITY_SIGNAL_WATCHDOG_PID_FILE" \
+        VISIBILITY_SIGNAL_OWNER_PID_FILE="$VISIBILITY_SIGNAL_OWNER_PID_FILE" \
         CLAUDE_INVOKED_LOG="$VISIBILITY_SIGNAL_CLAUDE_LOG" \
         "$GH_PR_ENRICH" 1 --enrich --output-dir "$VISIBILITY_SIGNAL_DIR/report" \
         >/dev/null 2>&1 || rc=$?
