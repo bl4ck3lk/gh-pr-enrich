@@ -179,7 +179,7 @@ CANCEL_DESCENDANT_PID_FILE="$TEST_OUTPUT_DIR/cancel-descendant.pid"
 CANCEL_TERM_MARKER="$TEST_OUTPUT_DIR/cancel-term"
 mkdir -p "$CANCEL_DIR"
 env PATH="$STUB_DIR:$PATH" TMPDIR="$CANCEL_DIR" BASH_ENV="$DEBUG_ENV" \
-    GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
+    GH_PR_ENRICH_GITHUB_TIMEOUT=30 \
     REPORT_TEST_SUPERVISOR_PID_FILE="$CANCEL_SUPERVISOR_PID_FILE" \
     REPORT_TEST_WATCHDOG_PID_FILE="$CANCEL_WATCHDOG_PID_FILE" \
     "$GH_PR_ENRICH" --test-call exercise_report_run_watchdog cancel \
@@ -187,7 +187,13 @@ env PATH="$STUB_DIR:$PATH" TMPDIR="$CANCEL_DIR" BASH_ENV="$DEBUG_ENV" \
         "$CANCEL_TERM_MARKER" >/dev/null 2>&1 &
 BACKGROUND_PID=$!
 CANCEL_DESCENDANT_PID=$(pid_file_value "$CANCEL_DESCENDANT_PID_FILE")
-kill -TERM "$BACKGROUND_PID"
+if [ -n "$CANCEL_DESCENDANT_PID" ] && \
+        kill -0 "$BACKGROUND_PID" 2>/dev/null; then
+    assert_true 0 "managed cancellation waits for the command descendant"
+    kill -TERM "$BACKGROUND_PID" 2>/dev/null || true
+else
+    assert_true 1 "managed cancellation waits for the command descendant"
+fi
 rc=0
 wait "$BACKGROUND_PID" || rc=$?
 BACKGROUND_PID=""
