@@ -1750,14 +1750,18 @@ LOCAL_WORKSPACE_FINGERPRINT=$(cd "$LOCAL_MUTATION_WS" && \
         .reports/pr-reviews/pr-999)
 LOCAL_INTENT_FINGERPRINT="$(write_fixture_intent_inputs \
     "$LOCAL_MUTATION_REPORT")"
+LOCAL_DISCUSSION_FINGERPRINT="$(write_fixture_discussion_inputs \
+    "$LOCAL_MUTATION_REPORT" '["PRRT_local"]')"
 jq -n --arg workspace_fingerprint "$LOCAL_WORKSPACE_FINGERPRINT" \
     --arg intent_fingerprint "$LOCAL_INTENT_FINGERPRINT" \
+    --arg discussion_fingerprint "$LOCAL_DISCUSSION_FINGERPRINT" \
     '{pr:{repository:"o/r",number:999,base_sha:"captured-base",
         base_ref_name:"main",
         title:"Fixture PR",body:"captured intent"},
     unresolved_threads:[{thread_id:"PRRT_local",comments_complete:true,
         comment_identity:[]}],coverage:{
-        intent:{fingerprint:$intent_fingerprint},code_access:{
+        intent:{fingerprint:$intent_fingerprint},
+        discussion:{fingerprint:$discussion_fingerprint},code_access:{
             state:"enabled",pr_head_sha:"captured-head",
             snapshot_source:"git_index",
             workspace_fingerprint:$workspace_fingerprint}}}' \

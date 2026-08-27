@@ -6970,7 +6970,7 @@ if [ "$1" = "resolve" ]; then
         # Validate thread ID format (PRRT_ prefix + base64-safe characters)
         if [[ ! "$THREAD_ID" =~ ^PRRT_[A-Za-z0-9_-]+$ ]]; then
             echo "⚠️  Skipping invalid thread ID: $THREAD_ID (must start with PRRT_ followed by valid characters)"
-            ((FAILED++))
+            FAILED=$((FAILED + 1))
             continue
         fi
 
@@ -6985,11 +6985,11 @@ if [ "$1" = "resolve" ]; then
 
         if echo "$RESULT" | jq -e '.data.resolveReviewThread.thread.isResolved' > /dev/null 2>&1; then
             echo "✅ Resolved: $THREAD_ID"
-            ((RESOLVED++))
+            RESOLVED=$((RESOLVED + 1))
         else
             ERROR=$(echo "$RESULT" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "$RESULT")
             echo "❌ Failed to resolve $THREAD_ID: $ERROR"
-            ((FAILED++))
+            FAILED=$((FAILED + 1))
         fi
     done
 
@@ -7895,14 +7895,14 @@ if [ "$1" = "address" ]; then
                         echo "  ⚠️  $RESOLVE_FAILED thread(s) failed to resolve - task may not be fully addressed"
                     fi
                 fi
-                ((FIXED++))
-                ((CURRENT++))
+                FIXED=$((FIXED + 1))
+                CURRENT=$((CURRENT + 1))
                 echo ""
                 ;;
             s|S)
                 echo "  ⏭️  Skipped"
-                ((SKIPPED++))
-                ((CURRENT++))
+                SKIPPED=$((SKIPPED + 1))
+                CURRENT=$((CURRENT + 1))
                 echo ""
                 ;;
             o|O)
@@ -8736,10 +8736,19 @@ cleanup_live_analysis_discussion_temps() {
 # Re-fetch the same normalized inputs used by the original collection. The
 # temporary snapshot stays outside the report directory so an untrusted branch
 # cannot preplant any of its paths or observe a partially collected identity.
-fetch_live_analysis_discussion_snapshot_once() {
+fetch_live_analysis_discussion_snapshot_once() (
     local repository="$1" pr_number="$2"
     local owner="${repository%%/*}" repo_name="${repository#*/}"
     local live_dir pages_file snapshot_file snapshot_rc=0
+    cleanup_live_discussion_snapshot_once() {
+        case "$LIVE_DISCUSSION_TEMP_DIR" in
+            /tmp/gh-pr-enrich-live-discussion.*)
+                rm -rf "$LIVE_DISCUSSION_TEMP_DIR" 2>/dev/null || true
+                ;;
+        esac
+        LIVE_DISCUSSION_TEMP_DIR=""
+    }
+    trap cleanup_live_discussion_snapshot_once EXIT
     [ -n "$owner" ] && [ -n "$repo_name" ] && [ "$owner" != "$repo_name" ] || return 1
     live_dir="$(mktemp -d "/tmp/gh-pr-enrich-live-discussion.XXXXXX")" || return 1
     LIVE_DISCUSSION_TEMP_DIR="$live_dir"
@@ -8845,7 +8854,7 @@ fetch_live_analysis_discussion_snapshot_once() {
     rm -rf "$live_dir"
     LIVE_DISCUSSION_TEMP_DIR=""
     return "$snapshot_rc"
-}
+)
 
 fetch_live_analysis_discussion_fingerprint_once() {
     local repository="$1" pr_number="$2" fingerprint=""
