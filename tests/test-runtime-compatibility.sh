@@ -2446,8 +2446,8 @@ assert_eq $'intent/issues\no/r' \
     "$(sort -u "$PUBLIC_LINKED_VISIBILITY_LOG")" \
     "every repository contributing external content is revalidated before disclosure"
 assert_contains "$(cat "$PUBLIC_LINKED_QUERY_ARGS_LOG")" \
-    "ids[]=ISSUE_linked" \
-    "linked issue node IDs are passed with the documented GraphQL list syntax"
+    "ids0[]=ISSUE_linked" \
+    "linked issue node IDs are passed through the first bounded GraphQL batch"
 
 PRIMARY_VISIBILITY_DRIFT_DIR="$TEST_OUTPUT_DIR/primary-visibility-drift"
 PRIMARY_VISIBILITY_DRIFT_CLAUDE_LOG="$TEST_OUTPUT_DIR/primary-visibility-drift-claude.txt"
