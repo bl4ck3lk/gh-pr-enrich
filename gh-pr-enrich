@@ -1138,6 +1138,7 @@ REPORT_RUN_OWNER_PID=""
 REPORT_RUN_WATCHDOG_PID=""
 REPORT_RUN_WATCHDOG_STARTING=false
 REPORT_RUN_WATCHDOG_STATUS=0
+REPORT_RUN_WATCHDOG_CONTROL_DIR=""
 EXTERNAL_VISIBILITY_TEMP_FILE=""
 PARENT_CAPTURE_CONTROL_DIR=""
 
@@ -1170,28 +1171,204 @@ report_run_is_owner_shell() {
     [ "$SELECTED_ANALYSIS_WORKER_PID" = "$REPORT_RUN_OWNER_PID" ]
 }
 
+prepare_report_run_watchdog_control() {
+    REPORT_RUN_WATCHDOG_CONTROL_DIR="$(mktemp -d \
+        "${TMPDIR:-/tmp}/gh-pr-enrich-report-watchdog.XXXXXX")" || return 1
+}
+
+cleanup_report_run_watchdog_control() {
+    cleanup_report_run_watchdog_control_dir "$REPORT_RUN_WATCHDOG_CONTROL_DIR"
+    REPORT_RUN_WATCHDOG_CONTROL_DIR=""
+}
+
+cleanup_report_run_watchdog_control_dir() {
+    local control_dir="$1"
+    [ -n "$control_dir" ] || return 0
+    rm -f "$control_dir/completed" "$control_dir/abort" \
+        "$control_dir/command-started" "$control_dir/fired" \
+        "$control_dir/release" "$control_dir/start" \
+        "$control_dir/stopped-jobs" "$control_dir/supervisor-ready" \
+        "$control_dir/timed-out" "$control_dir/watchdog-release" \
+        "$control_dir/watchdog-ready" "$control_dir/watchdog-terminate" \
+        "$control_dir/watchdog-terminated" "$control_dir/watchdog-exited" \
+        2>/dev/null || true
+    rmdir "$control_dir" 2>/dev/null || true
+}
+
 run_report_command() {
-    local command_pid command_rc=0 timeout_seconds
+    local command_pid command_rc=0 timeout_seconds wait_attempt=0 wait_limit
+    local launch_attempt=0 watchdog_launch_attempt=0 command_start_attempt=0
+    local watchdog_control_dir="" stopped_pid=""
     local parent_capture_control_dir="${PARENT_CAPTURE_CONTROL_DIR:-}"
-    local command_group_owned=false
     if ! report_run_is_owner_shell; then
         "$@"
         return $?
     fi
+    prepare_report_run_watchdog_control || return 125
+    watchdog_control_dir="$REPORT_RUN_WATCHDOG_CONTROL_DIR"
+    timeout_seconds="$(positive_integer_or_default \
+        "${GH_PR_ENRICH_GITHUB_TIMEOUT:-}" 60 3600)"
+    wait_limit=$((timeout_seconds * 50 + 150))
     REPORT_RUN_CHILD_STARTING=true
+    REPORT_RUN_WATCHDOG_STARTING=true
     set -m
-    PARENT_CAPTURE_CONTROL_DIR="" "$@" &
+    (
+        local child_pid child_rc=0 supervisor_signalled=false gate_attempt=0
+        trap 'supervisor_signalled=true' TERM INT
+        set +m
+        : > "$watchdog_control_dir/supervisor-ready"
+        while [ ! -e "$watchdog_control_dir/start" ] && \
+              [ ! -e "$watchdog_control_dir/abort" ] && \
+              [ "$gate_attempt" -lt 500 ]; do
+            sleep 0.01
+            gate_attempt=$((gate_attempt + 1))
+        done
+        if [ ! -e "$watchdog_control_dir/start" ] || \
+           [ -e "$watchdog_control_dir/abort" ]; then
+            exit 125
+        fi
+        (
+            trap - TERM INT
+            PARENT_CAPTURE_CONTROL_DIR="" "$@"
+        ) &
+        child_pid=$!
+        : > "$watchdog_control_dir/command-started"
+        wait "$child_pid" || child_rc=$?
+        # Once the supervisor receives TERM it stays alive until the owner
+        # reaps it or the watchdog KILLs its process group. That live process
+        # anchors the numeric group identity throughout the grace period.
+        if [ "$supervisor_signalled" = true ]; then
+            while :; do sleep 1; done
+        fi
+        : > "$watchdog_control_dir/completed"
+        while [ ! -e "$watchdog_control_dir/release" ] || \
+              [ ! -e "$watchdog_control_dir/watchdog-exited" ]; do
+            sleep 0.02
+        done
+        exit "$child_rc"
+    ) &
     command_pid=$!
-    if kill -0 -- "-$command_pid" 2>/dev/null; then
-        command_group_owned=true
+    while [ ! -e "$watchdog_control_dir/supervisor-ready" ] && \
+          [ "$launch_attempt" -lt 500 ]; do
+        sleep 0.01
+        launch_attempt=$((launch_attempt + 1))
+    done
+    if [ ! -e "$watchdog_control_dir/supervisor-ready" ] || \
+       { [ -n "$TEST_CALL_FN" ] && \
+         [ "${GH_PR_ENRICH_TEST_FORCE_UNOWNED_REPORT_GROUP:-false}" = true ]; } || \
+       ! kill -0 -- "-$command_pid" 2>/dev/null; then
+        : > "$watchdog_control_dir/abort"
+        set +m
+        jobs -s -p > "$watchdog_control_dir/stopped-jobs" 2>/dev/null || true
+        while IFS= read -r stopped_pid; do
+            [ "$stopped_pid" = "$command_pid" ] || continue
+            kill -CONT -- "-$command_pid" 2>/dev/null || true
+            break
+        done < "$watchdog_control_dir/stopped-jobs"
+        wait "$command_pid" 2>/dev/null || true
+        REPORT_RUN_CHILD_STARTING=false
+        REPORT_RUN_WATCHDOG_STARTING=false
+        cleanup_report_run_watchdog_control
+        if [ -n "${RUN_LOCK_PENDING_SIGNAL:-}" ]; then
+            handle_report_run_signal "$RUN_LOCK_PENDING_SIGNAL" \
+                "$RUN_LOCK_PENDING_EXIT_CODE"
+        fi
+        return 125
     fi
     set +m
     REPORT_RUN_CHILD_PID="$command_pid"
-    REPORT_RUN_CHILD_GROUP_OWNED="$command_group_owned"
+    REPORT_RUN_CHILD_GROUP_OWNED=true
     REPORT_RUN_CHILD_SUPERVISOR=false
-    REPORT_RUN_CHILD_STARTING=false
     if ! publish_parent_capture_child "$parent_capture_control_dir" \
-            "$command_pid" "$command_group_owned"; then
+            "$command_pid" true; then
+        : > "$watchdog_control_dir/abort"
+        REPORT_RUN_CHILD_STARTING=false
+        REPORT_RUN_WATCHDOG_STARTING=false
+        terminate_report_run_child
+        return 125
+    fi
+    REPORT_RUN_WATCHDOG_STATUS=0
+    (
+        watchdog_fired=false watchdog_attempt=0 gate_attempt=0
+        watchdog_termination_requested=false
+        report_watchdog_exit() {
+            : > "$watchdog_control_dir/watchdog-exited"
+        }
+        trap report_watchdog_exit EXIT
+        trap '[ "$watchdog_fired" = true ] || exit 0' TERM INT
+        : > "$watchdog_control_dir/watchdog-ready"
+        while [ ! -e "$watchdog_control_dir/start" ] && \
+              [ ! -e "$watchdog_control_dir/abort" ] && \
+              [ ! -e "$watchdog_control_dir/watchdog-release" ] && \
+              [ ! -e "$watchdog_control_dir/watchdog-terminate" ] && \
+              [ "$gate_attempt" -lt 500 ]; do
+            sleep 0.01
+            gate_attempt=$((gate_attempt + 1))
+        done
+        if [ -e "$watchdog_control_dir/watchdog-terminate" ]; then
+            watchdog_termination_requested=true
+        else
+            [ -e "$watchdog_control_dir/start" ] && \
+                [ ! -e "$watchdog_control_dir/abort" ] && \
+                [ ! -e "$watchdog_control_dir/watchdog-release" ] || exit 0
+            while [ "$watchdog_attempt" -lt $((timeout_seconds * 5)) ]; do
+                if [ -e "$watchdog_control_dir/watchdog-terminate" ]; then
+                    watchdog_termination_requested=true
+                    break
+                fi
+                [ ! -e "$watchdog_control_dir/watchdog-release" ] || exit 0
+                sleep 0.2
+                watchdog_attempt=$((watchdog_attempt + 1))
+            done
+        fi
+        if [ -e "$watchdog_control_dir/watchdog-terminate" ]; then
+            watchdog_termination_requested=true
+        fi
+        if [ "$watchdog_termination_requested" != true ]; then
+            [ ! -e "$watchdog_control_dir/watchdog-release" ] || exit 0
+        fi
+        watchdog_fired=true
+        : > "$watchdog_control_dir/fired"
+        kill -TERM -- "-$command_pid" 2>/dev/null || true
+        sleep 1 || true
+        # The supervisor remains alive after TERM, anchoring this process-group
+        # identity until the KILL has been sent. No delayed signal can target a
+        # PID that the owner has already reaped and the OS has reused.
+        kill -KILL -- "-$command_pid" 2>/dev/null || true
+        if [ "$watchdog_termination_requested" = true ] || \
+           [ -e "$watchdog_control_dir/watchdog-terminate" ]; then
+            : > "$watchdog_control_dir/watchdog-terminated"
+            exit 0
+        fi
+        : > "$watchdog_control_dir/timed-out"
+        exit 124
+    ) &
+    REPORT_RUN_WATCHDOG_PID=$!
+    while [ ! -e "$watchdog_control_dir/watchdog-ready" ] && \
+          [ "$watchdog_launch_attempt" -lt 500 ]; do
+        sleep 0.01
+        watchdog_launch_attempt=$((watchdog_launch_attempt + 1))
+    done
+    if [ ! -e "$watchdog_control_dir/watchdog-ready" ] || \
+       [ -e "$watchdog_control_dir/watchdog-exited" ] || \
+       ! kill -0 -- "-$command_pid" 2>/dev/null; then
+        : > "$watchdog_control_dir/abort"
+        REPORT_RUN_CHILD_STARTING=false
+        REPORT_RUN_WATCHDOG_STARTING=false
+        terminate_report_run_child
+        return 125
+    fi
+    : > "$watchdog_control_dir/start"
+    while [ ! -e "$watchdog_control_dir/command-started" ] && \
+          [ ! -e "$watchdog_control_dir/watchdog-exited" ] && \
+          [ "$command_start_attempt" -lt 500 ]; do
+        sleep 0.01
+        command_start_attempt=$((command_start_attempt + 1))
+    done
+    REPORT_RUN_WATCHDOG_STARTING=false
+    REPORT_RUN_CHILD_STARTING=false
+    if [ ! -e "$watchdog_control_dir/command-started" ] || \
+       [ -e "$watchdog_control_dir/watchdog-exited" ]; then
         terminate_report_run_child
         return 125
     fi
@@ -1206,39 +1383,39 @@ run_report_command() {
         handle_report_run_signal "$RUN_LOCK_PENDING_SIGNAL" \
             "$RUN_LOCK_PENDING_EXIT_CODE"
     fi
-    timeout_seconds="$(positive_integer_or_default \
-        "${GH_PR_ENRICH_GITHUB_TIMEOUT:-}" 60 3600)"
-    REPORT_RUN_WATCHDOG_STATUS=0
-    REPORT_RUN_WATCHDOG_STARTING=true
-    (
-        watchdog_fired=false watchdog_attempt=0
-        trap '[ "$watchdog_fired" = true ] || exit 0' TERM INT
-        while [ "$watchdog_attempt" -lt $((timeout_seconds * 5)) ]; do
-            sleep 0.2
-            watchdog_attempt=$((watchdog_attempt + 1))
-        done
-        watchdog_fired=true
-        if [ "$command_group_owned" = true ]; then
-            kill -TERM -- "-$command_pid" 2>/dev/null || true
-        else
-            kill -TERM "$command_pid" 2>/dev/null || true
-        fi
-        sleep 1 || true
-        if [ "$command_group_owned" = true ]; then
-            kill -KILL -- "-$command_pid" 2>/dev/null || true
-        else
-            kill -KILL "$command_pid" 2>/dev/null || true
-        fi
-        exit 124
-    ) &
-    REPORT_RUN_WATCHDOG_PID=$!
-    REPORT_RUN_WATCHDOG_STARTING=false
-    if [ -n "${RUN_LOCK_PENDING_SIGNAL:-}" ]; then
-        handle_report_run_signal "$RUN_LOCK_PENDING_SIGNAL" \
-            "$RUN_LOCK_PENDING_EXIT_CODE"
+    while [ ! -e "$watchdog_control_dir/completed" ] && \
+          [ ! -e "$watchdog_control_dir/timed-out" ] && \
+          [ ! -e "$watchdog_control_dir/watchdog-exited" ] && \
+          [ -z "${selected_writer_signal:-}" ] && \
+          [ "$wait_attempt" -lt "$wait_limit" ]; do
+        sleep 0.02
+        wait_attempt=$((wait_attempt + 1))
+    done
+    if [ -n "${selected_writer_signal:-}" ]; then
+        terminate_report_run_child
+        case "$selected_writer_signal" in
+            INT) return 130 ;;
+            TERM) return 143 ;;
+        esac
+    fi
+    if [ -e "$watchdog_control_dir/completed" ]; then
+        : > "$watchdog_control_dir/release"
+    fi
+    stop_report_run_watchdog
+    if [ -n "${selected_writer_signal:-}" ]; then
+        terminate_report_run_child
+        case "$selected_writer_signal" in
+            INT) return 130 ;;
+            TERM) return 143 ;;
+        esac
+    fi
+    if [ ! -e "$watchdog_control_dir/completed" ] && \
+       [ ! -e "$watchdog_control_dir/timed-out" ]; then
+        terminate_report_run_child
+        REPORT_RUN_WATCHDOG_STATUS=0
+        return 125
     fi
     wait "$command_pid" || command_rc=$?
-    stop_report_run_watchdog
     clear_parent_capture_child "$parent_capture_control_dir"
     if [ "$REPORT_RUN_WATCHDOG_STATUS" -eq 124 ]; then
         if [ "$REPORT_RUN_CHILD_PID" = "$command_pid" ]; then
@@ -1247,11 +1424,17 @@ run_report_command() {
             REPORT_RUN_CHILD_SUPERVISOR=false
         fi
         REPORT_RUN_WATCHDOG_STATUS=0
+        cleanup_report_run_watchdog_control
         return 124
     fi
     if [ "$REPORT_RUN_WATCHDOG_STATUS" -ne 0 ]; then
-        terminate_report_run_child
+        if [ "$REPORT_RUN_CHILD_PID" = "$command_pid" ]; then
+            REPORT_RUN_CHILD_PID=""
+            REPORT_RUN_CHILD_GROUP_OWNED=false
+            REPORT_RUN_CHILD_SUPERVISOR=false
+        fi
         REPORT_RUN_WATCHDOG_STATUS=0
+        cleanup_report_run_watchdog_control
         return 125
     fi
     if [ "$REPORT_RUN_CHILD_PID" = "$command_pid" ]; then
@@ -1259,18 +1442,25 @@ run_report_command() {
         REPORT_RUN_CHILD_GROUP_OWNED=false
         REPORT_RUN_CHILD_SUPERVISOR=false
     fi
+    cleanup_report_run_watchdog_control
     return "$command_rc"
 }
 
 stop_report_run_watchdog() {
     local watchdog_rc=0
     if [ -n "$REPORT_RUN_WATCHDOG_PID" ]; then
-        kill -TERM "$REPORT_RUN_WATCHDOG_PID" 2>/dev/null || true
+        : > "$REPORT_RUN_WATCHDOG_CONTROL_DIR/watchdog-release"
         wait "$REPORT_RUN_WATCHDOG_PID" 2>/dev/null || watchdog_rc=$?
-        # A fast request can finish before the watcher installs its TERM trap.
-        # The parent owns this TERM, so either conventional signal status means
-        # the not-yet-armed watcher was still stopped successfully.
-        case "$watchdog_rc" in 130|143) watchdog_rc=0 ;; esac
+        REPORT_RUN_WATCHDOG_STATUS="$watchdog_rc"
+        REPORT_RUN_WATCHDOG_PID=""
+    fi
+}
+
+terminate_report_run_watchdog() {
+    local watchdog_rc=0
+    if [ -n "$REPORT_RUN_WATCHDOG_PID" ]; then
+        : > "$REPORT_RUN_WATCHDOG_CONTROL_DIR/watchdog-terminate"
+        wait "$REPORT_RUN_WATCHDOG_PID" 2>/dev/null || watchdog_rc=$?
         REPORT_RUN_WATCHDOG_STATUS="$watchdog_rc"
         REPORT_RUN_WATCHDOG_PID=""
     fi
@@ -1285,38 +1475,51 @@ terminate_report_run_child() {
     # TERM grace, KILL/reap, and EXIT cleanup. Its longer bound is still finite
     # but prevents the parent from killing the cleanup owner prematurely.
     [ "$command_supervisor" != true ] || terminate_limit=100
-    stop_report_run_watchdog
     if [ -z "$command_pid" ]; then
+        stop_report_run_watchdog
+        cleanup_report_run_watchdog_control
         return 0
     fi
-    if [ "$command_group_owned" = true ]; then
-        kill -TERM -- "-$command_pid" 2>/dev/null || true
-    else
-        kill -TERM "$command_pid" 2>/dev/null || true
-    fi
-    while [ "$terminate_attempt" -lt "$terminate_limit" ]; do
-        if [ "$command_group_owned" = true ]; then
-            kill -0 -- "-$command_pid" 2>/dev/null || break
-        else
-            kill -0 "$command_pid" 2>/dev/null || break
-        fi
-        sleep 0.05
-        terminate_attempt=$((terminate_attempt + 1))
-    done
-    if [ "$command_group_owned" = true ]; then
+    if [ "$command_group_owned" = true ] && \
+       [ -n "$REPORT_RUN_WATCHDOG_PID" ]; then
+        # Once armed, the watchdog is the sole signal owner for this group.
+        # Cancellation asks it to escalate immediately; if this owner dies at
+        # any point, the live supervisor anchors the PGID until the watchdog's
+        # KILL completes. Only then may this owner reap the supervisor.
+        terminate_report_run_watchdog
         if kill -0 -- "-$command_pid" 2>/dev/null; then
             kill -KILL -- "-$command_pid" 2>/dev/null || true
         fi
     else
-        if kill -0 "$command_pid" 2>/dev/null; then
+        if [ "$command_group_owned" = true ]; then
+            kill -TERM -- "-$command_pid" 2>/dev/null || true
+        else
+            kill -TERM "$command_pid" 2>/dev/null || true
+        fi
+        while [ "$terminate_attempt" -lt "$terminate_limit" ]; do
+            if [ "$command_group_owned" = true ]; then
+                kill -0 -- "-$command_pid" 2>/dev/null || break
+            else
+                kill -0 "$command_pid" 2>/dev/null || break
+            fi
+            sleep 0.05
+            terminate_attempt=$((terminate_attempt + 1))
+        done
+        if [ "$command_group_owned" = true ]; then
+            if kill -0 -- "-$command_pid" 2>/dev/null; then
+                kill -KILL -- "-$command_pid" 2>/dev/null || true
+            fi
+        elif kill -0 "$command_pid" 2>/dev/null; then
             kill -KILL "$command_pid" 2>/dev/null || true
         fi
+        stop_report_run_watchdog
     fi
     wait "$command_pid" 2>/dev/null || true
     clear_parent_capture_child
     REPORT_RUN_CHILD_PID=""
     REPORT_RUN_CHILD_GROUP_OWNED=false
     REPORT_RUN_CHILD_SUPERVISOR=false
+    cleanup_report_run_watchdog_control
 }
 
 # Watch mode has no report-directory lease, but it still needs the same bounded,
@@ -2873,7 +3076,7 @@ validate_output_directory_for_writes() {
     [ -d "$output_abs" ] || return 1
 
     inventory="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-preflight.XXXXXX")"
-    if ! find "$output_abs" -mindepth 1 \( -type f -o -type l \) \
+    if ! find "$output_abs" -mindepth 1 ! -type d \
             -print0 > "$inventory" 2>/dev/null; then
         rm -f "$inventory"
         echo "Error: Report output directory could not be inspected safely." >&2
@@ -2883,6 +3086,9 @@ validate_output_directory_for_writes() {
         relative="${candidate#"$output_abs/"}"
         if [ -L "$candidate" ]; then
             invalid_reason="symbolic link: $relative"
+            break
+        elif [ ! -f "$candidate" ]; then
+            invalid_reason="non-regular file: $relative"
             break
         elif ! is_generated_report_artifact "$relative"; then
             invalid_reason="unrelated file: $relative"
@@ -10761,7 +10967,7 @@ resolve_code_access() {
                     local candidate relative unexpected_output="" output_inventory=""
                     if [ -d "$output_abs" ]; then
                         output_inventory="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-output.XXXXXX")"
-                        if ! find "$output_abs" -mindepth 1 \( -type f -o -type l \) \
+                        if ! find "$output_abs" -mindepth 1 ! -type d \
                                 -print0 > "$output_inventory" 2>/dev/null; then
                             rm -f "$output_inventory"
                             echo "disabled: report output directory could not be inspected safely"
@@ -10771,6 +10977,9 @@ resolve_code_access() {
                             relative="${candidate#"$output_abs/"}"
                             if [ -L "$candidate" ]; then
                                 unexpected_output="$relative (symbolic link)"
+                                break
+                            elif [ ! -f "$candidate" ]; then
+                                unexpected_output="$relative (non-regular file)"
                                 break
                             fi
                             if ! is_generated_report_artifact "$relative"; then
@@ -11401,7 +11610,6 @@ _select_analysis_artifact() (
     }
     handle_selection_signal() {
         selected_writer_signal="$1"
-        terminate_report_run_child
     }
     trap cleanup_selection_transaction EXIT
     trap 'handle_selection_signal INT' INT
@@ -12103,7 +12311,60 @@ generate_analysis_report() {
 # Runs after every definition above and exits before the CLI flow. Keeps the
 # test suites pointed at shipped functions rather than at copies.
 # ============================================================================
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace validate_analysis_candidate build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged analysis_intent_snapshot_from_files analysis_intent_fingerprint_from_files fetch_live_analysis_intent_fingerprint verify_analysis_intent_unchanged verify_analysis_intent_with_status analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job"
+report_watchdog_fast_fixture() {
+    return 7
+}
+
+report_watchdog_start_marker_fixture() {
+    [ "$#" -eq 1 ] || return 2
+    : > "$1"
+}
+
+report_watchdog_timeout_fixture() {
+    local child_pid_file="$1" descendant_pid_file="$2" term_marker="$3"
+    local descendant_pid=""
+    [ "$#" -eq 3 ] || return 2
+    selected_analysis_worker_pid || return 2
+    printf '%s\n' "$SELECTED_ANALYSIS_WORKER_PID" > "$child_pid_file"
+    trap ': > "$term_marker"; exit 0' TERM
+    /bin/sleep 60 &
+    descendant_pid=$!
+    printf '%s\n' "$descendant_pid" > "$descendant_pid_file"
+    wait "$descendant_pid"
+}
+
+exercise_report_run_watchdog() {
+    local mode="${1:-}" exercise_rc=0
+    shift || true
+    REPORT_RUN_STANDALONE=true
+    REPORT_RUN_MANAGED=false
+    case "$mode" in
+        fast)
+            [ "$#" -eq 0 ] || return 2
+            run_report_command report_watchdog_fast_fixture
+            ;;
+        start-marker)
+            [ "$#" -eq 1 ] || return 2
+            run_report_command report_watchdog_start_marker_fixture "$1"
+            ;;
+        timeout)
+            [ "$#" -eq 3 ] || return 2
+            run_report_command report_watchdog_timeout_fixture "$1" "$2" "$3"
+            ;;
+        cancel)
+            [ "$#" -eq 3 ] || return 2
+            selected_writer_signal=""
+            trap 'selected_writer_signal=TERM' TERM
+            run_report_command report_watchdog_timeout_fixture "$1" "$2" "$3" || \
+                exercise_rc=$?
+            trap - TERM
+            return "$exercise_rc"
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace validate_analysis_candidate build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged analysis_intent_snapshot_from_files analysis_intent_fingerprint_from_files fetch_live_analysis_intent_fingerprint verify_analysis_intent_unchanged verify_analysis_intent_with_status analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job exercise_report_run_watchdog"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in
@@ -12806,7 +13067,6 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                 handle_provider_writer_signal() {
                     PROVIDER_WRITER_SIGNAL="$1"
                     selected_writer_signal="$1"
-                    terminate_report_run_child
                 }
                 trap cleanup_provider_combined_writer EXIT
                 trap 'handle_provider_writer_signal INT' INT

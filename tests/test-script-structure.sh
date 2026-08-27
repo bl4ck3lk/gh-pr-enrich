@@ -76,6 +76,66 @@ assert_jq "$TEST_OUTPUT_DIR/ctx/claude-context.json" '.pr.title == "t"' \
 assert_jq "$TEST_OUTPUT_DIR/ctx/analysis-context.json" '.pr.title == "t"' \
     "dispatched function produced the provider-neutral context file"
 
+# A fired report watchdog can retain its command PID through the TERM-to-KILL
+# grace period. The command supervisor must stay alive until the owner stops the
+# watcher, anchoring the numeric process-group identity through any delayed KILL.
+RUN_REPORT_COMMAND_BODY=$(sed -n '/^run_report_command() {/,/^}/p' "$GH_PR_ENRICH")
+assert_contains "$RUN_REPORT_COMMAND_BODY" 'if [ "$supervisor_signalled" = true ]' \
+    "report supervisors stay alive after receiving a timeout signal"
+assert_contains "$RUN_REPORT_COMMAND_BODY" ': > "$watchdog_control_dir/completed"' \
+    "report supervisors publish completion before waiting for owner release"
+assert_contains "$RUN_REPORT_COMMAND_BODY" \
+    ': > "$watchdog_control_dir/supervisor-ready"' \
+    "report supervisors announce readiness before command launch"
+assert_contains "$RUN_REPORT_COMMAND_BODY" ': > "$watchdog_control_dir/start"' \
+    "report owners acknowledge isolated process groups before command launch"
+assert_contains "$RUN_REPORT_COMMAND_BODY" \
+    '[ ! -e "$watchdog_control_dir/watchdog-exited" ]' \
+    "completed supervisors wait for confirmed watchdog exit"
+assert_contains "$RUN_REPORT_COMMAND_BODY" ': > "$watchdog_control_dir/release"' \
+    "report owners release completed supervisors before stopping the watchdog"
+assert_not_contains "$RUN_REPORT_COMMAND_BODY" 'kill -USR1' \
+    "report watchdogs do not repurpose a process-wide application signal"
+assert_not_contains "$RUN_REPORT_COMMAND_BODY" 'kill -TERM "$command_pid"' \
+    "report watchdogs have no PID-only fallback for unowned command groups"
+assert_not_contains "$RUN_REPORT_COMMAND_BODY" 'kill -KILL "$command_pid"' \
+    "report escalation has no PID-only fallback for unowned command groups"
+STOP_REPORT_WATCHDOG_BODY=$(sed -n '/^stop_report_run_watchdog() {/,/^}/p' \
+    "$GH_PR_ENRICH")
+assert_contains "$STOP_REPORT_WATCHDOG_BODY" \
+    ': > "$REPORT_RUN_WATCHDOG_CONTROL_DIR/watchdog-release"' \
+    "report owners release watchdogs before waiting for them"
+assert_not_contains "$STOP_REPORT_WATCHDOG_BODY" \
+    'kill -TERM "$REPORT_RUN_WATCHDOG_PID"' \
+    "report owners never signal a saved numeric watchdog PID"
+TERMINATE_REPORT_CHILD_BODY=$(sed -n \
+    '/^terminate_report_run_child() {/,/^}/p' "$GH_PR_ENRICH")
+assert_contains "$TERMINATE_REPORT_CHILD_BODY" \
+    'terminate_report_run_watchdog' \
+    "cancellation delegates escalation to the command watchdog"
+TERMINATE_REAP_LINE=$(printf '%s\n' "$TERMINATE_REPORT_CHILD_BODY" | \
+    grep -n '^    wait "\$command_pid"' | cut -d: -f1)
+TERMINATE_WATCHDOG_LINE=$(printf '%s\n' "$TERMINATE_REPORT_CHILD_BODY" | \
+    grep -n 'terminate_report_run_watchdog' | cut -d: -f1)
+assert_true "$([ -n "$TERMINATE_WATCHDOG_LINE" ] && \
+    [ "$TERMINATE_WATCHDOG_LINE" -lt "$TERMINATE_REAP_LINE" ] && \
+    echo 0 || echo 1)" \
+    "cancellation stops its signalling owner before reaping the PGID anchor"
+
+# Inventory every non-directory entry without opening it. A generated filename
+# is not safe merely because it is allowlisted when its inode is a FIFO, socket,
+# device, or another non-regular type.
+SPECIAL_OUTPUT_DIR="$TEST_OUTPUT_DIR/special-output"
+mkdir -p "$SPECIAL_OUTPUT_DIR"
+mkfifo "$SPECIAL_OUTPUT_DIR/checks.json"
+rc=0
+SPECIAL_OUTPUT_OUT=$("$GH_PR_ENRICH" --test-call \
+    validate_output_directory_for_writes "$SPECIAL_OUTPUT_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "report preflight rejects an allowlisted FIFO without opening it"
+assert_contains "$SPECIAL_OUTPUT_OUT" "non-regular file: checks.json" \
+    "special-file rejection identifies the unsafe generated artifact"
+
 # ---------------------------------------------------------------------------
 # Dispatcher is allowlisted (must not invoke arbitrary shell functions)
 # ---------------------------------------------------------------------------

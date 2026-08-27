@@ -1779,10 +1779,9 @@ COLLECTION_SIGNAL_RESIDUE=$(find "$COLLECTION_SIGNAL_REPORT" -maxdepth 1 \
 assert_true "$([ -z "$COLLECTION_SIGNAL_RESIDUE" ] && echo 0 || echo 1)" \
     "EXIT retries signal cleanup and leaves no report lock residue"
 
-# A DEBUG hook signals the parent immediately before `command_pid=$!`, making
-# the launch-to-publication boundary deterministic rather than scheduler-
-# dependent. The starting-state guard must defer cleanup until that exact child
-# PID is known.
+# A DEBUG hook signals the parent immediately before the managed launch leaves
+# its starting state. The command and watchdog are both published by then, so
+# deferred cleanup can reap the exact child tree deterministically.
 CHILD_START_STUBS="$TEST_OUTPUT_DIR/child-start-stubs"
 CHILD_START_REPORT="$TEST_OUTPUT_DIR/child-start-report"
 CHILD_START_PID_FILE="$TEST_OUTPUT_DIR/child-start.pid"
@@ -1801,7 +1800,7 @@ exec "$CHILD_START_BASE_GH" "$@"
 STUB
 cat > "$CHILD_START_BASH_ENV" << 'STUB'
 __gh_pr_enrich_child_start_debug() {
-    if [ "$BASH_COMMAND" = 'command_pid=$!' ] && \
+    if [ "$BASH_COMMAND" = 'REPORT_RUN_CHILD_STARTING=false' ] && \
        [ -d "$CHILD_START_REPORT/.selected-analysis.lock" ] && \
        [ ! -e "$CHILD_START_HOOK_MARKER" ]; then
         : > "$CHILD_START_HOOK_MARKER"
@@ -1872,10 +1871,15 @@ exec "$REPORT_WATCHDOG_BASE_GH" "$@"
 STUB
 cat > "$REPORT_WATCHDOG_BASH_ENV" << 'STUB'
 __gh_pr_enrich_report_watchdog_debug() {
-    if [ "$BASH_COMMAND" = 'REPORT_RUN_WATCHDOG_PID=$!' ] && \
+    if [ "$BASH_COMMAND" = 'REPORT_RUN_WATCHDOG_STARTING=false' ] && \
        [ -d "$REPORT_WATCHDOG_REPORT/.selected-analysis.lock" ] && \
        [ ! -e "$REPORT_WATCHDOG_MARKER" ]; then
-        printf '%s\n' "$!" > "$REPORT_WATCHDOG_PID_FILE"
+        printf '%s\n' "$REPORT_RUN_WATCHDOG_PID" > "$REPORT_WATCHDOG_PID_FILE"
+        for (( _report_watchdog_wait=0; \
+                _report_watchdog_wait < 200; _report_watchdog_wait++ )); do
+            [ -e "$REPORT_WATCHDOG_CHILD_PID_FILE" ] && break
+            sleep 0.05
+        done
         : > "$REPORT_WATCHDOG_MARKER"
         kill -TERM "$$"
     fi
