@@ -403,6 +403,225 @@ workspace_file_link_count() {
     return 1
 }
 
+# Materialize one validated workspace manifest without launching helper
+# processes per file. The raw Git batch response is parsed by exact byte count,
+# and working-tree overrides are copied and hashed in the same bounded process.
+materialize_code_access_manifest() {
+    local manifest="$1" batch_response="$2" snapshot_root="$3"
+    local repo_root="$4" snapshot_source="$5"
+    if ! command -v perl > /dev/null 2>&1; then
+        echo "Error: Perl is required to materialize immutable code snapshots." >&2
+        return 1
+    fi
+    perl - "$manifest" "$batch_response" "$snapshot_root" "$repo_root" \
+        "$snapshot_source" <<'PERL'
+use strict;
+use warnings;
+use Digest::SHA qw(sha256_hex);
+use Fcntl qw(:DEFAULT :mode);
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
+
+my ($manifest_path, $batch_path, $snapshot_root, $repo_root, $snapshot_source) = @ARGV;
+die "invalid snapshot source\n"
+    unless $snapshot_source eq 'git_index' || $snapshot_source eq 'working_tree';
+
+open my $manifest_fh, '<:raw', $manifest_path or die "open manifest: $!\n";
+my $manifest;
+{
+    local $/;
+    $manifest = <$manifest_fh>;
+}
+close $manifest_fh or die "close manifest: $!\n";
+my @fields = split /\0/, $manifest, -1;
+pop @fields if @fields && $fields[-1] eq '';
+open my $batch_fh, '<:raw', $batch_path or die "open batch response: $!\n";
+
+my %created_dirs = ($snapshot_root => 1);
+my $batch_buffer = '';
+
+sub safe_relative {
+    my ($relative) = @_;
+    return length($relative) > 0 && $relative !~ m{^/} &&
+        $relative !~ m{(?:^|/)\.\.(?:/|$)};
+}
+
+sub source_regular_without_symlinks {
+    my ($relative) = @_;
+    my $current = $repo_root;
+    my @parts = split m{/}, $relative, -1;
+    for my $index (0 .. $#parts) {
+        return 0 if $parts[$index] eq '';
+        $current .= '/' . $parts[$index];
+        my @metadata = lstat $current;
+        return 0 unless @metadata && !S_ISLNK($metadata[2]);
+        if ($index == $#parts) {
+            return 0 unless S_ISREG($metadata[2]);
+        } else {
+            return 0 unless S_ISDIR($metadata[2]);
+        }
+    }
+    return 1;
+}
+
+sub ensure_parent {
+    my ($destination) = @_;
+    my $parent = dirname($destination);
+    return if $created_dirs{$parent};
+    make_path($parent, { mode => 0700 });
+    my @metadata = lstat $parent;
+    die "unsafe snapshot parent\n"
+        unless @metadata && S_ISDIR($metadata[2]) && !S_ISLNK($metadata[2]);
+    $created_dirs{$parent} = 1;
+}
+
+sub write_all {
+    my ($destination_fh, $buffer) = @_;
+    my $offset = 0;
+    while ($offset < length($buffer)) {
+        my $written = syswrite($destination_fh, $buffer,
+            length($buffer) - $offset, $offset);
+        die "write snapshot: $!\n" unless defined($written) && $written > 0;
+        $offset += $written;
+    }
+}
+
+sub read_batch_line {
+    while (index($batch_buffer, "\n") < 0) {
+        my $chunk = '';
+        my $read = sysread($batch_fh, $chunk, 65536);
+        die "truncated Git batch header\n" unless defined($read) && $read > 0;
+        $batch_buffer .= $chunk;
+    }
+    my $newline = index($batch_buffer, "\n");
+    return substr($batch_buffer, 0, $newline + 1, '');
+}
+
+sub read_batch_byte {
+    if (length($batch_buffer) == 0) {
+        my $read = sysread($batch_fh, $batch_buffer, 65536);
+        die "truncated Git batch response\n" unless defined($read) && $read > 0;
+    }
+    return substr($batch_buffer, 0, 1, '');
+}
+
+sub copy_exact_batch_bytes {
+    my ($destination_fh, $remaining) = @_;
+    while ($remaining > 0) {
+        if (length($batch_buffer) > 0) {
+            my $available = length($batch_buffer);
+            my $take = $remaining < $available ? $remaining : $available;
+            my $buffer = substr($batch_buffer, 0, $take, '');
+            write_all($destination_fh, $buffer);
+            $remaining -= $take;
+        } else {
+            my $wanted = $remaining > 65536 ? 65536 : $remaining;
+            my $buffer = '';
+            my $read = sysread($batch_fh, $buffer, $wanted);
+            die "truncated Git batch response\n" unless defined($read) && $read > 0;
+            write_all($destination_fh, $buffer);
+            $remaining -= $read;
+        }
+    }
+}
+
+sub copy_workspace_bytes {
+    my ($source, $destination_fh) = @_;
+    open my $source_fh, '<:raw', $source or die "open workspace source: $!\n";
+    my $digest = Digest::SHA->new(256);
+    while (1) {
+        my $buffer = '';
+        my $read = sysread($source_fh, $buffer, 65536);
+        die "read workspace source: $!\n" unless defined $read;
+        last if $read == 0;
+        $digest->add($buffer);
+        write_all($destination_fh, $buffer);
+    }
+    close $source_fh or die "close workspace source: $!\n";
+    return $digest->hexdigest;
+}
+
+my $cursor = 0;
+while ($cursor < @fields) {
+    my $kind = $fields[$cursor++];
+    if ($kind eq 'head' || $kind eq 'index') {
+        die "truncated manifest\n" unless $cursor < @fields;
+        $cursor++;
+        next;
+    }
+    if ($kind eq 'missing') {
+        die "truncated manifest\n" unless $cursor + 1 < @fields;
+        $cursor += 2;
+        next;
+    }
+    if ($kind eq 'symlink') {
+        die "truncated manifest\n" unless $cursor + 2 < @fields;
+        my ($origin, $relative, $expected_hash) = @fields[$cursor .. $cursor + 2];
+        $cursor += 3;
+        die "invalid symlink manifest record\n"
+            unless ($origin eq 'untracked' || $origin eq 'ignored') &&
+                safe_relative($relative) && $expected_hash =~ /\A[0-9a-fA-F]{64}\z/;
+        my $target = readlink "$repo_root/$relative";
+        die "changed workspace symlink\n"
+            unless defined($target) && sha256_hex($target . "\n") eq lc($expected_hash);
+        next;
+    }
+    die "invalid manifest record\n" unless $kind eq 'file';
+    die "truncated manifest\n" unless $cursor + 4 < @fields;
+    my ($origin, $relative, $mode, $source_identity, $expected_hash) =
+        @fields[$cursor .. $cursor + 4];
+    $cursor += 5;
+    die "invalid file manifest record\n"
+        unless safe_relative($relative) && $mode =~ /\A[0-7]+\z/ &&
+            source_regular_without_symlinks($relative);
+
+    my $destination = "$snapshot_root/$relative";
+    ensure_parent($destination);
+    sysopen my $destination_fh, $destination, O_WRONLY | O_CREAT | O_EXCL, 0600
+        or die "create snapshot file: $!\n";
+    binmode $destination_fh;
+
+    if ($source_identity =~ /\Agit:([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\z/) {
+        my $source_oid = $1;
+        die "invalid indexed snapshot record\n"
+            unless $snapshot_source eq 'git_index' &&
+                $expected_hash eq $source_identity && ($mode eq '644' || $mode eq '755');
+        my $header = read_batch_line();
+        chomp $header;
+        my ($response_oid, $response_type, $response_size, @extra) = split / /, $header;
+        die "invalid Git batch header\n"
+            unless !@extra && defined($response_size) &&
+                $response_oid eq $source_oid && $response_type eq 'blob' &&
+                $response_size =~ /\A(?:0|[1-9][0-9]*)\z/ && length($response_size) <= 18;
+        copy_exact_batch_bytes($destination_fh, 0 + $response_size);
+        my $separator = read_batch_byte();
+        die "invalid Git batch separator\n" unless $separator eq "\n";
+    } elsif ($source_identity eq 'workspace') {
+        die "invalid working-tree snapshot record\n"
+            unless $snapshot_source eq 'working_tree' &&
+                $expected_hash =~ /\A[0-9a-fA-F]{64}\z/;
+        my $actual_hash = copy_workspace_bytes("$repo_root/$relative", $destination_fh);
+        die "changed workspace file\n" unless $actual_hash eq lc($expected_hash);
+    } else {
+        die "invalid snapshot source identity\n";
+    }
+    close $destination_fh or die "close snapshot file: $!\n";
+    chmod oct($mode), $destination or die "chmod snapshot file: $!\n";
+    my @destination_metadata = stat $destination;
+    die "snapshot mode mismatch\n"
+        unless @destination_metadata && S_IMODE($destination_metadata[2]) == oct($mode);
+}
+
+if ($snapshot_source eq 'git_index') {
+    die "extra Git batch bytes\n" if length($batch_buffer) > 0;
+    my $extra = '';
+    my $extra_read = sysread($batch_fh, $extra, 1);
+    die "extra Git batch bytes\n" unless defined($extra_read) && $extra_read == 0;
+}
+close $batch_fh or die "close batch response: $!\n";
+PERL
+}
+
 # Write a canonical NUL-delimited manifest for every repository-visible path.
 # HEAD and index identity bind staged state. Tracked files whose clean-filtered
 # content matches the index are bound to that exact blob, so smudge filters cannot
@@ -940,166 +1159,12 @@ create_code_access_snapshot() {
             return 1
         fi
     fi
-    {
-      while IFS= read -r -d '' kind <&3; do
-        case "$kind" in
-            head|index)
-                IFS= read -r -d '' _ <&3 || {
-                    rm -f "$manifest"
-                    cleanup_code_access_snapshot
-                    return 1
-                }
-                ;;
-            missing)
-                IFS= read -r -d '' origin <&3 && \
-                    IFS= read -r -d '' relative <&3 || {
-                        rm -f "$manifest"
-                        cleanup_code_access_snapshot
-                        return 1
-                    }
-                ;;
-            symlink)
-                IFS= read -r -d '' origin <&3 && \
-                    IFS= read -r -d '' relative <&3 && \
-                    IFS= read -r -d '' expected_hash <&3 || {
-                        rm -f "$manifest"
-                        cleanup_code_access_snapshot
-                        return 1
-                    }
-                case "$origin" in
-                    untracked|ignored) ;;
-                    *)
-                        rm -f "$manifest"
-                        cleanup_code_access_snapshot
-                        return 1
-                        ;;
-                esac
-                case "$relative" in ""|/*|../*|*/../*|*/..)
-                    rm -f "$manifest"
-                    cleanup_code_access_snapshot
-                    return 1
-                    ;;
-                esac
-                if ! [[ "$expected_hash" =~ ^[0-9a-fA-F]{64}$ ]] || \
-                   [ ! -L "$repo_root/$relative" ] || \
-                   path_has_symlink_component "$(dirname "$repo_root/$relative")" || \
-                   ! current_link_hash="$(
-                       set -o pipefail
-                       readlink "$repo_root/$relative" | sha256_stream
-                   )" || [ "$current_link_hash" != "$expected_hash" ]; then
-                    rm -f "$manifest"
-                    cleanup_code_access_snapshot
-                    return 1
-                fi
-                # The link identity is part of the fingerprint, but the link is
-                # intentionally absent from the immutable analysis snapshot.
-                ;;
-            file)
-                IFS= read -r -d '' origin <&3 && \
-                    IFS= read -r -d '' relative <&3 && \
-                    IFS= read -r -d '' mode <&3 && \
-                    IFS= read -r -d '' source_identity <&3 && \
-                    IFS= read -r -d '' expected_hash <&3 || {
-                        rm -f "$manifest"
-                        cleanup_code_access_snapshot
-                        return 1
-                    }
-                case "$relative" in ""|/*|../*|*/../*|*/..)
-                    rm -f "$manifest"
-                    cleanup_code_access_snapshot
-                    return 1
-                    ;;
-                esac
-                destination="$CODE_ACCESS_SNAPSHOT_DIR/$relative"
-                mkdir -p "$(dirname "$destination")" || {
-                    rm -f "$manifest"
-                    cleanup_code_access_snapshot
-                    return 1
-                }
-                if [ -L "$repo_root/$relative" ] || [ ! -f "$repo_root/$relative" ]; then
-                    rm -f "$manifest"
-                    cleanup_code_access_snapshot
-                    return 1
-                fi
-                case "$source_identity" in
-                    git:*)
-                        source_oid="${source_identity#git:}"
-                        if { ! [[ "$source_oid" =~ ^[0-9a-fA-F]{40}$ ]] && \
-                             ! [[ "$source_oid" =~ ^[0-9a-fA-F]{64}$ ]]; } || \
-                           [ "$snapshot_source" != "git_index" ] || \
-                           [ "$expected_hash" != "$source_identity" ] || \
-                           ! IFS=' ' read -r response_oid response_type response_size <&4 || \
-                           [ "$response_oid" != "$source_oid" ] || \
-                           [ "$response_type" != "blob" ] || \
-                           ! [[ "$response_size" =~ ^(0|[1-9][0-9]*)$ ]] || \
-                           [ "${#response_size}" -gt 18 ]; then
-                            rm -f "$manifest"
-                            cleanup_code_access_snapshot
-                            return 1
-                        fi
-                        : > "$destination" || {
-                            rm -f "$manifest"
-                            cleanup_code_access_snapshot
-                            return 1
-                        }
-                        block_count=$((response_size / 65536))
-                        remainder=$((response_size % 65536))
-                        if { [ "$block_count" -gt 0 ] && \
-                             ! dd bs=65536 count="$block_count" <&4 \
-                                > "$destination" 2>/dev/null; } || \
-                           { [ "$remainder" -gt 0 ] && \
-                             ! dd bs=1 count="$remainder" <&4 \
-                                >> "$destination" 2>/dev/null; } || \
-                           ! IFS= read -r response_separator <&4 || \
-                           [ -n "$response_separator" ]; then
-                            rm -f "$manifest"
-                            cleanup_code_access_snapshot
-                            return 1
-                        fi
-                        ;;
-                    workspace)
-                        if ! cp "$repo_root/$relative" "$destination"; then
-                            rm -f "$manifest"
-                            cleanup_code_access_snapshot
-                            return 1
-                        fi
-                        ;;
-                    *)
-                        rm -f "$manifest"
-                        cleanup_code_access_snapshot
-                        return 1
-                        ;;
-                esac
-                if ! chmod "$mode" "$destination" || \
-                   ! destination_mode="$(workspace_file_mode "$destination")" || \
-                   [ "$destination_mode" != "$mode" ]; then
-                    rm -f "$manifest"
-                    cleanup_code_access_snapshot
-                    return 1
-                fi
-                if [ "$source_identity" = "workspace" ] && \
-                   { ! destination_hash="$(sha256_file "$destination")" || \
-                     [ "$destination_hash" != "$expected_hash" ]; }; then
-                    rm -f "$manifest"
-                    cleanup_code_access_snapshot
-                    return 1
-                fi
-                ;;
-            *)
-                rm -f "$manifest"
-                cleanup_code_access_snapshot
-                return 1
-                ;;
-        esac
-      done
-      if [ "$snapshot_source" = "git_index" ]; then
-          if IFS= read -r -n 1 _ <&4; then
-              rm -f "$manifest"
-              cleanup_code_access_snapshot
-              return 1
-          fi
-      fi
-    } 3< "$manifest" 4< "$batch_response"
+    if ! materialize_code_access_manifest "$manifest" "$batch_response" \
+            "$CODE_ACCESS_SNAPSHOT_DIR" "$repo_root" "$snapshot_source"; then
+        rm -f "$manifest"
+        cleanup_code_access_snapshot
+        return 1
+    fi
     if [ "$snapshot_source" = "git_index" ]; then
         if ! rm -f "$batch_requests" "$batch_response" || \
            ! rmdir "$CODE_ACCESS_BATCH_DIR"; then
@@ -1172,7 +1237,9 @@ publish_parent_capture_child() {
 clear_parent_capture_child() {
     local control_dir="${1:-${PARENT_CAPTURE_CONTROL_DIR:-}}"
     [ -z "$control_dir" ] || rm -f "$control_dir/active-child" \
-        "$control_dir/active-child.tmp"
+        "$control_dir/active-child.tmp" "$control_dir/active-child-claim" \
+        "$control_dir/active-child-terminate" \
+        "$control_dir/active-child-terminated"
 }
 
 cleanup_external_visibility_temp() {
@@ -1218,12 +1285,18 @@ run_report_command() {
     local launch_attempt=0 watchdog_launch_attempt=0 command_start_attempt=0
     local watchdog_control_dir="" stopped_pid=""
     local parent_capture_control_dir="${PARENT_CAPTURE_CONTROL_DIR:-}"
+    local parent_capture_terminate_marker=""
+    local parent_capture_terminated_marker=""
     if ! report_run_is_owner_shell; then
         "$@"
         return $?
     fi
     prepare_report_run_watchdog_control || return 125
     watchdog_control_dir="$REPORT_RUN_WATCHDOG_CONTROL_DIR"
+    if [ -n "$parent_capture_control_dir" ]; then
+        parent_capture_terminate_marker="${parent_capture_control_dir}/active-child-terminate"
+        parent_capture_terminated_marker="${parent_capture_control_dir}/active-child-terminated"
+    fi
     timeout_seconds="$(positive_integer_or_default \
         "${GH_PR_ENRICH_GITHUB_TIMEOUT:-}" 60 3600)"
     wait_limit=$((timeout_seconds * 50 + 150))
@@ -1319,18 +1392,24 @@ run_report_command() {
               [ ! -e "$watchdog_control_dir/abort" ] && \
               [ ! -e "$watchdog_control_dir/watchdog-release" ] && \
               [ ! -e "$watchdog_control_dir/watchdog-terminate" ] && \
+              { [ -z "$parent_capture_terminate_marker" ] || \
+                [ ! -e "$parent_capture_terminate_marker" ]; } && \
               [ "$gate_attempt" -lt 500 ]; do
             sleep 0.01
             gate_attempt=$((gate_attempt + 1))
         done
-        if [ -e "$watchdog_control_dir/watchdog-terminate" ]; then
+        if [ -e "$watchdog_control_dir/watchdog-terminate" ] || \
+           { [ -n "$parent_capture_terminate_marker" ] && \
+             [ -e "$parent_capture_terminate_marker" ]; }; then
             watchdog_termination_requested=true
         else
             [ -e "$watchdog_control_dir/start" ] && \
                 [ ! -e "$watchdog_control_dir/abort" ] && \
                 [ ! -e "$watchdog_control_dir/watchdog-release" ] || exit 0
             while [ "$watchdog_attempt" -lt $((timeout_seconds * 5)) ]; do
-                if [ -e "$watchdog_control_dir/watchdog-terminate" ]; then
+                if [ -e "$watchdog_control_dir/watchdog-terminate" ] || \
+                   { [ -n "$parent_capture_terminate_marker" ] && \
+                     [ -e "$parent_capture_terminate_marker" ]; }; then
                     watchdog_termination_requested=true
                     break
                 fi
@@ -1339,7 +1418,9 @@ run_report_command() {
                 watchdog_attempt=$((watchdog_attempt + 1))
             done
         fi
-        if [ -e "$watchdog_control_dir/watchdog-terminate" ]; then
+        if [ -e "$watchdog_control_dir/watchdog-terminate" ] || \
+           { [ -n "$parent_capture_terminate_marker" ] && \
+             [ -e "$parent_capture_terminate_marker" ]; }; then
             watchdog_termination_requested=true
         fi
         if [ "$watchdog_termination_requested" != true ]; then
@@ -1353,8 +1434,14 @@ run_report_command() {
         # identity until the KILL has been sent. No delayed signal can target a
         # PID that the owner has already reaped and the OS has reused.
         kill -KILL -- "-$command_pid" 2>/dev/null || true
+        if [ -n "$parent_capture_terminated_marker" ] && \
+           [ -e "$parent_capture_terminate_marker" ]; then
+            : > "$parent_capture_terminated_marker"
+        fi
         if [ "$watchdog_termination_requested" = true ] || \
-           [ -e "$watchdog_control_dir/watchdog-terminate" ]; then
+           [ -e "$watchdog_control_dir/watchdog-terminate" ] || \
+           { [ -n "$parent_capture_terminate_marker" ] && \
+             [ -e "$parent_capture_terminate_marker" ]; }; then
             : > "$watchdog_control_dir/watchdog-terminated"
             exit 0
         fi
@@ -1577,48 +1664,97 @@ PARENT_CAPTURE_STARTING=false
 PARENT_CAPTURE_PENDING_SIGNAL=""
 PARENT_CAPTURE_PENDING_STATUS=""
 PARENT_CAPTURE_OUTPUT_FILE=""
+PARENT_CAPTURE_OWNER_LEASE_FD=""
+PARENT_CAPTURE_OWNER_BOOTSTRAP_FD=""
+PARENT_CAPTURE_OWNER_TOKEN=""
+
+close_parent_capture_owner_fd() {
+    case "$1" in
+        9) exec 9>&- ;;
+        8) exec 8>&- ;;
+        7) exec 7>&- ;;
+        6) exec 6>&- ;;
+        5) exec 5>&- ;;
+        "") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+close_parent_capture_owner_bootstrap() {
+    close_parent_capture_owner_fd "$PARENT_CAPTURE_OWNER_BOOTSTRAP_FD" || \
+        return 1
+    PARENT_CAPTURE_OWNER_BOOTSTRAP_FD=""
+}
+
+release_parent_capture_owner_channel() {
+    local previous_pipe_trap write_status=0
+    [ -n "$PARENT_CAPTURE_OWNER_LEASE_FD" ] || return 0
+    previous_pipe_trap="$(trap -p PIPE)"
+    trap '' PIPE
+    case "$PARENT_CAPTURE_OWNER_LEASE_FD" in
+        9) printf '%s\n' "$PARENT_CAPTURE_OWNER_TOKEN" >&9 2>/dev/null || write_status=$? ;;
+        8) printf '%s\n' "$PARENT_CAPTURE_OWNER_TOKEN" >&8 2>/dev/null || write_status=$? ;;
+        7) printf '%s\n' "$PARENT_CAPTURE_OWNER_TOKEN" >&7 2>/dev/null || write_status=$? ;;
+        6) printf '%s\n' "$PARENT_CAPTURE_OWNER_TOKEN" >&6 2>/dev/null || write_status=$? ;;
+        5) printf '%s\n' "$PARENT_CAPTURE_OWNER_TOKEN" >&5 2>/dev/null || write_status=$? ;;
+        *) write_status=1 ;;
+    esac
+    close_parent_capture_owner_fd "$PARENT_CAPTURE_OWNER_LEASE_FD" || \
+        write_status=1
+    PARENT_CAPTURE_OWNER_LEASE_FD=""
+    trap - PIPE
+    [ -z "$previous_pipe_trap" ] || eval "$previous_pipe_trap"
+    [ "$write_status" -eq 0 ]
+}
 
 cleanup_parent_capture_control() {
     [ -z "$PARENT_CAPTURE_CONTROL_DIR" ] || {
         clear_parent_capture_child "$PARENT_CAPTURE_CONTROL_DIR"
+        rm -f "$PARENT_CAPTURE_CONTROL_DIR/completed" \
+            "$PARENT_CAPTURE_CONTROL_DIR/release" \
+            "$PARENT_CAPTURE_CONTROL_DIR/watchdog-release" \
+            "$PARENT_CAPTURE_CONTROL_DIR/watchdog-fired" \
+            "$PARENT_CAPTURE_CONTROL_DIR/owner"
         rmdir "$PARENT_CAPTURE_CONTROL_DIR" 2>/dev/null || true
     }
     PARENT_CAPTURE_CONTROL_DIR=""
+    PARENT_CAPTURE_OWNER_TOKEN=""
 }
 
 terminate_parent_capture_active_child() {
     local child_pid="" group_owned="" attempt=0
+    local active_child claim
     [ -n "$PARENT_CAPTURE_CONTROL_DIR" ] && \
-        [ -f "$PARENT_CAPTURE_CONTROL_DIR/active-child" ] && \
-        [ ! -L "$PARENT_CAPTURE_CONTROL_DIR/active-child" ] || return 0
+        [ -d "$PARENT_CAPTURE_CONTROL_DIR" ] || return 0
+    active_child="$PARENT_CAPTURE_CONTROL_DIR/active-child"
+    claim="$PARENT_CAPTURE_CONTROL_DIR/active-child-claim"
+    [ -f "$active_child" ] && [ ! -L "$active_child" ] || return 0
+    mv "$active_child" "$claim" 2>/dev/null || return 0
     IFS=$'\t' read -r child_pid group_owned \
-        < "$PARENT_CAPTURE_CONTROL_DIR/active-child" || return 0
+        < "$claim" || {
+            rm -f "$claim"
+            return 0
+        }
+    rm -f "$claim"
     [[ "$child_pid" =~ ^[1-9][0-9]*$ ]] || return 0
     case "$group_owned" in true|false) ;; *) return 0 ;; esac
-    if [ "$group_owned" = true ]; then
-        kill -TERM -- "-$child_pid" 2>/dev/null || true
-        while kill -0 -- "-$child_pid" 2>/dev/null && \
-              [ "$attempt" -lt 40 ]; do
-            sleep 0.05
-            attempt=$((attempt + 1))
-        done
-        kill -0 -- "-$child_pid" 2>/dev/null && \
-            kill -KILL -- "-$child_pid" 2>/dev/null || true
-    else
-        kill -TERM "$child_pid" 2>/dev/null || true
-        while kill -0 "$child_pid" 2>/dev/null && \
-              [ "$attempt" -lt 40 ]; do
-            sleep 0.05
-            attempt=$((attempt + 1))
-        done
-        kill -0 "$child_pid" 2>/dev/null && \
-            kill -KILL "$child_pid" 2>/dev/null || true
-    fi
+    # The nested report watchdog is already identity-bound to this published
+    # supervisor. Ask that sole signal owner to escalate and acknowledge KILL;
+    # this outer owner never signals a saved numeric PID or PGID itself.
+    : > "$PARENT_CAPTURE_CONTROL_DIR/active-child-terminate"
+    while [ ! -e "$PARENT_CAPTURE_CONTROL_DIR/active-child-terminated" ] && \
+          [ "$attempt" -lt 60 ]; do
+        sleep 0.05
+        attempt=$((attempt + 1))
+    done
+    rm -f "$PARENT_CAPTURE_CONTROL_DIR/active-child-claim" \
+        "$PARENT_CAPTURE_CONTROL_DIR/active-child-terminate" \
+        "$PARENT_CAPTURE_CONTROL_DIR/active-child-terminated"
 }
 
 terminate_parent_capture() {
     local capture_pid="$PARENT_CAPTURE_PID"
-    local attempt=0 fallback_pid=""
+    local attempt=0 watchdog_pid=""
     [ -n "$capture_pid" ] || return 0
     # The direct request group is published in a private control directory.
     # Terminate it independently so a stopped or wedged supervisor cannot be
@@ -1631,35 +1767,39 @@ terminate_parent_capture() {
         kill -TERM "$capture_pid" 2>/dev/null || true
         kill -CONT "$capture_pid" 2>/dev/null || true
     fi
-    # Bound the supervisor wait even if its shell is wedged. The separately
-    # grouped request has already received TERM/KILL through its direct handle.
+    # The capture supervisor remains alive after publishing command completion,
+    # anchoring its PID/PGID until this identity-bound watchdog is released or
+    # finishes escalation. Reap the watchdog before releasing and reaping the
+    # supervisor so neither side can signal a recycled numeric identity.
     (
         trap 'exit 0' TERM INT
-        sleep 5
+        watchdog_attempt=0
+        while [ ! -e "$PARENT_CAPTURE_CONTROL_DIR/watchdog-release" ] && \
+              [ "$watchdog_attempt" -lt 100 ]; do
+            sleep 0.05
+            watchdog_attempt=$((watchdog_attempt + 1))
+        done
+        [ ! -e "$PARENT_CAPTURE_CONTROL_DIR/watchdog-release" ] || exit 0
+        : > "$PARENT_CAPTURE_CONTROL_DIR/watchdog-fired"
         if [ "$PARENT_CAPTURE_GROUP_OWNED" = true ]; then
             kill -KILL -- "-$capture_pid" 2>/dev/null || true
         else
             kill -KILL "$capture_pid" 2>/dev/null || true
         fi
     ) &
-    fallback_pid=$!
-    wait "$capture_pid" 2>/dev/null || true
-    kill -TERM "$fallback_pid" 2>/dev/null || true
-    wait "$fallback_pid" 2>/dev/null || true
-    if [ "$PARENT_CAPTURE_GROUP_OWNED" = true ]; then
-        while kill -0 -- "-$capture_pid" 2>/dev/null && \
-              [ "$attempt" -lt 40 ]; do
-            sleep 0.05
-            attempt=$((attempt + 1))
-        done
-        if kill -0 -- "-$capture_pid" 2>/dev/null; then
-            kill -KILL -- "-$capture_pid" 2>/dev/null || true
-        fi
-    else
-        if kill -0 "$capture_pid" 2>/dev/null; then
-            kill -KILL "$capture_pid" 2>/dev/null || true
-        fi
+    watchdog_pid=$!
+    while [ ! -e "$PARENT_CAPTURE_CONTROL_DIR/completed" ] && \
+          [ ! -e "$PARENT_CAPTURE_CONTROL_DIR/watchdog-fired" ] && \
+          [ "$attempt" -lt 110 ]; do
+        sleep 0.05
+        attempt=$((attempt + 1))
+    done
+    if [ -e "$PARENT_CAPTURE_CONTROL_DIR/completed" ]; then
+        : > "$PARENT_CAPTURE_CONTROL_DIR/watchdog-release"
     fi
+    wait "$watchdog_pid" 2>/dev/null || true
+    release_parent_capture_owner_channel || true
+    wait "$capture_pid" 2>/dev/null || true
     terminate_parent_capture_active_child
     cleanup_parent_capture_control
     PARENT_CAPTURE_PID=""
@@ -1684,7 +1824,7 @@ handle_parent_capture_signal() {
 
 run_parent_managed_capture() {
     local output_file="$1" capture_rc=0
-    local previous_int_trap previous_term_trap
+    local previous_int_trap previous_term_trap owner_fifo candidate_fd
     shift
     previous_int_trap="$(trap -p INT)"
     previous_term_trap="$(trap -p TERM)"
@@ -1694,22 +1834,96 @@ run_parent_managed_capture() {
     PARENT_CAPTURE_PENDING_SIGNAL=""
     PARENT_CAPTURE_PENDING_STATUS=""
     PARENT_CAPTURE_OUTPUT_FILE="$output_file"
+    PARENT_CAPTURE_OWNER_LEASE_FD=""
+    PARENT_CAPTURE_OWNER_BOOTSTRAP_FD=""
     PARENT_CAPTURE_CONTROL_DIR="$(mktemp -d \
         "${TMPDIR:-/tmp}/gh-pr-enrich-parent-capture.XXXXXX")" || return 1
-    if ! chmod 700 "$PARENT_CAPTURE_CONTROL_DIR"; then
+    owner_fifo="$PARENT_CAPTURE_CONTROL_DIR/owner"
+    PARENT_CAPTURE_OWNER_TOKEN="${PARENT_CAPTURE_CONTROL_DIR##*.}"
+    if ! chmod 700 "$PARENT_CAPTURE_CONTROL_DIR" || \
+       ! (umask 077; mkfifo "$owner_fifo"); then
         rmdir "$PARENT_CAPTURE_CONTROL_DIR" 2>/dev/null || true
         PARENT_CAPTURE_CONTROL_DIR=""
         return 1
     fi
+    for candidate_fd in 9 8 7 6 5; do
+        case "$candidate_fd" in
+            9) { { : >&9; } || { : <&9; }; } 2>/dev/null && continue ;;
+            8) { { : >&8; } || { : <&8; }; } 2>/dev/null && continue ;;
+            7) { { : >&7; } || { : <&7; }; } 2>/dev/null && continue ;;
+            6) { { : >&6; } || { : <&6; }; } 2>/dev/null && continue ;;
+            5) { { : >&5; } || { : <&5; }; } 2>/dev/null && continue ;;
+        esac
+        if [ -z "$PARENT_CAPTURE_OWNER_LEASE_FD" ]; then
+            PARENT_CAPTURE_OWNER_LEASE_FD="$candidate_fd"
+        else
+            PARENT_CAPTURE_OWNER_BOOTSTRAP_FD="$candidate_fd"
+            break
+        fi
+    done
+    if [ -z "$PARENT_CAPTURE_OWNER_LEASE_FD" ] || \
+       [ -z "$PARENT_CAPTURE_OWNER_BOOTSTRAP_FD" ]; then
+        cleanup_parent_capture_control
+        return 1
+    fi
+    case "$PARENT_CAPTURE_OWNER_BOOTSTRAP_FD" in
+        9) exec 9<>"$owner_fifo" ;;
+        8) exec 8<>"$owner_fifo" ;;
+        7) exec 7<>"$owner_fifo" ;;
+        6) exec 6<>"$owner_fifo" ;;
+        5) exec 5<>"$owner_fifo" ;;
+    esac
+    case "$PARENT_CAPTURE_OWNER_LEASE_FD" in
+        9) exec 9>"$owner_fifo" ;;
+        8) exec 8>"$owner_fifo" ;;
+        7) exec 7>"$owner_fifo" ;;
+        6) exec 6>"$owner_fifo" ;;
+        5) exec 5>"$owner_fifo" ;;
+    esac
     trap 'handle_parent_capture_signal INT 130' INT
     trap 'handle_parent_capture_signal TERM 143' TERM
     set -m
-    "$@" > "$output_file" &
+    (
+        managed_capture_rc=0
+        # TERM/INT reach the managed command group, but this supervisor stays
+        # alive as the group-identity anchor until the owner releases it.
+        trap ':' INT TERM
+        close_parent_capture_owner_fd "$PARENT_CAPTURE_OWNER_LEASE_FD" || \
+            exit 1
+        close_parent_capture_owner_fd \
+            "$PARENT_CAPTURE_OWNER_BOOTSTRAP_FD" || exit 1
+        PARENT_CAPTURE_OWNER_LEASE_FD=""
+        PARENT_CAPTURE_OWNER_BOOTSTRAP_FD=""
+        PARENT_CAPTURE_CONTROL_DIR="$PARENT_CAPTURE_CONTROL_DIR" \
+            "$@" > "$output_file" || managed_capture_rc=$?
+        : > "$PARENT_CAPTURE_CONTROL_DIR/completed"
+        owner_message=""
+        IFS= read -r owner_message <&4 || true
+        exec 4<&-
+        if [ -n "$owner_message" ] && \
+           [ "$owner_message" != "$PARENT_CAPTURE_OWNER_TOKEN" ]; then
+            managed_capture_rc=125
+        fi
+        clear_parent_capture_child "$PARENT_CAPTURE_CONTROL_DIR"
+        rm -f "$PARENT_CAPTURE_CONTROL_DIR/completed" \
+            "$PARENT_CAPTURE_CONTROL_DIR/release" \
+            "$PARENT_CAPTURE_CONTROL_DIR/watchdog-release" \
+            "$PARENT_CAPTURE_CONTROL_DIR/watchdog-fired" \
+            "$PARENT_CAPTURE_CONTROL_DIR/owner"
+        rmdir "$PARENT_CAPTURE_CONTROL_DIR" 2>/dev/null || true
+        exit "$managed_capture_rc"
+    ) 4<"$owner_fifo" &
     PARENT_CAPTURE_PID=$!
     if kill -0 -- "-$PARENT_CAPTURE_PID" 2>/dev/null; then
         PARENT_CAPTURE_GROUP_OWNED=true
     fi
     set +m
+    close_parent_capture_owner_bootstrap || {
+        release_parent_capture_owner_channel || true
+        wait "$PARENT_CAPTURE_PID" 2>/dev/null || true
+        cleanup_parent_capture_control
+        return 1
+    }
     [ -z "${GH_PR_ENRICH_DEBUG_PARENT_CAPTURE_PID_FILE:-}" ] || \
         printf '%s\n' "$PARENT_CAPTURE_PID" >> \
             "$GH_PR_ENRICH_DEBUG_PARENT_CAPTURE_PID_FILE"
@@ -1717,6 +1931,21 @@ run_parent_managed_capture() {
     if [ -n "$PARENT_CAPTURE_PENDING_SIGNAL" ]; then
         handle_parent_capture_signal "$PARENT_CAPTURE_PENDING_SIGNAL" \
             "$PARENT_CAPTURE_PENDING_STATUS"
+    fi
+    while [ ! -e "$PARENT_CAPTURE_CONTROL_DIR/completed" ] && \
+          kill -0 "$PARENT_CAPTURE_PID" 2>/dev/null; do
+        sleep 0.02
+    done
+    if [ -n "$TEST_CALL_FN" ] && \
+       [ -n "${GH_PR_ENRICH_TEST_PARENT_CAPTURE_RELEASE_READY:-}" ] && \
+       [ -e "$PARENT_CAPTURE_CONTROL_DIR/completed" ]; then
+        : > "$GH_PR_ENRICH_TEST_PARENT_CAPTURE_RELEASE_READY"
+        while [ ! -e "${GH_PR_ENRICH_TEST_PARENT_CAPTURE_RELEASE_GATE:-}" ]; do
+            sleep 0.01
+        done
+    fi
+    if [ -e "$PARENT_CAPTURE_CONTROL_DIR/completed" ]; then
+        release_parent_capture_owner_channel || true
     fi
     wait "$PARENT_CAPTURE_PID" || capture_rc=$?
     PARENT_CAPTURE_PID=""
@@ -11495,7 +11724,9 @@ verify_external_disclosure_sources() {
     local context_payload linked_issue_ids expected_linked_issues
     local primary_repository primary_repository_id
     local live_repository live_repository_id live_visibility linked_issue_id
-    local visibility_query
+    local visibility_query visibility_variable_defs='$primaryId: ID!'
+    local visibility_node_fields="" visibility_batch_key
+    local visibility_batch_index=0 visibility_batch_size=0
     local -a linked_issue_args=()
 
     # PRIVATE, INTERNAL, and indeterminate sources are allowed only through the
@@ -11554,21 +11785,42 @@ verify_external_disclosure_sources() {
     fi
     while IFS= read -r linked_issue_id; do
         [ -n "$linked_issue_id" ] || continue
-        linked_issue_args+=("-F" "ids[]=$linked_issue_id")
+        if [ "$visibility_batch_size" -eq 100 ]; then
+            visibility_batch_index=$((visibility_batch_index + 1))
+            visibility_batch_size=0
+        fi
+        if [ "$visibility_batch_size" -eq 0 ]; then
+            visibility_variable_defs="$visibility_variable_defs, \
+\$ids$visibility_batch_index: [ID!]!"
+            if [ "$visibility_batch_index" -eq 0 ]; then
+                visibility_batch_key="nodes"
+            else
+                visibility_batch_key="linkedIssues$visibility_batch_index"
+            fi
+            visibility_node_fields="$visibility_node_fields
+          $visibility_batch_key: nodes(ids: \
+\$ids$visibility_batch_index) {
+            id
+            ... on Issue { repository { nameWithOwner visibility } }
+          }"
+        fi
+        linked_issue_args+=("-F" \
+            "ids${visibility_batch_index}[]=$linked_issue_id")
+        visibility_batch_size=$((visibility_batch_size + 1))
     done <<< "$linked_issue_ids"
 
     if [ "${#linked_issue_args[@]}" -gt 0 ]; then
-        visibility_query='query ExternalDisclosureVisibility(
-          $primaryId: ID!, $ids: [ID!]!
+        # GitHub limits each `nodes(ids:)` field to 100 IDs. Keep every batch
+        # in one GraphQL operation so the complete visibility attestation is a
+        # single hosted snapshot rather than a sequence of torn reads.
+        visibility_query="query ExternalDisclosureVisibility(
+          $visibility_variable_defs
         ) {
-          primaryRepository: node(id: $primaryId) {
+          primaryRepository: node(id: \$primaryId) {
             ... on Repository { id nameWithOwner visibility }
           }
-          nodes(ids: $ids) {
-            id
-            ... on Issue { repository { nameWithOwner visibility } }
-          }
-        }'
+          $visibility_node_fields
+        }"
     else
         # `gh api graphql` supplies an omitted list variable as null instead of
         # applying a GraphQL default. Use a literal empty list so the live
@@ -11593,7 +11845,11 @@ verify_external_disclosure_sources() {
        ! jq -e '
             ((.errors // []) | length) == 0 and
             (.data.primaryRepository | type) == "object" and
-            ((.data.nodes // null) | type) == "array"
+            ((.data | to_entries |
+              map(select((.key == "nodes") or
+                (.key | startswith("linkedIssues"))))) as $batches |
+              ($batches | length) > 0 and
+              all($batches[]; (.value | type) == "array"))
         ' "$EXTERNAL_VISIBILITY_TEMP_FILE" > /dev/null 2>&1; then
         cleanup_external_visibility_temp
         echo "Error: Current external repository visibility could not be verified; Claude enrichment is blocked." >&2
@@ -11620,7 +11876,10 @@ verify_external_disclosure_sources() {
        ! printf '%s' "$expected_linked_issues" | \
          jq -e --slurpfile live "$EXTERNAL_VISIBILITY_TEMP_FILE" '
             . as $expected
-            | ($live[0].data.nodes // []) as $nodes
+            | ($live[0].data | to_entries |
+                map(select((.key == "nodes") or
+                  (.key | startswith("linkedIssues")))) |
+                map(.value) | add // []) as $nodes
             | ($expected == ($nodes | map({
                 id: (.id // ""),
                 repository: (.repository.nameWithOwner // ""),
@@ -12784,7 +13043,17 @@ exercise_report_run_watchdog() {
     esac
 }
 
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default retrospective_report_date workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace validate_analysis_candidate build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments run_semgrep_with_watchdog collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_snapshot fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged build_address_expected_discussion_snapshot verify_analysis_discussion_snapshot_with_status analysis_intent_snapshot_from_files analysis_intent_fingerprint_from_files fetch_live_analysis_intent_fingerprint verify_analysis_intent_unchanged verify_analysis_intent_with_status analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job exercise_report_run_watchdog"
+exercise_parent_capture_nested_watchdog() {
+    local output_file="$1"
+    shift
+    [ "$#" -eq 3 ] || return 2
+    REPORT_RUN_STANDALONE=true
+    REPORT_RUN_MANAGED=false
+    run_parent_managed_capture "$output_file" run_report_command \
+        report_watchdog_timeout_fixture "$1" "$2" "$3"
+}
+
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default retrospective_report_date workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace validate_analysis_candidate build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments run_semgrep_with_watchdog collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_snapshot fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged build_address_expected_discussion_snapshot verify_analysis_discussion_snapshot_with_status analysis_intent_snapshot_from_files analysis_intent_fingerprint_from_files fetch_live_analysis_intent_fingerprint verify_analysis_intent_unchanged verify_analysis_intent_with_status analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation verify_external_disclosure_sources run_parent_managed_capture sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job exercise_report_run_watchdog exercise_parent_capture_nested_watchdog"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in

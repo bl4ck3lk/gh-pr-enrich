@@ -272,6 +272,7 @@ export GH_PR_ENRICH_PROMPT="$HOME/.config/gh-pr-enrich-prompt.txt"
 |------|----------|---------|
 | `gh` | ✅ Yes | `brew install gh` |
 | `jq` | ✅ Yes | `brew install jq` |
+| `perl` | Only for immutable code snapshots | Included with macOS; `apt-get install perl` on Linux |
 | `claude` | Only for `--enrich` | [claude.ai/code](https://claude.ai/code) |
 | `semgrep` | Only for `--sast` | `pip install semgrep` |
 

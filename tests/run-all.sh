@@ -9,7 +9,7 @@ FAILED=0
 for suite in "$SCRIPT_DIR"/test-*.sh; do
     name="$(basename "$suite")"
     printf '%-34s ' "$name"
-    if output=$("$suite" 2>&1); then
+    if output=$(bash "$suite" 2>&1); then
         printf 'PASS  (%s)\n' "$(printf '%s' "$output" | grep -o 'Results: [0-9]*/[0-9]* passed' | tail -1)"
     else
         printf 'FAIL\n'

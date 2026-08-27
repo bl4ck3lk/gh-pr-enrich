@@ -499,10 +499,38 @@ BATCH_REPLACED_OID=$(git -C "$BATCH_REPO" rev-parse HEAD:file-0.txt)
 BATCH_REPLACEMENT_OID=$(printf 'LOCAL_REPLACEMENT_SECRET\n' | \
     git -C "$BATCH_REPO" hash-object -w --stdin)
 git -C "$BATCH_REPO" replace "$BATCH_REPLACED_OID" "$BATCH_REPLACEMENT_OID"
+BATCH_HELPER_LOG="$TEST_OUTPUT_DIR/batch-index-helpers.log"
+REAL_BATCH_DIRNAME=$(command -v dirname)
+REAL_BATCH_MKDIR=$(command -v mkdir)
+REAL_BATCH_STAT=$(command -v stat)
+REAL_BATCH_CHMOD=$(command -v chmod)
+REAL_BATCH_DD=$(command -v dd)
+cat > "$BATCH_STUBS/materialization-helper" << 'STUB'
+#!/bin/bash
+helper=${0##*/}
+printf '%s\n' "$helper" >> "$BATCH_HELPER_LOG"
+case "$helper" in
+    dirname) real_helper="$REAL_BATCH_DIRNAME" ;;
+    mkdir) real_helper="$REAL_BATCH_MKDIR" ;;
+    stat) real_helper="$REAL_BATCH_STAT" ;;
+    chmod) real_helper="$REAL_BATCH_CHMOD" ;;
+    dd) real_helper="$REAL_BATCH_DD" ;;
+    *) exit 127 ;;
+esac
+exec "$real_helper" "$@"
+STUB
+chmod +x "$BATCH_STUBS/materialization-helper"
+for BATCH_HELPER in dirname mkdir stat chmod dd; do
+    ln -s materialization-helper "$BATCH_STUBS/$BATCH_HELPER"
+done
 : > "$BATCH_GIT_LOG"
+: > "$BATCH_HELPER_LOG"
 BATCH_SNAPSHOT_JSON=$(cd "$BATCH_REPO" && \
     env PATH="$BATCH_STUBS:$STUB_DIR:$PATH" REAL_BATCH_GIT="$REAL_BATCH_GIT" \
-        BATCH_GIT_LOG="$BATCH_GIT_LOG" PS_CALLED_LOG="$PS_CALLED_LOG" \
+        BATCH_GIT_LOG="$BATCH_GIT_LOG" BATCH_HELPER_LOG="$BATCH_HELPER_LOG" \
+        REAL_BATCH_DIRNAME="$REAL_BATCH_DIRNAME" REAL_BATCH_MKDIR="$REAL_BATCH_MKDIR" \
+        REAL_BATCH_STAT="$REAL_BATCH_STAT" REAL_BATCH_CHMOD="$REAL_BATCH_CHMOD" \
+        REAL_BATCH_DD="$REAL_BATCH_DD" PS_CALLED_LOG="$PS_CALLED_LOG" \
         "$GH_PR_ENRICH" materialize-analysis-snapshot "$BATCH_REPORT")
 BATCH_SNAPSHOT_PATH=$(printf '%s' "$BATCH_SNAPSHOT_JSON" | jq -r '.path')
 assert_eq "1" "$(grep -c 'cat-file --batch' "$BATCH_GIT_LOG" || true)" \
@@ -511,6 +539,9 @@ assert_eq "0" "$(grep -c 'cat-file blob' "$BATCH_GIT_LOG" || true)" \
     "indexed snapshot materialization launches no per-file Git blob processes"
 assert_contains "$(cat "$BATCH_GIT_LOG")" "--no-replace-objects" \
     "indexed materialization disables local Git replacement objects"
+assert_true "$([ "$(wc -l < "$BATCH_HELPER_LOG" | tr -d ' ')" -lt 50 ] && \
+    echo 0 || echo 1)" \
+    "indexed materialization launches only a constant number of file helpers"
 assert_eq "fixture-0" "$(cat "$BATCH_SNAPSHOT_PATH/file-0.txt")" \
     "local replacement refs cannot substitute unbound snapshot bytes"
 assert_eq "same" "$(cat "$BATCH_SNAPSHOT_PATH/duplicate-one.txt")" \

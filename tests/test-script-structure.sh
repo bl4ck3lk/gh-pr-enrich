@@ -32,6 +32,9 @@ setup
 # ---------------------------------------------------------------------------
 rc=0; bash -n "$GH_PR_ENRICH" 2>/dev/null || rc=$?
 assert_true "$rc" "script parses cleanly (bash -n)"
+assert_contains "$(cat "$SCRIPT_DIR/run-all.sh")" \
+    'output=$(bash "$suite" 2>&1)' \
+    "the aggregate runner does not require executable suite files"
 
 # ---------------------------------------------------------------------------
 # No duplicated function bodies
