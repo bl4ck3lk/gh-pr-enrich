@@ -130,10 +130,8 @@ case "$1 $2" in
                     |= (.pageInfo = {hasNextPage:false,endCursor:null}
                         | .nodes |= map(
                             . as $thread
-                            | if ($mutation_log | length) > 0 and
-                                 ($mutation_log | test("(^|\\n)threadId=" +
-                                    $thread.id +
-                                    "(\\n|$)"))
+                            | if ($mutation_log | split("\n") |
+                                  index("threadId=" + $thread.id)) != null
                               then .isResolved = true
                               else .
                               end
@@ -1199,9 +1197,13 @@ jq '.task_list[0].task = "OWNED RESOLUTION TASK"
 mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
     "$STALE_MUTATION_REPORT/analysis.json"
 : > "$MUTATION_LOG"
+OWNED_RESOLUTION_RC=0
 OWNED_RESOLUTION_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
     env GH_HEAD_MODE=captured GH_MUTATIONS_LOG="$MUTATION_LOG" \
-    PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" address 999 2>&1))
+    PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" address 999 2>&1)) || \
+    OWNED_RESOLUTION_RC=$?
+assert_true "$([ "$OWNED_RESOLUTION_RC" -eq 0 ] && echo 0 || echo 1)" \
+    "a clean batch exits successfully" "$OWNED_RESOLUTION_OUT"
 assert_contains "$OWNED_RESOLUTION_OUT" "Resolved: PRRT_first" \
     "a clean batch accepts its first owned resolution"
 assert_contains "$OWNED_RESOLUTION_OUT" "Resolved: PRRT_second" \
