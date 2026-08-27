@@ -2032,9 +2032,12 @@ ADDRESS_HOSTED_RESULT_FILE=""
 ADDRESS_HOSTED_CONTROL_DIR=""
 ADDRESS_COMMAND_MANAGEMENT_ENABLED=false
 ADDRESS_PENDING_SIGNAL_STATUS=""
+ADDRESS_HOSTED_TIMEOUT_MULTIPLIER=1
 ADDRESS_BATCH_ACTIVE=false
 ADDRESS_BATCH_ATTEMPTED_THREAD_IDS=()
 ADDRESS_BATCH_CONFIRMED_THREAD_IDS=()
+ADDRESS_EXPECTED_DISCUSSION_FILE=""
+ADDRESS_EXPECTED_DISCUSSION_REPLACEMENT=""
 ADDRESS_SELECTED_IDENTITY=""
 ADDRESS_BATCH_LOCK_DIR=""
 ADDRESS_BATCH_LOCK_TOKEN=""
@@ -2121,7 +2124,8 @@ run_address_hosted_command() {
     local output_file="$1"
     shift
     local child_pid command_rc=0 timeout_seconds control_dir owner_pid
-    local timeout_attempt=0 timeout_limit status_value=""
+    local timeout_attempt=0 timeout_limit timeout_multiplier
+    local timeout_budget_seconds status_value=""
     ADDRESS_MUTATION_CHILD_STARTING=true
     ADDRESS_HOSTED_RESULT_FILE="$output_file"
     control_dir="$(mktemp -d \
@@ -2155,12 +2159,15 @@ run_address_hosted_command() {
     ADDRESS_MUTATION_CHILD_PID="$child_pid"
     timeout_seconds="$(positive_integer_or_default \
         "${GH_PR_ENRICH_GITHUB_TIMEOUT:-}" 60 3600)"
+    timeout_multiplier="$(positive_integer_or_default \
+        "${ADDRESS_HOSTED_TIMEOUT_MULTIPLIER:-}" 1 16)"
+    timeout_budget_seconds=$((timeout_seconds * timeout_multiplier))
     ADDRESS_MUTATION_CHILD_STARTING=false
     if [ -n "$ADDRESS_PENDING_SIGNAL_STATUS" ]; then
         terminate_address_mutation_child
         exit "$ADDRESS_PENDING_SIGNAL_STATUS"
     fi
-    timeout_limit=$((timeout_seconds * 5))
+    timeout_limit=$((timeout_budget_seconds * 5))
     while [ ! -f "$control_dir/complete" ] && \
           address_job_is_running "$ADDRESS_MUTATION_CHILD_JOB_SPEC" && \
           [ "$timeout_attempt" -lt "$timeout_limit" ]; do
@@ -2170,7 +2177,7 @@ run_address_hosted_command() {
     if [ ! -f "$control_dir/complete" ] && \
        address_job_is_running "$ADDRESS_MUTATION_CHILD_JOB_SPEC"; then
         terminate_address_mutation_child
-        echo "Error: GitHub request timed out after ${timeout_seconds}s" >&2
+        echo "Error: GitHub request timed out after ${timeout_budget_seconds}s" >&2
         return 124
     fi
     if [ ! -f "$control_dir/complete" ] || \
@@ -2226,6 +2233,95 @@ verify_address_analysis_intent_unchanged() {
     esac
     [ "$command_rc" -eq 0 ] && \
         [ "$INTENT_VERIFICATION_STATUS" = "unchanged" ]
+}
+
+prepare_address_expected_discussion() {
+    local context_file="$1" report_dir="$2" candidate="" command_rc=0
+    [ -z "$ADDRESS_EXPECTED_DISCUSSION_FILE" ] || return 0
+    candidate="$(mktemp \
+        "${TMPDIR:-/tmp}/gh-pr-enrich-address-discussion.XXXXXX")" || return 1
+    chmod 600 "$candidate" || {
+        rm -f "$candidate"
+        return 1
+    }
+    run_address_hosted_command "$candidate" env \
+        ADDRESS_COMMAND_MANAGEMENT_ENABLED=false \
+        "$0" --test-call build_address_expected_discussion_snapshot \
+        "$context_file" "$report_dir" || command_rc=$?
+    if [ "$command_rc" -ne 0 ] || [ -L "$candidate" ] || \
+       ! jq -e 'type == "object"' "$candidate" > /dev/null 2>&1; then
+        rm -f "$candidate"
+        [ "$ADDRESS_HOSTED_RESULT_FILE" != "$candidate" ] || \
+            ADDRESS_HOSTED_RESULT_FILE=""
+        return 1
+    fi
+    ADDRESS_EXPECTED_DISCUSSION_FILE="$candidate"
+    [ "$ADDRESS_HOSTED_RESULT_FILE" != "$candidate" ] || \
+        ADDRESS_HOSTED_RESULT_FILE=""
+}
+
+verify_address_analysis_discussion_unchanged() {
+    local context_file="$1" status_file="" command_rc=0 status=""
+    [ -n "$ADDRESS_EXPECTED_DISCUSSION_FILE" ] || return 1
+    status_file="$(mktemp \
+        "${TMPDIR:-/tmp}/gh-pr-enrich-address-discussion-status.XXXXXX")" || \
+        return 1
+    chmod 600 "$status_file" || {
+        rm -f "$status_file"
+        return 1
+    }
+    ADDRESS_HOSTED_TIMEOUT_MULTIPLIER=8 \
+    run_address_hosted_command "$status_file" env \
+        ADDRESS_COMMAND_MANAGEMENT_ENABLED=false \
+        "$0" --test-call verify_analysis_discussion_snapshot_with_status \
+        "$context_file" "$ADDRESS_EXPECTED_DISCUSSION_FILE" || command_rc=$?
+    status="$(sed -n \
+        's/^GH_PR_ENRICH_DISCUSSION_STATUS=//p' "$status_file" | tail -n 1)"
+    rm -f "$status_file"
+    [ "$ADDRESS_HOSTED_RESULT_FILE" != "$status_file" ] || \
+        ADDRESS_HOSTED_RESULT_FILE=""
+    case "$status" in
+        unchanged|mismatch|unavailable)
+            DISCUSSION_VERIFICATION_STATUS="$status"
+            ;;
+        *)
+            DISCUSSION_VERIFICATION_STATUS="unavailable"
+            ;;
+    esac
+    [ "$command_rc" -eq 0 ] && \
+        [ "$DISCUSSION_VERIFICATION_STATUS" = "unchanged" ]
+}
+
+mark_address_expected_discussion_resolved() {
+    local thread_id="$1" replacement=""
+    [ -n "$ADDRESS_EXPECTED_DISCUSSION_FILE" ] || return 1
+    ADDRESS_EXPECTED_DISCUSSION_REPLACEMENT="$(mktemp \
+        "${TMPDIR:-/tmp}/gh-pr-enrich-address-discussion-next.XXXXXX")" || \
+        return 1
+    replacement="$ADDRESS_EXPECTED_DISCUSSION_REPLACEMENT"
+    chmod 600 "$replacement" || {
+        rm -f "$replacement"
+        ADDRESS_EXPECTED_DISCUSSION_REPLACEMENT=""
+        return 1
+    }
+    if ! jq -cS -e --arg thread_id "$thread_id" '
+            ([.review_threads[] | select(.id == $thread_id)] | length) as $count
+            | if $count == 1 and
+                 any(.review_threads[];
+                    .id == $thread_id and .is_resolved == false)
+              then .review_threads |= map(
+                    if .id == $thread_id then .is_resolved = true else . end
+                  )
+              else error("owned resolution was not captured as unresolved")
+              end
+        ' "$ADDRESS_EXPECTED_DISCUSSION_FILE" > "$replacement" 2>/dev/null || \
+       ! mv "$replacement" "$ADDRESS_EXPECTED_DISCUSSION_FILE"; then
+        rm -f "$replacement"
+        ADDRESS_EXPECTED_DISCUSSION_REPLACEMENT=""
+        return 1
+    fi
+    ADDRESS_EXPECTED_DISCUSSION_REPLACEMENT=""
+    chmod 600 "$ADDRESS_EXPECTED_DISCUSSION_FILE"
 }
 
 release_address_batch_lock() {
@@ -3067,7 +3163,16 @@ path_has_symlink_component() {
         probe="${probe%/}"
     done
     while [ "$probe" != "." ] && [ "$probe" != "/" ] && [ -n "$probe" ]; do
-        parent="$(dirname "$probe")"
+        case "$probe" in
+            */*)
+                parent="${probe%/*}"
+                while [ "$parent" != "/" ] && [[ "$parent" = */ ]]; do
+                    parent="${parent%/}"
+                done
+                [ -n "$parent" ] || parent="/"
+                ;;
+            *) parent="." ;;
+        esac
         if [ -L "$probe" ]; then
             # macOS exposes system directories such as /tmp and /var through
             # root-level aliases into /private. Those links are outside a
@@ -4729,6 +4834,26 @@ if [ "$1" = "install-skill" ]; then
     exit 0
 fi
 
+retrospective_report_date() {
+    local summary_file="$1"
+    [ -f "$summary_file" ] && ! [ -L "$summary_file" ] || return 1
+    jq -s -er '
+        def valid_github_date:
+            . as $raw
+            | select(type == "string")
+            | select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            | select(try ((fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ")) == $raw) catch false)
+            | $raw[0:10];
+        if length == 1 and (.[0] | type) == "object"
+        then .[0]
+        else error("summary must contain exactly one JSON object")
+        end
+        | [.createdAt, .updatedAt]
+        | map(valid_github_date)
+        | .[0] // empty
+    ' "$summary_file" 2>/dev/null
+}
+
 # Handle retrospective subcommand - analyze patterns across all PR reports
 if [ "$1" = "retrospective" ]; then
     shift
@@ -5328,6 +5453,7 @@ RETRO_HELP
         local pr_count=0
         local skipped_no_analysis=0
         local skipped_date=0
+        local skipped_unknown_date=0
         local skipped_author=0
         local legacy_reports=()
 
@@ -5386,11 +5512,18 @@ RETRO_HELP
                 continue
             fi
 
-            # Apply date filter
-            if [ -n "$since_date" ] && [ -f "$summary_file" ]; then
-                local pr_date
-                pr_date=$(jq -r '.createdAt // .updatedAt // ""' "$summary_file" 2>/dev/null | cut -d'T' -f1)
-                if [ -n "$pr_date" ] && [[ "$pr_date" < "$since_date" ]]; then
+            # Apply date filter. A missing or malformed report date cannot
+            # prove that the report belongs in a bounded time window.
+            if [ -n "$since_date" ]; then
+                local pr_date=""
+                if pr_date="$(retrospective_report_date "$summary_file")"; then
+                    :
+                else
+                    cleanup_retrospective_report_snapshot "$analysis_file" || return 1
+                    ((skipped_unknown_date++)) || true
+                    continue
+                fi
+                if [[ "$pr_date" < "$since_date" ]]; then
                     cleanup_retrospective_report_snapshot "$analysis_file" || return 1
                     ((skipped_date++)) || true
                     continue
@@ -5449,6 +5582,7 @@ RETRO_HELP
         echo "Found $pr_count PR reports with structured analysis" >&2
         [ "$skipped_no_analysis" -gt 0 ] && echo "  Skipped $skipped_no_analysis PRs without analysis.json or claude-analysis.json" >&2 || true
         [ "$skipped_date" -gt 0 ] && echo "  Skipped $skipped_date PRs before $since_date" >&2 || true
+        [ "$skipped_unknown_date" -gt 0 ] && echo "  Skipped $skipped_unknown_date PRs without a verifiable date" >&2 || true
         [ "$skipped_author" -gt 0 ] && echo "  Skipped $skipped_author PRs by other authors" >&2 || true
         if [ "${#legacy_reports[@]}" -gt 0 ]; then
             echo "  Excluded ${#legacy_reports[@]} report(s) in the older format (no finding categories): ${legacy_reports[*]}" >&2
@@ -7187,6 +7321,10 @@ if [ "$1" = "address" ]; then
             rm -f "$ADDRESS_MUTATION_RESULT_FILE"
         [ -z "$ADDRESS_HOSTED_RESULT_FILE" ] || \
             rm -f "$ADDRESS_HOSTED_RESULT_FILE"
+        [ -z "$ADDRESS_EXPECTED_DISCUSSION_FILE" ] || \
+            rm -f "$ADDRESS_EXPECTED_DISCUSSION_FILE"
+        [ -z "$ADDRESS_EXPECTED_DISCUSSION_REPLACEMENT" ] || \
+            rm -f "$ADDRESS_EXPECTED_DISCUSSION_REPLACEMENT"
         rm -f "$ADDRESS_FROZEN_ANALYSIS" "$ADDRESS_FROZEN_CONTEXT"
         [ -z "$ADDRESS_PENDING_SIGNAL_STATUS" ] || \
             exit_status="$ADDRESS_PENDING_SIGNAL_STATUS"
@@ -7409,6 +7547,12 @@ if [ "$1" = "address" ]; then
                             echo "  ❌ Selected analysis changed before the mutation batch began. The newer publication was preserved."
                             exit 1
                         fi
+                        if ! prepare_address_expected_discussion \
+                                "$ADDRESS_CONTEXT_FILE" "$ANALYSIS_DIR"; then
+                            invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                            echo "  ❌ Captured discussion inputs no longer match the selected analysis. Re-run before resolving threads."
+                            exit 1
+                        fi
 
                         # Validate the complete task batch before resolving any
                         # thread. Per-thread checks are repeated below to close
@@ -7464,7 +7608,6 @@ if [ "$1" = "address" ]; then
                                 exit 1
                             fi
                         done
-
                         ADDRESS_BATCH_ATTEMPTED_THREAD_IDS=()
                         ADDRESS_BATCH_CONFIRMED_THREAD_IDS=()
                         ADDRESS_BATCH_ACTIVE=true
@@ -7495,6 +7638,19 @@ if [ "$1" = "address" ]; then
                                 rollback_active_address_thread_batch || true
                                 invalidate_selected_analysis "$ANALYSIS_DIR" || true
                                 echo "  ❌ Live review discussion changed or could not be fetched completely. Re-run before resolving threads."
+                                exit 1
+                            fi
+                            if ! verify_address_analysis_discussion_unchanged \
+                                    "$ADDRESS_CONTEXT_FILE"; then
+                                rollback_active_address_thread_batch || true
+                                [ "$DISCUSSION_VERIFICATION_STATUS" != "mismatch" ] || \
+                                    invalidate_selected_analysis \
+                                        "$ANALYSIS_DIR" || true
+                                if [ "$DISCUSSION_VERIFICATION_STATUS" = "mismatch" ]; then
+                                    echo "  ❌ The complete GitHub discussion changed since analysis. Re-run before resolving threads."
+                                else
+                                    echo "  ❌ The complete GitHub discussion could not be revalidated; no further thread mutation was sent."
+                                fi
                                 exit 1
                             fi
                             if ! verify_address_analysis_intent_unchanged \
@@ -7654,9 +7810,25 @@ if [ "$1" = "address" ]; then
                                 echo "  ❌ State changed during resolution; hosted thread state was left unchanged and the analysis was invalidated. Manual reconciliation is required."
                                 exit 1
                             fi
+                            if ! mark_address_expected_discussion_resolved \
+                                    "$TID"; then
+                                rollback_active_address_thread_batch || true
+                                invalidate_selected_analysis "$ANALYSIS_DIR" || true
+                                echo "  ❌ The owned resolution could not be recorded in the expected discussion state. Manual reconciliation is required."
+                                exit 1
+                            fi
                         done
                         BATCH_COMMIT_FAILURE=""
+                        if ! verify_address_analysis_discussion_unchanged \
+                                "$ADDRESS_CONTEXT_FILE"; then
+                            if [ "$DISCUSSION_VERIFICATION_STATUS" = "mismatch" ]; then
+                                BATCH_COMMIT_FAILURE="discussion_changed"
+                            else
+                                BATCH_COMMIT_FAILURE="discussion_unavailable"
+                            fi
+                        fi
                         for TID in "${ADDRESS_BATCH_CONFIRMED_THREAD_IDS[@]}"; do
+                            [ -z "$BATCH_COMMIT_FAILURE" ] || break
                             LIVE_ANALYSIS_DIGEST="$(sha256_file "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
                             LIVE_ANALYSIS_MODE="$(workspace_file_mode "$ADDRESS_LIVE_ANALYSIS_FILE" 2>/dev/null || echo "")"
                             LIVE_CONTEXT_DIGEST="$(sha256_file "$ADDRESS_LIVE_CONTEXT_FILE" 2>/dev/null || echo "")"
@@ -7703,7 +7875,8 @@ if [ "$1" = "address" ]; then
                             rollback_active_address_thread_batch || true
                             invalidate_selected_analysis "$ANALYSIS_DIR" || true
                             if [ "$BATCH_COMMIT_FAILURE" = "head_unavailable" ] || \
-                               [ "$BATCH_COMMIT_FAILURE" = "intent_unavailable" ]; then
+                               [ "$BATCH_COMMIT_FAILURE" = "intent_unavailable" ] || \
+                               [ "$BATCH_COMMIT_FAILURE" = "discussion_unavailable" ]; then
                                 echo "  ❌ Hosted PR state could not be revalidated before batch commit; resolved threads were left unchanged and the analysis was invalidated. Manual reconciliation is required."
                             else
                                 echo "  ❌ Task thread state changed before batch commit. Re-run before resolving threads."
@@ -8563,10 +8736,10 @@ cleanup_live_analysis_discussion_temps() {
 # Re-fetch the same normalized inputs used by the original collection. The
 # temporary snapshot stays outside the report directory so an untrusted branch
 # cannot preplant any of its paths or observe a partially collected identity.
-fetch_live_analysis_discussion_fingerprint_once() {
+fetch_live_analysis_discussion_snapshot_once() {
     local repository="$1" pr_number="$2"
     local owner="${repository%%/*}" repo_name="${repository#*/}"
-    local live_dir pages_file fingerprint=""
+    local live_dir pages_file snapshot_file snapshot_rc=0
     [ -n "$owner" ] && [ -n "$repo_name" ] && [ "$owner" != "$repo_name" ] || return 1
     live_dir="$(mktemp -d "/tmp/gh-pr-enrich-live-discussion.XXXXXX")" || return 1
     LIVE_DISCUSSION_TEMP_DIR="$live_dir"
@@ -8661,10 +8834,26 @@ fetch_live_analysis_discussion_fingerprint_once() {
         LIVE_DISCUSSION_TEMP_DIR=""
         return 1
     }
-    fingerprint="$(analysis_discussion_fingerprint_from_files \
-        "$live_dir" 2>/dev/null || echo "")"
+    snapshot_file="$live_dir/discussion-snapshot.json"
+    analysis_discussion_snapshot_from_files "$live_dir" \
+        > "$snapshot_file" 2>/dev/null || {
+        rm -rf "$live_dir"
+        LIVE_DISCUSSION_TEMP_DIR=""
+        return 1
+    }
+    cat "$snapshot_file" || snapshot_rc=$?
     rm -rf "$live_dir"
     LIVE_DISCUSSION_TEMP_DIR=""
+    return "$snapshot_rc"
+}
+
+fetch_live_analysis_discussion_fingerprint_once() {
+    local repository="$1" pr_number="$2" fingerprint=""
+    fingerprint="$(
+        set -o pipefail
+        fetch_live_analysis_discussion_snapshot_once \
+            "$repository" "$pr_number" | sha256_stream
+    )" || return 1
     [ -n "$fingerprint" ] || return 1
     printf '%s\n' "$fingerprint"
 }
@@ -8672,8 +8861,8 @@ fetch_live_analysis_discussion_fingerprint_once() {
 # A discussion snapshot is assembled from four independently paginated API
 # surfaces. Require two consecutive complete snapshots to agree so a mutation
 # between requests cannot be accepted as one coherent hosted state.
-fetch_live_analysis_discussion_fingerprint() {
-    local repository="$1" pr_number="$2" fingerprint=""
+fetch_live_analysis_discussion_snapshot() {
+    local repository="$1" pr_number="$2" snapshot_rc=0
     DISCUSSION_STABILITY_FIRST="$(mktemp \
         "/tmp/gh-pr-enrich-discussion-stability.XXXXXX")" || return 1
     DISCUSSION_STABILITY_SECOND="$(mktemp \
@@ -8682,9 +8871,9 @@ fetch_live_analysis_discussion_fingerprint() {
         DISCUSSION_STABILITY_FIRST=""
         return 1
     }
-    if ! fetch_live_analysis_discussion_fingerprint_once \
+    if ! fetch_live_analysis_discussion_snapshot_once \
             "$repository" "$pr_number" > "$DISCUSSION_STABILITY_FIRST" || \
-       ! fetch_live_analysis_discussion_fingerprint_once \
+       ! fetch_live_analysis_discussion_snapshot_once \
             "$repository" "$pr_number" > "$DISCUSSION_STABILITY_SECOND" || \
        ! cmp -s "$DISCUSSION_STABILITY_FIRST" "$DISCUSSION_STABILITY_SECOND"; then
         rm -f "$DISCUSSION_STABILITY_FIRST" "$DISCUSSION_STABILITY_SECOND"
@@ -8692,10 +8881,20 @@ fetch_live_analysis_discussion_fingerprint() {
         DISCUSSION_STABILITY_SECOND=""
         return 1
     fi
-    fingerprint="$(cat "$DISCUSSION_STABILITY_FIRST" 2>/dev/null || echo "")"
+    cat "$DISCUSSION_STABILITY_FIRST" || snapshot_rc=$?
     rm -f "$DISCUSSION_STABILITY_FIRST" "$DISCUSSION_STABILITY_SECOND"
     DISCUSSION_STABILITY_FIRST=""
     DISCUSSION_STABILITY_SECOND=""
+    return "$snapshot_rc"
+}
+
+fetch_live_analysis_discussion_fingerprint() {
+    local repository="$1" pr_number="$2" fingerprint=""
+    fingerprint="$(
+        set -o pipefail
+        fetch_live_analysis_discussion_snapshot \
+            "$repository" "$pr_number" | sha256_stream
+    )" || return 1
     [ -n "$fingerprint" ] || return 1
     printf '%s\n' "$fingerprint"
 }
@@ -8734,6 +8933,57 @@ verify_analysis_discussion_unchanged() {
     fi
     DISCUSSION_VERIFICATION_STATUS="unchanged"
 }
+
+build_address_expected_discussion_snapshot() (
+    local context_file="$1" report_dir="$2" snapshot_file=""
+    local expected_fingerprint="" actual_fingerprint=""
+    snapshot_file="$(mktemp \
+        "/tmp/gh-pr-enrich-address-expected-discussion.XXXXXX")" || return 1
+    trap 'rm -f "$snapshot_file"' EXIT
+    expected_fingerprint="$(jq -r \
+        '.coverage.discussion.fingerprint // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    [ -n "$expected_fingerprint" ] || return 1
+    analysis_discussion_snapshot_from_files "$report_dir" \
+        > "$snapshot_file" 2>/dev/null || return 1
+    actual_fingerprint="$(sha256_file "$snapshot_file" 2>/dev/null || echo "")"
+    [ "$actual_fingerprint" = "$expected_fingerprint" ] || return 1
+    cat "$snapshot_file"
+)
+
+verify_analysis_discussion_snapshot_with_status() (
+    local context_file="$1" expected_file="$2" repository="" pr_number=""
+    local current_file="" verification_rc=0
+    trap cleanup_live_analysis_discussion_temps EXIT
+    DISCUSSION_VERIFICATION_STATUS="unavailable"
+    repository="$(jq -r '.pr.repository // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    pr_number="$(jq -r '.pr.number // ""' \
+        "$context_file" 2>/dev/null || echo "")"
+    current_file="$(mktemp \
+        "/tmp/gh-pr-enrich-address-current-discussion.XXXXXX")" || \
+        verification_rc=1
+    if [ "$verification_rc" -eq 0 ]; then
+        CURRENT_DISCUSSION_TEMP_FILE="$current_file"
+        if [ -z "$repository" ] || [ -z "$pr_number" ] || \
+           [ -L "$expected_file" ] || \
+           ! jq -e 'type == "object"' "$expected_file" > /dev/null 2>&1 || \
+           ! fetch_live_analysis_discussion_snapshot \
+                "$repository" "$pr_number" > "$current_file" 2>/dev/null; then
+            verification_rc=1
+        elif cmp -s "$expected_file" "$current_file"; then
+            DISCUSSION_VERIFICATION_STATUS="unchanged"
+        else
+            DISCUSSION_VERIFICATION_STATUS="mismatch"
+            verification_rc=1
+        fi
+    fi
+    [ -z "$current_file" ] || rm -f "$current_file"
+    CURRENT_DISCUSSION_TEMP_FILE=""
+    printf 'GH_PR_ENRICH_DISCUSSION_STATUS=%s\n' \
+        "$DISCUSSION_VERIFICATION_STATUS"
+    return "$verification_rc"
+)
 
 # Re-fetch one complete PR/linked-issue intent snapshot. The pull request fields
 # are repeated on every GraphQL page and must agree, preventing pagination from
@@ -12525,7 +12775,7 @@ exercise_report_run_watchdog() {
     esac
 }
 
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace validate_analysis_candidate build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments run_semgrep_with_watchdog collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged analysis_intent_snapshot_from_files analysis_intent_fingerprint_from_files fetch_live_analysis_intent_fingerprint verify_analysis_intent_unchanged verify_analysis_intent_with_status analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job exercise_report_run_watchdog"
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default retrospective_report_date workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace validate_analysis_candidate build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments run_semgrep_with_watchdog collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_snapshot fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged build_address_expected_discussion_snapshot verify_analysis_discussion_snapshot_with_status analysis_intent_snapshot_from_files analysis_intent_fingerprint_from_files fetch_live_analysis_intent_fingerprint verify_analysis_intent_unchanged verify_analysis_intent_with_status analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job exercise_report_run_watchdog"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in

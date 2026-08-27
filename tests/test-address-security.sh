@@ -56,6 +56,33 @@ done
 cat > "$STUB_DIR/gh" << 'STUB'
 #!/bin/bash
 case "$1 $2" in
+    "api --paginate")
+        report_dir=".reports/pr-reviews/pr-999"
+        case "${3:-}" in
+            repos/*/issues/*/comments)
+                if [ "${GH_LIVE_DISCUSSION_MODE:-}" = \
+                        "drift_after_mutation" ] && \
+                   [ -n "${GH_MUTATIONS_LOG:-}" ] && \
+                   [ -s "$GH_MUTATIONS_LOG" ]; then
+                    jq '. + [{id:9001,body:"concurrent discussion drift",
+                        user:{login:"reviewer"},created_at:"2026-02-01T00:00:00Z",
+                        updated_at:"2026-02-01T00:00:00Z",
+                        html_url:"https://github.com/o/r/pull/999#issuecomment-9001"}]' \
+                        "$report_dir/issue-comments.json"
+                else
+                    cat "$report_dir/issue-comments.json"
+                fi
+                ;;
+            repos/*/pulls/*/reviews)
+                cat "$report_dir/review-comments.json"
+                ;;
+            repos/*/pulls/*/comments)
+                cat "$report_dir/inline-comments.json"
+                ;;
+            *) exit 1 ;;
+        esac
+        exit $?
+        ;;
     "api user")
         echo '{"login":"test-operator"}'
         exit 0
@@ -93,6 +120,27 @@ case "$1 $2" in
         exit 0
         ;;
     "api graphql")
+        if [[ "$*" == *"reviewThreads(first: 100"* ]]; then
+            report_dir=".reports/pr-reviews/pr-999"
+            mutation_log=""
+            [ -z "${GH_MUTATIONS_LOG:-}" ] || \
+                mutation_log="$(cat "$GH_MUTATIONS_LOG" 2>/dev/null || true)"
+            jq --arg mutation_log "$mutation_log" '
+                .data.repository.pullRequest.reviewThreads
+                    |= (.pageInfo = {hasNextPage:false,endCursor:null}
+                        | .nodes |= map(
+                            . as $thread
+                            | if ($mutation_log | length) > 0 and
+                                 ($mutation_log | test("(^|\\n)threadId=" +
+                                    $thread.id +
+                                    "(\\n|$)"))
+                              then .isResolved = true
+                              else .
+                              end
+                          ))
+            ' "$report_dir/comment-threads.json"
+            exit $?
+        fi
         case "$*" in
             *"AnalysisIntentSnapshot"*)
                 if [ "${GH_LIVE_INTENT_MODE:-}" = "unavailable" ]; then
@@ -431,6 +479,28 @@ write_fixture_intent_inputs() {
         analysis_intent_fingerprint_from_files "$report_dir"
 }
 
+write_fixture_discussion_inputs() {
+    local report_dir="$1" thread_ids="$2"
+    printf '%s\n' '[]' > "$report_dir/issue-comments.json"
+    printf '%s\n' '[]' > "$report_dir/review-comments.json"
+    printf '%s\n' '[]' > "$report_dir/inline-comments.json"
+    jq -n --argjson tids "$thread_ids" '{data:{repository:{pullRequest:{
+        reviewThreads:{
+            nodes:[$tids[] | {
+                id:.,isResolved:false,isOutdated:false,path:"a.js",line:1,
+                originalLine:1,diffSide:"RIGHT",comments:{
+                    totalCount:0,pageInfo:{hasNextPage:false,endCursor:null},
+                    nodes:[]
+                }
+            }],
+            totalCount:($tids | length),
+            pageInfo:{hasNextPage:false,endCursor:null},pages_fetched:1
+        }
+    }}}}' > "$report_dir/comment-threads.json"
+    "$GH_PR_ENRICH" --test-call \
+        analysis_discussion_fingerprint_from_files "$report_dir"
+}
+
 write_current_selection() {
     local ws="$1"
     local source_file="$2"
@@ -438,6 +508,7 @@ write_current_selection() {
     local report_dir="$ws/.reports/pr-reviews/pr-999"
     local context_file="$report_dir/analysis-context.json"
     local context_fingerprint workspace_fingerprint intent_fingerprint
+    local discussion_fingerprint
     local inspected_sha thread_ids existing_root
 
     existing_root=$(git -C "$ws" rev-parse --show-toplevel 2>/dev/null || echo "")
@@ -474,14 +545,18 @@ write_current_selection() {
         | unique
     ' "$report_dir/analysis.json")
     intent_fingerprint="$(write_fixture_intent_inputs "$report_dir")"
+    discussion_fingerprint="$(write_fixture_discussion_inputs \
+        "$report_dir" "$thread_ids")"
 
     jq -n --argjson tids "$thread_ids" --arg inspected_sha "$inspected_sha" \
-        --arg intent_fingerprint "$intent_fingerprint" '{
+        --arg intent_fingerprint "$intent_fingerprint" \
+        --arg discussion_fingerprint "$discussion_fingerprint" '{
         pr: {repository:"o/r", number:999, base_sha:"captured-base",
             base_ref_name:"main",
             title:"Fixture PR",body:"captured intent"},
         unresolved_threads: [$tids[] | {thread_id:.,comments_complete:true,comment_identity:[]}],
         coverage: {intent:{fingerprint:$intent_fingerprint},
+            discussion:{fingerprint:$discussion_fingerprint},
             code_access:{state:"enabled", pr_head_sha:"captured-head",
                 inspected_sha:$inspected_sha, revision_matches:false}}
     }' > "$context_file"
@@ -1080,6 +1155,59 @@ assert_not_contains "$(cat "$MUTATION_LOG")" "threadId=PRRT_second" \
     "later-thread drift blocks its resolution mutation"
 assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
     "later-thread drift invalidates the selected artifact"
+
+# Complete-discussion drift outside the task threads must stop the batch. The
+# first owned resolution is retained for manual reconciliation; the unrelated
+# issue comment prevents every later mutation.
+restore_stale_selection
+jq '.task_list[0].task = "COMPLETE DISCUSSION DRIFT TASK"
+    | .task_list[0].thread_ids = ["PRRT_first","PRRT_second"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
+: > "$MUTATION_LOG"
+set +e
+COMPLETE_DISCUSSION_DRIFT_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured \
+    GH_LIVE_DISCUSSION_MODE=drift_after_mutation \
+    GH_MUTATIONS_LOG="$MUTATION_LOG" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1))
+COMPLETE_DISCUSSION_DRIFT_RC=$?
+set -e
+assert_true "$([ "$COMPLETE_DISCUSSION_DRIFT_RC" -ne 0 ] && echo 0 || echo 1)" \
+    "unrelated discussion drift exits nonzero"
+assert_eq "1" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
+    "unrelated discussion drift blocks the second resolution"
+assert_contains "$COMPLETE_DISCUSSION_DRIFT_OUT" \
+    "Manual reconciliation is required for: PRRT_first" \
+    "unrelated discussion drift reports the owned partial resolution"
+assert_not_contains "$(cat "$MUTATION_LOG")" "threadId=PRRT_second" \
+    "unrelated discussion drift sends no later mutation"
+assert_not_contains "$(cat "$MUTATION_LOG")" "unresolve:" \
+    "unrelated discussion drift never reopens the owned resolution"
+assert_true "$([ ! -e "$STALE_MUTATION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+    "unrelated discussion drift invalidates the selected artifact"
+
+# The expected snapshot advances only after a confirmed owned resolution, so a
+# clean multi-thread batch does not reject its own first mutation.
+restore_stale_selection
+jq '.task_list[0].task = "OWNED RESOLUTION TASK"
+    | .task_list[0].thread_ids = ["PRRT_first","PRRT_second"]' \
+    "$STALE_MUTATION_REPORT/analysis.json" \
+    > "$STALE_MUTATION_REPORT/analysis.json.tmp"
+mv "$STALE_MUTATION_REPORT/analysis.json.tmp" \
+    "$STALE_MUTATION_REPORT/analysis.json"
+: > "$MUTATION_LOG"
+OWNED_RESOLUTION_OUT=$(printf 'f' | (cd "$STALE_MUTATION_WS" && \
+    env GH_HEAD_MODE=captured GH_MUTATIONS_LOG="$MUTATION_LOG" \
+    PATH="$STUB_DIR:$PATH" "$GH_PR_ENRICH" address 999 2>&1))
+assert_contains "$OWNED_RESOLUTION_OUT" "Resolved: PRRT_first" \
+    "a clean batch accepts its first owned resolution"
+assert_contains "$OWNED_RESOLUTION_OUT" "Resolved: PRRT_second" \
+    "a clean batch accepts its second owned resolution"
+assert_eq "2" "$(wc -l < "$MUTATION_LOG" | tr -d ' ')" \
+    "a clean batch sends exactly two resolution mutations"
 
 # The same failure path remains safe when the already-resolved first thread
 # itself requires GraphQL pagination. The later drift cannot trigger an unsafe

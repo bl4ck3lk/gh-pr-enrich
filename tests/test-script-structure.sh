@@ -84,6 +84,110 @@ assert_eq "0" "$(grep -c -- '--arg diff' "$GH_PR_ENRICH" || true)" \
 assert_contains "$(sed -n '/^fetch_pr_diff() {/,/^}/p' "$GH_PR_ENRICH")" \
     '--rawfile diff' "diff normalization loads the complete diff from a file"
 
+# This helper runs for every inventoried path. Ancestor traversal must stay in
+# the shell instead of spawning one dirname process per path component.
+SYMLINK_COMPONENT_BODY=$(sed -n \
+    '/^path_has_symlink_component() {/,/^}/p' "$GH_PR_ENRICH")
+assert_contains "$SYMLINK_COMPONENT_BODY" '${probe%/*}' \
+    "symlink ancestor traversal uses shell parameter expansion"
+assert_not_contains "$SYMLINK_COMPONENT_BODY" 'dirname' \
+    "symlink ancestor traversal does not fork per path component"
+
+DATE_FILTER_DIR="$TEST_OUTPUT_DIR/retrospective-dates"
+mkdir -p "$DATE_FILTER_DIR"
+cat > "$DATE_FILTER_DIR/recent.json" << 'EOF'
+{"createdAt":"2026-08-20T12:34:56Z"}
+EOF
+assert_eq "2026-08-20" \
+    "$("$GH_PR_ENRICH" --test-call retrospective_report_date \
+        "$DATE_FILTER_DIR/recent.json")" \
+    "retrospective dates accept a complete recent GitHub timestamp"
+cat > "$DATE_FILTER_DIR/fallback.json" << 'EOF'
+{"createdAt":"not-a-date","updatedAt":"2026-07-15T01:02:03Z"}
+EOF
+assert_eq "2026-07-15" \
+    "$("$GH_PR_ENRICH" --test-call retrospective_report_date \
+        "$DATE_FILTER_DIR/fallback.json")" \
+    "retrospective dates fall back to a valid updatedAt"
+cat > "$DATE_FILTER_DIR/old.json" << 'EOF'
+{"createdAt":"2025-01-02T03:04:05Z"}
+EOF
+assert_eq "2025-01-02" \
+    "$("$GH_PR_ENRICH" --test-call retrospective_report_date \
+        "$DATE_FILTER_DIR/old.json")" \
+    "retrospective dates preserve an old report date for cutoff comparison"
+cat > "$DATE_FILTER_DIR/invalid.json" << 'EOF'
+{"createdAt":"2026-02-30T00:00:00Z","updatedAt":null}
+EOF
+rc=0
+"$GH_PR_ENRICH" --test-call retrospective_report_date \
+    "$DATE_FILTER_DIR/invalid.json" > /dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "retrospective dates reject impossible calendar dates"
+cat > "$DATE_FILTER_DIR/missing.json" << 'EOF'
+{"number":1}
+EOF
+rc=0
+"$GH_PR_ENRICH" --test-call retrospective_report_date \
+    "$DATE_FILTER_DIR/missing.json" > /dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "retrospective dates reject summaries without timestamps"
+rc=0
+"$GH_PR_ENRICH" --test-call retrospective_report_date \
+    "$DATE_FILTER_DIR/absent.json" > /dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "retrospective dates reject missing summaries"
+touch "$DATE_FILTER_DIR/empty.json"
+rc=0
+"$GH_PR_ENRICH" --test-call retrospective_report_date \
+    "$DATE_FILTER_DIR/empty.json" > /dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "retrospective dates reject an empty summary"
+cat > "$DATE_FILTER_DIR/multiple.json" << 'EOF'
+{"createdAt":"2026-08-20T12:34:56Z"}
+{"createdAt":"2026-08-21T12:34:56Z"}
+EOF
+rc=0
+"$GH_PR_ENRICH" --test-call retrospective_report_date \
+    "$DATE_FILTER_DIR/multiple.json" > /dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "retrospective dates reject multiple JSON documents"
+cat > "$DATE_FILTER_DIR/non-object.json" << 'EOF'
+["2026-08-20T12:34:56Z"]
+EOF
+rc=0
+"$GH_PR_ENRICH" --test-call retrospective_report_date \
+    "$DATE_FILTER_DIR/non-object.json" > /dev/null 2>&1 || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "retrospective dates reject a non-object summary"
+rc=0
+grep -F 'skipped_unknown_date++' "$GH_PR_ENRICH" > /dev/null || rc=$?
+assert_true "$rc" \
+    "retrospective --since excludes and counts unverifiable dates"
+
+ADDRESS_MODE_BODY=$(sed -n \
+    '/^if \[ "\$1" = "address" \]; then/,/^# Handle --help flag/p' \
+    "$GH_PR_ENRICH")
+assert_contains "$ADDRESS_MODE_BODY" 'prepare_address_expected_discussion' \
+    "address mode anchors a complete captured discussion snapshot"
+assert_contains "$ADDRESS_MODE_BODY" \
+    'verify_address_analysis_discussion_unchanged' \
+    "address mode revalidates the complete discussion around mutations"
+assert_contains "$(sed -n \
+    '/^verify_address_analysis_discussion_unchanged() {/,/^}/p' \
+    "$GH_PR_ENRICH")" 'ADDRESS_HOSTED_TIMEOUT_MULTIPLIER=8' \
+    "complete discussion verification receives an eight-request budget"
+assert_contains "$ADDRESS_MODE_BODY" \
+    'mark_address_expected_discussion_resolved' \
+    "address mode records only its confirmed resolution in expected state"
+ADDRESS_DISCUSSION_UPDATE_BODY=$(sed -n \
+    '/^mark_address_expected_discussion_resolved() {/,/^}/p' \
+    "$GH_PR_ENRICH")
+assert_contains "$ADDRESS_DISCUSSION_UPDATE_BODY" '.is_resolved = true' \
+    "owned discussion updates change only the resolved field"
+assert_contains "$ADDRESS_DISCUSSION_UPDATE_BODY" 'jq -cS -e' \
+    "owned discussion updates preserve canonical snapshot bytes"
+
 # Dispatcher invokes the real function.
 mkdir -p "$TEST_OUTPUT_DIR/ctx"
 cat > "$TEST_OUTPUT_DIR/ctx/pr-summary.json" << 'EOF'
