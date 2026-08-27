@@ -122,6 +122,33 @@ assert_true "$([ -n "$TERMINATE_WATCHDOG_LINE" ] && \
     echo 0 || echo 1)" \
     "cancellation stops its signalling owner before reaping the PGID anchor"
 
+# Semgrep uses the same identity-safe handoff: its group leader publishes
+# completion, then remains alive until the owner releases it and the only
+# numeric signal owner has confirmed exit.
+SEMGREP_WATCHDOG_BODY=$(sed -n \
+    '/^run_semgrep_with_watchdog() {/,/^collect_sast_findings() {/p' \
+    "$GH_PR_ENRICH")
+assert_contains "$SEMGREP_WATCHDOG_BODY" ': > "$launch_dir/completed"' \
+    "the Semgrep supervisor publishes scanner completion"
+assert_contains "$SEMGREP_WATCHDOG_BODY" \
+    '[ ! -e "$launch_dir/watchdog-exited" ]' \
+    "the Semgrep supervisor anchors its PGID until watchdog exit"
+assert_contains "$SEMGREP_WATCHDOG_BODY" \
+    ': > "$semgrep_launch_dir/supervisor-release"' \
+    "the Semgrep owner releases a completed supervisor before reaping it"
+assert_contains "$SEMGREP_WATCHDOG_BODY" \
+    ': > "$watchdog_launch_dir/watchdog-release"' \
+    "the Semgrep owner stops its watchdog through private control state"
+assert_contains "$SEMGREP_WATCHDOG_BODY" \
+    ': > "$semgrep_launch_dir/start"' \
+    "the Semgrep owner releases scanner and watchdog through one shared gate"
+assert_contains "$SEMGREP_WATCHDOG_BODY" \
+    '[ "$gate_attempt" -lt 500 ]' \
+    "Semgrep launch gates are bounded if their owner disappears"
+assert_not_contains "$SEMGREP_WATCHDOG_BODY" \
+    'kill -TERM "$watchdog_pid"' \
+    "the Semgrep owner never signals a saved numeric watchdog PID"
+
 # Inventory every non-directory entry without opening it. A generated filename
 # is not safe merely because it is allowlisted when its inode is a FIFO, socket,
 # device, or another non-regular type.
@@ -135,6 +162,142 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "report preflight rejects an allowlisted FIFO without opening it"
 assert_contains "$SPECIAL_OUTPUT_OUT" "non-regular file: checks.json" \
     "special-file rejection identifies the unsafe generated artifact"
+
+# A regular generated file can still alias unrelated content through a hard
+# link. Preflight must fail before any report redirection truncates that inode.
+HARDLINK_OUTPUT_DIR="$TEST_OUTPUT_DIR/hardlink-output"
+HARDLINK_SENTINEL="$TEST_OUTPUT_DIR/hardlink-sentinel"
+mkdir -p "$HARDLINK_OUTPUT_DIR"
+printf 'preserve-me\n' > "$HARDLINK_SENTINEL"
+ln "$HARDLINK_SENTINEL" "$HARDLINK_OUTPUT_DIR/checks.json"
+rc=0
+HARDLINK_OUTPUT_OUT=$("$GH_PR_ENRICH" --test-call \
+    validate_output_directory_for_writes "$HARDLINK_OUTPUT_DIR" 2>&1) || rc=$?
+assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+    "report preflight rejects an allowlisted hard-linked file"
+assert_contains "$HARDLINK_OUTPUT_OUT" "hard-linked file: checks.json" \
+    "hard-link rejection identifies the unsafe generated artifact"
+assert_eq "preserve-me" "$(cat "$HARDLINK_SENTINEL")" \
+    "hard-link rejection preserves the unrelated inode contents"
+
+# Automatic code access also inventories an ignored report directory before
+# excluding it from cleanliness checks. A generated name sharing a tracked
+# source inode must disable that exclusion.
+HARDLINK_REPO="$TEST_OUTPUT_DIR/hardlink-repo"
+mkdir -p "$HARDLINK_REPO/report"
+(cd "$HARDLINK_REPO" && git init -q . && \
+    git config user.email t@t && git config user.name t && \
+    git config commit.gpgsign false && \
+    printf 'report/\n' > .gitignore && printf 'source\n' > tracked.txt && \
+    git add .gitignore tracked.txt && git commit -qm init)
+ln "$HARDLINK_REPO/tracked.txt" "$HARDLINK_REPO/report/checks.json"
+HARDLINK_HEAD=$(git -C "$HARDLINK_REPO" rev-parse HEAD)
+HARDLINK_ACCESS=$( (cd "$HARDLINK_REPO" && \
+    "$GH_PR_ENRICH" --test-call resolve_code_access "$HARDLINK_HEAD" \
+        "$HARDLINK_REPO/report" 2>&1) || true)
+assert_contains "$HARDLINK_ACCESS" "disabled" \
+    "automatic code access rejects a generated name hard-linked to tracked source"
+assert_contains "$HARDLINK_ACCESS" "uncommitted or untracked files" \
+    "hard-linked output is treated as unsafe local workspace state"
+
+# Exercise the natural-completion handshake directly with a fast scanner stub.
+SEMGREP_STUB_DIR="$TEST_OUTPUT_DIR/semgrep-stubs"
+SEMGREP_RAW="$TEST_OUTPUT_DIR/semgrep-raw.json"
+SEMGREP_STDERR="$TEST_OUTPUT_DIR/semgrep.stderr"
+SEMGREP_SNAPSHOT=$(mktemp -d /tmp/gh-pr-enrich-code-snapshot.XXXXXX)
+SEMGREP_BOUNDARY_ENV="$TEST_OUTPUT_DIR/semgrep-boundary-env"
+SEMGREP_BOUNDARY_WATCHDOG_PID="$TEST_OUTPUT_DIR/semgrep-boundary-watchdog.pid"
+SEMGREP_BOUNDARY_JOBS="$TEST_OUTPUT_DIR/semgrep-boundary.jobs"
+SEMGREP_BOUNDARY_REACHED="$TEST_OUTPUT_DIR/semgrep-boundary.reached"
+SEMGREP_BOUNDARY_UNSAFE_SIGNAL="$TEST_OUTPUT_DIR/semgrep-boundary-unsafe-signal"
+mkdir -p "$SEMGREP_STUB_DIR"
+cat > "$SEMGREP_STUB_DIR/semgrep" << 'STUB'
+#!/bin/sh
+printf '{"results":[],"errors":[]}\n'
+STUB
+chmod +x "$SEMGREP_STUB_DIR/semgrep"
+cat > "$SEMGREP_BOUNDARY_ENV" << 'STUB'
+__gh_pr_enrich_semgrep_completion_debug() {
+    case "$BASH_COMMAND" in
+        'kill -TERM -- "-$semgrep_pid"'*|'kill -KILL -- "-$semgrep_pid"'*)
+            printf 'unsafe\n' > "$SEMGREP_BOUNDARY_UNSAFE_SIGNAL"
+            ;;
+        'watchdog_pid=$!')
+            [ -e "$SEMGREP_BOUNDARY_WATCHDOG_PID" ] || \
+                printf '%s\n' "$!" > "$SEMGREP_BOUNDARY_WATCHDOG_PID"
+            ;;
+        'semgrep_pid=$!') ;;
+        semgrep_pid=*)
+            [ -e "$SEMGREP_BOUNDARY_REACHED" ] && return 0
+            printf 'reached\n' > "$SEMGREP_BOUNDARY_REACHED"
+            jobs -r -p > "$SEMGREP_BOUNDARY_JOBS"
+            ;;
+        'semgrep_reaping=false')
+            if [ "${SEMGREP_BOUNDARY_SIGNAL_POINT:-}" = reaping-clear ] && \
+               [ ! -e "$SEMGREP_BOUNDARY_SIGNAL_SENT" ]; then
+                printf 'sent\n' > "$SEMGREP_BOUNDARY_SIGNAL_SENT"
+                /bin/sh -c 'kill -TERM "$PPID"'
+            fi
+            ;;
+    esac
+}
+set -T
+trap '__gh_pr_enrich_semgrep_completion_debug' DEBUG
+STUB
+rc=0
+BASH_ENV="$SEMGREP_BOUNDARY_ENV" \
+    SEMGREP_BOUNDARY_WATCHDOG_PID="$SEMGREP_BOUNDARY_WATCHDOG_PID" \
+    SEMGREP_BOUNDARY_JOBS="$SEMGREP_BOUNDARY_JOBS" \
+    SEMGREP_BOUNDARY_REACHED="$SEMGREP_BOUNDARY_REACHED" \
+    SEMGREP_BOUNDARY_UNSAFE_SIGNAL="$SEMGREP_BOUNDARY_UNSAFE_SIGNAL" \
+    PATH="$SEMGREP_STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call \
+        run_semgrep_with_watchdog 2 "$SEMGREP_RAW" "$SEMGREP_STDERR" \
+        auto "$SEMGREP_SNAPSHOT" . || rc=$?
+assert_true "$rc" "a fast Semgrep run completes through the watchdog handoff"
+assert_contains "$(cat "$SEMGREP_RAW")" '"results":[]' \
+    "the Semgrep watchdog handoff preserves scanner output"
+SEMGREP_BOUNDARY_PID=$(cat "$SEMGREP_BOUNDARY_WATCHDOG_PID" 2>/dev/null || echo "")
+assert_true "$([ -s "$SEMGREP_BOUNDARY_REACHED" ] && \
+    [ -n "$SEMGREP_BOUNDARY_PID" ] && echo 0 || echo 1)" \
+    "the Semgrep fixture reaches the supervisor-reap boundary"
+assert_true "$([ -f "$SEMGREP_BOUNDARY_JOBS" ] && \
+    ! grep -Fx "$SEMGREP_BOUNDARY_PID" "$SEMGREP_BOUNDARY_JOBS" >/dev/null 2>&1 && \
+    echo 0 || echo 1)" \
+    "the Semgrep watchdog is not running when the PGID anchor is cleared"
+rmdir "$SEMGREP_SNAPSHOT"
+
+# A signal at that exact boundary must be deferred until the wait-only reap is
+# complete. It must not re-enter numeric process-group termination after the
+# watchdog has exited.
+SEMGREP_SIGNAL_RAW="$TEST_OUTPUT_DIR/semgrep-signal-raw.json"
+SEMGREP_SIGNAL_STDERR="$TEST_OUTPUT_DIR/semgrep-signal.stderr"
+SEMGREP_SIGNAL_SNAPSHOT=$(mktemp -d /tmp/gh-pr-enrich-code-snapshot.XXXXXX)
+SEMGREP_SIGNAL_TMP=$(mktemp -d /tmp/gh-pr-enrich-semgrep-test.XXXXXX)
+SEMGREP_BOUNDARY_SIGNAL_SENT="$TEST_OUTPUT_DIR/semgrep-boundary-signal.sent"
+rm -f "$SEMGREP_BOUNDARY_REACHED" "$SEMGREP_BOUNDARY_JOBS" \
+    "$SEMGREP_BOUNDARY_WATCHDOG_PID" "$SEMGREP_BOUNDARY_UNSAFE_SIGNAL" \
+    "$SEMGREP_BOUNDARY_SIGNAL_SENT"
+rc=0
+BASH_ENV="$SEMGREP_BOUNDARY_ENV" \
+    TMPDIR="$SEMGREP_SIGNAL_TMP" \
+    SEMGREP_BOUNDARY_SIGNAL_POINT=reaping-clear \
+    SEMGREP_BOUNDARY_SIGNAL_SENT="$SEMGREP_BOUNDARY_SIGNAL_SENT" \
+    SEMGREP_BOUNDARY_WATCHDOG_PID="$SEMGREP_BOUNDARY_WATCHDOG_PID" \
+    SEMGREP_BOUNDARY_JOBS="$SEMGREP_BOUNDARY_JOBS" \
+    SEMGREP_BOUNDARY_REACHED="$SEMGREP_BOUNDARY_REACHED" \
+    SEMGREP_BOUNDARY_UNSAFE_SIGNAL="$SEMGREP_BOUNDARY_UNSAFE_SIGNAL" \
+    PATH="$SEMGREP_STUB_DIR:$PATH" "$GH_PR_ENRICH" --test-call \
+        run_semgrep_with_watchdog 2 "$SEMGREP_SIGNAL_RAW" \
+        "$SEMGREP_SIGNAL_STDERR" auto "$SEMGREP_SIGNAL_SNAPSHOT" . || rc=$?
+assert_eq "143" "$rc" \
+    "TERM at the terminal reap boundary is deferred then preserved"
+assert_true "$([ ! -e "$SEMGREP_BOUNDARY_UNSAFE_SIGNAL" ] && echo 0 || echo 1)" \
+    "terminal reap cancellation never re-enters numeric PGID signalling"
+SEMGREP_SIGNAL_RESIDUE=$(find "$SEMGREP_SIGNAL_TMP" -mindepth 1 -print -quit)
+assert_true "$([ -z "$SEMGREP_SIGNAL_RESIDUE" ] && echo 0 || echo 1)" \
+    "terminal reap cancellation removes private Semgrep control state"
+rmdir "$SEMGREP_SIGNAL_SNAPSHOT"
+rmdir "$SEMGREP_SIGNAL_TMP"
 
 # ---------------------------------------------------------------------------
 # Dispatcher is allowlisted (must not invoke arbitrary shell functions)

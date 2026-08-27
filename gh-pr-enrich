@@ -385,6 +385,24 @@ workspace_file_mode() {
     return 1
 }
 
+# Return the inode link count on both BSD and GNU stat. Generated artifacts
+# must have exactly one name: otherwise a report redirection could mutate an
+# unrelated file that shares the same inode.
+workspace_file_link_count() {
+    local link_count=""
+    if link_count="$(stat -c '%h' "$1" 2>/dev/null)" && \
+       [[ "$link_count" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s\n' "$link_count"
+        return 0
+    fi
+    if link_count="$(stat -f '%l' "$1" 2>/dev/null)" && \
+       [[ "$link_count" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s\n' "$link_count"
+        return 0
+    fi
+    return 1
+}
+
 # Write a canonical NUL-delimited manifest for every repository-visible path.
 # HEAD and index identity bind staged state. Tracked files whose clean-filtered
 # content matches the index are bound to that exact blob, so smudge filters cannot
@@ -3067,7 +3085,7 @@ path_has_symlink_component() {
 # branch-supplied symlink or overwrite unrelated user content.
 validate_output_directory_for_writes() {
     local output_dir="$1" candidate relative repo_root output_abs output_rel tracked=""
-    local inventory invalid_reason=""
+    local inventory invalid_reason="" link_count=""
     if [ -L "$output_dir" ]; then
         echo "Error: Report output directory cannot be a symbolic link: $output_dir" >&2
         return 1
@@ -3089,6 +3107,10 @@ validate_output_directory_for_writes() {
             break
         elif [ ! -f "$candidate" ]; then
             invalid_reason="non-regular file: $relative"
+            break
+        elif ! link_count="$(workspace_file_link_count "$candidate")" || \
+             [ "$link_count" -ne 1 ]; then
+            invalid_reason="hard-linked file: $relative"
             break
         elif ! is_generated_report_artifact "$relative"; then
             invalid_reason="unrelated file: $relative"
@@ -10432,12 +10454,18 @@ run_semgrep_with_watchdog() {
     local -a targets=("$@")
     local semgrep_pid="" watchdog_pid="" semgrep_rc=0 watchdog_rc=0
     local semgrep_group_owned=false
-    local semgrep_starting=false watchdog_starting=false semgrep_wrapper_signal=""
-    local launch_attempts=0
+    local semgrep_starting=false watchdog_starting=false semgrep_reaping=false
+    local semgrep_stopping=false
+    local semgrep_wrapper_signal=""
+    local launch_attempts=0 wait_attempt=0 wait_limit=$((timeout_secs * 50 + 150))
     local semgrep_launch_dir="" watchdog_launch_dir=""
     cleanup_semgrep_launch() {
         [ -n "$semgrep_launch_dir" ] || return 0
-        rm -f "$semgrep_launch_dir/ready" "$semgrep_launch_dir/go" 2>/dev/null || true
+        rm -f "$semgrep_launch_dir/ready" "$semgrep_launch_dir/go" \
+            "$semgrep_launch_dir/abort" "$semgrep_launch_dir/completed" \
+            "$semgrep_launch_dir/start" \
+            "$semgrep_launch_dir/supervisor-release" \
+            "$semgrep_launch_dir/watchdog-exited" 2>/dev/null || true
         rmdir "$semgrep_launch_dir" 2>/dev/null || true
         semgrep_launch_dir=""
     }
@@ -10445,17 +10473,55 @@ run_semgrep_with_watchdog() {
         [ -n "$watchdog_launch_dir" ] || return 0
         rm -f "$watchdog_launch_dir/ready" "$watchdog_launch_dir/go" \
             "$watchdog_launch_dir/started" \
-            "$watchdog_launch_dir/completed" 2>/dev/null || true
+            "$watchdog_launch_dir/fired" "$watchdog_launch_dir/timed-out" \
+            "$watchdog_launch_dir/watchdog-release" \
+            "$watchdog_launch_dir/watchdog-terminate" \
+            "$watchdog_launch_dir/watchdog-terminated" 2>/dev/null || true
         rmdir "$watchdog_launch_dir" 2>/dev/null || true
         watchdog_launch_dir=""
     }
     stop_semgrep_watchdog() {
         if [ -n "$watchdog_pid" ]; then
-            kill -TERM "$watchdog_pid" 2>/dev/null || true
-            wait "$watchdog_pid" 2>/dev/null || true
+            : > "$watchdog_launch_dir/watchdog-release"
+            wait "$watchdog_pid" 2>/dev/null || watchdog_rc=$?
             watchdog_pid=""
         fi
-        cleanup_semgrep_watchdog_launch
+    }
+    terminate_semgrep_watchdog() {
+        if [ -n "$watchdog_pid" ]; then
+            : > "$watchdog_launch_dir/watchdog-terminate"
+            wait "$watchdog_pid" 2>/dev/null || watchdog_rc=$?
+            watchdog_pid=""
+        fi
+    }
+    semgrep_watchdog_finished_signalling() {
+        [ -n "$semgrep_launch_dir" ] && \
+            [ -e "$semgrep_launch_dir/watchdog-exited" ] && \
+            { [ -e "$semgrep_launch_dir/completed" ] || \
+              { [ -n "$watchdog_launch_dir" ] && \
+                [ -e "$watchdog_launch_dir/fired" ]; }; }
+    }
+    reap_semgrep_group() {
+        local preserve_status="${1:-false}" reap_rc=0
+        [ -n "$semgrep_pid" ] || return 0
+        semgrep_reaping=true
+        while :; do
+            wait "$semgrep_pid" || reap_rc=$?
+            if [ -n "$semgrep_wrapper_signal" ] && \
+               [ "$reap_rc" -ge 128 ] && kill -0 "$semgrep_pid" 2>/dev/null; then
+                reap_rc=0
+                continue
+            fi
+            break
+        done
+        semgrep_pid=""
+        [ "$preserve_status" != true ] || semgrep_rc="$reap_rc"
+        cleanup_semgrep_launch
+        semgrep_reaping=false
+        if [ "$semgrep_stopping" != true ] && \
+           [ -n "$semgrep_wrapper_signal" ]; then
+            handle_semgrep_wrapper_signal "$semgrep_wrapper_signal"
+        fi
     }
     stop_semgrep_group() {
         [ -n "$semgrep_pid" ] || return 0
@@ -10469,20 +10535,34 @@ run_semgrep_with_watchdog() {
             kill -TERM "$semgrep_pid" 2>/dev/null || true
             kill -KILL "$semgrep_pid" 2>/dev/null || true
         fi
-        wait "$semgrep_pid" 2>/dev/null || true
-        semgrep_pid=""
-        cleanup_semgrep_launch
+        reap_semgrep_group false
     }
     stop_semgrep_wrapper() {
         local signal_exit="$1"
-        stop_semgrep_watchdog
-        stop_semgrep_group
+        semgrep_stopping=true
+        if [ "$semgrep_group_owned" = true ] && [ -n "$watchdog_pid" ]; then
+            # Once armed, the watcher is the sole numeric signal owner. It
+            # finishes TERM-to-KILL escalation before the owner reaps the PGID
+            # supervisor, so no delayed signal can target a reused group ID.
+            terminate_semgrep_watchdog
+            reap_semgrep_group false
+        elif semgrep_watchdog_finished_signalling; then
+            # Terminal state plus watchdog acknowledgement makes this a
+            # wait-only boundary. Never signal a numeric PGID after its sole
+            # signalling owner has exited.
+            reap_semgrep_group false
+        else
+            stop_semgrep_watchdog
+            stop_semgrep_group
+        fi
+        cleanup_semgrep_watchdog_launch
         exit "$signal_exit"
     }
     handle_semgrep_wrapper_signal() {
         local signal_name="$1"
         [ -n "$semgrep_wrapper_signal" ] || semgrep_wrapper_signal="$signal_name"
-        if [ "$semgrep_starting" = true ] || [ "$watchdog_starting" = true ]; then
+        if [ "$semgrep_starting" = true ] || \
+           [ "$watchdog_starting" = true ] || [ "$semgrep_reaping" = true ]; then
             return 0
         fi
         case "$semgrep_wrapper_signal" in
@@ -10506,10 +10586,36 @@ run_semgrep_with_watchdog() {
             launch_dir="$1"
             working_directory="$2"
             shift 2
+            scanner_rc=0 gate_attempt=0
+            supervisor_signalled=false
+            trap "supervisor_signalled=true" TERM INT
             : > "$launch_dir/ready"
-            while [ ! -f "$launch_dir/go" ]; do :; done
-            cd "$working_directory" || exit 125
-            exec "$@"
+            while [ ! -e "$launch_dir/start" ] && \
+                  [ ! -e "$launch_dir/abort" ] && \
+                  [ "$gate_attempt" -lt 500 ]; do
+                /bin/sleep 0.01
+                gate_attempt=$((gate_attempt + 1))
+            done
+            [ -e "$launch_dir/start" ] && \
+                [ ! -e "$launch_dir/abort" ] || exit 125
+            if [ "$supervisor_signalled" != true ]; then
+                if cd "$working_directory"; then
+                    "$@" &
+                    scanner_pid=$!
+                    wait "$scanner_pid" || scanner_rc=$?
+                else
+                    scanner_rc=125
+                fi
+            fi
+            if [ "$supervisor_signalled" = true ]; then
+                while :; do /bin/sleep 1; done
+            fi
+            : > "$launch_dir/completed"
+            while [ ! -e "$launch_dir/supervisor-release" ] || \
+                  [ ! -e "$launch_dir/watchdog-exited" ]; do
+                /bin/sleep 0.02
+            done
+            exit "$scanner_rc"
         ' sh "$semgrep_launch_dir" "$working_directory" \
             semgrep --config "$config" --json --quiet -- "${targets[@]}" \
         > "$raw_file" 2> "$stderr_file" &
@@ -10525,8 +10631,8 @@ run_semgrep_with_watchdog() {
     if [ -f "$semgrep_launch_dir/ready" ] && \
        kill -0 -- "-$semgrep_pid" 2>/dev/null; then
         semgrep_group_owned=true
-        : > "$semgrep_launch_dir/go"
     else
+        : > "$semgrep_launch_dir/abort"
         set +m
         stop_semgrep_group
         echo "Error: Could not isolate the Semgrep process group." >&2
@@ -10539,32 +10645,68 @@ run_semgrep_with_watchdog() {
     }
     watchdog_starting=true
     (
-        watchdog_fired=false watchdog_attempt=0
+        watchdog_fired=false watchdog_attempt=0 gate_attempt=0
+        watchdog_termination_requested=false
+        watchdog_failed=false
         watchdog_limit=$((timeout_secs * 10))
+        semgrep_watchdog_exit() {
+            : > "$semgrep_launch_dir/watchdog-exited"
+        }
+        trap semgrep_watchdog_exit EXIT
         trap '[ "$watchdog_fired" = true ] || exit 0' TERM INT
         : > "$watchdog_launch_dir/ready"
-        while [ ! -f "$watchdog_launch_dir/go" ]; do :; done
+        while [ ! -e "$semgrep_launch_dir/start" ] && \
+              [ ! -e "$watchdog_launch_dir/watchdog-release" ] && \
+              [ ! -e "$watchdog_launch_dir/watchdog-terminate" ] && \
+              [ "$gate_attempt" -lt 500 ]; do
+            /bin/sleep 0.01
+            gate_attempt=$((gate_attempt + 1))
+        done
+        if [ -e "$watchdog_launch_dir/watchdog-terminate" ]; then
+            watchdog_termination_requested=true
+        else
+            [ -e "$semgrep_launch_dir/start" ] && \
+                [ ! -e "$watchdog_launch_dir/watchdog-release" ] || exit 0
+        fi
         : > "$watchdog_launch_dir/started"
-        while [ "$watchdog_attempt" -lt "$watchdog_limit" ]; do
-            [ ! -f "$watchdog_launch_dir/completed" ] || exit 0
+        while [ "$watchdog_termination_requested" != true ] && \
+              [ "$watchdog_attempt" -lt "$watchdog_limit" ]; do
+            if [ -e "$watchdog_launch_dir/watchdog-terminate" ]; then
+                watchdog_termination_requested=true
+                break
+            fi
+            [ ! -e "$watchdog_launch_dir/watchdog-release" ] || exit 0
             if ! sleep 0.1; then
-                [ "$semgrep_group_owned" != true ] || \
-                    kill -TERM -- "-$semgrep_pid" 2>/dev/null || true
-                [ "$semgrep_group_owned" != true ] || \
-                    kill -KILL -- "-$semgrep_pid" 2>/dev/null || true
-                exit 1
+                watchdog_failed=true
+                break
             fi
             watchdog_attempt=$((watchdog_attempt + 1))
         done
-        [ ! -f "$watchdog_launch_dir/completed" ] || exit 0
+        if [ -e "$watchdog_launch_dir/watchdog-terminate" ]; then
+            watchdog_termination_requested=true
+        fi
+        if [ "$watchdog_termination_requested" != true ] && \
+           [ "$watchdog_failed" != true ]; then
+            [ ! -e "$watchdog_launch_dir/watchdog-release" ] || exit 0
+        fi
         watchdog_fired=true
+        : > "$watchdog_launch_dir/fired"
         if [ "$semgrep_group_owned" = true ]; then
             kill -TERM -- "-$semgrep_pid" 2>/dev/null || true
+            /bin/sleep 1 || true
             kill -KILL -- "-$semgrep_pid" 2>/dev/null || true
         else
             kill -TERM "$semgrep_pid" 2>/dev/null || true
+            /bin/sleep 1 || true
             kill -KILL "$semgrep_pid" 2>/dev/null || true
         fi
+        if [ "$watchdog_termination_requested" = true ] || \
+           [ -e "$watchdog_launch_dir/watchdog-terminate" ]; then
+            : > "$watchdog_launch_dir/watchdog-terminated"
+            exit 0
+        fi
+        [ "$watchdog_failed" != true ] || exit 1
+        : > "$watchdog_launch_dir/timed-out"
         exit 124
     ) &
     watchdog_pid=$!
@@ -10577,12 +10719,14 @@ run_semgrep_with_watchdog() {
         launch_attempts=$((launch_attempts + 1))
     done
     if [ ! -f "$watchdog_launch_dir/ready" ]; then
+        : > "$semgrep_launch_dir/abort"
         stop_semgrep_watchdog
         stop_semgrep_group
+        cleanup_semgrep_watchdog_launch
         echo "Error: Could not initialize the Semgrep timeout watcher." >&2
         return 125
     fi
-    : > "$watchdog_launch_dir/go"
+    : > "$semgrep_launch_dir/start"
     launch_attempts=0
     while [ ! -f "$watchdog_launch_dir/started" ] && [ "$launch_attempts" -lt 100 ]; do
         kill -0 "$watchdog_pid" 2>/dev/null || break
@@ -10592,22 +10736,34 @@ run_semgrep_with_watchdog() {
     if [ ! -f "$watchdog_launch_dir/started" ]; then
         stop_semgrep_watchdog
         stop_semgrep_group
+        cleanup_semgrep_watchdog_launch
         echo "Error: Could not start the Semgrep timeout watcher." >&2
         return 125
     fi
 
-    wait "$semgrep_pid" || semgrep_rc=$?
-    semgrep_pid=""
-    cleanup_semgrep_launch
-    if [ -n "$watchdog_pid" ]; then
-        if ! : > "$watchdog_launch_dir/completed"; then
-            stop_semgrep_watchdog
-            echo "Error: Could not notify the Semgrep timeout watcher of scan completion." >&2
-            return 125
-        fi
-        wait "$watchdog_pid" 2>/dev/null || watchdog_rc=$?
-        watchdog_pid=""
+    while [ ! -e "$semgrep_launch_dir/completed" ] && \
+          [ ! -e "$watchdog_launch_dir/timed-out" ] && \
+          [ ! -e "$semgrep_launch_dir/watchdog-exited" ] && \
+          [ "$wait_attempt" -lt "$wait_limit" ]; do
+        /bin/sleep 0.02
+        wait_attempt=$((wait_attempt + 1))
+    done
+    if [ -e "$semgrep_launch_dir/completed" ]; then
+        : > "$semgrep_launch_dir/supervisor-release"
     fi
+    stop_semgrep_watchdog
+    if [ ! -e "$semgrep_launch_dir/completed" ] && \
+       [ ! -e "$watchdog_launch_dir/timed-out" ]; then
+        if semgrep_watchdog_finished_signalling; then
+            reap_semgrep_group false
+        else
+            stop_semgrep_group
+        fi
+        cleanup_semgrep_watchdog_launch
+        echo "Error: Semgrep timeout watcher exited before scan completion." >&2
+        return 125
+    fi
+    reap_semgrep_group true
     cleanup_semgrep_watchdog_launch
     if [ "$watchdog_rc" -eq 124 ]; then
         return 124
@@ -10965,6 +11121,7 @@ resolve_code_access() {
                     # output file against the closed generated-artifact allowlist
                     # first; only then may the directory itself be excluded.
                     local candidate relative unexpected_output="" output_inventory=""
+                    local link_count=""
                     if [ -d "$output_abs" ]; then
                         output_inventory="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-output.XXXXXX")"
                         if ! find "$output_abs" -mindepth 1 ! -type d \
@@ -10980,6 +11137,10 @@ resolve_code_access() {
                                 break
                             elif [ ! -f "$candidate" ]; then
                                 unexpected_output="$relative (non-regular file)"
+                                break
+                            elif ! link_count="$(workspace_file_link_count "$candidate")" || \
+                                 [ "$link_count" -ne 1 ]; then
+                                unexpected_output="$relative (hard-linked file)"
                                 break
                             fi
                             if ! is_generated_report_artifact "$relative"; then
@@ -12364,7 +12525,7 @@ exercise_report_run_watchdog() {
     esac
 }
 
-TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace validate_analysis_candidate build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged analysis_intent_snapshot_from_files analysis_intent_fingerprint_from_files fetch_live_analysis_intent_fingerprint verify_analysis_intent_unchanged verify_analysis_intent_with_status analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job exercise_report_run_watchdog"
+TEST_CALLABLE_FUNCTIONS="load_system_prompt resolve_code_access positive_integer_or_default workspace_file_mode code_access_workspace_fingerprint validate_code_access_grant validate_selected_workspace validate_analysis_candidate build_analysis_context build_claude_context fetch_pr_diff extract_unresolved_threads run_claude_analysis write_claude_analysis_artifact generate_analysis_report generate_coverage_section dedupe_bot_comments run_semgrep_with_watchdog collect_sast_findings emit_analysis_schema analysis_context_fingerprint analysis_discussion_snapshot_from_files analysis_discussion_fingerprint_from_files fetch_live_analysis_discussion_fingerprint verify_analysis_discussion_unchanged analysis_intent_snapshot_from_files analysis_intent_fingerprint_from_files fetch_live_analysis_intent_fingerprint verify_analysis_intent_unchanged verify_analysis_intent_with_status analysis_checks_snapshot_from_file analysis_checks_fingerprint_from_file fetch_live_analysis_checks_fingerprint verify_analysis_checks_unchanged verify_analysis_hosted_attestation sanitize_for_terminal select_analysis_file select_analysis_artifact invalidate_selected_analysis fetch_review_threads fetch_linked_issues fetch_pr_files fetch_pr_commits complete_pr_summary_connections verify_pr_head_unchanged validate_output_directory_for_writes signal_address_mutation_job exercise_report_run_watchdog"
 
 if [ -n "$TEST_CALL_FN" ]; then
     case " $TEST_CALLABLE_FUNCTIONS " in
