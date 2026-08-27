@@ -60,6 +60,30 @@ assert_eq "1" "$compat_copy_count" "the legacy Claude context is only a compatib
 assert_eq "0" "$(grep -c -- '--test-build-context' "$GH_PR_ENRICH" || true)" \
     "special-cased --test-build-context hook removed"
 
+# Complete comment corpora and PR summaries can exceed the platform argv
+# limit. Report assembly must load those JSON documents from files.
+assert_eq "0" "$(grep -c -- '--argjson comments' "$GH_PR_ENRICH" || true)" \
+    "report generation never passes a comment corpus through argv"
+COMMENT_STATS_BODY=$(sed -n \
+    '/^COMMENT_STATS_FILE="\$BASE_REPLACEMENT_DIR/,/^for BASE_VIEW/p' \
+    "$GH_PR_ENRICH")
+assert_contains "$COMMENT_STATS_BODY" '--slurpfile comments_doc' \
+    "comment statistics load the complete corpus from a file"
+assert_contains "$COMMENT_STATS_BODY" \
+    'comments must contain exactly one JSON array' \
+    "comment statistics reject empty, multi-document, and non-array JSON"
+COMBINED_REPORT_BODY=$(sed -n \
+    '/^echo "Creating combined JSON/,/^echo "Creating Markdown report/p' \
+    "$GH_PR_ENRICH")
+assert_contains "$COMBINED_REPORT_BODY" '--slurpfile comments_doc' \
+    "combined report generation loads comments from a file"
+assert_contains "$COMBINED_REPORT_BODY" 'must contain exactly one JSON document' \
+    "file-backed report inputs reject empty and multi-document JSON"
+assert_eq "0" "$(grep -c -- '--arg diff' "$GH_PR_ENRICH" || true)" \
+    "diff normalization never passes a complete diff through argv"
+assert_contains "$(sed -n '/^fetch_pr_diff() {/,/^}/p' "$GH_PR_ENRICH")" \
+    '--rawfile diff' "diff normalization loads the complete diff from a file"
+
 # Dispatcher invokes the real function.
 mkdir -p "$TEST_OUTPUT_DIR/ctx"
 cat > "$TEST_OUTPUT_DIR/ctx/pr-summary.json" << 'EOF'
