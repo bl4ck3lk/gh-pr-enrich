@@ -2,13 +2,16 @@ name: tests
 
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
     branches: ['**']
 
 jobs:
-  test:
+  prepare:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      suites: ${{ steps.suites.outputs.suites }}
     steps:
       - uses: actions/checkout@v4
 
@@ -17,12 +20,54 @@ jobs:
           bash --version | head -1
           jq --version
           gh --version | head -1
+          shellcheck --version | head -2
 
-      - name: SKILL.md regression checks
-        run: tests/test-skill-md.sh
+      - name: Shell syntax check
+        run: bash -n gh-pr-enrich
 
-      - name: Retrospective subcommand tests
-        run: tests/test-retrospective.sh
+      - name: Lint shell scripts
+        run: shellcheck -S error gh-pr-enrich tests/*.sh tests/lib/*.sh
 
-      - name: Enrichment-context tests
-        run: tests/test-enrichment-context.sh
+      - name: Discover test suites
+        id: suites
+        run: |
+          suites=$(find tests -maxdepth 1 -type f -name 'test-*.sh' -print \
+            | sort \
+            | jq -Rsc 'split("\n") | map(select(length > 0))')
+          test "$suites" != '[]'
+          printf 'suites=%s\n' "$suites" >> "$GITHUB_OUTPUT"
+
+  suite:
+    needs: prepare
+    runs-on: ubuntu-latest
+    # A suite that cannot finish within five minutes must be split or made
+    # cheaper; CI should never normalize multi-minute serial bottlenecks.
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.prepare.outputs.suites) }}
+    name: ${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run suite
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: bash "$SUITE"
+
+  # Preserve the stable aggregate check name used by branch protection while
+  # allowing independent suites to run concurrently.
+  test:
+    if: always()
+    needs: [prepare, suite]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require preparation and every suite
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          SUITE_RESULT: ${{ needs.suite.result }}
+        run: |
+          test "$PREPARE_RESULT" = success
+          test "$SUITE_RESULT" = success

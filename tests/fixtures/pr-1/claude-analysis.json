@@ -1,16 +1,78 @@
 {
   "issue_categories": [
     {
-      "name": "Error Handling",
+      "finding_id": "missing-api-error-handling",
+      "name": "Missing error handling in API calls",
+      "category": "error_handling",
+      "verdict": "confirmed",
+      "confidence": "high",
       "severity": "high",
-      "description": "Missing error handling in API calls",
-      "thread_ids": ["PRRT_test1"]
+      "impact": "moderate",
+      "likelihood": "likely",
+      "severity_rationale": "Unhandled rejection surfaces as a 500 on every upstream error.",
+      "description": "fetchUser() has no catch around the network call.",
+      "evidence": [
+        {
+          "file": "src/api.js",
+          "line": 22,
+          "detail": "await fetch without catch"
+        }
+      ],
+      "thread_ids": [
+        "PRRT_test1"
+      ]
+    },
+    {
+      "finding_id": "missing-api-timeout-handling",
+      "name": "Missing timeout handling in API calls",
+      "category": "error_handling",
+      "verdict": "confirmed",
+      "confidence": "high",
+      "severity": "high",
+      "impact": "moderate",
+      "likelihood": "likely",
+      "severity_rationale": "A stalled upstream can hold the request open until infrastructure termination.",
+      "description": "fetchUser() has no bounded timeout path.",
+      "evidence": [
+        {
+          "file": "src/api.js",
+          "line": 22,
+          "detail": "fetch call has no abort signal"
+        }
+      ],
+      "thread_ids": [
+        "PRRT_test1"
+      ]
     }
   ],
+  "category_coverage": [
+    {
+      "category": "error_handling",
+      "verdict": "findings_reported",
+      "note": "See findings above."
+    },
+    {
+      "category": "concurrency",
+      "verdict": "reviewed_none_found",
+      "note": "No shared mutable state in the diff."
+    },
+    {
+      "category": "secrets_exposure",
+      "verdict": "not_applicable",
+      "note": "No credentials or configuration touched."
+    }
+  ],
+  "disputed_comments": [],
   "systemic_issues": [
     {
       "pattern": "Inconsistent error handling",
-      "evidence": ["Thread PRRT_test1: missing try/catch"],
+      "finding_ids": [
+        "missing-api-error-handling",
+        "missing-api-timeout-handling"
+      ],
+      "evidence": [
+        "Thread PRRT_test1: missing try/catch"
+      ],
       "recommendation": "Add standardized error wrapper"
     }
   ],
@@ -18,14 +80,24 @@
     {
       "area": "Other API endpoints",
       "risk": "Same pattern may exist",
-      "investigation_hint": "Search for similar fetch calls"
+      "investigation_hint": "Search for similar fetch calls",
+      "checked": false
     }
   ],
   "task_list": [
     {
       "priority": "high",
       "task": "Add error handling to API calls",
-      "thread_ids": ["PRRT_test1"]
+      "finding_ids": [
+        "missing-api-error-handling"
+      ],
+      "thread_ids": [
+        "PRRT_test1"
+      ],
+      "file": "src/api.js",
+      "line": 22,
+      "suggested_fix": "Wrap the fetch in try/catch and surface a typed error.",
+      "verification": "npm test -- api.test.js"
     }
   ],
   "process_improvements": [],
