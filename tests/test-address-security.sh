@@ -515,6 +515,11 @@ write_current_selection() {
             git config user.name t && \
             git -c commit.gpgsign=false commit -qm fixture --allow-empty)
     fi
+    if [ ! -f "$ws/a.js" ]; then
+        printf 'const fixture = true;\n' > "$ws/a.js"
+        git -C "$ws" add a.js
+        git -C "$ws" -c commit.gpgsign=false commit -qm 'add cited fixture' -- a.js
+    fi
     inspected_sha=$(git -C "$ws" rev-parse HEAD)
 
     # Address is a strict mutation consumer: every displayed task must map to
@@ -617,6 +622,62 @@ run_address() {
         "$GH_PR_ENRICH" address 999 2>&1) || true
 }
 
+# Empty remediation work is independent of unresolved review evidence. The
+# status written by an analyzer must not override the current derived state.
+EMPTY_REVIEW_WS="$TEST_OUTPUT_DIR/empty-review"
+EMPTY_REVIEW_REPORT="$EMPTY_REVIEW_WS/.reports/pr-reviews/pr-999"
+mkdir -p "$EMPTY_REVIEW_REPORT"
+echo '{"task_list":[]}' > "$EMPTY_REVIEW_REPORT/claude-analysis.json"
+write_current_selection "$EMPTY_REVIEW_WS" "$EMPTY_REVIEW_REPORT/claude-analysis.json"
+for incomplete_case in not_reviewable plausible; do
+    jq --arg mode "$incomplete_case" '
+        .category_coverage = [{category:"logic_error",verdict:"not_reviewable"}]
+        | ._metadata.review_status = {state:"complete"}
+        | if $mode == "plausible" then
+            .issue_categories = [{finding_id:"needs-evidence",verdict:"plausible",
+                thread_ids:[],evidence:[{file:"a.js",line:1,detail:"unverified"}]}]
+          else . end
+    ' "$EMPTY_REVIEW_REPORT/analysis.json" > "$TEST_OUTPUT_DIR/empty-review.tmp"
+    mv "$TEST_OUTPUT_DIR/empty-review.tmp" "$EMPTY_REVIEW_REPORT/analysis.json"
+    EMPTY_REVIEW_RC=0
+    EMPTY_REVIEW_OUT=$(cd "$EMPTY_REVIEW_WS" && env PATH="$STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" address 999 2>&1) || EMPTY_REVIEW_RC=$?
+    assert_eq 0 "$EMPTY_REVIEW_RC" "$incomplete_case review remains displayable without tasks"
+    assert_contains "$EMPTY_REVIEW_OUT" "Review incomplete" \
+        "$incomplete_case review cannot announce completion with zero tasks"
+    assert_not_contains "$EMPTY_REVIEW_OUT" "All done" \
+        "$incomplete_case review does not falsely announce all work done"
+done
+
+# Fully covered no-task reports must remain distinguishable from incomplete ones.
+jq '.coverage += {
+    sources:(["issue_comments","review_comments","inline_comments","review_threads","checks","linked_issues"]
+        | map({key:.,value:{requested:true,status:"completed"}}) | from_entries),
+    issue_comments:{truncated:[],superseded_bot_duplicates:0},review_comments:{truncated:[]},
+    inline_comments:{truncated:[]},unresolved_threads:{truncated:[],incomplete_comment_threads:[]},
+    diff:{files_truncated:[]},commits:{truncated:[]},linked_issues:{truncated:[]},pr_description:{truncated:[]}
+}' "$EMPTY_REVIEW_REPORT/analysis-context.json" > "$TEST_OUTPUT_DIR/empty-review.tmp"
+mv "$TEST_OUTPUT_DIR/empty-review.tmp" "$EMPTY_REVIEW_REPORT/analysis-context.json"
+EMPTY_COMPLETE_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+    "$EMPTY_REVIEW_REPORT/analysis-context.json")
+jq --arg fp "$EMPTY_COMPLETE_FINGERPRINT" '.coverage.context_fingerprint = $fp' \
+    "$EMPTY_REVIEW_REPORT/analysis-context.json" > "$TEST_OUTPUT_DIR/empty-review.tmp"
+mv "$TEST_OUTPUT_DIR/empty-review.tmp" "$EMPTY_REVIEW_REPORT/analysis-context.json"
+jq --arg fp "$EMPTY_COMPLETE_FINGERPRINT" '
+    ._metadata.context_fingerprint = $fp | .issue_categories = []
+    | .category_coverage = (["logic_error","boundary_condition","concurrency","error_handling",
+        "resource_lifecycle","security","secrets_exposure","data_integrity","api_contract","performance",
+        "test_gap","observability","maintainability","documentation","build_ci","dependency_risk"]
+        | map({category:.,verdict:"not_applicable"}))
+' "$EMPTY_REVIEW_REPORT/analysis.json" > "$TEST_OUTPUT_DIR/empty-review.tmp"
+mv "$TEST_OUTPUT_DIR/empty-review.tmp" "$EMPTY_REVIEW_REPORT/analysis.json"
+EMPTY_COMPLETE_OUT=$(cd "$EMPTY_REVIEW_WS" && env PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1)
+assert_contains "$EMPTY_COMPLETE_OUT" 'Review complete; no tasks generated.' \
+    'fully covered not-applicable categories permit a complete no-task review'
+assert_not_contains "$EMPTY_COMPLETE_OUT" 'Review incomplete' \
+    'complete review display does not invent missing evidence'
+
 # ---------------------------------------------------------------------------
 # jq program-string breakout
 #
@@ -644,6 +705,28 @@ OUT=$(run_address "PRRT_benign")
 OPENED=$(cat "$OPENED_LOG" 2>/dev/null || echo "")
 assert_contains "$OPENED" "https://github.com/o/r/pull/999#discussion_r1" \
     "a valid thread id still opens its comment URL"
+
+BASE_TASK_REPORT="$TEST_OUTPUT_DIR/ws/.reports/pr-reviews/pr-999"
+BASE_TASK_SHA=$(git -C "$TEST_OUTPUT_DIR/ws" rev-parse HEAD)
+jq --arg base "$BASE_TASK_SHA" '.pr.base_sha = $base' \
+    "$BASE_TASK_REPORT/analysis-context.json" > "$TEST_OUTPUT_DIR/base-task.tmp"
+mv "$TEST_OUTPUT_DIR/base-task.tmp" "$BASE_TASK_REPORT/analysis-context.json"
+BASE_TASK_FINGERPRINT=$("$GH_PR_ENRICH" --test-call analysis_context_fingerprint \
+    "$BASE_TASK_REPORT/analysis-context.json")
+jq --arg fp "$BASE_TASK_FINGERPRINT" '.coverage.context_fingerprint = $fp' \
+    "$BASE_TASK_REPORT/analysis-context.json" > "$TEST_OUTPUT_DIR/base-task.tmp"
+mv "$TEST_OUTPUT_DIR/base-task.tmp" "$BASE_TASK_REPORT/analysis-context.json"
+jq --arg base "$BASE_TASK_SHA" --arg fp "$BASE_TASK_FINGERPRINT" '
+    .task_list[0].source = "base" | ._metadata.pr_base_sha = $base
+    | ._metadata.context_fingerprint = $fp' "$BASE_TASK_REPORT/analysis.json" \
+    > "$TEST_OUTPUT_DIR/base-task.tmp"
+mv "$TEST_OUTPUT_DIR/base-task.tmp" "$BASE_TASK_REPORT/analysis.json"
+BASE_TASK_OUT=$(printf q | (cd "$TEST_OUTPUT_DIR/ws" && env GH_BASE_OID="$BASE_TASK_SHA" PATH="$STUB_DIR:$PATH" \
+    "$GH_PR_ENRICH" address 999 2>&1))
+assert_contains "$BASE_TASK_OUT" "Location: a.js:1 (captured base $BASE_TASK_SHA)" \
+    'address labels a task location in the captured base revision'
+assert_contains "$BASE_TASK_OUT" 'Verify the current edit location' \
+    'base task locations do not imply that the same path remains in the workspace'
 
 # ---------------------------------------------------------------------------
 # The URL itself is checked before it reaches the opener
@@ -1774,7 +1857,8 @@ jq --arg fingerprint "$LOCAL_CONTEXT_FINGERPRINT" \
 jq -n --arg fingerprint "$LOCAL_CONTEXT_FINGERPRINT" \
     --arg workspace_fingerprint "$LOCAL_WORKSPACE_FINGERPRINT" '{
     issue_categories:[{finding_id:"local-mutation",name:"correctness",
-        severity:"high",verdict:"confirmed",thread_ids:["PRRT_local"]}],
+        severity:"high",verdict:"confirmed",thread_ids:["PRRT_local"],
+        evidence:[{file:"base.txt",line:1,detail:"fixture"}]}],
     task_list:[{priority:"high",task:"LOCAL MUTATION TASK",
         finding_ids:["local-mutation"],thread_ids:["PRRT_local"],file:"base.txt",line:1,
         suggested_fix:"fix",verification:"test"}],

@@ -223,6 +223,7 @@ jq '.disputed_comments' "$ANALYSIS"
 jq '[.category_coverage[] | select(.verdict == "not_reviewable")]' "$ANALYSIS"
 jq '.systemic_issues' "$ANALYSIS"
 jq '.adjacent_problems' "$ANALYSIS"
+jq '._metadata.review_status' "$ANALYSIS"
 ```
 
 Treat reviewer and bot statements as claims:
@@ -231,6 +232,13 @@ Treat reviewer and bot statements as claims:
 - `plausible`: investigate before acting;
 - `refuted` or `disputed_comments`: do not "fix" the claim;
 - `not_reviewable`: an open coverage gap, never a clean bill of health.
+
+Use the derived review status separately from task count. Selection verifies
+confirmed evidence and task addresses against the captured workspace; optional
+`source: "base"` addresses the exact captured base commit. Verify those bytes
+before citing them, especially for deleted files and old-side diff lines.
+Identical bot bodies retain their original references in
+`issue_comments[].source_comments`; distinct bodies remain separate evidence.
 
 Check issue-level comments separately because they have no resolvable thread:
 

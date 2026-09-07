@@ -133,6 +133,7 @@ fetch_watch_state() (
     local issue_ids_file review_ids_file thread_pages_file threads_file
     local thread_records_file overflow_threads_file overflow_thread
     local thread_index thread_id is_resolved comment_total comment_pages_file
+    local comment_fingerprint
     watch_tmp_dir="$(mktemp -d "/tmp/gh-pr-enrich-watch-state.XXXXXX")" || return 1
     chmod 700 "$watch_tmp_dir" || {
         rmdir "$watch_tmp_dir" 2>/dev/null || true
@@ -154,24 +155,27 @@ fetch_watch_state() (
 
     run_watch_github_command gh api --paginate \
         "repos/$owner/$repository/issues/$pr_number/comments?per_page=100" \
-        --jq '.[] | if .id == null then error("missing issue-comment id")
-              else (.id | tostring) end' \
+        --jq '.[] | {id:(.id | tostring), body, updated_at} | tojson' \
         > "$issue_lines_file" 2>/dev/null || return 1
-    jq -Rsc '
-        (split("\n") | map(select(length > 0))) as $ids
-        | if all($ids[]; test("^[1-9][0-9]*$")) then ($ids | unique | sort)
-          else error("issue-comment pagination returned an invalid id") end
+    jq -sc '
+        if all(.[]; (.id | type == "string" and test("^[1-9][0-9]*$"))
+                and (.body | type == "string")
+                and (.updated_at | type == "string")) and
+           (map(.id) | length == (unique | length)) then sort_by(.id)
+          else error("issue-comment pagination returned an invalid revision") end
     ' < "$issue_lines_file" > "$issue_ids_file" || return 1
 
     run_watch_github_command gh api --paginate \
         "repos/$owner/$repository/pulls/$pr_number/reviews?per_page=100" \
-        --jq '.[] | if .id == null then error("missing review id")
-              else (.id | tostring) end' \
+        --jq '.[] | {id:(.id | tostring), body, state, commit_id, submitted_at} | tojson' \
         > "$review_lines_file" 2>/dev/null || return 1
-    jq -Rsc '
-        (split("\n") | map(select(length > 0))) as $ids
-        | if all($ids[]; test("^[1-9][0-9]*$")) then ($ids | unique | sort)
-          else error("review pagination returned an invalid id") end
+    jq -sc '
+        if all(.[]; (.id | type == "string" and test("^[1-9][0-9]*$"))
+                and (.body | type == "string") and (.state | type == "string")
+                and (.commit_id | type == "string")
+                and ((.submitted_at | type) == "string" or .submitted_at == null)) and
+           (map(.id) | length == (unique | length)) then sort_by(.id)
+          else error("review pagination returned an invalid revision") end
     ' < "$review_lines_file" > "$review_ids_file" || return 1
 
     # gh follows the first pageInfo in a GraphQL query. Keep reviewThreads'
@@ -192,7 +196,7 @@ fetch_watch_state() (
                         nodes {
                             id
                             isResolved
-                            comments(first: 100) { totalCount nodes { id } }
+                            comments(first: 100) { totalCount nodes { id body lastEditedAt } }
                         }
                     }
                 }
@@ -228,7 +232,9 @@ fetch_watch_state() (
                 (.comments.nodes | type) != "array" or
                 (.comments.nodes | length) != ([.comments.totalCount, 100] | min) or
                 any(.comments.nodes[];
-                    (.id | type) != "string" or (.id | length) == 0) or
+                    (.id | type) != "string" or (.id | length) == 0 or
+                    (.body | type) != "string" or
+                    ((.lastEditedAt | type) != "string" and .lastEditedAt != null)) or
                 ([.comments.nodes[].id] | length) !=
                     ([.comments.nodes[].id] | unique | length))
           then error("review-thread pagination was incomplete or inconsistent")
@@ -237,7 +243,7 @@ fetch_watch_state() (
             threads: [$nodes[] | {
                 id, isResolved,
                 comment_total: .comments.totalCount,
-                initial_comment_ids: [.comments.nodes[].id]
+                initial_comments: [.comments.nodes[] | {id, body, lastEditedAt}]
             }]
           }
           end
@@ -247,12 +253,12 @@ fetch_watch_state() (
     # overflowed the embedded first page need another API request or jq process.
     jq -c '
         .threads[]
-        | select(.comment_total <= (.initial_comment_ids | length))
-        | {id, isResolved, comment_ids:(.initial_comment_ids | unique | sort)}
+        | select(.comment_total <= (.initial_comments | length))
+        | {id, isResolved, comments:(.initial_comments | sort_by(.id))}
     ' "$threads_file" > "$thread_records_file" || return 1
     jq -c '
         .threads | to_entries[]
-        | select(.value.comment_total > (.value.initial_comment_ids | length))
+        | select(.value.comment_total > (.value.initial_comments | length))
         | {index:.key, id:.value.id, isResolved:.value.isResolved,
            comment_total:.value.comment_total}
     ' "$threads_file" > "$overflow_threads_file" || return 1
@@ -279,7 +285,7 @@ fetch_watch_state() (
                         comments(first: 100, after: $endCursor) {
                             pageInfo { hasNextPage endCursor }
                             totalCount
-                            nodes { id }
+                            nodes { id body lastEditedAt }
                         }
                     }
                 }
@@ -291,7 +297,7 @@ fetch_watch_state() (
             --slurpfile top_threads "$threads_file" '
             map(.data.node.comments.nodes[]) as $comments
             | ([.[] | .data.node.comments.totalCount] | unique) as $totals
-            | ($top_threads[0].threads[$thread_index].initial_comment_ids | sort) as $initial_ids
+            | ($top_threads[0].threads[$thread_index].initial_comments | sort_by(.id)) as $initial_comments
             | if length == 0 or
                  any(.[]; ((.errors // []) | length) != 0) or
                  any(.[];
@@ -306,26 +312,39 @@ fetch_watch_state() (
                  (.[-1].data.node.comments.pageInfo.hasNextPage != false) or
                  (length > 1 and any(.[0:-1][];
                     .data.node.comments.pageInfo.hasNextPage != true)) or
-                 ([.[0].data.node.comments.nodes[].id] | sort) != $initial_ids or
+                 ([.[0].data.node.comments.nodes[] | {id, body, lastEditedAt}] | sort_by(.id)) != $initial_comments or
                  ($comments | length) != $expected_total or
-                 any($comments[]; (.id | type) != "string" or (.id | length) == 0) or
+                 any($comments[]; (.id | type) != "string" or (.id | length) == 0 or
+                    (.body | type) != "string" or
+                    ((.lastEditedAt | type) != "string" and .lastEditedAt != null)) or
                  ([$comments[].id] | length) !=
                     ([$comments[].id] | unique | length)
               then error("review-thread comment pagination was incomplete or inconsistent")
               else {id:$thread_id, isResolved:$expected_is_resolved,
-                    comment_ids:([$comments[].id] | unique | sort)}
+                    comments:([$comments[] | {id, body, lastEditedAt}] | sort_by(.id))}
               end
         ' "$comment_pages_file" >> "$thread_records_file" || return 1
     done < "$overflow_threads_file"
 
-    jq -n -e \
+    # Bodies can exceed ARG_MAX. Hash canonical revisions through files, then
+    # retain compact IDs for the existing count and new-comment notifications.
+    jq -Scn --slurpfile issues "$issue_ids_file" \
+        --slurpfile reviews "$review_ids_file" \
+        --slurpfile threads "$thread_records_file" \
+        '{issues:$issues[0], reviews:$reviews[0],
+          inline:([$threads[].comments[]] | sort_by(.id))}' \
+        > "$watch_tmp_dir/revisions.json" || return 1
+    comment_fingerprint="$(sha256_file "$watch_tmp_dir/revisions.json")" || return 1
+    jq -n -e --arg comment_fingerprint "$comment_fingerprint" \
         --slurpfile issue_comment_ids "$issue_ids_file" \
         --slurpfile review_ids "$review_ids_file" \
         --slurpfile threads "$thread_records_file" '
         {
-            issue_comment_ids: $issue_comment_ids[0],
-            review_ids: $review_ids[0],
-            inline_comment_ids: ([$threads[].comment_ids[]] | unique | sort),
+            issue_comment_ids: ($issue_comment_ids[0] | map(.id)),
+            review_ids: ($review_ids[0] | map(.id)),
+            inline_comment_ids: ([$threads[].comments[].id] | unique | sort),
+            comment_fingerprint: $comment_fingerprint,
+            thread_states: ([$threads[] | {id, isResolved}] | sort_by(.id)),
             unresolved: ([$threads[] | select(.isResolved == false)] | length)
         }
     '
@@ -1007,6 +1026,7 @@ cleanup_code_access_artifacts() {
 handle_code_access_cleanup_signal() {
     local signal_name="$1"
     local exit_status="${2:-0}"
+    local previous_trap="" previous_handler=""
     if [ "$signal_name" != "EXIT" ] && \
        { [ "$ANALYZER_CHILD_STARTING" = true ] || \
          [ "$ANALYZER_HEARTBEAT_STARTING" = true ] || \
@@ -1021,11 +1041,26 @@ handle_code_access_cleanup_signal() {
     terminate_analyzer_child
     terminate_analyzer_heartbeat
     cleanup_code_access_artifacts
+    case "$signal_name" in
+        INT) previous_trap="$CODE_ACCESS_PREVIOUS_INT_TRAP" ;;
+        TERM) previous_trap="$CODE_ACCESS_PREVIOUS_TERM_TRAP" ;;
+    esac
     restore_code_access_cleanup_traps
     if [ "$signal_name" = "EXIT" ]; then
         return "$exit_status"
     fi
-    kill -s "$signal_name" "$$"
+    if [ -n "$previous_trap" ]; then
+        # Bash 3.2 can coalesce a second INT sent while its first INT trap is
+        # running. Invoke the saved, shell-quoted handler directly instead of
+        # relying on self-signalling to run the enclosing cleanup owner.
+        previous_trap="${previous_trap#trap -- }"
+        previous_trap="${previous_trap% *}"
+        eval "previous_handler=$previous_trap"
+        eval "$previous_handler"
+    else
+        kill -s "$signal_name" "$$"
+        exit "$exit_status"
+    fi
 }
 
 install_code_access_cleanup_traps() {
@@ -3348,6 +3383,7 @@ is_generated_report_artifact() {
         issue-comments-with-graphql.json|review-comments-with-graphql.json|inline-comments-with-graphql.json|\
         issue-comments-deduped.json|all-comments.json|all-comments-with-graphql.json|\
         checks.json|linked-issues.json|linked-issues.json.raw|pr-diff.txt|pr-diff.json|\
+        pr-diff-help.txt|pr-diff-stderr.log|\
         sast-findings.json|semgrep-raw.json|\
         issue-comments-status.json|review-comments-status.json|inline-comments-status.json|\
         review-threads-status.json|checks-status.json|linked-issues-status.json|\
@@ -3832,6 +3868,7 @@ validate_analysis_thread_ids() {
         [(.unresolved_threads // [])[] | .thread_id
             | select(type == "string" and test("^PRRT_[A-Za-z0-9_-]+$"))] as $allowed
         | [(.issue_comments // [])[]?.url,
+           (.issue_comments // [])[]?.source_comments[]?.url,
            (.review_comments // [])[]?.url,
            (.inline_comments // [])[]?.url
            | select(type == "string" and length > 0)] as $comment_urls
@@ -3949,6 +3986,45 @@ validate_selected_provenance() {
         validate_analysis_task_links "$analysis_file"
 }
 
+# Derive review completeness independently of task count or analyzer-written
+# success fields. Missing context is incomplete, including legacy reports.
+analysis_review_status() {
+    local analysis_file="$1" context_file="${2:-/dev/null}"
+    [ -f "$context_file" ] || context_file=/dev/null
+    jq --slurpfile context "$context_file" '
+        ["logic_error", "boundary_condition", "concurrency", "error_handling", "resource_lifecycle", "security", "secrets_exposure", "data_integrity", "api_contract", "performance", "test_gap", "observability", "maintainability", "documentation", "build_ci", "dependency_risk"] as $categories
+        | ($context[0].coverage // {}) as $c
+        | [.category_coverage[]?.category] as $seen
+        | ["issue_comments", "review_comments", "inline_comments", "review_threads", "checks", "linked_issues"] as $required_sources
+        | [$c.issue_comments.truncated, $c.review_comments.truncated,
+           $c.inline_comments.truncated, $c.unresolved_threads.truncated,
+           $c.unresolved_threads.incomplete_comment_threads, $c.diff.files_truncated,
+           $c.commits.truncated, $c.linked_issues.truncated, $c.pr_description.truncated] as $omissions
+        | {
+            category_coverage_complete: (($seen | sort) == ($categories | sort) and
+                all(.category_coverage[]?; .verdict | IN("findings_reported", "reviewed_none_found", "not_applicable", "not_reviewable"))),
+            input_coverage_complete: (
+                all($required_sources[]; . as $key |
+                    $c.sources[$key].requested == true and $c.sources[$key].status == "completed") and
+                all($omissions[]; type == "array" and length == 0) and
+                (($c.issue_comments.superseded_bot_duplicates // 0) == 0 or
+                    $c.issue_comments.deduplication == "exact_body") and
+                ($c.code_access.state == "enabled" or
+                    ($c.diff.included == true and $c.diff.status == "completed" and
+                     $c.diff.files_included == $c.diff.files_total)) and
+                (($c.sast.requested // false) != true or $c.sast.status == "completed")
+            ),
+            not_reviewable_categories: [.category_coverage[]? | select(.verdict == "not_reviewable") | .category],
+            plausible_finding_ids: [.issue_categories[]? | select(.verdict == "plausible") | .finding_id],
+            confirmed_findings: ([.issue_categories[]? | select(.verdict == "confirmed")] | length),
+            task_count: ((.task_list // []) | length)
+          }
+        | .state = (if .category_coverage_complete and .input_coverage_complete and
+            (.not_reviewable_categories | length) == 0 and (.plausible_finding_ids | length) == 0
+            then "complete" else "incomplete" end)
+    ' "$analysis_file"
+}
+
 validate_selected_workspace() {
     local report_dir="$1"
     local analysis_file="$2"
@@ -3960,9 +4036,136 @@ validate_selected_workspace() {
        jq -e 'any((.issue_categories // [])[]; .verdict == "confirmed")' \
             "$analysis_file" > /dev/null 2>&1; then
         validate_code_access_grant "$context_file" "$report_dir" \
-            "$ignored_transaction_dir"
+            "$ignored_transaction_dir" || return 1
+        validate_analysis_evidence_anchors "$context_file" "$analysis_file" \
+            "$report_dir" "$ignored_transaction_dir"
     fi
 }
+
+# Check addresses, not the truth of a finding. Default anchors name the exact
+# reviewed workspace manifest; explicit base anchors name the captured base
+# commit (which can contain deleted or renamed files). Never read arbitrary
+# paths supplied by an analyzer or count lines in smudged working-tree bytes.
+validate_analysis_evidence_anchors() (
+    local context_file="$1" analysis_file="$2" report_dir="$3"
+    local transaction_dir="${4:-}" manifest="" expected source repo_root digest
+    if ! jq -e 'any(.issue_categories[]?; .verdict == "confirmed") or
+            any(.task_list[]?; .file != "n/a")' "$analysis_file" >/dev/null; then
+        return 0
+    fi
+    manifest="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-evidence-manifest.XXXXXX")" || return 1
+    trap 'rm -f "$manifest"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    expected="$(jq -r '.coverage.code_access.workspace_fingerprint // ""' "$context_file")"
+    source="$(jq -r '.coverage.code_access.snapshot_source // "git_index"' "$context_file")"
+    repo_root="$(git rev-parse --show-toplevel)" || return 1
+    build_code_access_workspace_manifest "$report_dir" "$manifest" "$transaction_dir" "$source" || return 1
+    digest="$(sha256_file "$manifest")" || return 1
+    [ "$expected" = "sha256:$digest" ] || return 1
+    perl - "$repo_root" "$manifest" "$context_file" "$analysis_file" <<'PERL'
+use strict;
+use warnings;
+use JSON::PP;
+use Digest::SHA;
+use Encode qw(encode);
+use Fcntl qw(O_RDONLY O_NOFOLLOW S_ISREG S_ISLNK);
+my ($root, $manifest_path, $context_path, $analysis_path) = @ARGV;
+sub bytes {
+    open my $fh, '<:raw', $_[0] or die "read evidence input: $!\n";
+    local $/;
+    return <$fh>;
+}
+my $context = decode_json(bytes($context_path));
+my $analysis = decode_json(bytes($analysis_path));
+my @fields = split /\0/, bytes($manifest_path), -1;
+die "invalid evidence manifest\n" unless shift(@fields) eq 'head';
+shift @fields;
+die "invalid evidence manifest\n" unless shift(@fields) eq 'index';
+shift @fields;
+my %files;
+while (@fields && length($fields[0])) {
+    my $kind = shift @fields;
+    if ($kind eq 'file') {
+        die "truncated evidence manifest\n" unless @fields >= 5;
+        my ($origin, $path, $mode, $identity, $hash) = splice @fields, 0, 5;
+        $files{$path} = [$identity, $hash];
+    } elsif ($kind eq 'symlink') {
+        splice @fields, 0, 3;
+    } else { die "invalid evidence manifest record\n"; }
+}
+my @anchors = (map { @{$_->{evidence}} }
+    grep { $_->{verdict} eq 'confirmed' } @{$analysis->{issue_categories}});
+push @anchors, grep { $_->{file} ne 'n/a' } @{$analysis->{task_list}};
+my %line_counts;
+for my $anchor (@anchors) {
+    my $path = encode('UTF-8', $anchor->{file});
+    my $display_path = encode_json($anchor->{file});
+    my $source = $anchor->{source} // 'workspace';
+    my $line = $anchor->{line};
+    die "Error: Invalid evidence path or line.\n"
+        if $path eq '' || $path =~ m{\A/|\0|(?:\A|/)(?:\.|\.\.)(?:/|\z)} ||
+           $path =~ m{//|/\z} || $line !~ /\A[1-9][0-9]*\z/;
+    die "Error: Unknown evidence source: $source\n"
+        unless $source eq 'workspace' || $source eq 'base';
+    my $key = "$source\0$path";
+    if (!exists $line_counts{$key}) {
+        my ($identity, $expected_hash);
+        if ($source eq 'base') {
+            my $base = $context->{pr}{base_sha} // '';
+            die "Error: Evidence base revision is unavailable.\n"
+                unless $base =~ /\A(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})\z/;
+            open my $tree, '-|', 'git', '-C', $root, 'ls-tree', '-z', $base, '--', $path
+                or die "read evidence base tree: $!\n";
+            my $record = do { local $/; <$tree> };
+            close $tree or die "Error: Evidence base revision is unavailable.\n";
+            die "Error: Evidence file is not a regular file in the captured base: $display_path\n"
+                unless $record =~ /\A100(?:644|755) blob ([0-9a-f]+)\t\Q$path\E\0\z/;
+            $identity = "git:$1";
+        } else {
+            die "Error: Evidence file is absent from the reviewed workspace: $display_path\n"
+                unless exists $files{$path};
+            ($identity, $expected_hash) = @{$files{$path}};
+        }
+        my $fh;
+        if ($identity =~ /\Agit:([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\z/) {
+            open $fh, '-|', 'git', '-C', $root, 'cat-file', 'blob', $1
+                or die "read evidence blob: $!\n";
+            binmode $fh;
+        } elsif ($identity eq 'workspace') {
+            my $parent = $root;
+            for my $component (split m{/}, $path) {
+                $parent .= "/$component";
+                my @stat = lstat $parent;
+                die "Error: Unsafe evidence path: $display_path\n" if !@stat || S_ISLNK($stat[2]);
+            }
+            sysopen $fh, "$root/$path", O_RDONLY | O_NOFOLLOW
+                or die "open workspace evidence: $!\n";
+            die "Error: Evidence must be a regular file: $display_path\n" unless S_ISREG((stat $fh)[2]);
+            binmode $fh;
+        } else { die "Error: Unknown evidence identity.\n"; }
+        my $sha = Digest::SHA->new(256);
+        my ($lines, $last, $length) = (0, '', 0);
+        while (1) {
+            my $buffer;
+            my $read = read $fh, $buffer, 65536;
+            die "read evidence bytes: $!\n" unless defined $read;
+            last if $read == 0;
+            $sha->add($buffer);
+            $lines += ($buffer =~ tr/\n//);
+            $last = substr($buffer, -1);
+            $length += $read;
+        }
+        close $fh or die "close evidence input: $!\n";
+        die "Error: Workspace evidence changed during validation: $display_path\n"
+            if $identity eq 'workspace' && $sha->hexdigest ne $expected_hash;
+        $line_counts{$key} = $lines + ($length && $last ne "\n" ? 1 : 0);
+    }
+    die "Error: Evidence line $line is outside $source file $display_path ($line_counts{$key} lines).\n"
+        if $line > $line_counts{$key};
+}
+PERL
+)
 
 validate_address_selection_pair() {
     local report_dir="$1"
@@ -7402,6 +7605,7 @@ if [ "$1" = "watch" ]; then
                 | length;
             {
                 changed: ($current != $previous),
+                comments_changed: ($current.comment_fingerprint != $previous.comment_fingerprint),
                 current_comments: (
                     ($current.issue_comment_ids | length)
                     + ($current.review_ids | length)
@@ -7450,11 +7654,11 @@ if [ "$1" = "watch" ]; then
             fi
 
             ADVANCE_WATCH_BASELINE=true
-            # Preserve resolution-only behavior: a final thread resolution is
-            # reported but does not run analysis when no unresolved work or new
-            # stable comment/review identity remains.
+            # Edits can change findings without adding IDs. A final resolution
+            # alone still needs no analyzer run when no unresolved work remains.
             if [ "$WATCH_ENRICH" = true ] && \
-               { [ "$CURRENT_UNRESOLVED" -gt 0 ] || [ "$NEW_COMMENTS" -gt 0 ]; }; then
+               { [ "$CURRENT_UNRESOLVED" -gt 0 ] || \
+                 [ "$(jq -r '.comments_changed' <<< "$WATCH_DELTA")" = true ]; }; then
                 echo "   Running analysis..."
                 WATCH_EXTERNAL_ARGS=()
                 [ "$WATCH_ALLOW_EXTERNAL" = true ] && WATCH_EXTERNAL_ARGS+=(--allow-external)
@@ -7470,6 +7674,19 @@ if [ "$1" = "watch" ]; then
                    [ -n "$AFTER_ANALYSIS_IDENTITY" ] && \
                    [ "$AFTER_ANALYSIS_IDENTITY" != "$BEFORE_ANALYSIS_IDENTITY" ]; then
                     echo "   ✅ Analysis updated: $WATCH_REPORT_DIR/analysis.md"
+                elif [ "$ENRICH_EXIT" -eq 0 ] && \
+                     [ "$CURRENT_COUNT" -eq 0 ] && [ "$CURRENT_UNRESOLVED" -eq 0 ] && \
+                     jq -e --arg repo "$REPO" --argjson pr "$WATCH_PR" '
+                         .pr.repository == $repo and .pr.number == $pr and
+                         (.coverage.discussion.fingerprint | type == "string" and length > 0) and
+                         .coverage.issue_comments.total == 0 and
+                         .coverage.review_comments.total == 0 and
+                         .coverage.inline_comments.total == 0 and
+                         .coverage.unresolved_threads.total == 0
+                     ' "$WATCH_REPORT_DIR/analysis-context.json" > /dev/null 2>&1; then
+                    # A complete discussion fingerprint attests that these zeros
+                    # came from collection, so the intentional analyzer skip is final.
+                    echo "   ✅ Report refreshed: no discussion remains."
                 else
                     ADVANCE_WATCH_BASELINE=false
                     echo "   ❌ Analysis did not publish a fresh selected artifact; retaining the prior watch state for retry."
@@ -7676,7 +7893,16 @@ if [ "$1" = "address" ]; then
     # Get task count
     TASK_COUNT=$(jq '.task_list | length' "$ANALYSIS_FILE")
     if [ "$TASK_COUNT" -eq 0 ]; then
-        echo "✅ No tasks found in analysis. All done!"
+        ADDRESS_REVIEW_STATUS="$(analysis_review_status "$ANALYSIS_FILE" \
+            "${ADDRESS_CONTEXT_FILE:-/dev/null}")" || exit 1
+        if [ "$(jq -r '.state' <<< "$ADDRESS_REVIEW_STATUS")" = incomplete ]; then
+            echo "No confirmed tasks are available. Review incomplete."
+            echo "Unreviewable categories: $(jq '.not_reviewable_categories | length' <<< "$ADDRESS_REVIEW_STATUS"); plausible findings: $(jq '.plausible_finding_ids | length' <<< "$ADDRESS_REVIEW_STATUS")."
+            echo "See analysis.md and context-coverage.md for the missing evidence."
+        else
+            echo "Review complete; no tasks generated."
+            echo "Confirmed findings: $(jq '.confirmed_findings' <<< "$ADDRESS_REVIEW_STATUS")."
+        fi
         exit 0
     fi
 
@@ -7694,6 +7920,7 @@ if [ "$1" = "address" ]; then
         THREAD_IDS=$(sanitize_for_terminal "$(echo "$TASK" | jq -r '(.thread_ids // []) | join(", ")')")
         TASK_FILE=$(sanitize_for_terminal "$(echo "$TASK" | jq -r '.file // ""')")
         TASK_LINE=$(sanitize_for_terminal "$(echo "$TASK" | jq -r '.line // 0')")
+        TASK_SOURCE=$(echo "$TASK" | jq -r '.source // "workspace"')
         TASK_FIX=$(sanitize_for_terminal "$(echo "$TASK" | jq -r '.suggested_fix // ""')")
         TASK_VERIFY=$(sanitize_for_terminal "$(echo "$TASK" | jq -r '.verification // ""')")
 
@@ -7715,7 +7942,12 @@ if [ "$1" = "address" ]; then
         echo "$DESCRIPTION"
         echo ""
         if [ -n "$TASK_FILE" ] && [ "$TASK_FILE" != "n/a" ] && [ "$TASK_FILE" != "null" ]; then
-            echo "Location: $TASK_FILE:$TASK_LINE"
+            if [ "$TASK_SOURCE" = base ]; then
+                echo "Location: $TASK_FILE:$TASK_LINE (captured base $(sanitize_for_terminal "$ADDRESS_CONTEXT_BASE"))"
+                echo "Verify the current edit location; this path may have been renamed or deleted."
+            else
+                echo "Location: $TASK_FILE:$TASK_LINE"
+            fi
         fi
         if [ -n "$TASK_FIX" ]; then
             echo "Suggested fix: $TASK_FIX"
@@ -8308,7 +8540,7 @@ if [ -z "$TEST_CALL_FN" ]; then
 
     # Validate PR_NUMBER is a positive integer (prevent path traversal)
     if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
-        echo "Error: PR_NUMBER must be a positive integer, got: '$PR_NUMBER'"
+        echo "Error: PR_NUMBER must be a positive integer, got: '$PR_NUMBER'" >&2
         exit 1
     fi
 
@@ -8398,7 +8630,7 @@ if [ -z "$TEST_CALL_FN" ]; then
             ;;
         --output-dir)
             if [ -z "${2:-}" ]; then
-                echo "Error: --output-dir requires a directory path."
+                echo "Error: --output-dir requires a directory path." >&2
                 exit 1
             fi
             OUTPUT_DIR="$2"
@@ -8441,7 +8673,7 @@ if [ -z "$TEST_CALL_FN" ]; then
             ;;
         --model)
             if [ -z "${2:-}" ]; then
-                echo "Error: --model requires a model name."
+                echo "Error: --model requires a model name." >&2
                 exit 1
             fi
             export GH_PR_ENRICH_MODEL="$2"
@@ -8449,19 +8681,19 @@ if [ -z "$TEST_CALL_FN" ]; then
             ;;
         --prompt)
             if [ -z "${2:-}" ]; then
-                echo "Error: --prompt requires a file path."
+                echo "Error: --prompt requires a file path." >&2
                 exit 1
             fi
             if [ ! -f "$2" ]; then
-                echo "Error: Prompt file not found: $2"
+                echo "Error: Prompt file not found: $2" >&2
                 exit 1
             fi
             CUSTOM_PROMPT_FILE="$2"
             shift 2
             ;;
         *)
-            echo "Unknown option: $1"
-            echo "Run 'gh pr-enrich --help' for usage"
+            echo "Unknown option: $1" >&2
+            echo "Run 'gh pr-enrich --help' for usage" >&2
             exit 1
             ;;
     esac
@@ -8470,8 +8702,8 @@ fi  # End of: if [ -z "$TEST_CALL_FN" ] for argument parsing
 
 # Ensure jq is available
 if ! command -v jq &> /dev/null; then
-    echo "Error: jq is required but not installed."
-    echo "Install with: brew install jq (macOS) or apt-get install jq (Linux)"
+    echo "Error: jq is required but not installed." >&2
+    echo "Install with: brew install jq (macOS) or apt-get install jq (Linux)" >&2
     exit 1
 fi
 
@@ -8978,6 +9210,8 @@ fetch_live_analysis_discussion_snapshot_once() (
         LIVE_DISCUSSION_TEMP_DIR=""
     }
     trap cleanup_live_discussion_snapshot_once EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     [ -n "$owner" ] && [ -n "$repo_name" ] && [ "$owner" != "$repo_name" ] || return 1
     live_dir="$(mktemp -d "/tmp/gh-pr-enrich-live-discussion.XXXXXX")" || return 1
     LIVE_DISCUSSION_TEMP_DIR="$live_dir"
@@ -10044,9 +10278,9 @@ extract_unresolved_threads() {
         }]' "$threads_file" > "$output_file"
 }
 
-# Bots repost their whole report on every push. Keeping all revisions burns the
-# context budget and double-counts the same finding. Keep the newest revision of
-# each bot report; never touch human comments, where repetition is signal.
+# Compress only byte-identical reports from the same bot. Similar openings do
+# not prove supersession: numbers, paths, and later paragraphs can name distinct
+# findings. Keep every source reference even when its body is shared.
 dedupe_bot_comments() {
     local input_file="$1"
     local output_file="$2"
@@ -10054,29 +10288,15 @@ dedupe_bot_comments() {
     jq '
     def is_bot: (.user // "") | test("\\[bot\\]$") or (ascii_downcase | IN("github-actions", "greptile", "codecov", "sonarcloud", "coderabbitai", "dependabot", "renovate"));
 
-    # Report identity: the bot plus the opening of its body, with digits removed
-    # so successive revisions of one report ("72% covered" then "84% covered")
-    # collapse while distinct reports stay apart.
-    #
-    # The first line alone is not enough to identify a report: bots routinely
-    # prefix every comment with the same HTML marker or status heading, so
-    # "### Job failed / unit-tests" and "### Job failed / e2e" would collapse and
-    # a real finding would be dropped as a duplicate. HTML comments are stripped
-    # and several lines are considered so unrelated reports diverge early.
-    def signature: ((.user // "") + "::" +
-        (((.body // "")
-          | gsub("<!--(?:[\\s\\S]*?)-->"; "")
-          | split("\n")
-          | map(select(test("\\S")))
-          | .[0:4]
-          | join(" "))
-         | ascii_downcase | gsub("[0-9]"; "") | gsub("[^a-z ]"; "") | .[0:200]));
-
     (map(select(is_bot | not))) as $humans
     | (map(select(is_bot))) as $bots
-    | ($bots | group_by(signature) | map(sort_by(.created_at // "")) ) as $grouped
+    | ($bots | group_by([.user, .body]) | map(sort_by(.created_at // "", .id)) ) as $grouped
     | {
-        kept: (($humans + ($grouped | map(.[-1]))) | sort_by(.created_at // "")),
+        kept: (($humans + ($grouped | map(
+            . as $sources | .[-1] + {source_comments: [$sources[] | {
+                id, url: .html_url, created_at, updated_at
+            }]}
+        ))) | sort_by(.created_at // "")),
         superseded: ($grouped | map(.[0:-1]) | add // [])
       }
     ' "$input_file" > "$output_file"
@@ -10094,18 +10314,31 @@ fetch_pr_diff() {
     local pr_num="$2"
     local diff_paths_file diff_paths_json diff_input_path diff_parser_root
 
-    # Fetch the unified diff for the PR
-    local diff_status="completed" diff_reason=""
-    if ! run_report_command gh pr diff "$pr_num" \
-            > "$output_dir/pr-diff.txt" 2>/dev/null; then
-        echo "⚠️  Could not fetch PR diff (binary files only, empty PR, or access denied)"
-        echo "   Analysis will proceed without code context."
-        echo "" > "$output_dir/pr-diff.txt"
+    # Recent gh releases require explicit permission to preserve literal escape
+    # bytes. Older versions lack that flag. Probe the installed capability and
+    # keep raw source in files, never render it directly to the terminal.
+    local diff_status="completed" diff_reason="" diff_diagnostic=""
+    local -a diff_args=(--color=never)
+    if run_report_command gh pr diff --help > "$output_dir/pr-diff-help.txt" 2>/dev/null && \
+       grep -Fq -- '--allow-escape-sequences' "$output_dir/pr-diff-help.txt"; then
+        diff_args+=(--allow-escape-sequences)
+    fi
+    rm -f "$output_dir/pr-diff-help.txt"
+    if ! run_report_command gh pr diff "$pr_num" "${diff_args[@]}" \
+            > "$output_dir/pr-diff.txt" 2> "$output_dir/pr-diff-stderr.log"; then
+        : > "$output_dir/pr-diff.txt"
         diff_status="failed"
         diff_reason="GitHub diff fetch failed or returned no readable diff"
     elif [ ! -s "$output_dir/pr-diff.txt" ]; then
         diff_status="failed"
         diff_reason="GitHub diff fetch succeeded but returned no diff content"
+    fi
+    diff_diagnostic="$(sanitize_for_terminal "$(head -c 8192 "$output_dir/pr-diff-stderr.log")")"
+    printf '%s\n' "$diff_diagnostic" > "$output_dir/pr-diff-stderr.log"
+    if [ "$diff_status" = failed ]; then
+        [ -z "$diff_diagnostic" ] || diff_reason="$diff_reason: $diff_diagnostic"
+        echo "⚠️  $diff_reason" >&2
+        echo "   Diff coverage is unavailable. See $output_dir/pr-diff-stderr.log" >&2
     fi
 
     diff_paths_file="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-diff-paths.XXXXXX")" || \
@@ -10570,7 +10803,10 @@ build_analysis_context() (
                 user: .user,
                 body: trunc(.body),
                 url: .html_url,
-                created_at: .created_at
+                created_at: .created_at,
+                source_comments: (.source_comments // [{
+                    id, url: .html_url, created_at, updated_at
+                }])
             }],
             review_comments: [$review_comments[] | {
                 user: .user,
@@ -10623,6 +10859,7 @@ build_analysis_context() (
                     total: ($raw | length),
                     included: ($kept | length),
                     superseded_bot_duplicates: ($superseded | length),
+                    deduplication: "exact_body",
                     truncated: [$kept[] | select(was_truncated(.body)) | .html_url]
                 },
                 review_comments: {
@@ -10778,6 +11015,7 @@ ANALYSIS_SCHEMA='{
               "properties": {
                 "file": { "type": "string", "minLength": 1, "pattern": "\\S" },
                 "line": { "type": "integer", "minimum": 1 },
+                "source": { "enum": ["workspace", "base"] },
                 "detail": { "type": "string" }
               },
               "required": ["file", "line", "detail"]
@@ -10864,6 +11102,7 @@ ANALYSIS_SCHEMA='{
           },
           "thread_ids": { "type": "array", "items": { "type": "string" } },
           "file": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "source": { "enum": ["workspace", "base"] },
           "line": { "type": "integer", "minimum": 0 },
           "suggested_fix": { "type": "string" },
           "verification": { "type": "string" }
@@ -11641,12 +11880,20 @@ resolve_code_access() {
                     if [ -n "$unexpected_output" ]; then
                         dirty_state="?? $output_rel/$unexpected_output"
                     else
-                        if ! dirty_state="$(git -C "$repo_root" status --porcelain \
-                                --untracked-files=all --ignored=matching -- . \
-                                ":(exclude,literal)$output_rel" 2>/dev/null)"; then
-                            echo "disabled: git status failed, so workspace cleanliness cannot be verified"
+                        # ls-files enumerates actual files, including ignored
+                        # files when no exclude rules are supplied. Unlike
+                        # status, it cannot collapse an ignored ancestor and
+                        # falsely count this validated child report as dirty.
+                        output_inventory="$(mktemp "${TMPDIR:-/tmp}/gh-pr-enrich-output.XXXXXX")" || return 1
+                        if ! git -C "$repo_root" ls-files --others -z -- . \
+                                ":(exclude,literal)$output_rel" \
+                                > "$output_inventory" 2>/dev/null; then
+                            rm -f "$output_inventory"
+                            echo "disabled: untracked and ignored files could not be inspected safely"
                             return 0
                         fi
+                        [ ! -s "$output_inventory" ] || dirty_state="untracked or ignored files outside the report"
+                        rm -f "$output_inventory"
                     fi
                 fi
                 ;;
@@ -12363,6 +12610,7 @@ _select_analysis_artifact() (
             (all(.evidence[];
                 (.file | type == "string" and test("\\S") and . != "n/a") and
                 (.line | (type == "number" and . == floor and . >= 1)) and
+                ((has("source") | not) or (.source | IN("workspace", "base"))) and
                 (.detail | type == "string"))) and
             (.thread_ids | type == "array") and (all(.thread_ids[]; type == "string")))) and
         (.category_coverage | type == "array") and
@@ -12403,6 +12651,7 @@ _select_analysis_artifact() (
             (.task | type == "string") and
             (.file | type == "string" and test("\\S")) and
             (.line | (type == "number" and . == floor and . >= 0)) and
+            ((has("source") | not) or (.source | IN("workspace", "base"))) and
             (((.file == "n/a") and (.line == 0)) or
              ((.file != "n/a") and (.line >= 1))) and
             (.suggested_fix | type == "string") and
@@ -12478,7 +12727,9 @@ _select_analysis_artifact() (
         | (($coverage.code_access.state // "disabled") != "enabled" and
            ($complete_diff | not)) as $code_unavailable
         | all($omissions[]; type == "array") and
-          ((([$omissions[] | length] | add) == 0 and ($code_unavailable | not)) or
+          ((([$omissions[] | length] | add) == 0 and ($code_unavailable | not) and
+            (($coverage.issue_comments.superseded_bot_duplicates // 0) == 0 or
+             $coverage.issue_comments.deduplication == "exact_body")) or
            all($result.category_coverage[];
              . as $category_coverage
              | if ($finding_categories | index($category_coverage.category)) != null
@@ -12614,6 +12865,7 @@ _select_analysis_artifact() (
     done
 
     local selected_tmp="$replacement_dir/analysis.json"
+    local normalized_tmp="$replacement_dir/normalized-analysis.json"
     local report_tmp="$replacement_dir/analysis.md"
     local coverage_tmp="$replacement_dir/context-coverage.md"
     local combined_tmp="$replacement_dir/combined-data.json"
@@ -12623,14 +12875,21 @@ _select_analysis_artifact() (
     # Render and validate every derived view before replacing the trusted
     # selected artifact. A malformed candidate must leave the prior selection
     # and its reports untouched.
-    if ! generate_analysis_report "$source_file" "$report_tmp"; then
+    if ! analysis_review_status "$source_file" "$context_file" \
+            > "$replacement_dir/review-status.json" || \
+       ! jq --slurpfile status "$replacement_dir/review-status.json" \
+            '._metadata.review_status = $status[0]' "$source_file" > "$normalized_tmp"; then
+        return 1
+    fi
+    rm -f "$replacement_dir/review-status.json"
+    if ! generate_analysis_report "$normalized_tmp" "$report_tmp" "$context_file"; then
         return 1
     fi
     if ! generate_coverage_section "$context_file" "$coverage_tmp"; then
         return 1
     fi
     if [ -f "$selection_backup_dir/combined-data.json" ]; then
-        if ! jq --slurpfile selected "$source_file" --slurpfile context "$context_file" \
+        if ! jq --slurpfile selected "$normalized_tmp" --slurpfile context "$context_file" \
             '.analysis = $selected[0]
              | .analysis_context_coverage = ($context[0].coverage // {})' \
             "$selection_backup_dir/combined-data.json" > "$combined_tmp"; then
@@ -12655,9 +12914,8 @@ _select_analysis_artifact() (
         fi
     fi
 
-    if ! cp "$source_file" "$selected_tmp"; then
-        return 1
-    fi
+    cp "$normalized_tmp" "$selected_tmp" || return 1
+    rm -f "$normalized_tmp"
     for selection_artifact in analysis.json analysis.md context-coverage.md \
             combined-data.json comprehensive-report.md; do
         [ -f "$replacement_dir/$selection_artifact" ] || continue
@@ -12828,7 +13086,7 @@ generate_coverage_section() {
         ((($c.unresolved_threads.incomplete_comment_threads // []) | length) | tostring) + " with replies beyond the " +
         (($c.unresolved_threads.comments_per_thread_limit // 0) | tostring) + "-reply page (later replies not analyzed) |\n" +
       "| Issue comments | " + (($c.issue_comments.included // 0) | tostring) + " of " + (($c.issue_comments.total // 0) | tostring) + " | " +
-        (($c.issue_comments.superseded_bot_duplicates // 0) | tostring) + " superseded bot reposts dropped; " +
+        (($c.issue_comments.superseded_bot_duplicates // 0) | tostring) + " identical bot reposts compressed (source references retained); " +
         ((($c.issue_comments.truncated // []) | length) | tostring) + " truncated |\n" +
       "| Review summaries | " + (($c.review_comments.total // 0) | tostring) + " | " +
         ((($c.review_comments.truncated // []) | length) | tostring) + " truncated |\n" +
@@ -12870,11 +13128,13 @@ generate_coverage_section() {
 generate_analysis_report() {
     local analysis_file="$1"
     local output_file="$2"
+    local context_file="${3:-/dev/null}" review_status
+    review_status="$(analysis_review_status "$analysis_file" "$context_file")" || return 1
 
     # Findings lead with verdict, severity and its derivation so a reader can tell
     # a traced defect from a repeated reviewer opinion without opening the JSON.
-    jq -r '
-    def anchor(e): (if (e.file // "") == "" or e.file == "n/a" then "" else e.file + ":" + ((e.line // 0) | tostring) end);
+    jq -r --argjson review_status "$review_status" '
+    def anchor(e): (if (e.file // "") == "" or e.file == "n/a" then "" else e.file + ":" + ((e.line // 0) | tostring) + (if e.source == "base" then " (captured base)" else "" end) end);
     def verdict_mark(v): (if v == "confirmed" then "✅ confirmed" elif v == "refuted" then "❌ refuted" else "🟡 plausible" end);
     # Evidence is strings in systemic_issues and objects in issue_categories.
     # Render either shape rather than aborting the report over a type mismatch:
@@ -12884,6 +13144,13 @@ generate_analysis_report() {
         else tostring end);
 
     "# PR Analysis Report\n\n" +
+    "**Review status: " + $review_status.state + "**\n\n" +
+    "Unreviewable categories: " + ($review_status.not_reviewable_categories | length | tostring) +
+    "; plausible findings: " + ($review_status.plausible_finding_ids | length | tostring) +
+    "; confirmed findings: " + ($review_status.confirmed_findings | tostring) +
+    "; tasks: " + ($review_status.task_count | tostring) + ".\n\n" +
+    (if $review_status.input_coverage_complete then "" else "Input evidence is incomplete; see context coverage.\n\n" end) +
+    (if $review_status.category_coverage_complete then "" else "The category sweep is incomplete.\n\n" end) +
     "## Issue Categories\n\n" +
     (if (.issue_categories | length) == 0 then
         "_No issue categories identified._\n\n"
@@ -13072,6 +13339,8 @@ fi
 # ============================================================================
 # Main PR logic
 # ============================================================================
+run_pr_report() {
+
 # Create output directory
 if path_has_symlink_component "$OUTPUT_DIR"; then
     echo "Error: Report output path contains a symbolic-link component: $OUTPUT_DIR" >&2
@@ -13797,7 +14066,8 @@ if [ "$ENRICH_WITH_CLAUDE" = true ]; then
                 rm -f "$PROVIDER_SOURCE_DIR/claude-analysis.raw.json"
                 generate_analysis_report \
                     "$PROVIDER_SOURCE_DIR/claude-analysis.json" \
-                    "$PROVIDER_SOURCE_DIR/claude-analysis.md" || exit 1
+                    "$PROVIDER_SOURCE_DIR/claude-analysis.md" \
+                    "$OUTPUT_DIR/analysis-context.json" || exit 1
 
                 acquire_selected_analysis_lock "$OUTPUT_DIR"
                 PROVIDER_LOCK_DIR="$SELECTED_ANALYSIS_LOCK_DIR"
@@ -13961,12 +14231,6 @@ fi
 
 # Output
 case $OUTPUT_FORMAT in
-    "json")
-        cat "$OUTPUT_DIR/combined-data.json"
-        ;;
-    "markdown")
-        cat "$OUTPUT_DIR/comprehensive-report.md"
-        ;;
     "combined")
         echo "✅ Report generated successfully!"
         echo "📁 Directory: $OUTPUT_DIR"
@@ -13984,7 +14248,26 @@ case $OUTPUT_FORMAT in
         ;;
 esac
 
-if ! cleanup_report_run_lock; then
+}
+
+# Scope progress redirection to the report call. Bash restores stdout when the
+# call returns, without exposing a payload descriptor to child processes (for
+# example, Git interprets GIT_TRACE=3 as an inherited trace destination).
+case "$OUTPUT_FORMAT" in
+    json)
+        run_pr_report 1>&2
+        cat "$OUTPUT_DIR/combined-data.json"
+        ;;
+    markdown)
+        run_pr_report 1>&2
+        cat "$OUTPUT_DIR/comprehensive-report.md"
+        ;;
+    *) run_pr_report ;;
+esac
+
+# Retain the report lease through payload emission so another collector cannot
+# replace its bytes between collection and the caller's read.
+if ! cleanup_report_run_lock >&2; then
     exit 1
 fi
 REPORT_RUN_MANAGED=false

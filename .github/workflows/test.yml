@@ -56,11 +56,41 @@ jobs:
           SUITE: ${{ matrix.suite }}
         run: bash "$SUITE"
 
+  macos-compatibility:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {suite: tests/test-runtime-compatibility.sh, group: lifecycle}
+          - {suite: tests/test-runtime-compatibility.sh, group: context}
+          - {suite: tests/test-runtime-compatibility.sh, group: disclosure}
+          - {suite: tests/test-runtime-compatibility.sh, group: visibility}
+          - {suite: tests/test-runtime-compatibility.sh, group: sast}
+          - {suite: tests/test-runtime-selection.sh, group: provider}
+          - {suite: tests/test-runtime-selection.sh, group: freeze}
+          - {suite: tests/test-runtime-selection.sh, group: contract}
+          - {suite: tests/test-runtime-selection.sh, group: workspace}
+          - {suite: tests/test-runtime-selection.sh, group: attestation}
+          - {suite: tests/test-runtime-selection.sh, group: publication}
+          - {suite: tests/test-runtime-selection.sh, group: signals}
+          - {suite: tests/test-runtime-selection.sh, group: validation}
+          - {suite: tests/test-evidence-anchors.sh, group: all}
+    name: macOS / ${{ matrix.suite }} / ${{ matrix.group }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify native Bash compatibility
+        env:
+          SUITE: ${{ matrix.suite }}
+          GH_PR_ENRICH_RUNTIME_GROUP: ${{ matrix.group }}
+        run: /bin/bash "$SUITE"
+
   # Preserve the stable aggregate check name used by branch protection while
   # allowing independent suites to run concurrently.
   test:
     if: always()
-    needs: [prepare, suite]
+    needs: [prepare, suite, macos-compatibility]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -68,6 +98,8 @@ jobs:
         env:
           PREPARE_RESULT: ${{ needs.prepare.result }}
           SUITE_RESULT: ${{ needs.suite.result }}
+          MACOS_RESULT: ${{ needs.macos-compatibility.result }}
         run: |
           test "$PREPARE_RESULT" = success
           test "$SUITE_RESULT" = success
+          test "$MACOS_RESULT" = success

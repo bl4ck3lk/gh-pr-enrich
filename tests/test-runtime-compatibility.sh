@@ -16,7 +16,26 @@ case "$RUNTIME_COMPATIBILITY_SHARD" in
         exit 1
         ;;
 esac
-TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output/runtime-compatibility-$RUNTIME_COMPATIBILITY_SHARD"
+RUNTIME_COMPATIBILITY_GROUP="${GH_PR_ENRICH_RUNTIME_GROUP:-all}"
+case "$RUNTIME_COMPATIBILITY_SHARD:$RUNTIME_COMPATIBILITY_GROUP" in
+    collection:all|collection:lifecycle|collection:context|collection:disclosure|\
+    collection:visibility|collection:sast|selection:all|selection:provider|\
+    selection:freeze|selection:contract|selection:workspace|selection:attestation|\
+    selection:publication|selection:signals|selection:validation) ;;
+    *)
+        echo "Error: unknown runtime compatibility group: $RUNTIME_COMPATIBILITY_SHARD:$RUNTIME_COMPATIBILITY_GROUP" >&2
+        exit 1
+        ;;
+esac
+
+# The default still runs the complete suite. CI can run each independent group
+# with the same shared fixtures to keep native macOS jobs below five minutes.
+runtime_group_enabled() {
+    [ "$RUNTIME_COMPATIBILITY_GROUP" = all ] || \
+        [ "$RUNTIME_COMPATIBILITY_GROUP" = "$1" ]
+}
+
+TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output/runtime-compatibility-$RUNTIME_COMPATIBILITY_SHARD-$RUNTIME_COMPATIBILITY_GROUP"
 STUB_DIR="$TEST_OUTPUT_DIR/stubs"
 TMP_ALIAS_OUTPUT="/tmp/gh-pr-enrich-runtime-$$"
 TMP_ALIAS_SELECTION="/tmp/gh-pr-enrich-selection-$$"
@@ -112,7 +131,7 @@ exec /bin/sleep "$@"
 STUB
 chmod +x "$STUB_DIR/sleep"
 
-suite_start "gh pr-enrich runtime compatibility ($RUNTIME_COMPATIBILITY_SHARD) suite"
+suite_start "gh pr-enrich runtime compatibility ($RUNTIME_COMPATIBILITY_SHARD/$RUNTIME_COMPATIBILITY_GROUP) suite"
 
 assert_no_selection_transaction_residue() {
     local report_dir="$1"
@@ -1421,6 +1440,7 @@ chmod +x "$STUB_DIR/semgrep"
 CLAUDE_LOG="$TEST_OUTPUT_DIR/claude-invoked.txt"
 
 if [ "$RUNTIME_COMPATIBILITY_SHARD" = collection ]; then
+if runtime_group_enabled lifecycle; then
 # Startup and watch-mode repository discovery happen before a report lease
 # exists. A signal sent only to the advertised CLI PID must still terminate the
 # parent-owned capture supervisor and its TERM-ignoring GitHub request.
@@ -2148,6 +2168,9 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
 assert_contains "$NEWLINE_OUTPUT_OUT" "unrelated file" \
     "newline filename rejection is reported as unrelated output content"
 
+fi
+
+if runtime_group_enabled context; then
 # macOS implements /tmp as a root-level operating-system alias to /private/tmp.
 # That trusted platform link must not make all standard temporary output paths
 # unusable, while the nested user-controlled link above remains rejected.
@@ -2316,6 +2339,9 @@ assert_contains "$CHECKS_UNAVAILABLE_HEAD_OUT" \
     "GitHub head, checks, discussion, or intent state changed or could not be revalidated" \
     "partial attestation head drift identifies the hosted-state boundary"
 
+fi
+
+if runtime_group_enabled disclosure; then
 PRIVATE_LINKED_LOCAL_DIR="$TEST_OUTPUT_DIR/private-linked-local"
 env PATH="$STUB_DIR:$PATH" REPO_VISIBILITY=PUBLIC \
     LINKED_ISSUE_VISIBILITY=PRIVATE \
@@ -2449,6 +2475,9 @@ assert_contains "$(cat "$PUBLIC_LINKED_QUERY_ARGS_LOG")" \
     "ids0[]=ISSUE_linked" \
     "linked issue node IDs are passed through the first bounded GraphQL batch"
 
+fi
+
+if runtime_group_enabled visibility; then
 PRIMARY_VISIBILITY_DRIFT_DIR="$TEST_OUTPUT_DIR/primary-visibility-drift"
 PRIMARY_VISIBILITY_DRIFT_CLAUDE_LOG="$TEST_OUTPUT_DIR/primary-visibility-drift-claude.txt"
 rc=0
@@ -2606,6 +2635,9 @@ for VISIBILITY_SIGNAL in INT TERM; do
     VISIBILITY_SIGNAL_WATCHDOG_PID_FILE=""
 done
 
+fi
+
+if runtime_group_enabled sast; then
 SAST_WORKSPACE="$TEST_OUTPUT_DIR/sast-workspace"
 SAST_PREPARED="$SAST_WORKSPACE/reports"
 mkdir -p "$SAST_WORKSPACE"
@@ -2767,6 +2799,7 @@ for VISIBILITY in INTERNAL UNKNOWN; do
         "$VISIBILITY disclosure failure identifies the repository visibility"
 done
 
+fi
 suite_end
 fi
 
@@ -2788,6 +2821,7 @@ assert_jq "$AUTHORIZED_DIR/analysis.json" '._metadata.repository_visibility == "
 AUTHORIZED_CLAUDE_FIXTURE="$TEST_OUTPUT_DIR/authorized-claude-fixture.json"
 cp "$AUTHORIZED_DIR/claude-analysis.json" "$AUTHORIZED_CLAUDE_FIXTURE"
 
+if runtime_group_enabled provider; then
 # The provider's combined-data publication uses the same no-clobber
 # transaction as selection/invalidation. A noncooperating destination that
 # appears after quarantine is preserved and aborts enrichment.
@@ -3023,7 +3057,6 @@ PROVIDER_SIGNAL_READY="$TEST_OUTPUT_DIR/provider-signal-ready"
 PROVIDER_SIGNAL_CHILD_PID_FILE="$TEST_OUTPUT_DIR/provider-signal-child-pid"
 PROVIDER_SIGNAL_DESCENDANT_PID_FILE="$TEST_OUTPUT_DIR/provider-signal-descendant-pid"
 PROVIDER_SIGNAL_LIVE_DIR_FILE="$TEST_OUTPUT_DIR/provider-signal-live-dir"
-PROVIDER_SIGNAL_LIVE_BASELINE_FILE="$TEST_OUTPUT_DIR/provider-signal-live-baseline"
 PROVIDER_SIGNAL_SOURCE_DIR_FILE="$TEST_OUTPUT_DIR/provider-signal-source-dir"
 PROVIDER_SIGNAL_BACKUP_DIR_FILE="$TEST_OUTPUT_DIR/provider-signal-backup-dir"
 PROVIDER_SIGNAL_OUT="$TEST_OUTPUT_DIR/provider-signal.out"
@@ -3053,6 +3086,17 @@ case "$destination" in
 esac
 exec "$PROVIDER_SIGNAL_REAL_CP" "$@"
 STUB
+cat > "$PROVIDER_SIGNAL_STUBS/mktemp" << 'STUB'
+#!/bin/bash
+created_path=$("$PROVIDER_SIGNAL_REAL_MKTEMP" "$@") || exit $?
+case "$created_path" in
+    */gh-pr-enrich-live-discussion.*)
+        [ ! -e "$PROVIDER_SIGNAL_MARKER" ] || \
+            printf '%s\n' "$created_path" > "$PROVIDER_SIGNAL_LIVE_DIR_FILE"
+        ;;
+esac
+printf '%s\n' "$created_path"
+STUB
 cat > "$PROVIDER_SIGNAL_STUBS/gh" << 'STUB'
 #!/bin/bash
 if [ "$1" = "api" ] && [ "$2" != "graphql" ] && \
@@ -3067,16 +3111,6 @@ if [ "$1" = "api" ] && [ "$2" != "graphql" ] && \
             descendant_pid=$!
             printf '%s\n' "$descendant_pid" \
                 > "$PROVIDER_SIGNAL_DESCENDANT_PID_FILE"
-            : > "$PROVIDER_SIGNAL_LIVE_DIR_FILE"
-            for live_dir in /tmp/gh-pr-enrich-live-discussion.*; do
-                [ -d "$live_dir" ] || continue
-                if ! grep -Fxq "$live_dir" \
-                        "$PROVIDER_SIGNAL_LIVE_BASELINE_FILE" 2>/dev/null; then
-                    printf '%s\n' "$live_dir" \
-                        > "$PROVIDER_SIGNAL_LIVE_DIR_FILE"
-                    break
-                fi
-            done
             : > "$PROVIDER_SIGNAL_READY"
             trap 'exit 143' TERM
             trap 'exit 130' INT
@@ -3087,12 +3121,10 @@ if [ "$1" = "api" ] && [ "$2" != "graphql" ] && \
 fi
 exec "$PROVIDER_SIGNAL_BASE_GH" "$@"
 STUB
-chmod +x "$PROVIDER_SIGNAL_STUBS/cp" "$PROVIDER_SIGNAL_STUBS/gh"
-find /tmp -maxdepth 1 -type d \
-    -name 'gh-pr-enrich-live-discussion.*' -print \
-    > "$PROVIDER_SIGNAL_LIVE_BASELINE_FILE"
+chmod +x "$PROVIDER_SIGNAL_STUBS/cp" "$PROVIDER_SIGNAL_STUBS/gh" "$PROVIDER_SIGNAL_STUBS/mktemp"
 RUNTIME_BACKGROUND_PID=""
 env PATH="$PROVIDER_SIGNAL_STUBS:$STUB_DIR:$PATH" \
+    GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
     REPO_VISIBILITY=PRIVATE GH_PR_ENRICH_CODE_ACCESS=false \
     CLAUDE_INVOKED_LOG="$CLAUDE_LOG" \
     PROVIDER_SIGNAL_REPORT="$PROVIDER_SIGNAL_DIR" \
@@ -3101,10 +3133,10 @@ env PATH="$PROVIDER_SIGNAL_STUBS:$STUB_DIR:$PATH" \
     PROVIDER_SIGNAL_CHILD_PID_FILE="$PROVIDER_SIGNAL_CHILD_PID_FILE" \
     PROVIDER_SIGNAL_DESCENDANT_PID_FILE="$PROVIDER_SIGNAL_DESCENDANT_PID_FILE" \
     PROVIDER_SIGNAL_LIVE_DIR_FILE="$PROVIDER_SIGNAL_LIVE_DIR_FILE" \
-    PROVIDER_SIGNAL_LIVE_BASELINE_FILE="$PROVIDER_SIGNAL_LIVE_BASELINE_FILE" \
     PROVIDER_SIGNAL_SOURCE_DIR_FILE="$PROVIDER_SIGNAL_SOURCE_DIR_FILE" \
     PROVIDER_SIGNAL_BACKUP_DIR_FILE="$PROVIDER_SIGNAL_BACKUP_DIR_FILE" \
     PROVIDER_SIGNAL_REAL_CP="$(command -v cp)" \
+    PROVIDER_SIGNAL_REAL_MKTEMP="$(command -v mktemp)" \
     PROVIDER_SIGNAL_BASE_GH="$STUB_DIR/gh" \
     "$GH_PR_ENRICH" 1 --enrich --allow-external \
     --output-dir "$PROVIDER_SIGNAL_DIR" \
@@ -3159,6 +3191,9 @@ assert_true "$([ ! -e "$PROVIDER_SIGNAL_SOURCE_DIR" ] && \
 assert_no_selection_transaction_residue "$PROVIDER_SIGNAL_DIR" \
     "provider TERM cleans every lock and publication transaction"
 
+fi
+
+if runtime_group_enabled freeze; then
 # Standalone immutable selection inputs are created directly in the system
 # temporary directory. Their source artifacts may be world-readable, but the
 # frozen copies must remain private from the instant cp writes them.
@@ -3360,6 +3395,8 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
 assert_contains "$PROVENANCE_RACE_OUT" "context fingerprint" \
     "the post-verification context race fails at immutable identity validation"
 
+fi
+
 HYBRID_SOURCE="$AUTHORIZED_DIR/hybrid-analysis.json"
 jq '.task_list = []
     | .process_improvements = [{
@@ -3387,6 +3424,7 @@ validate_candidate_contract() {
         "$report_dir" "$source_file" "$context_file" "$context_fingerprint"
 }
 
+if runtime_group_enabled contract; then
 # Untrusted PR prose may contain the marker substring. Only a complete marker
 # line inserted by the renderer is allowed to delimit the generated section.
 NEAR_MARKER='PR title mentions <!-- BEGIN SELECTED ANALYSIS --> without being a marker'
@@ -3607,6 +3645,8 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "captured comment URLs remain invalid as task thread IDs"
 cp "$DISPUTE_CONTEXT_ORIGINAL" "$AUTHORIZED_DIR/analysis-context.json"
 
+fi
+
 assert_jq "$AUTHORIZED_DIR/analysis-context.json" \
     '.coverage.code_access.state == "disabled"' \
     "the selection fixture records disabled repository code access"
@@ -3635,14 +3675,48 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
 assert_contains "$NO_CODE_CONFIRMED_OUT" "without enabled repository code access" \
     "the no-code confirmation error identifies the verdict contract"
 
+if runtime_group_enabled contract; then
 # Confirmed findings also require the current local workspace to remain the
 # exact one captured in the immutable context. An explicit code-access override
 # still permits a stable non-head checkout, but it does not waive this binding.
+for completion_case in not_reviewable plausible not_applicable; do
+    COMPLETION_SOURCE="$AUTHORIZED_DIR/completion-analysis.json"
+    jq --arg mode "$completion_case" '
+        .task_list = [] | .issue_categories = []
+        | .category_coverage |= map(.verdict = (if $mode == "not_applicable"
+            then "not_applicable" else "not_reviewable" end))
+        | if $mode == "plausible" then
+            .issue_categories = [{finding_id:"unresolved",name:"Needs evidence",
+                category:"logic_error",severity:"high",impact:"moderate",likelihood:"likely",
+                severity_rationale:"fixture",verdict:"plausible",confidence:"low",
+                description:"fixture",evidence:[{file:"a.js",line:1,detail:"unverified"}],
+                thread_ids:[],sources:["codex:orchestrator"]}]
+            | .category_coverage |= map(if .category == "logic_error"
+                then .verdict = "findings_reported" else . end)
+          else . end
+        | ._metadata.review_status = {state:"complete"}
+    ' "$HYBRID_SOURCE" > "$COMPLETION_SOURCE"
+    "$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$COMPLETION_SOURCE" >/dev/null
+    EXPECTED_COMPLETION=incomplete
+    [ "$completion_case" != not_applicable ] || EXPECTED_COMPLETION=complete
+    assert_jq_eq "$AUTHORIZED_DIR/analysis.json" '._metadata.review_status.state' \
+        "$EXPECTED_COMPLETION" "$completion_case completeness is derived independently of an empty task list"
+    assert_jq_eq "$AUTHORIZED_DIR/combined-data.json" '.analysis._metadata.review_status.state' \
+        "$EXPECTED_COMPLETION" "$completion_case completeness reaches JSON consumers"
+    assert_contains "$(cat "$AUTHORIZED_DIR/analysis.md")" "Review status: $EXPECTED_COMPLETION" \
+        "$completion_case completeness is visible in the selected report"
+done
+"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$HYBRID_SOURCE" >/dev/null
+rm -f "$COMPLETION_SOURCE"
+
+fi
+
 SELECTION_REPO="$TEST_OUTPUT_DIR/selection-workspace"
 SELECTION_REPORT="$SELECTION_REPO/report"
 mkdir -p "$SELECTION_REPORT"
 (cd "$SELECTION_REPO" && git init -q . && git config user.email t@t && git config user.name t \
-    && echo stable > tracked.txt && git add tracked.txt && git commit -qm init)
+    && echo stable > tracked.txt && echo 'const x = 1;' > a.js \
+    && git add tracked.txt a.js && git commit -qm init)
 SELECTION_HEAD=$(git -C "$SELECTION_REPO" rev-parse HEAD)
 SELECTION_CONTEXT_BASE="$TEST_OUTPUT_DIR/selection-context-base.json"
 SELECTION_CONTEXT_TMP="$TEST_OUTPUT_DIR/selection-context.tmp.json"
@@ -3697,6 +3771,25 @@ assert_jq_eq "$SELECTION_REPORT/analysis.json" \
 assert_jq "$SELECTION_REPORT/analysis.json" \
     '.task_list[0].finding_ids == ["unverified-finding"]' \
     "a task mapped to a confirmed finding is selectable"
+
+if runtime_group_enabled workspace; then
+for invalid_anchor in missing_file impossible_line; do
+    cp "$SELECTION_REPORT/analysis.json" "$TEST_OUTPUT_DIR/previous-selected.json"
+    cp "$SELECTION_REPORT/analysis.md" "$TEST_OUTPUT_DIR/previous-selected.md"
+    jq --arg mode "$invalid_anchor" '
+        .issue_categories[0].evidence[0] |=
+            (if $mode == "missing_file" then .file = "never-existed.txt" else .line = 1000000 end)
+    ' "$SELECTION_REPORT/hybrid-analysis.json" > "$SELECTION_REPORT/codex-analysis.json"
+    rc=0
+    (cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/codex-analysis.json") >/dev/null 2>&1 || rc=$?
+    assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+        "public selection rejects $invalid_anchor evidence"
+    assert_true "$(cmp -s "$TEST_OUTPUT_DIR/previous-selected.json" "$SELECTION_REPORT/analysis.json" &&
+        cmp -s "$TEST_OUTPUT_DIR/previous-selected.md" "$SELECTION_REPORT/analysis.md"; echo $?)" \
+        "$invalid_anchor rejection preserves the previous selected result and report"
+done
+rm -f "$SELECTION_REPORT/codex-analysis.json"
 
 # A clean native result still claims that the immutable code snapshot was
 # reviewed. Bind that claim to the same workspace fingerprint as a finding.
@@ -3761,7 +3854,7 @@ assert_no_selection_transaction_residue "$SELECTION_REPORT" \
 # own private replacement directory during final workspace revalidation.
 mkdir -p "$TMP_ALIAS_SELECTION/report"
 (cd "$TMP_ALIAS_SELECTION" && git init -q . && git config user.email t@t && \
-    git config user.name t && echo stable > tracked.txt && git add tracked.txt && \
+    git config user.name t && echo stable > tracked.txt && echo 'const x = 1;' > a.js && git add tracked.txt a.js && \
     git -c commit.gpgsign=false commit -qm init)
 TMP_ALIAS_HEAD=$(git -C "$TMP_ALIAS_SELECTION" rev-parse HEAD)
 cp "$AUTHORIZED_DIR/pr-summary.json" "$TMP_ALIAS_SELECTION/report/pr-summary.json"
@@ -3974,6 +4067,9 @@ rm -f "$MISSING_TASK_LINK" "$UNKNOWN_TASK_LINK" \
     "$MIXED_SYSTEMIC_SOURCE" "$DUPLICATE_TASK_THREAD" \
     "$MISMATCHED_TASK_THREAD" "$UNKNOWN_TASK_THREAD"
 
+fi
+
+if runtime_group_enabled attestation; then
 # Rendering can outlive the initial head/workspace checks. Mutate the tracked
 # workspace exactly when the frozen candidate is copied into its private
 # replacement directory; the final prepublication check must preserve every
@@ -4327,6 +4423,8 @@ assert_selection_views_match "$SELECTION_REPORT" "$CHECKS_TIMEOUT_BACKUP" \
 assert_no_selection_transaction_residue "$SELECTION_REPORT" \
     "checks timeout leaves no selection transaction residue"
 
+fi
+
 FINAL_BOUNDARY_BACKUP="$TEST_OUTPUT_DIR/final-boundary-backup"
 mkdir -p "$FINAL_BOUNDARY_BACKUP"
 for FINAL_VIEW in analysis.json analysis.md context-coverage.md \
@@ -4335,6 +4433,23 @@ for FINAL_VIEW in analysis.json analysis.md context-coverage.md \
         cp "$SELECTION_REPORT/$FINAL_VIEW" "$FINAL_BOUNDARY_BACKUP/$FINAL_VIEW"
 done
 
+# Both publication failures and cancellation block after this staging boundary.
+UNAVAILABLE_HEAD_STUBS="$TEST_OUTPUT_DIR/unavailable-head-stubs"
+mkdir -p "$UNAVAILABLE_HEAD_STUBS"
+cat > "$UNAVAILABLE_HEAD_STUBS/cp" << 'STUB'
+#!/bin/bash
+destination=""
+for argument in "$@"; do destination="$argument"; done
+case "$destination" in
+    "$UNAVAILABLE_HEAD_REPORT"/.selected-analysis-replacements.*/analysis.json)
+        : > "$UNAVAILABLE_HEAD_MARKER"
+        ;;
+esac
+exec "$UNAVAILABLE_HEAD_REAL_CP" "$@"
+STUB
+chmod +x "$UNAVAILABLE_HEAD_STUBS/cp"
+
+if runtime_group_enabled publication; then
 # The final hosted request sits between two local-state validations. Mutations
 # made while that request is in flight must be detected after the unchanged
 # hosted head returns and before any selected view is published.
@@ -4415,20 +4530,7 @@ mv "$FINAL_CONTEXT_BACKUP" "$SELECTION_REPORT/analysis-context.json"
 
 # A transient failure of the final hosted-head lookup fails closed without
 # deleting the previously valid selected views.
-UNAVAILABLE_HEAD_STUBS="$TEST_OUTPUT_DIR/unavailable-head-stubs"
 UNAVAILABLE_HEAD_MARKER="$TEST_OUTPUT_DIR/unavailable-head-marker"
-mkdir -p "$UNAVAILABLE_HEAD_STUBS"
-cat > "$UNAVAILABLE_HEAD_STUBS/cp" << 'STUB'
-#!/bin/bash
-destination=""
-for argument in "$@"; do destination="$argument"; done
-case "$destination" in
-    "$UNAVAILABLE_HEAD_REPORT"/.selected-analysis-replacements.*/analysis.json)
-        : > "$UNAVAILABLE_HEAD_MARKER"
-        ;;
-esac
-exec "$UNAVAILABLE_HEAD_REAL_CP" "$@"
-STUB
 cat > "$UNAVAILABLE_HEAD_STUBS/gh" << 'STUB'
 #!/bin/bash
 if [ "$1 $2" = "pr view" ] && [ -e "$UNAVAILABLE_HEAD_MARKER" ]; then
@@ -4677,6 +4779,9 @@ for LINK_IDENTITY_KIND in missing nonregular symlink; do
         "post-link $LINK_IDENTITY_KIND rollback leaves no residue"
 done
 
+fi
+
+if runtime_group_enabled signals; then
 # The initial hosted-head verification runs before writer-lock acquisition, but
 # it is still an owned, bounded external command. A stalled lookup must time out
 # without creating a lock or leaving any process-group member behind.
@@ -4709,6 +4814,7 @@ BLOCKED_HEAD_DESCENDANT_PID_FILE="$PRELOCK_HEAD_DESCENDANT_PID"
 rc=0
 PRELOCK_HEAD_OUT=$(cd "$PRELOCK_SELECTION_REPO" && \
     env PATH="$PRELOCK_HEAD_STUBS:$PATH" \
+    GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
     GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
     PRELOCK_HEAD_BASE_GH="$STUB_DIR/gh" \
     PRELOCK_HEAD_READY="$PRELOCK_HEAD_READY" \
@@ -4959,6 +5065,9 @@ assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
 assert_true "$([ ! -e "$SELECTION_REPORT/analysis.json" ] && echo 0 || echo 1)" \
     "strict workspace rejection invalidates stale selected artifacts"
 
+fi
+
+if runtime_group_enabled validation; then
 rc=0
 echo "do not overwrite" > "$TEST_OUTPUT_DIR/selection-temp-target.json"
 ln -s "$TEST_OUTPUT_DIR/selection-temp-target.json" \
@@ -5257,7 +5366,7 @@ mv "$AUTHORIZED_DIR/context-before-source-failure.json" "$AUTHORIZED_DIR/analysi
 # without a finding must remain explicitly not_reviewable.
 TRUNCATION_CASE_ROOT="$TEST_OUTPUT_DIR/truncated-selection"
 mkdir -p "$TRUNCATION_CASE_ROOT"
-for TRUNCATION_CASE in pr_body issue review inline thread_body thread_replies diff commit linked_issue; do
+for TRUNCATION_CASE in pr_body issue review inline thread_body thread_replies diff commit linked_issue unproven_bot_duplicates; do
     TRUNCATION_CASE_DIR="$TRUNCATION_CASE_ROOT/$TRUNCATION_CASE"
     mkdir -p "$TRUNCATION_CASE_DIR"
     cp "$AUTHORIZED_DIR/pr-summary.json" "$TRUNCATION_CASE_DIR/pr-summary.json"
@@ -5277,6 +5386,7 @@ for TRUNCATION_CASE in pr_body issue review inline thread_body thread_replies di
         diff) TRUNCATION_FILTER='.coverage.diff.files_truncated = ["a.js"]' ;;
         commit) TRUNCATION_FILTER='.coverage.commits.truncated = ["abc1234"]' ;;
         linked_issue) TRUNCATION_FILTER='.coverage.linked_issues.truncated = ["issue-u"]' ;;
+        unproven_bot_duplicates) TRUNCATION_FILTER='.coverage.issue_comments.superseded_bot_duplicates = 1 | del(.coverage.issue_comments.deduplication)' ;;
     esac
     jq "del(.coverage.context_fingerprint) | $TRUNCATION_FILTER" \
         "$AUTHORIZED_DIR/analysis-context.json" \
@@ -5485,5 +5595,7 @@ rc=0
 "$GH_PR_ENRICH" --test-call select_analysis_file "$AUTHORIZED_DIR" >/dev/null 2>&1 || rc=$?
 assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
     "consumers reject selected analysis after the report context moves to a new PR head"
+
+fi
 
 suite_end

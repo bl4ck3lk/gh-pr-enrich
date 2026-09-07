@@ -82,7 +82,7 @@ gh pr-enrich address 123
 | `uninstall-skill [--runtime codex\|claude\|both]` | Remove selected runtime registrations |
 | `select-analysis <REPORT_DIR> <SOURCE_JSON>` | Recheck the hosted PR head, promote a Codex, Claude, or hybrid result, and refresh derived views |
 | `resolve <ID...>` | Resolve one or more PR review threads by GraphQL ID |
-| `watch <PR>` | Monitor PR for new comments (options: `--interval`, `--enrich`, `--notify`) |
+| `watch <PR>` | Monitor comment revisions and thread resolution changes (options: `--interval`, `--enrich`, `--notify`) |
 | `address <PR>` | Work through selected issues; recheck the hosted head before resolving threads |
 | `retrospective` | Analyze patterns across all PRs (options: `--since`, `--author`, `--enrich`, `--format`) |
 
@@ -117,6 +117,11 @@ When run, the extension creates a directory with:
 ```
 
 Intermediate artifacts (`review-comments.json`, `inline-comments.json`, `unresolved-threads.json`, `issue-comments-deduped.json`, `claude-raw-response.json`, `id-mapping.txt`) are also kept in the same directory for debugging.
+
+`--json` and `--markdown` write only the requested artifact to stdout; collection
+and analysis progress goes to stderr. Diff transport preserves literal source
+bytes across supported GitHub CLI versions. Failed fetches retain up to 8 KiB of
+sanitized diagnostics in `pr-diff-stderr.log` and the diff coverage reason.
 
 When an analysis comes back empty, read `claude-stderr.log` first — an empty result is usually a failed or timed-out run, not a clean PR.
 
@@ -205,6 +210,25 @@ description, comment, thread reply, commit body, linked issue body, or file diff
 is truncated, categories without findings must remain `not_reviewable`; omitted
 evidence can never produce a clean selected verdict. The same rule applies when
 the analyzer has neither repository code access nor a complete included diff.
+
+Distinct bot comments are preserved in full before the per-comment body limit is
+applied. Only identical bodies from the same bot are compressed, and every
+original reference remains in `issue_comments[].source_comments`. Older contexts
+with unproven bot supersession must be refreshed before claiming complete review.
+
+Selection checks every confirmed evidence address and task location against the
+captured Git index or explicit working-tree snapshot. Missing files, traversal,
+and out-of-range lines reject the candidate while preserving the prior selected
+result. Evidence and tasks can specify `source: "base"` for a regular file at the
+captured `pr.base_sha`, including deleted files; that commit must exist locally.
+The default `source: "workspace"` uses the reviewed workspace fingerprint.
+These checks establish that an address exists; reviewers still verify the claim.
+
+`analysis.json` and the combined JSON expose derived `_metadata.review_status`,
+including input coverage, unreviewable categories, plausible finding IDs,
+confirmed findings, and task count. An empty task list can accompany an incomplete
+review. `address` and the Markdown report show that distinction; a valid
+`not_applicable` category alone does not make a review incomplete.
 
 The analysis runs when the PR has unresolved threads, review summaries, issue
 comments, or inline comments; if it has none, enrichment is skipped.

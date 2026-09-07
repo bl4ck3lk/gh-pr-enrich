@@ -1446,6 +1446,29 @@ assert_contains "$IGNORED_ROOT_OUTPUT" "disabled" \
     "repository-root output cannot bypass ignored-file detection"
 rm "$CODE_ACCESS_REPO/.env"
 
+# The default report is nested under an ignored ancestor. Sibling reports and
+# arbitrary files must still deny automatic access, including newline paths.
+DEFAULT_OUTPUT_REPO="$TEST_OUTPUT_DIR/default-output-repo"
+mkdir -p "$DEFAULT_OUTPUT_REPO/.reports/pr-reviews/pr-1"
+(cd "$DEFAULT_OUTPUT_REPO" && git init -q . && git config user.email t@t &&
+    git config user.name t && printf '.reports/\n' > .gitignore &&
+    git add .gitignore && git commit -qm init)
+DEFAULT_OUTPUT_HEAD=$(git -C "$DEFAULT_OUTPUT_REPO" rev-parse HEAD)
+DEFAULT_OUTPUT="$DEFAULT_OUTPUT_REPO/.reports/pr-reviews/pr-1"
+echo '{}' > "$DEFAULT_OUTPUT/pr-summary.json"
+DEFAULT_ACCESS=$(cd "$DEFAULT_OUTPUT_REPO" && "$GH_PR_ENRICH" --test-call \
+    resolve_code_access "$DEFAULT_OUTPUT_HEAD" "$DEFAULT_OUTPUT")
+assert_contains "$DEFAULT_ACCESS" "enabled:" \
+    "default ignored report artifacts allow automatic code access"
+for extra_path in '.reports/sibling.json' '.reports/pr-reviews/pr-1/secret.txt' $'.reports/odd\nname'; do
+    echo private > "$DEFAULT_OUTPUT_REPO/$extra_path"
+    DEFAULT_ACCESS=$(cd "$DEFAULT_OUTPUT_REPO" && "$GH_PR_ENRICH" --test-call \
+        resolve_code_access "$DEFAULT_OUTPUT_HEAD" "$DEFAULT_OUTPUT")
+    assert_contains "$DEFAULT_ACCESS" "disabled:" \
+        "ignored non-artifact files cannot hide behind the default output exclusion"
+    rm "$DEFAULT_OUTPUT_REPO/$extra_path"
+done
+
 # A user-selected report directory may contain tracked source. Generated-file
 # exclusions must never hide modifications to such files.
 OUTPUT_OVERLAP_REPO="$TEST_OUTPUT_DIR/output-overlap-repo"
@@ -2450,6 +2473,49 @@ assert_jq "$SAST_DIR2/sast-status.json" '.status == "skipped" and .requested == 
 
 # A successful gh exit with no bytes is not diff coverage. This occurs for
 # permission/binary edge cases and must not render as included 0 of 0 files.
+RAW_DIFF_DIR="$TEST_OUTPUT_DIR/raw-diff"
+RAW_DIFF_STUBS="$RAW_DIFF_DIR/stubs"
+mkdir -p "$RAW_DIFF_STUBS"
+cat > "$RAW_DIFF_STUBS/gh" << 'STUB'
+#!/bin/bash
+[ "$1 $2" = "pr diff" ] || exit 1
+case "$*" in
+    *--help*)
+        [ "$RAW_DIFF_CLI" != modern ] || echo '  --allow-escape-sequences'
+        exit 0 ;;
+esac
+case "$*" in *--color=never*) ;; *) echo 'color must be disabled' >&2; exit 1 ;; esac
+if [ "$RAW_DIFF_CLI" = failed ]; then
+    printf '\033[31mpermission denied: fixture\033[0m\n' >&2
+    exit 1
+fi
+case "$RAW_DIFF_CLI:$*" in
+    modern:*--allow-escape-sequences*) ;;
+    modern:*) echo 'diff contains escape sequences' >&2; exit 1 ;;
+    legacy:*--allow-escape-sequences*) echo 'unknown flag' >&2; exit 1 ;;
+esac
+printf 'diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -0,0 +1 @@\n+// raw \033[31m byte\n'
+STUB
+chmod +x "$RAW_DIFF_STUBS/gh"
+echo '{"changedFiles":1,"files":[{"path":"a.js"}]}' > "$RAW_DIFF_DIR/pr-summary.json"
+for raw_cli in modern legacy failed; do
+    PATH="$RAW_DIFF_STUBS:$PATH" RAW_DIFF_CLI="$raw_cli" "$GH_PR_ENRICH" \
+        --test-call fetch_pr_diff "$RAW_DIFF_DIR" 1 >/dev/null 2>&1
+    if [ "$raw_cli" = failed ]; then
+        assert_jq "$RAW_DIFF_DIR/diff-status.json" \
+            '.status == "failed" and (.reason | contains("permission denied"))' \
+            "failed diff transport preserves the actionable diagnostic"
+        raw_diagnostic_rc=0
+        LC_ALL=C grep -q $'\033' "$RAW_DIFF_DIR/pr-diff-stderr.log" || raw_diagnostic_rc=$?
+        assert_eq 1 "$raw_diagnostic_rc" "diff diagnostics do not retain terminal escape bytes"
+    else
+        assert_jq "$RAW_DIFF_DIR/diff-status.json" '.status == "completed"' \
+            "$raw_cli GitHub CLI preserves valid diff coverage"
+        assert_jq "$RAW_DIFF_DIR/pr-diff.json" '.raw_diff | contains("\u001b[31m")' \
+            "$raw_cli diff transport retains literal source escape bytes"
+    fi
+done
+
 EMPTY_DIFF_DIR="$TEST_OUTPUT_DIR/empty-diff"
 EMPTY_DIFF_STUBS="$EMPTY_DIFF_DIR/stubs"
 mkdir -p "$EMPTY_DIFF_DIR" "$EMPTY_DIFF_STUBS"

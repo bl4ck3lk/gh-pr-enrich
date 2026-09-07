@@ -4,7 +4,7 @@
 # Covers:
 #   - review threads are paginated (a 101st thread must not vanish silently)
 #   - outdated threads are labelled, not dropped
-#   - superseded bot comments are deduplicated
+#   - only identical bot comments are deduplicated, with references retained
 #   - commits, linked issues and failing checks reach the context
 #   - everything truncated or omitted is recorded in a coverage block
 
@@ -451,17 +451,17 @@ EOF
 DEDUPED="$TEST_OUTPUT_DIR/deduped.json"
 "$GH_PR_ENRICH" --test-call dedupe_bot_comments "$RAW_COMMENTS" "$DEDUPED" >/dev/null 2>&1 || true
 
-assert_jq_eq "$DEDUPED" '[.kept[] | select(.user == "codecov[bot]" and (.body | contains("Coverage report")))] | length' "1" \
-    "superseded bot reposts collapse to one"
+assert_jq_eq "$DEDUPED" '[.kept[] | select(.user == "codecov[bot]" and (.body | contains("Coverage report")))] | length' "3" \
+    "changed bot reports remain distinct evidence"
 assert_jq_eq "$DEDUPED" '[.kept[] | select(.body | contains("84% of lines covered"))] | length' "1" \
     "the newest bot report is the one kept"
-assert_jq_eq "$DEDUPED" '[.kept[] | select(.body | contains("72% of lines covered"))] | length' "0" \
-    "older bot reports are dropped"
-assert_jq_eq "$DEDUPED" '[.kept[] | select(.user == "codecov[bot]")] | length' "2" \
+assert_jq_eq "$DEDUPED" '[.kept[] | select(.body | contains("72% of lines covered"))] | length' "1" \
+    "older distinct bot evidence is retained"
+assert_jq_eq "$DEDUPED" '[.kept[] | select(.user == "codecov[bot]")] | length' "4" \
     "distinct bot report types are both kept"
 assert_jq_eq "$DEDUPED" '[.kept[] | select(.user == "human-reviewer")] | length' "2" \
     "repeated human comments are never deduplicated"
-assert_jq_eq "$DEDUPED" '.superseded | length' "2" "superseded comments are recorded"
+assert_jq_eq "$DEDUPED" '.superseded | length' "0" "changed bodies are never declared duplicates"
 
 # Distinct reports that share an opening line must survive. Bots commonly prefix
 # every comment with the same marker or status heading, so a first-line-only
@@ -490,9 +490,21 @@ assert_jq_eq "$SHARED_OUT" '[.kept[] | select(.body | contains("SQL injection"))
 assert_jq_eq "$SHARED_OUT" '[.kept[] | select(.body | contains("unit-tests"))] | length' "1" \
     "two different CI failures are not collapsed into one"
 
-# Whatever is dropped must be auditable, not merely counted.
-assert_jq "$DEDUPED" '[.superseded[] | select(.html_url != null)] | length == 2' \
-    "superseded comments keep their URLs so a drop can be reviewed"
+# Paths, numbers, punctuation, and text beyond a shared opening are evidence.
+COLLISIONS="$TEST_OUTPUT_DIR/collisions.json"
+jq -n '["api/v1/accounts.py", "api/v2/accounts.py", "api/v2/accounts_py"]
+    | to_entries | map({id:(.key+10), user:"security-audit[bot]",
+        body:("## Audit\nShared\nOpening\nBoilerplate\nFinding in " + .value),
+        created_at:(.key|tostring), html_url:("u"+(.key|tostring))})
+    | . + [.[0] + {id:20, created_at:"9", html_url:"duplicate-url"}]' > "$COLLISIONS"
+"$GH_PR_ENRICH" --test-call dedupe_bot_comments "$COLLISIONS" "$SHARED_OUT"
+assert_jq_eq "$SHARED_OUT" '.kept | length' "3" \
+    "different targets after identical boilerplate remain in context"
+assert_jq "$SHARED_OUT" '.superseded | map(.id) == [10]' \
+    "only a byte-identical body from the same bot is compressed"
+assert_jq "$SHARED_OUT" '.kept[] | select(.id == 20) |
+    .source_comments | map(.url) == ["u0", "duplicate-url"]' \
+    "compressed evidence retains every original reference"
 
 # ---------------------------------------------------------------------------
 # Context inputs: commits, linked issues, failing checks, coverage
@@ -609,8 +621,8 @@ assert_jq "$CTX" '[.unresolved_threads[] | select(.thread_id == "PRRT_page2")][0
     "analyzer is told which threads are outdated"
 
 # Bot dedup applied on the way into the context
-assert_jq_eq "$CTX" '[.issue_comments[] | select(.body | contains("Coverage report"))] | length' "1" \
-    "context contains one coverage report, not three"
+assert_jq_eq "$CTX" '[.issue_comments[] | select(.body | contains("Coverage report"))] | length' "3" \
+    "all distinct coverage reports reach the analyzer"
 
 # Coverage block
 assert_jq "$CTX" '.coverage != null' "context records a coverage block"
@@ -626,7 +638,7 @@ RETARGETED_CONTEXT_FINGERPRINT=$("$GH_PR_ENRICH" --test-call \
 assert_true "$([ "$CONTEXT_REVISION_FINGERPRINT" != "$RETARGETED_CONTEXT_FINGERPRINT" ] && echo 0 || echo 1)" \
     "changing only the PR base changes the context fingerprint"
 assert_jq_eq "$CTX" '.coverage.issue_comments.total' "6" "coverage records total issue comments"
-assert_jq_eq "$CTX" '.coverage.issue_comments.superseded_bot_duplicates' "2" \
+assert_jq_eq "$CTX" '.coverage.issue_comments.superseded_bot_duplicates' "0" \
     "coverage records how many bot duplicates were dropped"
 assert_jq_eq "$CTX" '.coverage.unresolved_threads.outdated' "1" "coverage counts outdated threads"
 assert_jq_eq "$CTX" '.coverage.diff.files_truncated | length' "1" "coverage names truncated diff files"
@@ -943,7 +955,7 @@ COV_TEXT=$(cat "$COV_MD" 2>/dev/null || echo "")
 
 assert_contains "$COV_TEXT" "Analysis Context Coverage" "coverage section has a heading"
 assert_contains "$COV_TEXT" "src/retry.js" "coverage section names the truncated file"
-assert_contains "$COV_TEXT" "superseded bot reposts dropped" "coverage section reports dropped bot reposts"
+assert_contains "$COV_TEXT" "identical bot reposts compressed" "coverage section reports compressed identical bot reposts"
 assert_contains "$COV_TEXT" "outdated" "coverage section reports outdated threads"
 
 # The "not verified against code" warning keys on the recorded access decision,
