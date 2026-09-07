@@ -11,7 +11,12 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 GH_PR_ENRICH="$PROJECT_DIR/gh-pr-enrich"
-TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output/enrichment-gate"
+ENRICHMENT_GATE_SHARD="${GH_PR_ENRICH_ENRICHMENT_SHARD:-standard}"
+case "$ENRICHMENT_GATE_SHARD" in
+    standard|watch-deletions) ;;
+    *) echo "Unknown enrichment gate shard: $ENRICHMENT_GATE_SHARD" >&2; exit 1 ;;
+esac
+TEST_OUTPUT_DIR="$SCRIPT_DIR/test-output/enrichment-gate-$ENRICHMENT_GATE_SHARD"
 STUB_DIR="$TEST_OUTPUT_DIR/stubs"
 
 # shellcheck source=lib/assert.sh
@@ -156,6 +161,7 @@ OUT=$(run_scenario "threads-only" "$THREAD_JSON" '[]')
 assert_eq "yes" "$(claude_ran threads-only)" "an unresolved thread triggers the analysis"
 assert_contains "$OUT" "Found 1 unresolved thread" "the script reports what it found"
 
+if [ "$ENRICHMENT_GATE_SHARD" = standard ]; then
 # The entire stdout stream is the selected payload, even when collection and
 # enrichment emit progress. Verify it against the artifact consumed by tools.
 for output_format in json markdown; do
@@ -216,6 +222,7 @@ assert_true "$([ ! -e "$TEST_OUTPUT_DIR/discussion-drift/report/claude-analysis.
     [ ! -e "$TEST_OUTPUT_DIR/discussion-drift/report/analysis.json" ] && echo 0 || echo 1)" \
     "same-head discussion drift publishes no analyzer or selected artifact"
 unset CLAUDE_DISCUSSION_DRIFT_MARKER
+fi
 
 # Watch integration: the first poll simultaneously replaces an issue-comment
 # ID, adds another issue comment, and deletes an inline comment. Total comments
@@ -285,16 +292,63 @@ case "$1 $2" in
         exit 0
         ;;
     "pr view")
+        if [ -n "${WATCH_DELETE_FAILURE_FILE:-}" ] && \
+           [ -e "$WATCH_DELETE_FAILURE_FILE.pending" ]; then
+            rm "$WATCH_DELETE_FAILURE_FILE.pending"
+            : > "$WATCH_DELETE_FAILURE_FILE"
+            exit 79
+        fi
         printf '%s\n' "$summary"
         exit 0
         ;;
     "pr checks") echo '[]'; exit 0 ;;
     "pr diff")
+        if [ "${3:-}" = --help ]; then
+            echo 'Usage: gh pr diff'
+            exit 0
+        fi
+        if [ -n "${WATCH_REFRESH_LOG:-}" ]; then
+            printf 'refreshed\n' >> "$WATCH_REFRESH_LOG"
+            if [ "${WATCH_DELETE_FAILURE:-}" = hard ] && \
+               [ ! -e "$WATCH_DELETE_FAILURE_FILE" ]; then
+                : > "$WATCH_DELETE_FAILURE_FILE.pending"
+            fi
+        fi
         printf 'diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -0,0 +1 @@\n+const x = 1;\n'
         exit 0
         ;;
 esac
 if [ "$1 $2" = "api graphql" ]; then
+    if [ -n "${WATCH_DELETE_LAST:-}" ]; then
+        case "$*" in
+            *ExternalDisclosureVisibility*|*closingIssuesReferences*) ;;
+            *)
+                case "$*" in
+                    *WatchReviewThreads*) ;;
+                    *)
+                        if [ "${WATCH_DELETE_FAILURE:-}" = partial ] && \
+                           [ "$poll" -gt 0 ] && \
+                           [ ! -e "$WATCH_DELETE_FAILURE_FILE" ]; then
+                            : > "$WATCH_DELETE_FAILURE_FILE"
+                            exit 79
+                        fi
+                        ;;
+                esac
+                jq -nc --arg kind "$WATCH_DELETE_LAST" --argjson poll "$poll" '
+                    (if $kind == "inline" and $poll == 0 then [{
+                        id:"THREAD_DELETED",isResolved:true,isOutdated:false,path:"a.js",line:1,
+                        comments:{totalCount:1,pageInfo:{hasNextPage:false,endCursor:null},
+                            nodes:[{id:"INLINE_DELETED",databaseId:10,body:"last comment",
+                                author:{login:"rev"},createdAt:"2026-01-01T00:00:00Z",
+                                url:"https://github.com/o/r/pull/1#discussion_r10"}]}
+                    }] else [] end) as $threads
+                    | {data:{repository:{pullRequest:{reviewThreads:{
+                        totalCount:($threads|length),pageInfo:{hasNextPage:false,endCursor:null},
+                        nodes:$threads}}}}}'
+                exit 0
+                ;;
+        esac
+    fi
     case "$*" in
         *ExternalDisclosureVisibility*)
             echo '{"data":{"primaryRepository":{"id":"REPO_o_r","nameWithOwner":"o/r","visibility":"PUBLIC"},"nodes":[]}}'
@@ -391,6 +445,22 @@ if [ "$1 $2" = "api graphql" ]; then
     exit 0
 fi
 if [ "$1" = "api" ] && [ "$2" = "--paginate" ]; then
+    if [ -n "${WATCH_DELETE_LAST:-}" ]; then
+        deletion_source=""
+        case "$3" in
+            *issues/*/comments*) deletion_source=issue ;;
+            *pulls/*/reviews*) deletion_source=review ;;
+        esac
+        jq -nc --arg requested "$deletion_source" --arg kind "$WATCH_DELETE_LAST" \
+            --argjson poll "$poll" '
+            if $requested == $kind and $poll == 0 then [{
+                id:101,body:"last comment",user:{login:"u"},state:"COMMENTED",
+                created_at:"2026-01-01T00:00:00Z",updated_at:"2026-01-01T00:00:00Z",
+                submitted_at:"2026-01-01T00:00:00Z",commit_id:"abc123",
+                html_url:"https://github.com/o/r/pull/1#issuecomment-101"
+            }] else [] end'
+        exit 0
+    fi
     if [ -n "${WATCH_REVISION_ONLY:-}" ]; then
         case "$3" in
             *issues/*/comments*) component=issue ;;
@@ -486,6 +556,60 @@ jq -nc '
       process_improvements:[],pr_template_suggestions:[]}}'
 STUB
 chmod +x "$WATCH_STUB_DIR/claude"
+
+if [ "$ENRICHMENT_GATE_SHARD" = watch-deletions ]; then
+    # Use the real collector and its previously selected analysis. The empty
+    # refresh must invalidate that selection and settle without invoking Claude.
+    assert_jq "$TEST_OUTPUT_DIR/threads-only/report/analysis.json" '._metadata.provider == "claude"' \
+        "watch deletion fixtures start with a selected analysis"
+    for deletion_case in issue review inline hard-failure partial-failure; do
+        deletion_kind="$deletion_case"
+        deletion_failure=""
+        expected_refreshes=1
+        case "$deletion_case" in
+            hard-failure|partial-failure)
+                deletion_kind=issue
+                deletion_failure="${deletion_case%-failure}"
+                expected_refreshes=2
+                ;;
+        esac
+        DELETE_CASE_DIR="$WATCH_CASE/delete-$deletion_case"
+        DELETE_REPORT="$DELETE_CASE_DIR/work/.reports/pr-reviews/pr-1"
+        mkdir -p "$DELETE_REPORT"
+        cp -R "$TEST_OUTPUT_DIR/threads-only/report/." "$DELETE_REPORT/"
+        printf '0\n' > "$WATCH_POLL_FILE"
+        printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"
+        DELETE_WATCH_OUT=$(
+            cd "$DELETE_CASE_DIR/work" && \
+            env WATCH_DELETE_LAST="$deletion_kind" WATCH_DELETE_FAILURE="$deletion_failure" \
+                WATCH_DELETE_FAILURE_FILE="$DELETE_CASE_DIR/failure" \
+                WATCH_REFRESH_LOG="$DELETE_CASE_DIR/refresh.log" \
+                WATCH_POLL_FILE="$WATCH_POLL_FILE" WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" \
+                WATCH_SLEEP_LIMIT=3 WATCH_CLAUDE_ATTEMPT_FILE="$DELETE_CASE_DIR/claude-attempt" \
+                WATCH_CLAUDE_LOG="$DELETE_CASE_DIR/claude.log" PATH="$WATCH_STUB_DIR:$PATH" \
+                "$GH_PR_ENRICH" watch 1 --interval 1 --enrich 2>&1
+        ) || true
+        assert_contains "$DELETE_WATCH_OUT" 'Initial state: 1 comments/reviews, 0 unresolved threads' \
+            "$deletion_case starts with exactly one comment and no unresolved work"
+        assert_eq "$expected_refreshes" "$(wc -l < "$DELETE_CASE_DIR/refresh.log" | tr -d ' ')" \
+            "$deletion_case deletion refreshes once after any failed attempt"
+        assert_contains "$DELETE_WATCH_OUT" 'Report refreshed: no discussion remains' \
+            "$deletion_case accepts the successful empty-discussion refresh"
+        assert_contains "$DELETE_WATCH_OUT" 'No changes (comments: 0, unresolved: 0)' \
+            "$deletion_case advances the baseline and stops repeating collection"
+        assert_true "$([ ! -e "$DELETE_REPORT/analysis.json" ] && echo 0 || echo 1)" \
+            "$deletion_case refresh invalidates the previous selected analysis"
+        assert_true "$([ ! -s "$DELETE_CASE_DIR/claude.log" ] && echo 0 || echo 1)" \
+            "$deletion_case zero-discussion refresh never invokes Claude"
+        if [ -n "$deletion_failure" ]; then
+            assert_true "$([ -e "$DELETE_CASE_DIR/failure" ] && echo 0 || echo 1)" \
+                "$deletion_case exercises its failed collection boundary"
+            assert_contains "$DELETE_WATCH_OUT" 'retaining the prior watch state for retry' \
+                "$deletion_case keeps the baseline until collection succeeds"
+        fi
+    done
+    suite_end
+fi
 
 WATCH_OUT_FILE="$WATCH_CASE/watch.out"
 set +e

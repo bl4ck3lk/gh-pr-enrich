@@ -7674,6 +7674,19 @@ if [ "$1" = "watch" ]; then
                    [ -n "$AFTER_ANALYSIS_IDENTITY" ] && \
                    [ "$AFTER_ANALYSIS_IDENTITY" != "$BEFORE_ANALYSIS_IDENTITY" ]; then
                     echo "   ✅ Analysis updated: $WATCH_REPORT_DIR/analysis.md"
+                elif [ "$ENRICH_EXIT" -eq 0 ] && \
+                     [ "$CURRENT_COUNT" -eq 0 ] && [ "$CURRENT_UNRESOLVED" -eq 0 ] && \
+                     jq -e --arg repo "$REPO" --argjson pr "$WATCH_PR" '
+                         .pr.repository == $repo and .pr.number == $pr and
+                         (.coverage.discussion.fingerprint | type == "string" and length > 0) and
+                         .coverage.issue_comments.total == 0 and
+                         .coverage.review_comments.total == 0 and
+                         .coverage.inline_comments.total == 0 and
+                         .coverage.unresolved_threads.total == 0
+                     ' "$WATCH_REPORT_DIR/analysis-context.json" > /dev/null 2>&1; then
+                    # A complete discussion fingerprint attests that these zeros
+                    # came from collection, so the intentional analyzer skip is final.
+                    echo "   ✅ Report refreshed: no discussion remains."
                 else
                     ADVANCE_WATCH_BASELINE=false
                     echo "   ❌ Analysis did not publish a fresh selected artifact; retaining the prior watch state for retry."
