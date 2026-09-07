@@ -62,16 +62,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite:
-          - tests/test-runtime-compatibility.sh
-          - tests/test-runtime-selection.sh
-          - tests/test-evidence-anchors.sh
-    name: macOS / ${{ matrix.suite }}
+        include:
+          - {suite: tests/test-runtime-compatibility.sh, group: lifecycle}
+          - {suite: tests/test-runtime-compatibility.sh, group: context}
+          - {suite: tests/test-runtime-compatibility.sh, group: disclosure}
+          - {suite: tests/test-runtime-compatibility.sh, group: visibility}
+          - {suite: tests/test-runtime-compatibility.sh, group: sast}
+          - {suite: tests/test-runtime-selection.sh, group: provider}
+          - {suite: tests/test-runtime-selection.sh, group: freeze}
+          - {suite: tests/test-runtime-selection.sh, group: contract}
+          - {suite: tests/test-runtime-selection.sh, group: workspace}
+          - {suite: tests/test-runtime-selection.sh, group: attestation}
+          - {suite: tests/test-runtime-selection.sh, group: publication}
+          - {suite: tests/test-runtime-selection.sh, group: signals}
+          - {suite: tests/test-runtime-selection.sh, group: validation}
+          - {suite: tests/test-evidence-anchors.sh, group: all}
+    name: macOS / ${{ matrix.suite }} / ${{ matrix.group }}
     steps:
       - uses: actions/checkout@v4
       - name: Verify native Bash compatibility
         env:
           SUITE: ${{ matrix.suite }}
+          GH_PR_ENRICH_RUNTIME_GROUP: ${{ matrix.group }}
         run: /bin/bash "$SUITE"
 
   # Preserve the stable aggregate check name used by branch protection while
