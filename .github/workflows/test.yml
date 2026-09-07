@@ -56,11 +56,29 @@ jobs:
           SUITE: ${{ matrix.suite }}
         run: bash "$SUITE"
 
+  macos-compatibility:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - tests/test-runtime-compatibility.sh
+          - tests/test-runtime-selection.sh
+          - tests/test-evidence-anchors.sh
+    name: macOS / ${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify native Bash compatibility
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: /bin/bash "$SUITE"
+
   # Preserve the stable aggregate check name used by branch protection while
   # allowing independent suites to run concurrently.
   test:
     if: always()
-    needs: [prepare, suite]
+    needs: [prepare, suite, macos-compatibility]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -68,6 +86,8 @@ jobs:
         env:
           PREPARE_RESULT: ${{ needs.prepare.result }}
           SUITE_RESULT: ${{ needs.suite.result }}
+          MACOS_RESULT: ${{ needs.macos-compatibility.result }}
         run: |
           test "$PREPARE_RESULT" = success
           test "$SUITE_RESULT" = success
+          test "$MACOS_RESULT" = success

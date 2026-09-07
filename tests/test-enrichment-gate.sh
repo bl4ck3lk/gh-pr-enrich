@@ -24,6 +24,18 @@ mkdir -p "$STUB_DIR"
 
 suite_start "gh pr-enrich enrichment gate suite"
 
+# A rejected invocation must leave the machine-readable stream empty too.
+for invalid_option in --unknown --output-dir --model --prompt; do
+    preflight_rc=0
+    "$GH_PR_ENRICH" 1 --json "$invalid_option" \
+        > "$TEST_OUTPUT_DIR/preflight.stdout" 2> "$TEST_OUTPUT_DIR/preflight.stderr" || preflight_rc=$?
+    assert_eq 1 "$preflight_rc" "$invalid_option is rejected before collection"
+    assert_eq "" "$(cat "$TEST_OUTPUT_DIR/preflight.stdout")" \
+        "$invalid_option does not corrupt JSON stdout"
+    assert_true "$([ -s "$TEST_OUTPUT_DIR/preflight.stderr" ] && echo 0 || echo 1)" \
+        "$invalid_option explains the failure on stderr"
+done
+
 # --- stubs ------------------------------------------------------------------
 # gh reads its canned responses from $FIXTURE_DIR, so each scenario supplies its
 # own threads and comments without changing the stub.
@@ -143,6 +155,28 @@ claude_ran() {
 OUT=$(run_scenario "threads-only" "$THREAD_JSON" '[]')
 assert_eq "yes" "$(claude_ran threads-only)" "an unresolved thread triggers the analysis"
 assert_contains "$OUT" "Found 1 unresolved thread" "the script reports what it found"
+
+# The entire stdout stream is the selected payload, even when collection and
+# enrichment emit progress. Verify it against the artifact consumed by tools.
+for output_format in json markdown; do
+    FORMAT_OUT="$TEST_OUTPUT_DIR/format-$output_format"
+    FORMAT_RC=0
+    env FIXTURE_DIR="$TEST_OUTPUT_DIR/threads-only/fixtures" \
+        CLAUDE_INVOKED_LOG="$TEST_OUTPUT_DIR/format-claude.txt" PATH="$STUB_DIR:$PATH" \
+        "$GH_PR_ENRICH" 1 --enrich --diff --"$output_format" --output-dir "$FORMAT_OUT" \
+        > "$TEST_OUTPUT_DIR/$output_format.stdout" \
+        2> "$TEST_OUTPUT_DIR/$output_format.stderr" || FORMAT_RC=$?
+    assert_eq "0" "$FORMAT_RC" "$output_format output completes successfully"
+    case "$output_format" in
+        json) FORMAT_ARTIFACT=combined-data.json ;;
+        markdown) FORMAT_ARTIFACT=comprehensive-report.md ;;
+    esac
+    assert_true "$(cmp -s "$TEST_OUTPUT_DIR/$output_format.stdout" \
+        "$FORMAT_OUT/$FORMAT_ARTIFACT"; echo $?)" \
+        "$output_format stdout contains only the requested artifact"
+    assert_contains "$(cat "$TEST_OUTPUT_DIR/$output_format.stderr")" "Fetching details" \
+        "$output_format progress remains available on stderr"
+done
 assert_jq "$TEST_OUTPUT_DIR/threads-only/report/claude-analysis.json" '.issue_categories != null' \
     "the analysis result is written"
 assert_jq "$TEST_OUTPUT_DIR/threads-only/report/analysis.json" '._metadata.provider == "claude"' \
@@ -215,6 +249,25 @@ chmod +x "$WATCH_STUB_DIR/sleep"
 cat > "$WATCH_STUB_DIR/gh" << 'STUB'
 #!/bin/bash
 poll=$(cat "$WATCH_POLL_FILE" 2>/dev/null || echo 0)
+# Execute the actual projection supplied by the CLI, so adding fields to the
+# watch contract cannot pass against a stub that always returns only IDs.
+if [ "$1 $2" = 'api --paginate' ] && [ "${WATCH_RAW_PAGES:-false}" != true ]; then
+    projection=""
+    previous=""
+    for argument in "$@"; do
+        [ "$previous" != --jq ] || projection="$argument"
+        previous="$argument"
+    done
+    if [ -n "$projection" ]; then
+        [ -z "${WATCH_PROJECTION_LOG:-}" ] || printf '%s\n' "$*" >> "$WATCH_PROJECTION_LOG"
+        if [ -n "${WATCH_PROJECTION_LOG:-}" ] && [ -n "${WATCH_LARGE_BODY_FILE:-}" ]; then
+            wc -c < "$WATCH_LARGE_BODY_FILE" >> "$WATCH_PROJECTION_LOG"
+        fi
+        set -o pipefail
+        WATCH_RAW_PAGES=true "$0" "$@" | jq -r "$projection"
+        exit $?
+    fi
+fi
 summary='{"number":1,"title":"t","body":"b","author":{"login":"u"},"state":"OPEN","url":"https://github.com/o/r/pull/1","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","mergeable":"MERGEABLE","isDraft":false,"headRefOid":"abc123","baseRefOid":"base123","baseRefName":"main","additions":1,"deletions":0,"changedFiles":1,"files":[{"path":"a.js","additions":1,"deletions":0}],"commits":[],"labels":[],"assignees":[],"reviews":[]}'
 case "$1 $2" in
     "repo view")
@@ -260,7 +313,7 @@ if [ "$1 $2" = "api graphql" ]; then
                 echo '{"errors":[{"message":"reply page failed"}],"data":{"node":null}}'
             elif [ "${WATCH_INCOMPLETE_THREAD_COMMENTS:-false}" = true ]; then
                 jq -nc --argjson resolved "$watch_reply_resolved" \
-                    '[range(1; 101) | {id:("INLINE_" + tostring)}] as $comments
+                    '[range(1; 101) | {id:("INLINE_" + tostring),body:"reply",lastEditedAt:null}] as $comments
                     | {data:{node:{id:"THREAD_1",isResolved:$resolved,comments:{
                         pageInfo:{hasNextPage:false,endCursor:null},
                         totalCount:101,nodes:$comments}}}}'
@@ -268,19 +321,31 @@ if [ "$1 $2" = "api graphql" ]; then
                 jq -nc --argjson resolved "$watch_reply_resolved" \
                     --argjson mutate_ids "$watch_mutate_reply_ids" '
                     [range(1; 101) | {id:(if . == 1 and $mutate_ids then
-                        "INLINE_CHANGED" else ("INLINE_" + tostring) end)}] as $comments
+                        "INLINE_CHANGED" else ("INLINE_" + tostring) end),body:"reply",lastEditedAt:null}] as $comments
                     | {data:{node:{id:"THREAD_1",isResolved:$resolved,comments:{
                         pageInfo:{hasNextPage:true,endCursor:"reply-page-1"},
                         totalCount:101,nodes:$comments}}}}'
                 jq -nc --argjson resolved "$watch_reply_resolved" \
                     '{data:{node:{id:"THREAD_1",isResolved:$resolved,comments:{
                     pageInfo:{hasNextPage:false,endCursor:null},
-                    totalCount:101,nodes:[{id:"INLINE_101"}]}}}}'
+                    totalCount:101,nodes:[{id:"INLINE_101",body:"reply",lastEditedAt:null}]}}}}'
             fi
             ;;
         *WatchReviewThreads*)
             [ -z "${WATCH_GRAPHQL_LOG:-}" ] || printf '%s\n' "$*" >> "$WATCH_GRAPHQL_LOG"
-            if [ "${WATCH_INCOMPLETE_THREADS:-false}" = true ]; then
+            if [ -n "${WATCH_REVISION_ONLY:-}" ]; then
+                jq -nc --arg mode "$WATCH_REVISION_ONLY" --argjson poll "$poll" '
+                    {data:{repository:{pullRequest:{reviewThreads:{
+                        totalCount:2,pageInfo:{hasNextPage:false,endCursor:null},
+                        nodes:[range(0;2) | {id:("THREAD_"+tostring),
+                            isResolved:(if $mode == "resolution" then . == ($poll % 2)
+                                elif $mode == "final_resolution" then $poll > 0 else true end),
+                            comments:{totalCount:1,nodes:[{
+                                id:("INLINE_"+tostring),lastEditedAt:null,
+                                body:(if $mode == "inline" and $poll > 0 then "edited" else "original" end)
+                            }]}}]
+                    }}}}}'
+            elif [ "${WATCH_INCOMPLETE_THREADS:-false}" = true ]; then
                 echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":101,"pageInfo":{"hasNextPage":true,"endCursor":"x"},"nodes":[]}}}}}'
             elif [ "${WATCH_TWO_LEVEL:-false}" = true ] || \
                  [ "${WATCH_INCOMPLETE_THREAD_COMMENTS:-false}" = true ] || \
@@ -293,7 +358,7 @@ if [ "$1 $2" = "api graphql" ]; then
                         isResolved:($thread_number != 1),
                         comments:(if $thread_number == 1 then {
                             totalCount:101,
-                            nodes:[range(1; 101) | {id:("INLINE_" + tostring)}]
+                            nodes:[range(1; 101) | {id:("INLINE_" + tostring),body:"reply",lastEditedAt:null}]
                         } else {totalCount:0,nodes:[]} end)
                     }] as $threads
                     | {data:{repository:{pullRequest:{reviewThreads:{
@@ -320,8 +385,19 @@ if [ "$1 $2" = "api graphql" ]; then
     exit 0
 fi
 if [ "$1" = "api" ] && [ "$2" = "--paginate" ]; then
-    watch_projection=false
-    case "$*" in *"--jq"*) watch_projection=true ;; esac
+    if [ -n "${WATCH_REVISION_ONLY:-}" ]; then
+        case "$3" in
+            *issues/*/comments*) component=issue ;;
+            *pulls/*/reviews*) component=review ;;
+            *) echo '[]'; exit 0 ;;
+        esac
+        jq -nc --arg mode "$WATCH_REVISION_ONLY" --arg component "$component" \
+            --argjson poll "$poll" '[{id:1,
+            body:(if $mode == $component and $poll > 0 then "edited" else "original" end),
+            updated_at:"2026-01-01T00:00:00Z",state:"COMMENTED",commit_id:"abc123",
+            submitted_at:"2026-01-01T00:00:00Z"}]'
+        exit 0
+    fi
     if [ "${WATCH_STALL_BASE:-false}" = true ] && [ "$poll" -gt 0 ]; then
         case "$3" in
             *issues/*/comments*)
@@ -336,28 +412,17 @@ if [ "$1" = "api" ] && [ "$2" = "--paginate" ]; then
                 ;;
         esac
     fi
-    if [ "$watch_projection" = true ] && [ -n "${WATCH_PROJECTION_LOG:-}" ]; then
-        printf '%s\n' "$*" >> "$WATCH_PROJECTION_LOG"
-        [ -z "${WATCH_LARGE_BODY_FILE:-}" ] || \
-            wc -c < "$WATCH_LARGE_BODY_FILE" >> "$WATCH_PROJECTION_LOG"
-    fi
     case "$3" in
         *issues/*/comments*)
-            if [ "$watch_projection" = true ]; then
-                if [ -n "${WATCH_LARGE_ID_COUNT:-}" ]; then
-                    jq -nr --argjson count "$WATCH_LARGE_ID_COUNT" \
-                        'range(1; $count + 1)'
-                else
-                    jq -nr 'range(1; 101)'
-                fi
-            else
-                jq -nc '[range(1; 101) | {
-                    id: ., body:"common", user:{login:"u"},
+            jq -nc --argjson count "${WATCH_LARGE_ID_COUNT:-100}" \
+                    --rawfile large_body "${WATCH_LARGE_BODY_FILE:-/dev/null}" \
+                    '(if $count > 100 then 10000 else 1 end) as $start
+                    | [range($start; $start + $count) | {
+                    id: ., body:(if . == 1 and ($large_body | length) > 0 then $large_body else "common" end), user:{login:"u"},
                     created_at:"2026-01-01T00:00:00Z",
                     updated_at:"2026-01-01T00:00:00Z",
                     html_url:("https://github.com/o/r/pull/1#issuecomment-" + tostring)
                 }]'
-            fi
             if [ "${WATCH_INCOMPLETE_BASE:-}" = "issue-comments" ] || \
                { [ "${WATCH_TRANSIENT_BASE_FAILURE:-false}" = true ] && \
                  [ "$poll" -eq 1 ]; } || \
@@ -366,48 +431,25 @@ if [ "$1" = "api" ] && [ "$2" = "--paginate" ]; then
                 exit 41
             fi
             if [ "$poll" -eq 0 ]; then
-                if [ "$watch_projection" = true ]; then
-                    printf '101\n102\n'
-                else
                     echo '[{"id":101,"body":"old","user":{"login":"u"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-101"},{"id":102,"body":"keep","user":{"login":"u"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-102"}]'
-                fi
             else
-                if [ "$watch_projection" = true ]; then
-                    printf '103\n102\n104\n'
-                else
                     echo '[{"id":103,"body":"new","user":{"login":"u"},"created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-103"},{"id":102,"body":"keep","user":{"login":"u"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-102"},{"id":104,"body":"added","user":{"login":"u"},"created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","html_url":"https://github.com/o/r/pull/1#issuecomment-104"}]'
-                fi
             fi
             ;;
         *pulls/*/reviews*)
-            if [ "$watch_projection" = true ]; then
-                if [ -n "${WATCH_LARGE_ID_COUNT:-}" ]; then
-                    jq -nr --argjson count "$WATCH_LARGE_ID_COUNT" \
-                        'range(1001; 1001 + $count)'
-                else
-                    jq -nr 'range(1001; 1101)'
-                fi
-            else
-                jq -nc '[range(1001; 1101) | {
+            jq -nc --argjson count "${WATCH_LARGE_ID_COUNT:-100}" '
+                    (if $count > 100 then 100000 else 1001 end) as $start
+                    | [range($start; $start + $count) | {
                     id: ., body:"common", user:{login:"u"}, state:"COMMENTED",
                     submitted_at:"2026-01-01T00:00:00Z", commit_id:"abc123",
                     html_url:("https://github.com/o/r/pull/1#pullrequestreview-" + tostring)}]'
-            fi
             if [ "${WATCH_INCOMPLETE_BASE:-}" = "reviews" ]; then
                 exit 42
             fi
             if [ "$poll" -eq 0 ]; then
-                if [ "$watch_projection" = true ]; then
-                    echo '1101'
-                else
                     echo '[{"id":1101,"body":"old","user":{"login":"u"},"state":"COMMENTED","submitted_at":"2026-01-01T00:00:00Z","commit_id":"abc123","html_url":"https://github.com/o/r/pull/1#pullrequestreview-1101"}]'
-                fi
             else
-                if [ "$watch_projection" = true ]; then
-                    echo '1102'
-                else
                     echo '[{"id":1102,"body":"new","user":{"login":"u"},"state":"COMMENTED","submitted_at":"2026-01-02T00:00:00Z","commit_id":"abc123","html_url":"https://github.com/o/r/pull/1#pullrequestreview-1102"}]'
-                fi
             fi
             ;;
         *) echo '[]' ;;
@@ -473,6 +515,27 @@ assert_jq "$WATCH_WORK_DIR/.reports/pr-reviews/pr-1/analysis.json" \
     '._metadata.repository == "o/r" and ._metadata.pr_number == 1' \
     "watch success is bound to a current selected artifact for the watched PR"
 
+for revision_kind in issue review inline resolution final_resolution; do
+    printf '0\n' > "$WATCH_POLL_FILE"
+    printf '0\n' > "$WATCH_SLEEP_COUNT_FILE"
+    REVISION_WATCH_OUT=$(
+        cd "$WATCH_WORK_DIR" && env WATCH_REVISION_ONLY="$revision_kind" \
+            WATCH_POLL_FILE="$WATCH_POLL_FILE" WATCH_SLEEP_COUNT_FILE="$WATCH_SLEEP_COUNT_FILE" \
+            WATCH_SLEEP_LIMIT=1 WATCH_CLAUDE_ATTEMPT_FILE="$WATCH_CLAUDE_ATTEMPT_FILE" \
+            WATCH_CLAUDE_LOG="$WATCH_CLAUDE_LOG" PATH="$WATCH_STUB_DIR:$PATH" \
+            "$GH_PR_ENRICH" watch 1 --interval 1 --enrich 2>&1
+    ) || true
+    assert_contains "$REVISION_WATCH_OUT" 'Changes detected!' \
+        "watch detects $revision_kind changes without new IDs"
+    if [ "$revision_kind" = final_resolution ]; then
+        assert_not_contains "$REVISION_WATCH_OUT" 'Running analysis...' \
+            'resolving the final threads without comment edits does not rerun analysis'
+    else
+        assert_contains "$REVISION_WATCH_OUT" 'Running analysis...' \
+            "$revision_kind changes trigger enrichment without new comment IDs"
+    fi
+done
+
 WATCH_LARGE_BODY_FILE="$WATCH_CASE/large-comment-body.txt"
 WATCH_PROJECTION_LOG="$WATCH_CASE/projection.log"
 LC_ALL=C awk 'BEGIN { for (i = 0; i < 1100000; i++) printf "x" }' \
@@ -493,9 +556,9 @@ LARGE_BODY_WATCH_OUT=$(
 set -e
 assert_contains "$LARGE_BODY_WATCH_OUT" \
     "Initial state: 204 comments/reviews" \
-    "watch initializes after API-side projection of bodies larger than macOS ARG_MAX"
+    "watch hashes bodies larger than macOS ARG_MAX through files"
 assert_contains "$(cat "$WATCH_PROJECTION_LOG")" "--jq" \
-    "paginated base comment and review fetches project IDs before shell capture"
+    "paginated base comment and review fetches project revision fields before shell capture"
 assert_contains "$(cat "$WATCH_PROJECTION_LOG")" "1100000" \
     "the large-body regression exercises a payload beyond macOS ARG_MAX"
 
@@ -525,7 +588,7 @@ assert_eq "1" "$(grep -c 'WatchReviewThreads' "$WATCH_GRAPHQL_LOG")" \
 assert_eq "1" "$(grep -c 'WatchThreadComments' "$WATCH_GRAPHQL_LOG")" \
     "watch separately paginates the overflow thread's replies"
 assert_contains "$(cat "$WATCH_GRAPHQL_LOG")" \
-    'comments(first: 100) { totalCount nodes { id } }' \
+    'comments(first: 100) { totalCount nodes { id body lastEditedAt } }' \
     "top-level pagination omits nested comments pageInfo"
 assert_contains "$(cat "$WATCH_GRAPHQL_LOG")" \
     'comments(first: 100, after: $endCursor)' \
@@ -593,7 +656,7 @@ LARGE_ID_WATCH_OUT=$(
 )
 set -e
 assert_contains "$LARGE_ID_WATCH_OUT" \
-    "Initial state: 140001 comments/reviews" \
+    "Initial state: 140004 comments/reviews" \
     "watch initializes with complete ID arrays beyond macOS ARG_MAX"
 assert_contains "$LARGE_ID_WATCH_OUT" "Changes detected!" \
     "watch computes a large-state delta over stdin instead of argv"

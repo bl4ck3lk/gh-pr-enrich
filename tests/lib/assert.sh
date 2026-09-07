@@ -7,6 +7,9 @@
 #   assert_eq "expected" "$actual" "description"
 #   suite_end   # exits 1 if any assertion failed
 
+# Fixtures must not inherit machine-specific signing, filters, or aliases.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'

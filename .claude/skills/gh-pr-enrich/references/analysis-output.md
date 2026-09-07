@@ -6,6 +6,13 @@ and worked end-to-end workflows. Pre-v2.1 reports may only have a
 fallback, and only when no current `analysis-context.json` exists. Current
 provider source artifacts are never selected implicitly.
 
+The selector derives `_metadata.review_status` from captured input coverage,
+category coverage, and unresolved plausible findings. Read `.state` (`complete`
+or `incomplete`) independently of `.task_count` and `.confirmed_findings`.
+Analyzer-provided status is replaced during selection. An empty task list does
+not establish review or remediation completion; `not_applicable` categories are
+valid coverage decisions.
+
 ## Analyzing Output
 
 ### Reading the Selected Analysis
@@ -41,6 +48,15 @@ Each finding is verified, categorized, rated and anchored:
 
 Each `PRRT_...` thread ID may appear in only one task. Combine all remediation
 for a shared review thread into that task so hosted resolution occurs only once.
+
+Confirmed evidence and task addresses must resolve to an existing regular file
+and line. An omitted `source` means `"workspace"`: the captured Git-index bytes
+or the explicitly granted working-tree bytes, bound by the workspace fingerprint.
+Use `source: "base"` for a file at the exact captured `pr.base_sha`, such as a
+deleted or renamed path. The base commit must be locally available. Diff old-side
+line numbers may refer to a merge base, so verify the exact captured base before
+using them. A valid address does not prove the semantic claim. Tasks proposing
+new files can use `file: "n/a"`, `line: 0`, and describe the new path in the fix.
 
 **Verdict** — what verification concluded:
 - `confirmed` — the defect was traced in the code

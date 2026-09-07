@@ -66,6 +66,11 @@ invent an identifier or URL.
 
 Every finding needs at least one evidence entry naming a file and line you
 actually inspected. A finding you cannot anchor to code is a "plausible" at best.
+Confirmed evidence and task addresses must name an existing regular file and
+line in the provided workspace snapshot (source "workspace", the default).
+Source "base" names the exact captured pr.base_sha, including deleted paths;
+use it only after verifying that revision's bytes. Old-side diff line numbers
+can refer to a different merge base. Address validation does not verify a claim.
 
 Budget your reading. Start with the files the PR changed and the files cited in
 comments, and follow at most one hop from there (the direct callers or callees
@@ -158,7 +163,7 @@ Each task_list entry must carry:
   A PRRT thread_id may appear in only one task. Consolidate all work for one
   review thread into that task so address mode cannot resolve it prematurely.
 - file and line: where the change goes. Use the real path from the repository.
-  For a task with no single site (a decision, a discussion, a follow-up), use
+  For a task with no existing site (a new file, a decision, a follow-up), use
   file "n/a" and line 0.
 - suggested_fix: the concrete change — a corrected condition, the guard to add,
   the call to move. Not "handle this properly".

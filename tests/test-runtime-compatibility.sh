@@ -3023,7 +3023,6 @@ PROVIDER_SIGNAL_READY="$TEST_OUTPUT_DIR/provider-signal-ready"
 PROVIDER_SIGNAL_CHILD_PID_FILE="$TEST_OUTPUT_DIR/provider-signal-child-pid"
 PROVIDER_SIGNAL_DESCENDANT_PID_FILE="$TEST_OUTPUT_DIR/provider-signal-descendant-pid"
 PROVIDER_SIGNAL_LIVE_DIR_FILE="$TEST_OUTPUT_DIR/provider-signal-live-dir"
-PROVIDER_SIGNAL_LIVE_BASELINE_FILE="$TEST_OUTPUT_DIR/provider-signal-live-baseline"
 PROVIDER_SIGNAL_SOURCE_DIR_FILE="$TEST_OUTPUT_DIR/provider-signal-source-dir"
 PROVIDER_SIGNAL_BACKUP_DIR_FILE="$TEST_OUTPUT_DIR/provider-signal-backup-dir"
 PROVIDER_SIGNAL_OUT="$TEST_OUTPUT_DIR/provider-signal.out"
@@ -3053,6 +3052,17 @@ case "$destination" in
 esac
 exec "$PROVIDER_SIGNAL_REAL_CP" "$@"
 STUB
+cat > "$PROVIDER_SIGNAL_STUBS/mktemp" << 'STUB'
+#!/bin/bash
+created_path=$("$PROVIDER_SIGNAL_REAL_MKTEMP" "$@") || exit $?
+case "$created_path" in
+    */gh-pr-enrich-live-discussion.*)
+        [ ! -e "$PROVIDER_SIGNAL_MARKER" ] || \
+            printf '%s\n' "$created_path" > "$PROVIDER_SIGNAL_LIVE_DIR_FILE"
+        ;;
+esac
+printf '%s\n' "$created_path"
+STUB
 cat > "$PROVIDER_SIGNAL_STUBS/gh" << 'STUB'
 #!/bin/bash
 if [ "$1" = "api" ] && [ "$2" != "graphql" ] && \
@@ -3067,16 +3077,6 @@ if [ "$1" = "api" ] && [ "$2" != "graphql" ] && \
             descendant_pid=$!
             printf '%s\n' "$descendant_pid" \
                 > "$PROVIDER_SIGNAL_DESCENDANT_PID_FILE"
-            : > "$PROVIDER_SIGNAL_LIVE_DIR_FILE"
-            for live_dir in /tmp/gh-pr-enrich-live-discussion.*; do
-                [ -d "$live_dir" ] || continue
-                if ! grep -Fxq "$live_dir" \
-                        "$PROVIDER_SIGNAL_LIVE_BASELINE_FILE" 2>/dev/null; then
-                    printf '%s\n' "$live_dir" \
-                        > "$PROVIDER_SIGNAL_LIVE_DIR_FILE"
-                    break
-                fi
-            done
             : > "$PROVIDER_SIGNAL_READY"
             trap 'exit 143' TERM
             trap 'exit 130' INT
@@ -3087,12 +3087,10 @@ if [ "$1" = "api" ] && [ "$2" != "graphql" ] && \
 fi
 exec "$PROVIDER_SIGNAL_BASE_GH" "$@"
 STUB
-chmod +x "$PROVIDER_SIGNAL_STUBS/cp" "$PROVIDER_SIGNAL_STUBS/gh"
-find /tmp -maxdepth 1 -type d \
-    -name 'gh-pr-enrich-live-discussion.*' -print \
-    > "$PROVIDER_SIGNAL_LIVE_BASELINE_FILE"
+chmod +x "$PROVIDER_SIGNAL_STUBS/cp" "$PROVIDER_SIGNAL_STUBS/gh" "$PROVIDER_SIGNAL_STUBS/mktemp"
 RUNTIME_BACKGROUND_PID=""
 env PATH="$PROVIDER_SIGNAL_STUBS:$STUB_DIR:$PATH" \
+    GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
     REPO_VISIBILITY=PRIVATE GH_PR_ENRICH_CODE_ACCESS=false \
     CLAUDE_INVOKED_LOG="$CLAUDE_LOG" \
     PROVIDER_SIGNAL_REPORT="$PROVIDER_SIGNAL_DIR" \
@@ -3101,10 +3099,10 @@ env PATH="$PROVIDER_SIGNAL_STUBS:$STUB_DIR:$PATH" \
     PROVIDER_SIGNAL_CHILD_PID_FILE="$PROVIDER_SIGNAL_CHILD_PID_FILE" \
     PROVIDER_SIGNAL_DESCENDANT_PID_FILE="$PROVIDER_SIGNAL_DESCENDANT_PID_FILE" \
     PROVIDER_SIGNAL_LIVE_DIR_FILE="$PROVIDER_SIGNAL_LIVE_DIR_FILE" \
-    PROVIDER_SIGNAL_LIVE_BASELINE_FILE="$PROVIDER_SIGNAL_LIVE_BASELINE_FILE" \
     PROVIDER_SIGNAL_SOURCE_DIR_FILE="$PROVIDER_SIGNAL_SOURCE_DIR_FILE" \
     PROVIDER_SIGNAL_BACKUP_DIR_FILE="$PROVIDER_SIGNAL_BACKUP_DIR_FILE" \
     PROVIDER_SIGNAL_REAL_CP="$(command -v cp)" \
+    PROVIDER_SIGNAL_REAL_MKTEMP="$(command -v mktemp)" \
     PROVIDER_SIGNAL_BASE_GH="$STUB_DIR/gh" \
     "$GH_PR_ENRICH" 1 --enrich --allow-external \
     --output-dir "$PROVIDER_SIGNAL_DIR" \
@@ -3638,11 +3636,42 @@ assert_contains "$NO_CODE_CONFIRMED_OUT" "without enabled repository code access
 # Confirmed findings also require the current local workspace to remain the
 # exact one captured in the immutable context. An explicit code-access override
 # still permits a stable non-head checkout, but it does not waive this binding.
+for completion_case in not_reviewable plausible not_applicable; do
+    COMPLETION_SOURCE="$AUTHORIZED_DIR/completion-analysis.json"
+    jq --arg mode "$completion_case" '
+        .task_list = [] | .issue_categories = []
+        | .category_coverage |= map(.verdict = (if $mode == "not_applicable"
+            then "not_applicable" else "not_reviewable" end))
+        | if $mode == "plausible" then
+            .issue_categories = [{finding_id:"unresolved",name:"Needs evidence",
+                category:"logic_error",severity:"high",impact:"moderate",likelihood:"likely",
+                severity_rationale:"fixture",verdict:"plausible",confidence:"low",
+                description:"fixture",evidence:[{file:"a.js",line:1,detail:"unverified"}],
+                thread_ids:[],sources:["codex:orchestrator"]}]
+            | .category_coverage |= map(if .category == "logic_error"
+                then .verdict = "findings_reported" else . end)
+          else . end
+        | ._metadata.review_status = {state:"complete"}
+    ' "$HYBRID_SOURCE" > "$COMPLETION_SOURCE"
+    "$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$COMPLETION_SOURCE" >/dev/null
+    EXPECTED_COMPLETION=incomplete
+    [ "$completion_case" != not_applicable ] || EXPECTED_COMPLETION=complete
+    assert_jq_eq "$AUTHORIZED_DIR/analysis.json" '._metadata.review_status.state' \
+        "$EXPECTED_COMPLETION" "$completion_case completeness is derived independently of an empty task list"
+    assert_jq_eq "$AUTHORIZED_DIR/combined-data.json" '.analysis._metadata.review_status.state' \
+        "$EXPECTED_COMPLETION" "$completion_case completeness reaches JSON consumers"
+    assert_contains "$(cat "$AUTHORIZED_DIR/analysis.md")" "Review status: $EXPECTED_COMPLETION" \
+        "$completion_case completeness is visible in the selected report"
+done
+"$GH_PR_ENRICH" select-analysis "$AUTHORIZED_DIR" "$HYBRID_SOURCE" >/dev/null
+rm -f "$COMPLETION_SOURCE"
+
 SELECTION_REPO="$TEST_OUTPUT_DIR/selection-workspace"
 SELECTION_REPORT="$SELECTION_REPO/report"
 mkdir -p "$SELECTION_REPORT"
 (cd "$SELECTION_REPO" && git init -q . && git config user.email t@t && git config user.name t \
-    && echo stable > tracked.txt && git add tracked.txt && git commit -qm init)
+    && echo stable > tracked.txt && echo 'const x = 1;' > a.js \
+    && git add tracked.txt a.js && git commit -qm init)
 SELECTION_HEAD=$(git -C "$SELECTION_REPO" rev-parse HEAD)
 SELECTION_CONTEXT_BASE="$TEST_OUTPUT_DIR/selection-context-base.json"
 SELECTION_CONTEXT_TMP="$TEST_OUTPUT_DIR/selection-context.tmp.json"
@@ -3697,6 +3726,24 @@ assert_jq_eq "$SELECTION_REPORT/analysis.json" \
 assert_jq "$SELECTION_REPORT/analysis.json" \
     '.task_list[0].finding_ids == ["unverified-finding"]' \
     "a task mapped to a confirmed finding is selectable"
+
+for invalid_anchor in missing_file impossible_line; do
+    cp "$SELECTION_REPORT/analysis.json" "$TEST_OUTPUT_DIR/previous-selected.json"
+    cp "$SELECTION_REPORT/analysis.md" "$TEST_OUTPUT_DIR/previous-selected.md"
+    jq --arg mode "$invalid_anchor" '
+        .issue_categories[0].evidence[0] |=
+            (if $mode == "missing_file" then .file = "never-existed.txt" else .line = 1000000 end)
+    ' "$SELECTION_REPORT/hybrid-analysis.json" > "$SELECTION_REPORT/codex-analysis.json"
+    rc=0
+    (cd "$SELECTION_REPO" && "$GH_PR_ENRICH" select-analysis "$SELECTION_REPORT" \
+        "$SELECTION_REPORT/codex-analysis.json") >/dev/null 2>&1 || rc=$?
+    assert_true "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" \
+        "public selection rejects $invalid_anchor evidence"
+    assert_true "$(cmp -s "$TEST_OUTPUT_DIR/previous-selected.json" "$SELECTION_REPORT/analysis.json" &&
+        cmp -s "$TEST_OUTPUT_DIR/previous-selected.md" "$SELECTION_REPORT/analysis.md"; echo $?)" \
+        "$invalid_anchor rejection preserves the previous selected result and report"
+done
+rm -f "$SELECTION_REPORT/codex-analysis.json"
 
 # A clean native result still claims that the immutable code snapshot was
 # reviewed. Bind that claim to the same workspace fingerprint as a finding.
@@ -3761,7 +3808,7 @@ assert_no_selection_transaction_residue "$SELECTION_REPORT" \
 # own private replacement directory during final workspace revalidation.
 mkdir -p "$TMP_ALIAS_SELECTION/report"
 (cd "$TMP_ALIAS_SELECTION" && git init -q . && git config user.email t@t && \
-    git config user.name t && echo stable > tracked.txt && git add tracked.txt && \
+    git config user.name t && echo stable > tracked.txt && echo 'const x = 1;' > a.js && git add tracked.txt a.js && \
     git -c commit.gpgsign=false commit -qm init)
 TMP_ALIAS_HEAD=$(git -C "$TMP_ALIAS_SELECTION" rev-parse HEAD)
 cp "$AUTHORIZED_DIR/pr-summary.json" "$TMP_ALIAS_SELECTION/report/pr-summary.json"
@@ -4709,6 +4756,7 @@ BLOCKED_HEAD_DESCENDANT_PID_FILE="$PRELOCK_HEAD_DESCENDANT_PID"
 rc=0
 PRELOCK_HEAD_OUT=$(cd "$PRELOCK_SELECTION_REPO" && \
     env PATH="$PRELOCK_HEAD_STUBS:$PATH" \
+    GH_PR_ENRICH_TEST_REAL_GITHUB_SLEEP=true \
     GH_PR_ENRICH_GITHUB_TIMEOUT=1 \
     PRELOCK_HEAD_BASE_GH="$STUB_DIR/gh" \
     PRELOCK_HEAD_READY="$PRELOCK_HEAD_READY" \
@@ -5257,7 +5305,7 @@ mv "$AUTHORIZED_DIR/context-before-source-failure.json" "$AUTHORIZED_DIR/analysi
 # without a finding must remain explicitly not_reviewable.
 TRUNCATION_CASE_ROOT="$TEST_OUTPUT_DIR/truncated-selection"
 mkdir -p "$TRUNCATION_CASE_ROOT"
-for TRUNCATION_CASE in pr_body issue review inline thread_body thread_replies diff commit linked_issue; do
+for TRUNCATION_CASE in pr_body issue review inline thread_body thread_replies diff commit linked_issue unproven_bot_duplicates; do
     TRUNCATION_CASE_DIR="$TRUNCATION_CASE_ROOT/$TRUNCATION_CASE"
     mkdir -p "$TRUNCATION_CASE_DIR"
     cp "$AUTHORIZED_DIR/pr-summary.json" "$TRUNCATION_CASE_DIR/pr-summary.json"
@@ -5277,6 +5325,7 @@ for TRUNCATION_CASE in pr_body issue review inline thread_body thread_replies di
         diff) TRUNCATION_FILTER='.coverage.diff.files_truncated = ["a.js"]' ;;
         commit) TRUNCATION_FILTER='.coverage.commits.truncated = ["abc1234"]' ;;
         linked_issue) TRUNCATION_FILTER='.coverage.linked_issues.truncated = ["issue-u"]' ;;
+        unproven_bot_duplicates) TRUNCATION_FILTER='.coverage.issue_comments.superseded_bot_duplicates = 1 | del(.coverage.issue_comments.deduplication)' ;;
     esac
     jq "del(.coverage.context_fingerprint) | $TRUNCATION_FILTER" \
         "$AUTHORIZED_DIR/analysis-context.json" \
