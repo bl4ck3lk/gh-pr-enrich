@@ -13326,11 +13326,7 @@ fi
 # ============================================================================
 # Main PR logic
 # ============================================================================
-# Keep the requested payload on its own stream. Function captures and file
-# redirects still own their stdout; uncaptured progress goes to stderr.
-case "$OUTPUT_FORMAT" in
-    json|markdown) exec 3>&1 1>&2 ;;
-esac
+run_pr_report() {
 
 # Create output directory
 if path_has_symlink_component "$OUTPUT_DIR"; then
@@ -14222,12 +14218,6 @@ fi
 
 # Output
 case $OUTPUT_FORMAT in
-    "json")
-        cat "$OUTPUT_DIR/combined-data.json" >&3
-        ;;
-    "markdown")
-        cat "$OUTPUT_DIR/comprehensive-report.md" >&3
-        ;;
     "combined")
         echo "✅ Report generated successfully!"
         echo "📁 Directory: $OUTPUT_DIR"
@@ -14245,7 +14235,26 @@ case $OUTPUT_FORMAT in
         ;;
 esac
 
-if ! cleanup_report_run_lock; then
+}
+
+# Scope progress redirection to the report call. Bash restores stdout when the
+# call returns, without exposing a payload descriptor to child processes (for
+# example, Git interprets GIT_TRACE=3 as an inherited trace destination).
+case "$OUTPUT_FORMAT" in
+    json)
+        run_pr_report 1>&2
+        cat "$OUTPUT_DIR/combined-data.json"
+        ;;
+    markdown)
+        run_pr_report 1>&2
+        cat "$OUTPUT_DIR/comprehensive-report.md"
+        ;;
+    *) run_pr_report ;;
+esac
+
+# Retain the report lease through payload emission so another collector cannot
+# replace its bytes between collection and the caller's read.
+if ! cleanup_report_run_lock >&2; then
     exit 1
 fi
 REPORT_RUN_MANAGED=false

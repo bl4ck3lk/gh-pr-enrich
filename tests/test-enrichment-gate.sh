@@ -159,23 +159,29 @@ assert_contains "$OUT" "Found 1 unresolved thread" "the script reports what it f
 # The entire stdout stream is the selected payload, even when collection and
 # enrichment emit progress. Verify it against the artifact consumed by tools.
 for output_format in json markdown; do
-    FORMAT_OUT="$TEST_OUTPUT_DIR/format-$output_format"
+  for trace_mode in off descriptor; do
+    FORMAT_CASE="$output_format-$trace_mode"
+    FORMAT_TRACE=0
+    [ "$trace_mode" != descriptor ] || FORMAT_TRACE=3
+    FORMAT_OUT="$TEST_OUTPUT_DIR/format-$FORMAT_CASE"
     FORMAT_RC=0
     env FIXTURE_DIR="$TEST_OUTPUT_DIR/threads-only/fixtures" \
+        GIT_TRACE="$FORMAT_TRACE" \
         CLAUDE_INVOKED_LOG="$TEST_OUTPUT_DIR/format-claude.txt" PATH="$STUB_DIR:$PATH" \
         "$GH_PR_ENRICH" 1 --enrich --diff --"$output_format" --output-dir "$FORMAT_OUT" \
-        > "$TEST_OUTPUT_DIR/$output_format.stdout" \
-        2> "$TEST_OUTPUT_DIR/$output_format.stderr" || FORMAT_RC=$?
-    assert_eq "0" "$FORMAT_RC" "$output_format output completes successfully"
+        > "$TEST_OUTPUT_DIR/$FORMAT_CASE.stdout" \
+        2> "$TEST_OUTPUT_DIR/$FORMAT_CASE.stderr" 3>&- || FORMAT_RC=$?
+    assert_eq "0" "$FORMAT_RC" "$FORMAT_CASE output completes successfully"
     case "$output_format" in
         json) FORMAT_ARTIFACT=combined-data.json ;;
         markdown) FORMAT_ARTIFACT=comprehensive-report.md ;;
     esac
-    assert_true "$(cmp -s "$TEST_OUTPUT_DIR/$output_format.stdout" \
+    assert_true "$(cmp -s "$TEST_OUTPUT_DIR/$FORMAT_CASE.stdout" \
         "$FORMAT_OUT/$FORMAT_ARTIFACT"; echo $?)" \
-        "$output_format stdout contains only the requested artifact"
-    assert_contains "$(cat "$TEST_OUTPUT_DIR/$output_format.stderr")" "Fetching details" \
-        "$output_format progress remains available on stderr"
+        "$FORMAT_CASE stdout contains only the requested artifact"
+    assert_contains "$(cat "$TEST_OUTPUT_DIR/$FORMAT_CASE.stderr")" "Fetching details" \
+        "$FORMAT_CASE progress remains available on stderr"
+  done
 done
 assert_jq "$TEST_OUTPUT_DIR/threads-only/report/claude-analysis.json" '.issue_categories != null' \
     "the analysis result is written"
